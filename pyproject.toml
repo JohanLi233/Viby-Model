@@ -1,0 +1,11 @@
+[project]
+name = "viby"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.7.1",
+    "transformers>=4.54.1",
+    "wandb>=0.21.0",
+]
