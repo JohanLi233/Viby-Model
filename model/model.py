@@ -30,12 +30,6 @@ class VibyConfig(PretrainedConfig):
         rope_theta: float = 1000000.0,
         rope_scaling: Optional[dict] = None,
         z_loss_factor: float = 0.0001,
-        # MoE parameters
-        use_moe: bool = False,
-        num_experts: int = 8,
-        num_experts_per_token: int = 2,
-        expert_capacity_factor: float = 1.0,
-        aux_loss_coef: float = 0.01,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -56,12 +50,6 @@ class VibyConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.z_loss_factor = z_loss_factor
         self.attn_softmax_temp = kwargs.get("attn_softmax_temp", 1.0)
-        # MoE parameters
-        self.use_moe = use_moe
-        self.num_experts = num_experts
-        self.num_experts_per_token = num_experts_per_token
-        self.expert_capacity_factor = expert_capacity_factor
-        self.aux_loss_coef = aux_loss_coef
 
 
 def z_loss_cross_entropy(
