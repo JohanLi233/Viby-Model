@@ -18,18 +18,29 @@ class VibyConfig(PretrainedConfig):
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         hidden_act: str = "silu",
-        hidden_size: int = 640,
+        hidden_size: int = 512,
         intermediate_size: int = 1792,
         max_position_embeddings: int = 32768,
-        original_max_position_embeddings: int = 1024,
+        original_max_position_embeddings: int = 512,
         num_attention_heads: int = 8,
-        num_hidden_layers: int = 16,
+        num_hidden_layers: int = 8,
         num_key_value_heads: int = 2,
         vocab_size: int = 6400,
         rms_norm_eps: float = 1e-05,
         rope_theta: float = 1000000.0,
         rope_scaling: Optional[dict] = None,
         z_loss_factor: float = 0.0001,
+        use_moe: bool = True,
+        num_experts_per_tok: int = 2,
+        n_routed_experts: int = 4,
+        n_shared_experts: int = 1,
+        scoring_func: str = 'softmax',
+        aux_loss_alpha: float = 0.1,
+        seq_aux: bool = True,
+        norm_topk_prob: bool = True,
+        # Sink attention parameters
+        num_sink_tokens: int = 4,
+        window_length: int = 512,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -50,6 +61,17 @@ class VibyConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.z_loss_factor = z_loss_factor
         self.attn_softmax_temp = kwargs.get("attn_softmax_temp", 1.0)
+        self.use_moe = use_moe
+        self.num_experts_per_tok = num_experts_per_tok
+        self.n_routed_experts = n_routed_experts
+        self.n_shared_experts = n_shared_experts
+        self.scoring_func = scoring_func
+        self.aux_loss_alpha = aux_loss_alpha
+        self.seq_aux = seq_aux
+        self.norm_topk_prob = norm_topk_prob
+        # Sink attention config
+        self.num_sink_tokens = num_sink_tokens
+        self.window_length = window_length
 
 
 def z_loss_cross_entropy(
@@ -200,6 +222,15 @@ class Attention(nn.Module):
         # QK normalization layers (like Qwen3)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        
+        # Sink attention parameters
+        self.num_sink_tokens = getattr(args, 'num_sink_tokens', 4)
+        self.window_length = getattr(args, 'window_length', 512)
+        
+        # Sink tokens cache for each head
+        self.sink_cache = {}  # Will store sink key/value pairs
+        self.window_cache = {}  # Will store recent window key/value pairs
+        self.cache_initialized = False
 
     def forward(
         self,
@@ -222,8 +253,11 @@ class Attention(nn.Module):
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
-        if past_key_value is not None:
-            # 将过去的 k, v 与当前的 k, v 连接起来
+        # Enhanced sink attention cache management
+        if use_cache:
+            xk, xv = self._update_sink_cache(xk, xv, past_key_value)
+        elif past_key_value is not None:
+            # Standard KV cache concatenation
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
 
@@ -266,6 +300,42 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.o_proj(output))
 
         return output, past_kv
+    
+    def _update_sink_cache(self, xk, xv, past_key_value):
+        """Update sink attention cache with new keys and values"""
+        if past_key_value is not None:
+            # Concatenate with past keys/values
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        
+        seq_len = xk.size(1)
+        
+        # If sequence is shorter than sink tokens, return as-is
+        if seq_len <= self.num_sink_tokens:
+            return xk, xv
+        
+        # Separate sink tokens and sliding window tokens
+        sink_k = xk[:, :self.num_sink_tokens]  # First few tokens as sink
+        sink_v = xv[:, :self.num_sink_tokens]
+        
+        # Keep recent tokens within window length
+        if seq_len > self.num_sink_tokens + self.window_length:
+            # Keep sink + recent window
+            recent_start = seq_len - self.window_length
+            recent_k = xk[:, recent_start:]
+            recent_v = xv[:, recent_start:]
+            
+            # Combine sink and recent tokens
+            xk = torch.cat([sink_k, recent_k], dim=1)
+            xv = torch.cat([sink_v, recent_v], dim=1)
+        
+        return xk, xv
+    
+    def reset_cache(self):
+        """Reset sink attention cache"""
+        self.sink_cache = {}
+        self.window_cache = {}
+        self.cache_initialized = False
 
 
 class FeedForward(nn.Module):
@@ -289,6 +359,120 @@ class FeedForward(nn.Module):
         )
 
 
+class MoEGate(nn.Module):
+    def __init__(self, config: VibyConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        import torch.nn.init as init
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, hidden_states):
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+        logits = F.linear(hidden_states, self.weight, None)
+        if self.scoring_func == 'softmax':
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
+
+        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores
+            aux_topk = self.top_k
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            if self.seq_aux:
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                ce.scatter_add_(1, topk_idx_for_aux_loss,
+                                torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
+                    seq_len * aux_topk / self.n_routed_experts)
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+            else:
+                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                ce = mask_ce.float().mean(0)
+                Pi = scores_for_aux.mean(0)
+                fi = ce * self.n_routed_experts
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = 0
+        return topk_idx, topk_weight, aux_loss
+
+
+class MOEFeedForward(nn.Module):
+    def __init__(self, config: VibyConfig):
+        super().__init__()
+        self.config = config
+        self.experts = nn.ModuleList([
+            FeedForward(config)
+            for _ in range(config.n_routed_experts)
+        ])
+        self.gate = MoEGate(config)
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList([
+                FeedForward(config)
+                for _ in range(config.n_shared_experts)
+            ])
+
+    def forward(self, x):
+        identity = x
+        orig_shape = x.shape
+        bsz, seq_len, _ = x.shape
+        topk_idx, topk_weight, aux_loss = self.gate(x)
+        x = x.view(-1, x.shape[-1])
+        flat_topk_idx = topk_idx.view(-1)
+        if self.training:
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            y = torch.empty_like(x)
+            for i, expert in enumerate(self.experts):
+                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i])
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            y = y.view(*orig_shape)
+        else:
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+        if self.config.n_shared_experts > 0:
+            for expert in self.shared_experts:
+                y = y + expert(identity)
+        self.aux_loss = aux_loss
+        return y
+
+    @torch.no_grad()
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        expert_cache = torch.zeros_like(x)
+        idxs = flat_expert_indices.argsort()
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        token_idxs = idxs // self.config.num_experts_per_tok
+        for i, end_idx in enumerate(tokens_per_expert):
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            expert = self.experts[i]
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            expert_tokens = x[exp_token_idx]
+            expert_out = expert(expert_tokens)
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
+
+        return expert_cache
+
+
 class VibyBlock(nn.Module):
     def __init__(self, layer_id: int, config: VibyConfig):
         super().__init__()
@@ -302,7 +486,7 @@ class VibyBlock(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = FeedForward(config)
+        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(
         self,
@@ -325,6 +509,11 @@ class VibyBlock(nn.Module):
             self.post_attention_layernorm(hidden_states)
         )
         return hidden_states, present_key_value
+    
+    def reset_cache(self):
+        """Reset attention cache for this block"""
+        if hasattr(self.self_attn, 'reset_cache'):
+            self.self_attn.reset_cache()
 
 
 class VibyModel(nn.Module):
@@ -407,7 +596,19 @@ class VibyModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, presents
+        aux_loss = sum(
+            layer.mlp.aux_loss
+            for layer in self.layers
+            if isinstance(layer.mlp, MOEFeedForward)
+        )
+
+        return hidden_states, presents, aux_loss
+    
+    def reset_cache(self):
+        """Reset all attention caches"""
+        for layer in self.layers:
+            if hasattr(layer, 'reset_cache'):
+                layer.reset_cache()
 
 
 class VibyForCausalLM(PreTrainedModel, GenerationMixin):
@@ -431,7 +632,7 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
         labels: Optional[torch.Tensor] = None,  # 增加了 labels 以便计算 loss
         **args,
     ):
-        hidden_states, past_kvs = self.model(
+        hidden_states, past_kvs, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -449,6 +650,8 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
             loss = z_loss_cross_entropy(
                 shift_logits, shift_labels, self.config.z_loss_factor
             )
+            if aux_loss > 0:
+                loss = loss + aux_loss
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -456,3 +659,8 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
             past_key_values=past_kvs,
             hidden_states=hidden_states,
         )
+    
+    def reset_cache(self):
+        """Reset all sink attention caches"""
+        if hasattr(self.model, 'reset_cache'):
+            self.model.reset_cache()

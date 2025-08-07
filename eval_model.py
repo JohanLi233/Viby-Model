@@ -13,8 +13,8 @@ warnings.filterwarnings("ignore")
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained("./model/")
     modes = {0: "pretrain", 1: "full_sft"}
-    ckp = f"./{args.out_dir}/{modes[args.model_mode]}_{args.hidden_size}.pth"
-    # ckp = f"./{args.out_dir}/{modes[args.model_mode]}_{args.hidden_size}_no_local.pth"
+    # ckp = f"./{args.out_dir}/{modes[args.model_mode]}_{args.hidden_size}.pth"
+    ckp = f"./{args.out_dir}/{modes[args.model_mode]}_{args.hidden_size}_moe.pth"
 
     # Configure YaRN if enabled
     rope_scaling = None
@@ -45,6 +45,7 @@ def init_model(args):
                 else getattr(args, "original_max_seq_len", 1024)
             ),
             rope_scaling=rope_scaling,
+            use_moe=args.use_moe,
         )
     )
 
@@ -131,8 +132,8 @@ def main():
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu", type=str
     )
-    parser.add_argument("--hidden_size", default=640, type=int)
-    parser.add_argument("--num_hidden_layers", default=16, type=int)
+    parser.add_argument("--hidden_size", default=512, type=int)
+    parser.add_argument("--num_hidden_layers", default=8, type=int)
     parser.add_argument("--max_seq_len", default=1024, type=int)
     parser.add_argument("--history_cnt", default=0, type=int)
     parser.add_argument(
@@ -150,7 +151,7 @@ def main():
     )
     parser.add_argument(
         "--original_max_seq_len",
-        default=1024,
+        default=512,
         type=int,
         help="Original context length before scaling",
     )
@@ -159,6 +160,10 @@ def main():
     )
     parser.add_argument(
         "--yarn_beta_slow", default=1.0, type=float, help="YaRN beta_slow parameter"
+    )
+    # MoE parameters
+    parser.add_argument(
+        "--use_moe", action="store_true", help="Enable Mixture of Experts"
     )
     args = parser.parse_args()
 

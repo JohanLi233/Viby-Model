@@ -39,7 +39,7 @@ def add_common_args(parser):
         help="Automatically resume from latest checkpoint",
     )
     parser.add_argument("--local_rank", type=int, default=-1)
-    parser.add_argument("--hidden_size", default=640, type=int)
+    parser.add_argument("--hidden_size", default=512, type=int)
     parser.add_argument("--num_hidden_layers", default=8, type=int)
     parser.add_argument("--max_seq_len", default=1024, type=int)
 
@@ -55,8 +55,8 @@ def get_pretrain_parser():
         batch_size=32,
         learning_rate=0.01,
         accumulation_steps=8,
-        hidden_size=640,
-        num_hidden_layers=16,
+        hidden_size=512,
+        num_hidden_layers=8,
         max_seq_len=1024,
     )
 
@@ -77,8 +77,8 @@ def get_sft_parser():
         batch_size=16,
         learning_rate=0.001,
         accumulation_steps=1,
-        hidden_size=640,
-        num_hidden_layers=16,
+        hidden_size=512,
+        num_hidden_layers=8,
         max_seq_len=2048,
     )
 
@@ -94,7 +94,7 @@ def get_sft_parser():
     )
     parser.add_argument(
         "--original_max_seq_len",
-        default=1024,
+        default=512,
         type=int,
         help="Original context length before scaling",
     )
