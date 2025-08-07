@@ -189,12 +189,12 @@ class BaseTrainer:
                 if (
                     step == 0 and epoch == self.start_epoch
                 ):  # 只在训练开始时打印一次即可
-                    Logger(f"--- Verification ---")
+                    Logger("--- Verification ---")
                     Logger(f"Tensor dtype inside autocast context: {res.logits.dtype}")
                     Logger(f"Expected dtype: {self.args.dtype}")
                     Logger(f"Device: {self.device}")
                     Logger(f"Autocast dtype: {torch.get_autocast_dtype('mps')}")
-                    Logger(f"--------------------")
+                    Logger("--------------------")
 
                 logits_flat = res.logits.view(-1, res.logits.size(-1))
                 targets_flat = Y.view(-1)
