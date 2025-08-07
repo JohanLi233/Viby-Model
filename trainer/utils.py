@@ -237,15 +237,10 @@ def create_mixed_optimizer(model, args, ddp=False, training_type="pretrain"):
         if p.ndim == 2 and "embed" not in n and "lm_head" not in n
     ]
 
-    # 2. AdamW 优化器处理的参数，进一步细分：
-    # a. 嵌入层参数 (包括 token embedding 和 value embedding)
     embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-    # b. 输出头参数
-    # head_params = [p for n, p in model.named_parameters() if "lm_head" in n]
-    # c. 所有标量参数 (如偏置、LayerNorm的增益等)
     scalar_params = [p for p in model.parameters() if p.ndim < 2]
 
-    Logger(f"参数分组完成：")
+    Logger("参数分组完成：")
     Logger(f"  - Muon 参数组: {len(muon_params)} 个张量")
     Logger(f"  - 嵌入层参数组: {len(embed_params)} 个张量")
     Logger(f"  - 标量参数组: {len(scalar_params)} 个张量")
