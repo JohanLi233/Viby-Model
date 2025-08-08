@@ -30,6 +30,7 @@ class VibyConfig(PretrainedConfig):
         rope_theta: float = 1000000.0,
         rope_scaling: Optional[dict] = None,
         z_loss_factor: float = 0.0001,
+        sliding_window: int = 128,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -50,6 +51,8 @@ class VibyConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.z_loss_factor = z_loss_factor
         self.attn_softmax_temp = kwargs.get("attn_softmax_temp", 1.0)
+        # SWA sliding window length; 参考 gpt-oss，默认开启 128；在注意力层内每隔一层生效
+        self.sliding_window = sliding_window
 
 
 def z_loss_cross_entropy(
@@ -196,6 +199,9 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
         self.attn_softmax_temp = args.attn_softmax_temp
+        # SWA attention sink (per-head learnable logit slot), follow gpt-oss style
+        self.sinks = nn.Parameter(torch.zeros(self.n_local_heads))
+        self.sliding_window_default = args.sliding_window
 
         # QK normalization layers (like Qwen3)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
@@ -208,6 +214,7 @@ class Attention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache=False,
         attention_mask: Optional[torch.Tensor] = None,
+        sliding_window: Optional[int] = None,
     ):
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -239,29 +246,77 @@ class Attention(nn.Module):
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        final_attn_mask = None
-        # is_causal 用于在训练 prefill 阶段自动生成上三角掩码
-        # 当提供了 attention_mask (例如处理padding)，需要手动构建掩码
-        is_causal = attention_mask is None
-        if attention_mask is not None:
-            final_attn_mask = attention_mask.to(torch.bool)
-        # ----------------------------------------------------
+        # 构建掩码与缩放，改为手写注意力以注入 SWA sink
 
+        # Dropout 概率（与 F.sdpa 语义一致，只在训练时生效）
         dropout_p = self.dropout if self.training else 0.0
 
-        # Apply temperature scaling to the query for YaRN
+        # YaRN 温度缩放：等价于对 Q 做温度缩放
         if self.attn_softmax_temp != 1.0:
             xq = xq / self.attn_softmax_temp
 
-        output = F.scaled_dot_product_attention(
-            xq,
-            key,
-            value,
-            attn_mask=final_attn_mask,
-            dropout_p=dropout_p,
-            is_causal=is_causal,  # 当没有提供 mask 时，自动应用因果掩码
+        # 手写 attention：QK^T / sqrt(d)
+        d = self.head_dim
+        scale = 1.0 / math.sqrt(d)
+        # xq: [B, H, Tq, D], key: [B, H, Tk, D]
+        # 使用 einsum 代替 batched matmul，等价于: (B,H,Tq,D) x (B,H,Tk,D)^T -> (B,H,Tq,Tk)
+        attn_scores = torch.einsum("bhqd,bhkd->bhqk", xq, key) * scale
+
+        # 始终应用因果掩码（decoder-only）
+        tq = attn_scores.size(-2)
+        tk = attn_scores.size(-1)
+        past_len = tk - tq
+        causal_mask = torch.ones((tq, tk), device=attn_scores.device, dtype=torch.bool)
+        causal_mask = torch.triu(causal_mask, diagonal=1 + past_len)
+        attn_scores = attn_scores.masked_fill(
+            causal_mask, torch.finfo(attn_scores.dtype).min
         )
 
+        # Key padding mask：由 attention_mask 推导（1=保留，0=填充 → True 表示屏蔽）
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                key_padding_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(1)
+                # [B, 1, 1, Tk] 可广播到 [B, H, Tq, Tk]
+            else:
+                # 已经是更高维度的掩码时，尽力广播
+                key_padding_mask = attention_mask.to(torch.bool)
+                if key_padding_mask.dim() == 3:
+                    key_padding_mask = key_padding_mask.unsqueeze(1)
+            attn_scores = attn_scores.masked_fill(
+                key_padding_mask, torch.finfo(attn_scores.dtype).min
+            )
+
+        # Sliding Window Attention（参考 gpt-oss），仅当窗口 > 0 时启用
+        win = self.sliding_window_default if sliding_window is None else sliding_window
+        if win is not None and win > 0:
+            tq = attn_scores.size(-2)
+            tk = attn_scores.size(-1)
+            past_len = tk - tq
+            q_abs = torch.arange(tq, device=attn_scores.device) + past_len
+            k_abs = torch.arange(tk, device=attn_scores.device)
+            # 仅允许关注最近 win 个 key：mask 位置为 True 表示被屏蔽
+            allow = k_abs.unsqueeze(0) >= (q_abs.unsqueeze(1) - win)
+            sw_mask = ~allow  # [Tq, Tk]
+            attn_scores = attn_scores.masked_fill(
+                sw_mask, torch.finfo(attn_scores.dtype).min
+            )
+
+        # SWA sink：按 gpt-oss，在 softmax 归一化前拼接额外列，再 softmax，之后丢弃该列
+        sink_logits = self.sinks.view(1, self.n_local_heads, 1, 1).to(attn_scores.dtype)
+        sink_logits = sink_logits.expand(bsz, -1, attn_scores.size(-2), 1)
+        attn_scores = torch.cat([attn_scores, sink_logits], dim=-1)
+
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        # 丢弃 sink 概率列，仅对真实 token 做加权
+        attn_weights = attn_weights[..., :-1]
+        if dropout_p > 0.0:
+            attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
+
+        # 与 V 做乘积
+        # 使用 einsum 代替 batched matmul，(B,H,Tq,Tk) x (B,H,Tk,D) -> (B,H,Tq,D)
+        output = torch.einsum("bhqk,bhkd->bhqd", attn_weights, value)
+
+        # 回转维度
         output = output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
 
@@ -288,7 +343,9 @@ class FeedForward(nn.Module):
         self.swiglu_limit = 7.0
 
     @staticmethod
-    def swiglu_clamp(x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0) -> torch.Tensor:
+    def swiglu_clamp(
+        x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0
+    ) -> torch.Tensor:
         x_glu, x_linear = x[..., ::2], x[..., 1::2]
         x_glu = x_glu.clamp(min=None, max=limit)
         x_linear = x_linear.clamp(min=-limit, max=limit)
@@ -313,6 +370,7 @@ class VibyBlock(nn.Module):
         self.self_attn = Attention(config)
 
         self.layer_id = layer_id
+        self.default_sliding_window = config.sliding_window
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -328,12 +386,15 @@ class VibyBlock(nn.Module):
         attention_mask=None,
     ):
         residual = hidden_states
+        # sliding window 策略：参考 gpt-oss，仅对偶数层启用，默认窗口 128
+        sliding_window = self.default_sliding_window if (self.layer_id % 2 == 0) else 0
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states),
             position_embeddings,
             past_key_value,
             use_cache,
             attention_mask,
+            sliding_window=sliding_window,
         )
         hidden_states += residual
         hidden_states = hidden_states + self.mlp(
@@ -395,7 +456,7 @@ class VibyModel(nn.Module):
         **kwargs,
     ):
         batch_size, seq_length = input_ids.shape
-        past_key_values = past_key_values or [None] * len(self.layers) # type: ignore
+        past_key_values = past_key_values or [None] * len(self.layers)  # type: ignore
         start_pos = (
             past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         )
@@ -403,8 +464,8 @@ class VibyModel(nn.Module):
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
         position_embeddings = (
-            self.freqs_cos[start_pos : start_pos + seq_length], # type: ignore
-            self.freqs_sin[start_pos : start_pos + seq_length], # type: ignore
+            self.freqs_cos[start_pos : start_pos + seq_length],  # type: ignore
+            self.freqs_sin[start_pos : start_pos + seq_length],  # type: ignore
         )
 
         presents = []
@@ -435,7 +496,7 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(
             self.config.hidden_size, self.config.vocab_size, bias=False
         )
-        self.model.embed_tokens.weight = self.lm_head.weight
+        self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
@@ -466,8 +527,41 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
             )
 
         return CausalLMOutputWithPast(
-            loss=loss, # type: ignore
+            loss=loss,  # type: ignore
             logits=logits,
             past_key_values=past_kvs,
             hidden_states=hidden_states,
         )
+
+    # 让 HF generate 正确地只喂最后一个 token（当使用缓存时），并传递好 attention_mask
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        # 当有缓存时，仅传入最后一个 token，避免重复累积 K/V
+        if past_key_values is not None and len(past_key_values) > 0 and past_key_values[0] is not None:
+            input_ids = input_ids[:, -1:]
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
+            "use_cache": kwargs.get("use_cache", True),
+        }
+
+    # Beam search 等会调用该方法以重排缓存
+    def _reorder_cache(self, past_key_values, beam_idx: torch.LongTensor):
+        if past_key_values is None:
+            return past_key_values
+        reordered = []
+        for layer_past in past_key_values:
+            if layer_past is None:
+                reordered.append(None)
+                continue
+            k, v = layer_past
+            k = k.index_select(0, beam_idx)
+            v = v.index_select(0, beam_idx)
+            reordered.append((k, v))
+        return reordered

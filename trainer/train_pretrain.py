@@ -20,15 +20,19 @@ def init_model(lm_config, args):
     """初始化模型和tokenizer"""
     tokenizer = AutoTokenizer.from_pretrained("../model/")
 
-    # 使用更高效的初始化
-    with torch.device(args.device):
-        model = VibyForCausalLM(lm_config)
+    # 初始化模型
+    model = VibyForCausalLM(lm_config)
 
-    # 设置模型dtype
+    # 设置设备与dtype
+    target_dtype = None
     if args.dtype == "bfloat16":
-        model = model.to(torch.bfloat16)  # type: ignore
+        target_dtype = torch.bfloat16
     elif args.dtype == "float16":
-        model = model.to(torch.float16)  # type: ignore
+        target_dtype = torch.float16
+    if target_dtype is not None:
+        model = model.to(device=args.device, dtype=target_dtype)  # type: ignore
+    else:
+        model = model.to(device=args.device)  # type: ignore
 
     # 编译模型以提升性能
     model = torch.compile(model)

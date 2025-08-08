@@ -48,31 +48,44 @@ class BaseTrainer:
 
     def _init_distributed_mode(self):
         """初始化分布式训练模式"""
-        dist.init_process_group(backend="nccl")
+        # 根据可用硬件选择合适的后端
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
         self.ddp_local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self.device = f"cuda:{self.ddp_local_rank}"
-        torch.cuda.set_device(self.device)
-        self.args.device = torch.device(self.device)
+
+        if torch.cuda.is_available():
+            self.device = f"cuda:{self.ddp_local_rank}"
+            torch.cuda.set_device(self.ddp_local_rank)
+            self.args.device = torch.device(self.device)
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            # MPS 暂不支持 NCCL，使用 Gloo，并保持单设备 'mps'
+            self.device = "mps"
+            self.args.device = torch.device("mps")
+        else:
+            self.device = "cpu"
+            self.args.device = torch.device("cpu")
 
         # 设置随机种子
         base_seed = 1337
         rank = dist.get_rank()
         torch.manual_seed(base_seed + rank)
-        torch.cuda.manual_seed(base_seed + rank)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(base_seed + rank)
 
     def _init_training_components(self):
         """初始化训练组件"""
-        # 混合精度训练
-        self.scaler = torch.amp.GradScaler(  # type: ignore
-            enabled=(self.args.dtype in ["float16", "bfloat16"])
-        )
-
         # 自动类型转换上下文
         device_type = (
             "cuda"
             if "cuda" in str(self.device)
             else "mps" if "mps" in str(self.device) else "cpu"
         )
+        
+        # 混合精度训练（MPS 也启用 GradScaler）
+        use_grad_scaler = device_type in ("cuda", "mps") and (
+            self.args.dtype in ["float16", "bfloat16"]
+        )
+        self.scaler = torch.amp.GradScaler(enabled=use_grad_scaler)  # type: ignore
         if device_type == "cpu":
             self.ctx = nullcontext()
         elif device_type == "cuda":
@@ -193,7 +206,20 @@ class BaseTrainer:
                     Logger(f"Tensor dtype inside autocast context: {res.logits.dtype}")
                     Logger(f"Expected dtype: {self.args.dtype}")
                     Logger(f"Device: {self.device}")
-                    Logger(f"Autocast dtype: {torch.get_autocast_dtype('mps')}")
+                    # 安全打印 autocast dtype
+                    dev_str = str(self.device)
+                    dev_type = (
+                        "cuda" if "cuda" in dev_str else "mps" if "mps" in dev_str else "cpu"
+                    )
+                    try:
+                        if dev_type == "cuda" and hasattr(torch, "get_autocast_gpu_dtype"):
+                            Logger(f"Autocast dtype: {torch.get_autocast_gpu_dtype()}")
+                        elif dev_type == "cpu" and hasattr(torch, "get_autocast_cpu_dtype"):
+                            Logger(f"Autocast dtype: {torch.get_autocast_cpu_dtype()}")
+                        else:
+                            Logger("Autocast dtype: n/a")
+                    except Exception:
+                        Logger("Autocast dtype: n/a")
                     Logger("--------------------")
 
                 logits_flat = res.logits.view(-1, res.logits.size(-1))

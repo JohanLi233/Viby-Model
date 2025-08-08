@@ -30,10 +30,10 @@ class PretrainDataset(Dataset):
         return offsets
 
     def _get_line_at_offset(self, offset: int) -> str:
-        """Read a specific line using its byte offset"""
-        with open(self.data_path, "r", encoding="utf-8") as f:
+        """Read a specific line using its byte offset (binary-safe)."""
+        with open(self.data_path, "rb") as f:
             f.seek(offset)
-            return f.readline().strip()
+            return f.readline().decode("utf-8", errors="ignore").strip()
 
     def _load_sample(self, index: int) -> Dict[str, Any]:
         """Load a single sample with caching"""
@@ -106,10 +106,10 @@ class SFTDataset(Dataset):
         return offsets
 
     def _get_line_at_offset(self, offset: int) -> str:
-        """Read a specific line using its byte offset"""
-        with open(self.data_path, "r", encoding="utf-8") as f:
+        """Read a specific line using its byte offset (binary-safe)."""
+        with open(self.data_path, "rb") as f:
             f.seek(offset)
-            return f.readline().strip()
+            return f.readline().decode("utf-8", errors="ignore").strip()
 
     def _load_sample(self, index: int) -> Dict[str, Any]:
         """Load a single sample with caching"""
@@ -148,19 +148,20 @@ class SFTDataset(Dataset):
     def _generate_loss_mask(self, input_ids):
         loss_mask = [0] * len(input_ids)
         i = 0
-        while i < len(input_ids):
+        n = len(input_ids)
+        while i < n:
             if input_ids[i : i + len(self.bos_id)] == self.bos_id:
                 start = i + len(self.bos_id)
                 end = start
-                while end < len(input_ids):
+                while end < n:
                     if input_ids[end : end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
-                for j in range(
-                    start + 1, min(end + len(self.eos_id) + 1, self.max_length)
-                ):
+                # 仅在未超出实际序列长度的范围内打掩码；若未找到eos，则掩码到序列末尾
+                upper = min(end + len(self.eos_id) + 1, n)
+                for j in range(start + 1, upper):
                     loss_mask[j] = 1
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+                i = end + len(self.eos_id) if end < n else n
             else:
                 i += 1
         return loss_mask
@@ -169,11 +170,14 @@ class SFTDataset(Dataset):
         sample = self._load_sample(index)
         # 构建对话提示
         prompt = self._create_chat_prompt(sample["conversations"])
-        input_ids = self.tokenizer(prompt).input_ids[: self.max_length]
-        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
-
-        # 生成动态损失掩码
-        loss_mask = self._generate_loss_mask(input_ids)
+        # 先在未填充的序列上生成 loss mask，避免将 PAD 区域计入损失
+        input_ids_trunc = self.tokenizer(prompt).input_ids[: self.max_length]
+        loss_mask = self._generate_loss_mask(input_ids_trunc)
+        # 对 input_ids 与 mask 分别进行填充对齐
+        input_ids = input_ids_trunc + [self.tokenizer.pad_token_id] * (
+            self.max_length - len(input_ids_trunc)
+        )
+        loss_mask += [0] * (self.max_length - len(loss_mask))
 
         # 构建训练数据
         X = torch.tensor(input_ids[:-1], dtype=torch.long)

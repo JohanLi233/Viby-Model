@@ -197,8 +197,8 @@ def main():
             args.device
         )
         prompt_len = inputs["input_ids"].shape[1]
-        # 计算还能生成多少新的token
-        max_new = args.max_seq_len - prompt_len
+        # 计算还能生成多少新的token，至少生成 1 个
+        max_new = max(1, args.max_seq_len - prompt_len)
 
         print("🤖️: ", end="")
         generated_ids = model.generate(
@@ -212,6 +212,7 @@ def main():
             streamer=streamer,
             top_p=args.top_p,
             temperature=args.temperature,
+            use_cache=True,
             repetition_penalty=args.repetition_penalty,
         )
 
