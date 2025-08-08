@@ -135,16 +135,20 @@ def load_checkpoint(checkpoint_path, model, optimizer, scaler, args):
             original_model = original_model._orig_mod
         original_model.load_state_dict(checkpoint["model_state_dict"])
 
-    # 加载优化器状态
-    if "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-    # 加载scaler状态
-    if "scaler_state_dict" in checkpoint:
-        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+    # 加载优化器与scaler状态（如未指定重置）
+    if not getattr(args, "reset_optimizer", False):
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scaler_state_dict" in checkpoint:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
     start_epoch = checkpoint.get("epoch", 0)
     start_step = checkpoint.get("step", 0)
+
+    # 如要求重置优化器，则从step 0开始
+    if getattr(args, "reset_optimizer", False):
+        start_step = 0
+        Logger("reset_optimizer set: optimizer/scaler states not loaded; start_step reset to 0")
 
     Logger(f"Resumed from epoch {start_epoch}, step {start_step}")
 

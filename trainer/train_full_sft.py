@@ -31,7 +31,7 @@ def init_model(lm_config, args):
         model = model.to(torch.float16)  # type: ignore
 
     # 加载预训练模型
-    ckp = f"{args.save_dir}/pretrain_{lm_config.hidden_size}.pth"
+    ckp = f"{args.save_dir}/pretrain_640.pth"
 
     if os.path.exists(ckp):
         # 如果是完整的检查点文件
@@ -86,8 +86,6 @@ if __name__ == "__main__":
         )
 
     lm_config = VibyConfig(
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_hidden_layers,
         max_position_embeddings=args.max_seq_len,
         original_max_position_embeddings=args.original_max_seq_len,
         rope_scaling=rope_scaling,

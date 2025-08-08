@@ -51,9 +51,7 @@ if __name__ == "__main__":
     args = setup_training_args(args, "pretrain")
 
     # 创建模型配置
-    lm_config = VibyConfig(
-        hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers
-    )
+    lm_config = VibyConfig()
 
     # 初始化模型
     model, tokenizer = init_model(lm_config, args)
