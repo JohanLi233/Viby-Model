@@ -1,0 +1,232 @@
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <torch/extension.h>
+#include <ATen/mps/MPSStream.h>
+#include <vector>
+#include <cstring>
+#include <unordered_map>
+
+// 缓存 Metal 设备、队列与管线，避免重复初始化开销
+static id<MTLDevice> g_device = nil;
+static std::unordered_map<std::string, id<MTLComputePipelineState>> g_pipelines;
+
+// 卷积参数结构体
+struct ConvParams {
+    int batch_size;
+    int dim;
+    int seqlen;
+    int width;
+    bool silu_activation;
+    
+    // Strides
+    int x_batch_stride;
+    int x_c_stride;
+    int x_l_stride;
+    int weight_c_stride;
+    int weight_width_stride;
+    int out_batch_stride;
+    int out_c_stride;
+    int out_l_stride;
+};
+
+static void ensure_metal_pipeline_initialized(id<MTLDevice> device) {
+  if (g_device != nil && !g_pipelines.empty()) {
+    return;
+  }
+
+  g_device = device;
+  TORCH_CHECK(g_device, "Failed to get default MTLDevice");
+
+  // 加载并编译 Metal 源码
+  std::ifstream file("causal_conv1d.metal");
+  if (!file.good()) {
+    const char *alt = std::getenv("CAUSAL_CONV1D_METAL_PATH");
+    TORCH_CHECK(alt != nullptr,
+                "Cannot open causal_conv1d.metal. Set env CAUSAL_CONV1D_METAL_PATH or run from the directory containing causal_conv1d.metal");
+    file = std::ifstream(alt);
+    TORCH_CHECK(file.good(), "Cannot open causal_conv1d.metal from CAUSAL_CONV1D_METAL_PATH");
+  }
+  std::string source((std::istreambuf_iterator<char>(file)),
+                     std::istreambuf_iterator<char>());
+  NSString *librarySource = [NSString stringWithUTF8String:source.c_str()];
+
+  NSError *error = nil;
+  id<MTLLibrary> library = [g_device newLibraryWithSource:librarySource
+                                                  options:nil
+                                                    error:&error];
+  TORCH_CHECK(library, "Failed to compile Metal library: ",
+              [[error localizedDescription] UTF8String]);
+
+  // 创建不同的计算管线
+  std::vector<std::string> function_names = {
+    "causal_conv1d_fwd_kernel",
+    "causal_conv1d_simple_kernel"
+  };
+  
+  for (const auto& func_name : function_names) {
+    NSString *functionName = [NSString stringWithUTF8String:func_name.c_str()];
+    id<MTLFunction> function = [library newFunctionWithName:functionName];
+    TORCH_CHECK(function, "Failed to find Metal function '", func_name, "'");
+    
+    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:function error:&error];
+    TORCH_CHECK(pipeline, "Failed to create compute pipeline state for '", func_name, "': ",
+                [[error localizedDescription] UTF8String]);
+    
+    g_pipelines[func_name] = pipeline;
+  }
+}
+
+// 设置卷积参数
+static ConvParams setup_conv_params(
+    const torch::Tensor &x, 
+    const torch::Tensor &weight,
+    const torch::Tensor &out,
+    bool silu_activation
+) {
+    ConvParams params;
+    
+    // 基本维度
+    params.batch_size = x.size(0);
+    params.dim = x.size(1);
+    params.seqlen = x.size(2);
+    params.width = weight.size(1);
+    params.silu_activation = silu_activation;
+    
+    // 步长信息
+    params.x_batch_stride = x.stride(0);
+    params.x_c_stride = x.stride(1);
+    params.x_l_stride = x.stride(2);
+    params.weight_c_stride = weight.stride(0);
+    params.weight_width_stride = weight.stride(1);
+    params.out_batch_stride = out.stride(0);
+    params.out_c_stride = out.stride(1);
+    params.out_l_stride = out.stride(2);
+    
+    return params;
+}
+
+// MPS causal conv1d 内核的 C++ 封装
+torch::Tensor causal_conv1d_fwd_mps(
+    const torch::Tensor &x, 
+    const torch::Tensor &weight,
+    const torch::Tensor &bias,
+    bool silu_activation = false
+) {
+  // 输入验证
+  TORCH_CHECK(x.device().is_mps(), "Tensor 'x' must be a MPS tensor");
+  TORCH_CHECK(weight.device().is_mps(), "Tensor 'weight' must be a MPS tensor");
+  TORCH_CHECK(x.is_contiguous(), "Tensor 'x' must be contiguous");
+  TORCH_CHECK(weight.is_contiguous(), "Tensor 'weight' must be contiguous");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat, "Only float32 supported");
+  TORCH_CHECK(weight.scalar_type() == torch::kFloat, "Only float32 supported");
+  
+  // 检查形状
+  TORCH_CHECK(x.dim() == 3, "Input tensor must have shape (batch, dim, seqlen)");
+  TORCH_CHECK(weight.dim() == 2, "Weight tensor must have shape (dim, width)");
+  TORCH_CHECK(x.size(1) == weight.size(0), "Input dim must match weight dim");
+  
+  if (bias.defined() && bias.numel() > 0) {
+    TORCH_CHECK(bias.device().is_mps(), "Tensor 'bias' must be a MPS tensor");
+    TORCH_CHECK(bias.is_contiguous(), "Tensor 'bias' must be contiguous");
+    TORCH_CHECK(bias.scalar_type() == torch::kFloat, "Only float32 supported");
+    TORCH_CHECK(bias.dim() == 1, "Bias tensor must be 1D");
+    TORCH_CHECK(bias.size(0) == x.size(1), "Bias dim must match input dim");
+  }
+
+  const int64_t batch_size = x.size(0);
+  const int64_t dim = x.size(1);
+  const int64_t seqlen = x.size(2);
+  const int64_t width = weight.size(1);
+  
+  if (seqlen == 0) {
+    return torch::empty_like(x);
+  }
+
+  // 使用 PyTorch 的当前 MPS 流
+  at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
+  id<MTLDevice> device = (id<MTLDevice>)stream->device();
+  ensure_metal_pipeline_initialized(device);
+
+  // 创建输出张量
+  auto result_tensor = torch::empty_like(x);
+  
+  // 获取 Metal 缓冲区
+  id<MTLBuffer> x_buffer = (id<MTLBuffer>)x.storage().data();
+  id<MTLBuffer> weight_buffer = (id<MTLBuffer>)weight.storage().data();
+  id<MTLBuffer> bias_buffer = (bias.defined() && bias.numel() > 0) ? (id<MTLBuffer>)bias.storage().data() : nil;
+  id<MTLBuffer> result_buffer = (id<MTLBuffer>)result_tensor.storage().data();
+  
+  // 计算偏移
+  const NSUInteger x_offset = (NSUInteger)(x.storage_offset() * x.element_size());
+  const NSUInteger weight_offset = (NSUInteger)(weight.storage_offset() * weight.element_size());
+  const NSUInteger bias_offset = (bias.defined() && bias.numel() > 0) ? (NSUInteger)(bias.storage_offset() * bias.element_size()) : 0;
+  const NSUInteger result_offset = (NSUInteger)(result_tensor.storage_offset() * result_tensor.element_size());
+
+  // 设置卷积参数
+  ConvParams params = setup_conv_params(x, weight, result_tensor, silu_activation);
+
+  // 选择合适的kernel（简化版本）
+  id<MTLComputePipelineState> pipeline = g_pipelines["causal_conv1d_simple_kernel"];
+  
+  // 编码计算命令
+  id<MTLComputeCommandEncoder> encoder = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
+  [encoder setComputePipelineState:pipeline];
+  
+  // 设置缓冲区
+  [encoder setBuffer:x_buffer offset:x_offset atIndex:0];
+  [encoder setBuffer:weight_buffer offset:weight_offset atIndex:1];
+  if (bias_buffer != nil) {
+    [encoder setBuffer:bias_buffer offset:bias_offset atIndex:2];
+  } else {
+    [encoder setBuffer:nil offset:0 atIndex:2];
+  }
+  [encoder setBuffer:result_buffer offset:result_offset atIndex:3];
+  
+  // 设置参数
+  uint32_t batch_u32 = (uint32_t)batch_size;
+  uint32_t dim_u32 = (uint32_t)dim;
+  uint32_t seqlen_u32 = (uint32_t)seqlen;
+  bool silu_flag = silu_activation;
+  
+  [encoder setBytes:&batch_u32 length:sizeof(uint32_t) atIndex:4];
+  [encoder setBytes:&dim_u32 length:sizeof(uint32_t) atIndex:5];
+  [encoder setBytes:&seqlen_u32 length:sizeof(uint32_t) atIndex:6];
+  [encoder setBytes:&silu_flag length:sizeof(bool) atIndex:7];
+
+  // 计算线程组大小
+  // 使用 3D 网格: (batch_size, dim, seqlen)
+  MTLSize gridSize = MTLSizeMake((NSUInteger)batch_size, (NSUInteger)dim, (NSUInteger)seqlen);
+  
+  // 选择线程组大小
+  NSUInteger maxThreadsPerGroup = [pipeline maxTotalThreadsPerThreadgroup];
+  NSUInteger threadsPerGroup = MIN(256, maxThreadsPerGroup); // 保守的线程组大小
+  MTLSize threadgroupSize = MTLSizeMake(1, 1, threadsPerGroup);
+  
+  [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+
+  return result_tensor;
+}
+
+// 简化的接口函数，匹配 PyTorch autograd function 的期望
+torch::Tensor causal_conv1d_mps(
+    const torch::Tensor &x,
+    const torch::Tensor &weight,
+    const torch::Tensor &bias,
+    const torch::Tensor &seq_idx,
+    const torch::Tensor &initial_states,
+    const torch::Tensor &final_states_out,
+    bool silu_activation
+) {
+    // 目前只实现基础功能，忽略高级参数
+    return causal_conv1d_fwd_mps(x, weight, bias, silu_activation);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("causal_conv1d_fwd", &causal_conv1d_fwd_mps, 
+        "Causal Conv1D forward pass using Metal compute kernel (MPS)");
+  m.def("causal_conv1d", &causal_conv1d_mps,
+        "Causal Conv1D with full interface compatibility");
+}
