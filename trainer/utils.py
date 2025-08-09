@@ -143,14 +143,17 @@ def load_checkpoint(checkpoint_path, model, optimizer, scaler, args):
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
     start_epoch = checkpoint.get("epoch", 0)
-    start_step = checkpoint.get("step", 0)
+    last_finished_step = checkpoint.get("step", 0)
+
+    # 从下一步继续，避免重复已完成的 step
+    start_step = int(last_finished_step) + 1
 
     # 如要求重置优化器，则从step 0开始
     if getattr(args, "reset_optimizer", False):
         start_step = 0
         Logger("reset_optimizer set: optimizer/scaler states not loaded; start_step reset to 0")
 
-    Logger(f"Resumed from epoch {start_epoch}, step {start_step}")
+    Logger(f"Resumed from epoch {start_epoch}, next_step {start_step}")
 
     return start_epoch, start_step
 
@@ -344,10 +347,13 @@ def log_training_progress(
     args,
     wandb=None,
     grad_norm=0.0,
+    base_step_offset: int = 0,
 ):
     """统一的训练进度日志记录"""
     spend_time = time.time() - start_time
-    steps_per_sec = (step + 1) / spend_time
+    # 使用相对步数计算速率，避免 resume 后跳过的步导致速率异常
+    effective_steps_done = max(1, (step - base_step_offset + 1))
+    steps_per_sec = effective_steps_done / spend_time if spend_time > 0 else 0.0
     tokens_per_sec = steps_per_sec * args.batch_size * args.max_seq_len
 
     Logger(

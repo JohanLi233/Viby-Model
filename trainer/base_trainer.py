@@ -172,6 +172,7 @@ class BaseTrainer:
         """训练一个epoch"""
         loss_fct = nn.CrossEntropyLoss(reduction="none")
         start_time = time.time()
+        base_step_offset_for_speed = skip_steps
         valid_loss_steps = 0
 
         self.model.train()
@@ -300,6 +301,7 @@ class BaseTrainer:
                     self.args,
                     wandb,
                     grad_norm_to_log,
+                    base_step_offset=base_step_offset_for_speed,
                 )
 
             # 模型保存

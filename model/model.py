@@ -329,11 +329,11 @@ class FeedForward(nn.Module):
         self.gate_proj = nn.Linear(
             config.hidden_size, config.intermediate_size * 2, bias=False
         )
-        self.down_proj = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=False
-        )
         self.up_proj = nn.Linear(
             config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
         )
         self.dropout = nn.Dropout(config.dropout)
         # keep original act for compatibility but we will use swiglu_clamp path
@@ -353,7 +353,7 @@ class FeedForward(nn.Module):
         return out_glu * (x_linear + 1)
 
     def forward(self, x):
-        # Use clamp-ed SwiGLU
+        # Use clamp-ed SwiGLU with gate-up structure
         gated = self.gate_proj(x)
         h = self.swiglu_clamp(gated, alpha=self.swiglu_alpha, limit=self.swiglu_limit)
         up = self.up_proj(x)
@@ -496,7 +496,7 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(
             self.config.hidden_size, self.config.vocab_size, bias=False
         )
-        self.lm_head.weight = self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = self.lm_head.weight
 
     def forward(
         self,
