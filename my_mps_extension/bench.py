@@ -1,9 +1,11 @@
 import os
 import sys
 import time
+import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
+import my_mps_extension._C as mps_ext
 
 # 设置环境变量和路径
 os.environ["CAUSAL_CONV1D_METAL_PATH"] = os.path.join(
@@ -114,17 +116,204 @@ def canon_forward_reference(x_btd, weight_dw, bias_d=None, activation: bool = Tr
     return y.movedim(-2, -1)
 
 
+def generate_attention_mask(batch: int, seqlen: int, device: torch.device, min_fill_ratio: float = 0.5):
+    """
+    生成 HuggingFace 风格的 2D attention_mask（1 表示有效，0 表示 padding）。
+    每个样本的有效长度在 [min_fill_ratio*seqlen, seqlen] 之间随机。
+    返回: mask (B, T) - float32
+    """
+    min_len = max(1, int(seqlen * min_fill_ratio))
+    lengths = torch.randint(low=min_len, high=seqlen + 1, size=(batch,), device=device)
+    mask = torch.zeros(batch, seqlen, device=device, dtype=torch.float32)
+    for b in range(batch):
+        mask[b, : lengths[b].item()] = 1.0
+    return mask
+
+
+def short_conv_hf_reference(
+    x_btd: torch.Tensor,
+    weight_dw: torch.Tensor,
+    bias_d: torch.Tensor | None,
+    activation: bool = True,
+    residual: bool = True,
+    attention_mask: torch.Tensor | None = None,
+):
+    """
+    模拟 HuggingFace `ShortConvolution.forward` 的关键路径：
+    - 输入为 [B, T, D]
+    - 先按 mask 将 padding 位置置零
+    - 做 depthwise causal conv（可选 SiLU）
+    - 可选 residual（将结果与原始 x 相加）
+    返回 [B, T, D]
+    """
+    x_in = x_btd
+    if attention_mask is not None:
+        x_btd = x_btd * attention_mask.unsqueeze(-1)
+    y = canon_forward_reference(x_btd, weight_dw, bias_d, activation)
+    if residual:
+        y = x_in + y
+    return y
+
+
+def short_conv_mps_like(
+    x_btd: torch.Tensor,
+    weight_dw: torch.Tensor,
+    bias_d: torch.Tensor | None,
+    activation: bool = True,
+    residual: bool = True,
+    attention_mask: torch.Tensor | None = None,
+):
+    """
+    使用自研 MPS 核模拟 HF 的 `ShortConvolution.forward`：
+    - 输入 [B, T, D]，按 mask 置零
+    - 走 [B, D, T] 路径调用 mps_ext.causal_conv1d_fwd
+    - 可选 residual
+    返回 [B, T, D]
+    """
+    x_in = x_btd
+    if attention_mask is not None:
+        x_btd = x_btd * attention_mask.unsqueeze(-1)
+    x_bdt = x_btd.movedim(-1, -2).contiguous()
+    y_bdt = mps_ext.causal_conv1d_fwd(
+        x_bdt, weight_dw.contiguous(), bias_d.contiguous() if bias_d is not None else None, activation
+    )
+    y = y_bdt.movedim(-2, -1)
+    if residual:
+        y = x_in + y
+    return y
+
+
+def run_hf_like_canon_ac_bench():
+    """
+    模拟 HF 中 CanonA/C 的使用：
+    - 输入 [B, T, D]
+    - 2D attention_mask (B, T)
+    - SiLU 激活 + 残差
+    对比 MPS 与 PyTorch 参考实现的性能与正确性。
+    """
+    device = torch.device("mps")
+    torch.manual_seed(202)
+    configs = [
+        # (B, T, D, W)
+        (2, 256, 768, 4),
+        (4, 512, 1024, 4),
+    ]
+
+    print("\n🧪 HF 场景：CanonA/C（B,T,D + mask + SiLU + residual）")
+    print(f"{'Config':<28} {'MPS(ms)':<10} {'PyTorch(ms)':<12} {'Speedup':<10} {'MPS_StdDev(%)':<15} {'Correct':<8}")
+    print("-" * 104)
+
+    for bsz, seqlen, dim, width in configs:
+        x_btd = torch.randn(bsz, seqlen, dim, device=device, dtype=torch.float32)
+        weight_dw = torch.randn(dim, width, device=device, dtype=torch.float32)
+        bias_d = torch.randn(dim, device=device, dtype=torch.float32)
+        mask = generate_attention_mask(bsz, seqlen, device)
+
+        cfg = f"B{bsz} T{seqlen} D{dim} W{width}"
+
+        def run_ref():
+            return short_conv_hf_reference(
+                x_btd, weight_dw, bias_d, activation=True, residual=True, attention_mask=mask
+            )
+
+        def run_mps():
+            return short_conv_mps_like(
+                x_btd, weight_dw, bias_d, activation=True, residual=True, attention_mask=mask
+            )
+
+        t_ref, _ = bench_robust_stable(run_ref, warmup=800, iters=300, runs=15, desc=cfg)
+        t_mps, std_mps = bench_robust_stable(run_mps, warmup=800, iters=300, runs=15, desc=cfg)
+
+        y_ref = run_ref()
+        y_mps = run_mps()
+        max_diff = torch.max(torch.abs(y_ref - y_mps)).item()
+        is_ok = max_diff < 1e-4
+
+        sp = t_ref / t_mps
+        std_pct = (std_mps / t_mps) * 100 if t_mps > 0 else 0
+        print(
+            f"{cfg:<28} {t_mps * 1000:<10.2f} {t_ref * 1000:<12.2f} {sp:<10.2f} {std_pct:<15.2f} {'✅' if is_ok else '❌':<8}"
+        )
+        if not is_ok:
+            print(f"  ⚠️ 最大差异: {max_diff:.6f}")
+
+
+def run_hf_like_canon_b_bench():
+    """
+    模拟 HF 中 CanonB 在 Attention 里的用法：
+    - 将 Q, K, V 在最后维度拼接，做 depthwise causal conv（SiLU + residual）
+    - 不执行注意力，仅基准化这一步
+    """
+    device = torch.device("mps")
+    torch.manual_seed(203)
+    configs = [
+        # (B, T, num_heads, num_kv_heads, head_dim, W)
+        (2, 256, 12, 4, 64, 4),  # Dq=768, Dk=256, Dv=256, Dtotal=1280
+        (2, 512, 16, 8, 64, 4),  # Dq=1024, Dk=512, Dv=512, Dtotal=2048
+    ]
+
+    print("\n🧪 HF 场景：CanonB（QKV 连接 + SiLU + residual）")
+    print(f"{'Config':<40} {'MPS(ms)':<10} {'PyTorch(ms)':<12} {'Speedup':<10} {'MPS_StdDev(%)':<15} {'Correct':<8}")
+    print("-" * 118)
+
+    for bsz, seqlen, n_heads, n_kv, head_dim, width in configs:
+        dq = n_heads * head_dim
+        dk = n_kv * head_dim
+        dv = n_kv * head_dim
+        d_total = dq + dk + dv
+
+        x_q = torch.randn(bsz, seqlen, dq, device=device)
+        x_k = torch.randn(bsz, seqlen, dk, device=device)
+        x_v = torch.randn(bsz, seqlen, dv, device=device)
+        x_cat = torch.cat([x_q, x_k, x_v], dim=-1)
+
+        weight_dw = torch.randn(d_total, width, device=device)
+        bias_d = torch.randn(d_total, device=device)
+        mask = generate_attention_mask(bsz, seqlen, device)
+
+        cfg = f"B{bsz} T{seqlen} H{n_heads} KV{n_kv} hd{head_dim} W{width}"
+
+        def run_ref():
+            return short_conv_hf_reference(
+                x_cat, weight_dw, bias_d, activation=True, residual=True, attention_mask=mask
+            )
+
+        def run_mps():
+            return short_conv_mps_like(
+                x_cat, weight_dw, bias_d, activation=True, residual=True, attention_mask=mask
+            )
+
+        t_ref, _ = bench_robust_stable(run_ref, warmup=800, iters=300, runs=15, desc=cfg)
+        t_mps, std_mps = bench_robust_stable(run_mps, warmup=800, iters=300, runs=15, desc=cfg)
+
+        y_ref = run_ref()
+        y_mps = run_mps()
+        max_diff = torch.max(torch.abs(y_ref - y_mps)).item()
+        is_ok = max_diff < 1e-4
+
+        sp = t_ref / t_mps
+        std_pct = (std_mps / t_mps) * 100 if t_mps > 0 else 0
+        print(
+            f"{cfg:<40} {t_mps * 1000:<10.2f} {t_ref * 1000:<12.2f} {sp:<10.2f} {std_pct:<15.2f} {'✅' if is_ok else '❌':<8}"
+        )
+        if not is_ok:
+            print(f"  ⚠️ 最大差异: {max_diff:.6f}")
+
+
 def main():
     print("🚀 Causal Conv1D MPS 性能测试")
 
     assert torch.backends.mps.is_available(), "MPS not available"
 
-    try:
-        import my_mps_extension._C as mps_ext
 
-        print("✅ 成功加载 MPS 扩展")
-    except ImportError as e:
-        print(f"❌ 无法加载扩展: {e}")
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="CausalConv1D MPS Benchmarks")
+    parser.add_argument("--only-hf", action="store_true", help="仅运行 HuggingFace 风格的 CanonA/C 与 CanonB 基准")
+    args = parser.parse_args()
+
+    if args.only_hf:
+        run_hf_like_canon_ac_bench()
+        run_hf_like_canon_b_bench()
         return
 
     device = torch.device("mps")
@@ -263,12 +452,6 @@ def main():
         (4, 512, 1024, 4),
     ]
 
-    try:
-        import my_mps_extension._C as mps_ext
-    except Exception as e:
-        print(f"无法加载扩展，跳过 Canon 场景测试: {e}")
-        return
-
     for bsz, seqlen, dim, width in canon_configs:
         x_btd = torch.randn(bsz, seqlen, dim, device=device)
         weight_dw = torch.randn(dim, width, device=device)
@@ -302,11 +485,17 @@ def main():
         sp = t_ref / t_mps
         std_pct = (std_mps / t_mps) * 100 if t_mps > 0 else 0
         print(
-            f"{cfg:<24} {t_mps*1000:<10.2f} {t_ref*1000:<12.2f} {sp:<10.2f} {std_pct:<15.2f} {'✅' if is_ok else '❌':<8}"
+            f"{cfg:<24} {t_mps * 1000:<10.2f} {t_ref * 1000:<12.2f} {sp:<10.2f} {std_pct:<15.2f} {'✅' if is_ok else '❌':<8}"
         )
 
         if not is_ok:
             print(f"  ⚠️ 最大差异: {max_diff:.6f}")
+
+    # =====================
+    # HF-like 场景补充：CanonA/C 与 CanonB
+    # =====================
+    run_hf_like_canon_ac_bench()
+    run_hf_like_canon_b_bench()
 
 
 if __name__ == "__main__":
