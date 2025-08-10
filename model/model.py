@@ -7,6 +7,12 @@ from typing import Optional, Tuple, List
 import torch.nn.functional as F
 from transformers import PreTrainedModel, GenerationMixin  # type: ignore
 from transformers.modeling_outputs import CausalLMOutputWithPast
+try:
+    from causal_conv1d_mps import short_conv_fused
+    HAS_CAUSAL_CONV1D_MPS = True
+except ImportError:
+    HAS_CAUSAL_CONV1D_MPS = False
+    short_conv_fused = None
 
 
 class VibyConfig(PretrainedConfig):
@@ -31,6 +37,11 @@ class VibyConfig(PretrainedConfig):
         rope_scaling: Optional[dict] = None,
         z_loss_factor: float = 0.0001,
         sliding_window: int = 128,
+        canon_set: str = "ABCD",
+        canon_bias: bool = True,
+        canon_activation: bool = True,
+        canon_kernel: int = 4,
+        canon_residual: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -53,6 +64,12 @@ class VibyConfig(PretrainedConfig):
         self.attn_softmax_temp = kwargs.get("attn_softmax_temp", 1.0)
         # SWA sliding window length; 参考 gpt-oss，默认开启 128；在注意力层内每隔一层生效
         self.sliding_window = sliding_window
+        # Canon layers configuration
+        self.canon_set = canon_set
+        self.canon_bias = canon_bias
+        self.canon_activation = canon_activation
+        self.canon_kernel = canon_kernel
+        self.canon_residual = canon_residual
 
 
 def z_loss_cross_entropy(
@@ -161,6 +178,83 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+class CanonLayer(nn.Module):
+    """Canon layer using causal 1D convolution for efficient sequence modeling."""
+    
+    def __init__(self, hidden_size: int, config: VibyConfig):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.kernel_size = config.canon_kernel
+        self.bias = config.canon_bias
+        self.activation = config.canon_activation
+        self.residual = config.canon_residual
+        
+        # Create weight and bias parameters
+        self.weight = nn.Parameter(torch.randn(hidden_size, self.kernel_size))
+        if self.bias:
+            self.bias_param = nn.Parameter(torch.zeros(hidden_size))
+        else:
+            self.register_parameter('bias_param', None)
+            
+    def reset_parameters(self):
+        nn.init.kaiming_normal_(self.weight, mode='fan_in', nonlinearity='relu')
+        if self.bias_param is not None:
+            nn.init.zeros_(self.bias_param)
+    
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape (batch, seq_len, hidden_size)
+            attention_mask: Optional mask of shape (batch, seq_len) with 1s for valid tokens
+        """
+        # Try to use MPS kernel first if available and on MPS device
+        if HAS_CAUSAL_CONV1D_MPS and x.device.type == "mps":
+            try:
+                output = short_conv_fused(
+                    x=x,
+                    weight=self.weight,
+                    bias=self.bias_param,
+                    attention_mask=attention_mask,
+                    activation=self.activation,
+                    residual=self.residual
+                )
+                return output
+            except Exception as e:
+                print(f"Warning: MPS kernel failed ({e}), falling back to PyTorch implementation")
+        
+        # Fallback to PyTorch implementation
+        residual = x if self.residual else 0
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            x = x * attention_mask.unsqueeze(-1)
+        
+        # Convert to (batch, hidden_size, seq_len) for conv1d
+        x_conv = x.transpose(1, 2)
+        
+        # Manual grouped convolution using F.conv1d
+        # Create weight tensor in correct format for F.conv1d: (out_channels, in_channels//groups, kernel_size)
+        conv_weight = self.weight.unsqueeze(1)  # (hidden_size, 1, kernel_size)
+        
+        # Apply causal padding
+        x_padded = F.pad(x_conv, (self.kernel_size - 1, 0))
+        
+        # Grouped convolution
+        x_conv = F.conv1d(x_padded, conv_weight, bias=self.bias_param, groups=self.hidden_size)
+        
+        # Remove padding to make it causal (keep only first seq_len outputs)
+        x_conv = x_conv[..., :x.shape[1]]
+        
+        # Apply activation if specified
+        if self.activation:
+            x_conv = F.silu(x_conv)
+        
+        # Convert back to (batch, seq_len, hidden_size)
+        output = x_conv.transpose(1, 2)
+        
+        return output + residual
+
+
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     重复 GQA 的 key/value 头以匹配 query 头的数量。
@@ -206,6 +300,16 @@ class Attention(nn.Module):
         # QK normalization layers (like Qwen3)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        
+        # Canon B layer for QKV projections
+        if "B" in args.canon_set:
+            total_dim = (
+                args.num_attention_heads * self.head_dim
+                + 2 * args.num_key_value_heads * self.head_dim
+            )
+            self.canon_b = CanonLayer(total_dim, args)
+        else:
+            self.canon_b = None
 
     def forward(
         self,
@@ -225,6 +329,27 @@ class Attention(nn.Module):
 
         xq = self.q_norm(xq)
         xk = self.k_norm(xk)
+        
+        # Apply Canon B if enabled
+        if self.canon_b is not None:
+            # Flatten back to 2D for Canon layer
+            xq_flat = xq.view(bsz, seq_len, -1)
+            xk_flat = xk.view(bsz, seq_len, -1) 
+            xv_flat = xv.view(bsz, seq_len, -1)
+            
+            # Apply Canon B to concatenated QKV
+            qkv_concat = torch.cat([xq_flat, xk_flat, xv_flat], dim=-1)
+            qkv_processed = self.canon_b(qkv_concat, attention_mask)
+            
+            # Split back to Q, K, V
+            q_dim = self.n_local_heads * self.head_dim
+            kv_dim = self.n_local_kv_heads * self.head_dim
+            xq_flat, xk_flat, xv_flat = qkv_processed.split([q_dim, kv_dim, kv_dim], dim=-1)
+            
+            # Reshape back to multi-head format
+            xq = xq_flat.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+            xk = xk_flat.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+            xv = xv_flat.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
@@ -341,6 +466,14 @@ class FeedForward(nn.Module):
         # SwiGLU parameters
         self.swiglu_alpha = 1.702
         self.swiglu_limit = 7.0
+        
+        # Canon D layer for gate and up projections
+        if "D" in config.canon_set:
+            # gate_proj outputs intermediate_size * 2, up_proj outputs intermediate_size
+            # Total concatenated dimension: intermediate_size * 3
+            self.canon_d = CanonLayer(config.intermediate_size * 3, config)
+        else:
+            self.canon_d = None
 
     @staticmethod
     def swiglu_clamp(
@@ -352,11 +485,20 @@ class FeedForward(nn.Module):
         out_glu = x_glu * torch.sigmoid(alpha * x_glu)
         return out_glu * (x_linear + 1)
 
-    def forward(self, x):
+    def forward(self, x, attention_mask: Optional[torch.Tensor] = None):
         # Use clamp-ed SwiGLU with gate-up structure
         gated = self.gate_proj(x)
-        h = self.swiglu_clamp(gated, alpha=self.swiglu_alpha, limit=self.swiglu_limit)
         up = self.up_proj(x)
+        
+        # Apply Canon D if enabled
+        if self.canon_d is not None:
+            gate_up_concat = torch.cat([gated, up], dim=-1)
+            gate_up_processed = self.canon_d(gate_up_concat, attention_mask)
+            # Split back: gated (intermediate_size * 2) + up (intermediate_size)
+            gated = gate_up_processed[..., :gated.shape[-1]]
+            up = gate_up_processed[..., gated.shape[-1]:]
+        
+        h = self.swiglu_clamp(gated, alpha=self.swiglu_alpha, limit=self.swiglu_limit)
         out = self.down_proj(h * up)
         return self.dropout(out)
 
@@ -376,6 +518,18 @@ class VibyBlock(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.mlp = FeedForward(config)
+        
+        # Canon A layer (after input layernorm, before attention)
+        if "A" in config.canon_set:
+            self.canon_a = CanonLayer(config.hidden_size, config)
+        else:
+            self.canon_a = None
+            
+        # Canon C layer (after post-attention layernorm, before MLP)
+        if "C" in config.canon_set:
+            self.canon_c = CanonLayer(config.hidden_size, config)
+        else:
+            self.canon_c = None
 
     def forward(
         self,
@@ -386,20 +540,37 @@ class VibyBlock(nn.Module):
         attention_mask=None,
     ):
         residual = hidden_states
+        
+        # Pre-attention processing
+        normed_hidden_states = self.input_layernorm(hidden_states)
+        
+        # Apply Canon A if enabled
+        if self.canon_a is not None:
+            normed_hidden_states = self.canon_a(normed_hidden_states, attention_mask)
+        
         # sliding window 策略：参考 gpt-oss，仅对偶数层启用，默认窗口 128
         sliding_window = self.default_sliding_window if (self.layer_id % 2 == 0) else 0
-        hidden_states, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states),
+        attn_output, present_key_value = self.self_attn(
+            normed_hidden_states,
             position_embeddings,
             past_key_value,
             use_cache,
             attention_mask,
             sliding_window=sliding_window,
         )
-        hidden_states += residual
-        hidden_states = hidden_states + self.mlp(
-            self.post_attention_layernorm(hidden_states)
-        )
+        hidden_states = residual + attn_output
+        
+        # Pre-MLP processing
+        residual = hidden_states
+        normed_hidden_states = self.post_attention_layernorm(hidden_states)
+        
+        # Apply Canon C if enabled
+        if self.canon_c is not None:
+            normed_hidden_states = self.canon_c(normed_hidden_states, attention_mask)
+            
+        mlp_output = self.mlp(normed_hidden_states, attention_mask)
+        hidden_states = residual + mlp_output
+        
         return hidden_states, present_key_value
 
 
@@ -497,6 +668,13 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
             self.config.hidden_size, self.config.vocab_size, bias=False
         )
         self.model.embed_tokens.weight = self.lm_head.weight
+        
+        # Initialize canon layers if present
+        self.apply(self._init_canon_layers)
+        
+    def _init_canon_layers(self, module):
+        if isinstance(module, CanonLayer):
+            module.reset_parameters()
 
     def forward(
         self,

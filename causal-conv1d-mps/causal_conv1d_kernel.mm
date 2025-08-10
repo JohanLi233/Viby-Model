@@ -140,7 +140,6 @@ torch::Tensor causal_conv1d_fwd_mps(
   const int64_t batch_size = x.size(0);
   const int64_t dim = x.size(1);
   const int64_t seqlen = x.size(2);
-  const int64_t width = weight.size(1);
   
   if (seqlen == 0) {
     return torch::empty_like(x);
@@ -166,8 +165,8 @@ torch::Tensor causal_conv1d_fwd_mps(
   const NSUInteger bias_offset = (bias.defined() && bias.numel() > 0) ? (NSUInteger)(bias.storage_offset() * bias.element_size()) : 0;
   const NSUInteger result_offset = (NSUInteger)(result_tensor.storage_offset() * result_tensor.element_size());
 
-  // 设置卷积参数
-  ConvParams params = setup_conv_params(x, weight, result_tensor, silu_activation);
+  // 注意：这里移除了未使用的params变量，因为我们使用的是简化kernel
+  // ConvParams params = setup_conv_params(x, weight, result_tensor, silu_activation);
 
   // 选择合适的kernel（简化版本）
   id<MTLComputePipelineState> pipeline = g_pipelines["causal_conv1d_simple_kernel"];

@@ -5,7 +5,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
-import my_mps_extension._C as mps_ext
+import causal_conv1d_mps._C as mps_ext
 
 # 设置环境变量和路径
 os.environ["CAUSAL_CONV1D_METAL_PATH"] = os.path.join(
@@ -242,8 +242,8 @@ def run_hf_like_canon_ac_bench():
                 x_btd, weight_dw, bias_d, activation=True, residual=True, attention_mask=mask
             )
 
-        t_ref, _ = bench_robust_stable(run_ref, warmup=800, iters=300, runs=15, desc=cfg)
-        t_mps, std_mps = bench_robust_stable(run_mps, warmup=800, iters=300, runs=15, desc=cfg)
+        t_ref, _ = bench_robust_stable(run_ref, warmup=800, iters=300, runs=150, desc=cfg)
+        t_mps, std_mps = bench_robust_stable(run_mps, warmup=800, iters=300, runs=150, desc=cfg)
 
         y_ref = run_ref()
         y_mps = run_mps()
@@ -304,8 +304,8 @@ def run_hf_like_canon_b_bench():
                 x_cat, weight_dw, bias_d, activation=True, residual=True, attention_mask=mask
             )
 
-        t_ref, _ = bench_robust_stable(run_ref, warmup=800, iters=300, runs=15, desc=cfg)
-        t_mps, std_mps = bench_robust_stable(run_mps, warmup=800, iters=300, runs=15, desc=cfg)
+        t_ref, _ = bench_robust_stable(run_ref, warmup=800, iters=300, runs=150, desc=cfg)
+        t_mps, std_mps = bench_robust_stable(run_mps, warmup=800, iters=300, runs=150, desc=cfg)
 
         y_ref = run_ref()
         y_mps = run_mps()
@@ -321,6 +321,78 @@ def run_hf_like_canon_b_bench():
             print(f"  ⚠️ 最大差异: {max_diff:.6f}")
 
 
+def run_hf_like_canon_d_bench():
+    """
+    模拟 HF 中 CanonD 在 MLP 里的用法：
+    - 将 gate_proj 和 up_proj 的输出在最后维度拼接
+    - 做 depthwise causal conv（SiLU + residual）
+    - 然后分割回原来的维度用于后续的 down_proj
+    """
+    device = torch.device("mps")
+    torch.manual_seed(204)
+    configs = [
+        # (B, T, hidden_size, intermediate_size, W) - 模拟 MLP 配置
+        (2, 256, 768, 2048, 4),   # 小模型配置
+        (2, 512, 1024, 4096, 4),  # 中等模型配置
+    ]
+
+    print("\n🧪 HF 场景 (Optimized Fused)：CanonD（MLP Gate&Up 连接 + Fused Kernel）")
+    print(f"{'Config':<35} {'MPS(ms)':<10} {'PyTorch(ms)':<12} {'Speedup':<10} {'MPS_StdDev(%)':<15} {'Correct':<8}")
+    print("-" * 113)
+
+    for bsz, seqlen, hidden_size, intermediate_size, width in configs:
+        # 模拟 MLP 中 gate_proj 和 up_proj 的输出
+        gate_output = torch.randn(bsz, seqlen, intermediate_size, device=device)
+        up_output = torch.randn(bsz, seqlen, intermediate_size, device=device)
+        
+        # CanonD 应用在连接后的输出上 (intermediate_size * 2)
+        x_cat = torch.cat([gate_output, up_output], dim=-1)
+        
+        weight_dw = torch.randn(intermediate_size * 2, width, device=device)
+        bias_d = torch.randn(intermediate_size * 2, device=device)
+        mask = generate_attention_mask(bsz, seqlen, device)
+
+        cfg = f"B{bsz} T{seqlen} H{hidden_size} I{intermediate_size} W{width}"
+
+        def run_ref():
+            # CanonD 参考实现：对连接后的张量做卷积，然后分割
+            conv_out = short_conv_hf_reference(
+                x_cat, weight_dw, bias_d, activation=True, residual=True, attention_mask=mask
+            )
+            # 分割回 gate 和 up 部分
+            gate_conv, up_conv = conv_out.chunk(2, dim=-1)
+            return gate_conv, up_conv
+
+        def run_mps():
+            # CanonD MPS 实现
+            conv_out = short_conv_mps_optimized(
+                x_cat, weight_dw, bias_d, activation=True, residual=True, attention_mask=mask
+            )
+            # 分割回 gate 和 up 部分
+            gate_conv, up_conv = conv_out.chunk(2, dim=-1)
+            return gate_conv, up_conv
+
+        t_ref, _ = bench_robust_stable(run_ref, warmup=800, iters=300, runs=150, desc=cfg)
+        t_mps, std_mps = bench_robust_stable(run_mps, warmup=800, iters=300, runs=150, desc=cfg)
+
+        gate_ref, up_ref = run_ref()
+        gate_mps, up_mps = run_mps()
+        
+        # 比较两个输出的差异
+        max_diff_gate = torch.max(torch.abs(gate_mps - gate_ref)).item()
+        max_diff_up = torch.max(torch.abs(up_mps - up_ref)).item()
+        max_diff = max(max_diff_gate, max_diff_up)
+        is_ok = max_diff < 1e-4
+
+        sp = t_ref / t_mps
+        std_pct = (std_mps / t_mps) * 100 if t_mps > 0 else 0
+        print(
+            f"{cfg:<35} {t_mps * 1000:<10.2f} {t_ref * 1000:<12.2f} {sp:<10.2f} {std_pct:<15.2f} {'✅' if is_ok else '❌':<8}"
+        )
+        if not is_ok:
+            print(f"  ⚠️ 最大差异: gate={max_diff_gate:.6f}, up={max_diff_up:.6f}")
+
+
 def main():
     print("🚀 Causal Conv1D MPS 性能测试")
 
@@ -329,12 +401,13 @@ def main():
 
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="CausalConv1D MPS Benchmarks")
-    parser.add_argument("--only-hf", action="store_true", help="仅运行 HuggingFace 风格的 CanonA/C 与 CanonB 基准")
+    parser.add_argument("--only-hf", action="store_true", help="仅运行 HuggingFace 风格的 CanonA/C、CanonB 与 CanonD 基准")
     args = parser.parse_args()
 
     if args.only_hf:
         run_hf_like_canon_ac_bench()
         run_hf_like_canon_b_bench()
+        run_hf_like_canon_d_bench()
         return
 
     device = torch.device("mps")
@@ -375,10 +448,10 @@ def main():
 
             # 性能测试（使用更稳定的方法）
             t_mps, std_mps = bench_robust_stable(
-                run_mps, warmup=1000, iters=500, runs=21, desc=config_str
+                run_mps, warmup=1000, iters=500, runs=210, desc=config_str
             )
             t_torch, _ = bench_robust_stable(
-                run_torch, warmup=1000, iters=500, runs=21, desc=config_str
+                run_torch, warmup=1000, iters=500, runs=210, desc=config_str
             )
 
             # 正确性验证
@@ -432,10 +505,10 @@ def main():
             return causal_conv1d_reference(x, weight, bias, True)
 
         t_mps_silu, std_mps_silu = bench_robust_stable(
-            run_mps_silu, warmup=1000, iters=400, runs=21, desc=config_str
+            run_mps_silu, warmup=1000, iters=400, runs=210, desc=config_str
         )
         t_torch_silu, _ = bench_robust_stable(
-            run_torch_silu, warmup=1000, iters=400, runs=21, desc=config_str
+            run_torch_silu, warmup=1000, iters=400, runs=210, desc=config_str
         )
         speedup_silu = t_torch_silu / t_mps_silu
         std_percent_mps_silu = (
@@ -492,11 +565,11 @@ def main():
             return canon_forward_reference(x_btd, weight_dw, bias_d, activation=True)
 
         t_ref, _ = bench_robust_stable(
-            run_ref_canon, warmup=1000, iters=500, runs=21, desc=cfg
+            run_ref_canon, warmup=1000, iters=500, runs=210, desc=cfg
         )
 
         t_mps, std_mps = bench_robust_stable(
-            run_mps_canon, warmup=1000, iters=500, runs=21, desc=cfg
+            run_mps_canon, warmup=1000, iters=500, runs=210, desc=cfg
         )
         y_mps = run_mps_canon()
         y_ref = run_ref_canon()
@@ -513,10 +586,11 @@ def main():
             print(f"  ⚠️ 最大差异: {max_diff:.6f}")
 
     # =====================
-    # HF-like 场景补充：CanonA/C 与 CanonB
+    # HF-like 场景补充：CanonA/C、CanonB 与 CanonD
     # =====================
     run_hf_like_canon_ac_bench()
     run_hf_like_canon_b_bench()
+    run_hf_like_canon_d_bench()
 
 
 if __name__ == "__main__":

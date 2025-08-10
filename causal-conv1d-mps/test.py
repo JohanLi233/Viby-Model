@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-测试 causal_conv1d 的 MPS 实现正确性
+基于pytest的causal_conv1d MPS实现测试
+改造自canon/causal-conv1d/tests/test_causal_conv1d.py
 """
 
 import torch
 import torch.nn.functional as F
-import sys
-import os
-
-# 添加当前目录到 Python 路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import my_mps_extension._C as mps_ext
+import pytest
+import causal_conv1d_mps
 
 
 def causal_conv1d_reference(x, weight, bias=None, silu_activation=False):
@@ -48,176 +44,163 @@ def causal_conv1d_reference(x, weight, bias=None, silu_activation=False):
     return out
 
 
-def test_basic_functionality():
-    """测试基本功能"""
-    print("=== 测试基本功能 ===")
+@pytest.mark.parametrize("itype", [torch.float32])  # MPS主要支持float32
+@pytest.mark.parametrize("silu_activation", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("seqlen", [1, 2, 8, 16, 32, 64, 128, 256])
+@pytest.mark.parametrize("dim", [64, 128, 256])
+def test_causal_conv1d_mps(dim, seqlen, width, has_bias, silu_activation, itype):
+    """测试基本的causal conv1d功能"""
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
 
-    # 测试参数
-    batch_size = 2
-    dim = 4
-    seqlen = 8
-    width = 4
-
+    device = "mps"
+    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
+    
+    # 设置随机种子
+    torch.random.manual_seed(42)
+    batch = 2
+    
     # 创建测试数据
-    torch.manual_seed(42)
-    x = torch.randn(batch_size, dim, seqlen, device="mps", dtype=torch.float32)
-    weight = torch.randn(dim, width, device="mps", dtype=torch.float32)
-    bias = torch.randn(dim, device="mps", dtype=torch.float32)
-
-    print(f"输入形状: x {x.shape}, weight {weight.shape}, bias {bias.shape}")
-
-    try:
-        # MPS 实现
-        print("运行 MPS 实现...")
-        result_mps = mps_ext.causal_conv1d_fwd(x, weight, bias, False)
-        print(f"MPS 结果形状: {result_mps.shape}")
-
-        # 参考实现
-        print("运行参考实现...")
-        result_ref = causal_conv1d_reference(x, weight, bias, False)
-        result_ref_mps = result_ref.to("mps")
-        print(f"参考结果形状: {result_ref_mps.shape}")
-
-        # 比较结果
-        diff = torch.abs(result_mps - result_ref_mps)
-        max_diff = torch.max(diff).item()
-        mean_diff = torch.mean(diff).item()
-
-        print(f"最大差异: {max_diff:.6f}")
-        print(f"平均差异: {mean_diff:.6f}")
-
-        # 检查是否在合理范围内
-        tolerance = 1e-4
-        if max_diff < tolerance:
-            print("✅ 基本功能测试通过")
-            return True
-        else:
-            print("❌ 基本功能测试失败，差异过大")
-            print("MPS 结果（前几个元素）:")
-            print(result_mps[0, 0, :5])
-            print("参考结果（前几个元素）:")
-            print(result_ref_mps[0, 0, :5])
-            return False
-
-    except Exception as e:
-        print(f"❌ 测试出错: {e}")
-        return False
+    x = torch.randn(batch, dim, seqlen, device=device, dtype=itype)
+    weight = torch.randn(dim, width, device=device, dtype=torch.float32)
+    if has_bias:
+        bias = torch.randn(dim, device=device, dtype=torch.float32)
+    else:
+        bias = None
+    
+    # MPS实现
+    out_mps = causal_conv1d_mps.causal_conv1d_fwd(x, weight, bias, silu_activation)
+    
+    # 参考实现
+    out_ref = causal_conv1d_reference(x, weight, bias, silu_activation)
+    out_ref = out_ref.to(device)
+    
+    print(f"Output max diff: {(out_mps - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out_mps - out_ref).abs().mean().item()}")
+    
+    # 验证结果
+    assert torch.allclose(out_mps, out_ref, rtol=rtol, atol=atol)
 
 
-def test_silu_activation():
-    """测试 SiLU 激活函数"""
-    print("\n=== 测试 SiLU 激活函数 ===")
+@pytest.mark.parametrize("itype", [torch.float32])
+@pytest.mark.parametrize("silu_activation", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("seqlen", [8, 16, 32, 64])
+@pytest.mark.parametrize("dim", [64, 128])
+def test_short_conv_fused(dim, seqlen, width, has_bias, silu_activation, itype):
+    """测试融合的short conv操作（HuggingFace风格）"""
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
 
-    # 简单测试数据
-    batch_size = 1
-    dim = 2
-    seqlen = 4
-    width = 4
-
-    torch.manual_seed(123)
-    x = torch.randn(batch_size, dim, seqlen, device="mps", dtype=torch.float32)
-    weight = torch.randn(dim, width, device="mps", dtype=torch.float32)
-    bias = torch.randn(dim, device="mps", dtype=torch.float32)
-
-    try:
-        # 测试不带激活
-        result_no_act = mps_ext.causal_conv1d_fwd(x, weight, bias, False)
-        ref_no_act = causal_conv1d_reference(x, weight, bias, False).to("mps")
-
-        # 测试带激活
-        result_with_act = mps_ext.causal_conv1d_fwd(x, weight, bias, True)
-        ref_with_act = causal_conv1d_reference(x, weight, bias, True).to("mps")
-
-        # 比较
-        diff_no_act = torch.max(torch.abs(result_no_act - ref_no_act)).item()
-        diff_with_act = torch.max(torch.abs(result_with_act - ref_with_act)).item()
-
-        print(f"无激活最大差异: {diff_no_act:.6f}")
-        print(f"有激活最大差异: {diff_with_act:.6f}")
-
-        tolerance = 1e-4
-        if diff_no_act < tolerance and diff_with_act < tolerance:
-            print("✅ SiLU 激活测试通过")
-            return True
-        else:
-            print("❌ SiLU 激活测试失败")
-            return False
-
-    except Exception as e:
-        print(f"❌ SiLU 激活测试出错: {e}")
-        return False
+    device = "mps"
+    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
+    
+    # 设置随机种子
+    torch.random.manual_seed(42)
+    batch = 2
+    
+    # 创建测试数据 - 注意：这里是 (batch, seqlen, dim) 格式
+    x = torch.randn(batch, seqlen, dim, device=device, dtype=itype)
+    weight = torch.randn(dim, width, device=device, dtype=torch.float32)
+    if has_bias:
+        bias = torch.randn(dim, device=device, dtype=torch.float32)
+    else:
+        bias = None
+    
+    # 创建注意力掩码
+    attention_mask = torch.ones(batch, seqlen, device=device, dtype=torch.float32)
+    # 随机设置一些padding位置
+    for b in range(batch):
+        valid_len = torch.randint(seqlen//2, seqlen, (1,)).item()
+        attention_mask[b, valid_len:] = 0
+    
+    # MPS融合实现
+    out_mps = causal_conv1d_mps.short_conv_fused(
+        x, weight, bias, attention_mask, activation=silu_activation, residual=True
+    )
+    
+    # 参考实现（手工实现相同的操作）
+    x_masked = x * attention_mask.unsqueeze(-1)
+    x_transposed = x_masked.transpose(-1, -2).contiguous()  # (batch, dim, seqlen)
+    
+    conv_out = causal_conv1d_reference(x_transposed, weight, bias, silu_activation)
+    conv_out = conv_out.transpose(-1, -2)  # 转回 (batch, seqlen, dim)
+    
+    out_ref = x + conv_out  # residual connection
+    
+    print(f"Output max diff: {(out_mps - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out_mps - out_ref).abs().mean().item()}")
+    
+    # 验证结果
+    assert torch.allclose(out_mps, out_ref, rtol=rtol, atol=atol)
 
 
 def test_edge_cases():
     """测试边界情况"""
-    print("\n=== 测试边界情况 ===")
-
-    results = []
-
-    # 测试最小尺寸
-    try:
-        print("测试最小尺寸...")
-        x = torch.randn(1, 1, 1, device="mps", dtype=torch.float32)
-        weight = torch.randn(1, 4, device="mps", dtype=torch.float32)
-        bias = torch.randn(1, device="mps", dtype=torch.float32)
-
-        result = mps_ext.causal_conv1d_fwd(x, weight, bias, False)
-        print(f"最小尺寸结果: {result.shape}")
-        results.append(True)
-    except Exception as e:
-        print(f"❌ 最小尺寸测试失败: {e}")
-        results.append(False)
-
-    # 测试无偏置
-    try:
-        print("测试无偏置...")
-        x = torch.randn(2, 3, 5, device="mps", dtype=torch.float32)
-        weight = torch.randn(3, 4, device="mps", dtype=torch.float32)
-        bias = torch.tensor([], device="mps", dtype=torch.float32)  # 空张量
-
-        # MPS 实现应该能处理空的 bias
-        result = mps_ext.causal_conv1d_fwd(x, weight, bias, False)
-        print(f"无偏置结果: {result.shape}")
-        results.append(True)
-    except Exception as e:
-        print(f"❌ 无偏置测试失败: {e}")
-        results.append(False)
-
-    all_passed = all(results)
-    if all_passed:
-        print("✅ 边界情况测试通过")
-    else:
-        print("❌ 部分边界情况测试失败")
-
-    return all_passed
-
-
-def main():
-    """主测试函数"""
-    print("开始测试 Causal Conv1D MPS 实现...")
-
     if not torch.backends.mps.is_available():
-        print("❌ MPS 不可用，跳过测试")
-        return
+        pytest.skip("MPS not available")
+    
+    device = "mps"
+    
+    # 测试最小尺寸
+    x = torch.randn(1, 1, 1, device=device, dtype=torch.float32)
+    weight = torch.randn(1, 2, device=device, dtype=torch.float32)
+    bias = torch.randn(1, device=device, dtype=torch.float32)
+    
+    result = causal_conv1d_mps.causal_conv1d_fwd(x, weight, bias, False)
+    assert result.shape == (1, 1, 1)
+    
+    # 测试无偏置
+    x = torch.randn(2, 3, 5, device=device, dtype=torch.float32)
+    weight = torch.randn(3, 4, device=device, dtype=torch.float32)
+    
+    result = causal_conv1d_mps.causal_conv1d_fwd(x, weight, None, False)
+    assert result.shape == (2, 3, 5)
 
-    results = []
 
-    # 运行各项测试
-    results.append(test_basic_functionality())
-    results.append(test_silu_activation())
-    results.append(test_edge_cases())
+def test_error_handling():
+    """测试错误处理"""
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+    
+    device = "mps"
+    
+    # 测试维度不匹配
+    x = torch.randn(2, 4, 8, device=device, dtype=torch.float32)
+    weight = torch.randn(5, 4, device=device, dtype=torch.float32)  # 错误的dim
+    
+    with pytest.raises(ValueError, match="does not match"):
+        causal_conv1d_mps.causal_conv1d_fwd(x, weight, None, False)
+    
+    # 测试错误的tensor维度
+    x_2d = torch.randn(4, 8, device=device, dtype=torch.float32)  # 应该是3D
+    weight = torch.randn(4, 4, device=device, dtype=torch.float32)
+    
+    with pytest.raises(ValueError, match="Expected 3D input tensor"):
+        causal_conv1d_mps.causal_conv1d_fwd(x_2d, weight, None, False)
 
-    # 总结
-    print(f"\n=== 测试总结 ===")
-    passed = sum(results)
-    total = len(results)
-    print(f"通过: {passed}/{total}")
 
-    if passed == total:
-        print("🎉 所有测试通过！")
-    else:
-        print("⚠️  部分测试失败，需要进一步调试")
+def test_different_dtypes():
+    """测试不同数据类型的支持"""
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+    
+    device = "mps"
+    batch, dim, seqlen, width = 2, 64, 32, 4
+    
+    # 测试float32
+    x = torch.randn(batch, dim, seqlen, device=device, dtype=torch.float32)
+    weight = torch.randn(dim, width, device=device, dtype=torch.float32)
+    bias = torch.randn(dim, device=device, dtype=torch.float32)
+    
+    result = causal_conv1d_mps.causal_conv1d_fwd(x, weight, bias, False)
+    assert result.dtype == torch.float32
+    assert result.shape == (batch, dim, seqlen)
 
 
 if __name__ == "__main__":
-    main()
+    # 运行所有测试
+    pytest.main([__file__])
