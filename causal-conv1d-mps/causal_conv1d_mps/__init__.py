@@ -5,8 +5,37 @@ A Metal Performance Shaders (MPS) implementation of causal 1D convolution for Py
 Provides high-performance GPU acceleration on Apple Silicon devices.
 """
 
+import os
+from pathlib import Path
 import torch
 from typing import Optional
+
+
+def _ensure_metal_path_env() -> None:
+    """Ensure CAUSAL_CONV1D_METAL_PATH is set to a valid .metal file.
+
+    Search order:
+    1) Existing env var (if points to an existing file)
+    2) Repo layout: parent of this package dir (../causal_conv1d.metal)
+    3) Current working directory: ./causal_conv1d.metal
+    """
+    env_key = "CAUSAL_CONV1D_METAL_PATH"
+    existing = os.environ.get(env_key)
+    if existing and Path(existing).exists():
+        return
+
+    pkg_dir = Path(__file__).resolve().parent
+    candidates = [
+        pkg_dir.parent / "causal_conv1d.metal",  # repo layout
+        Path.cwd() / "causal_conv1d.metal",      # current working dir
+    ]
+    for p in candidates:
+        if p.exists():
+            os.environ[env_key] = str(p)
+            break
+
+
+_ensure_metal_path_env()
 
 try:
     from . import _C
@@ -166,8 +195,67 @@ def short_conv_fused(
         bias = torch.tensor([], device=x.device, dtype=x.dtype)
 
     if attention_mask is not None:
-        attention_mask = attention_mask.to(torch.float32).contiguous()
+        # 统一 mask 的 dtype 与形状到 (B, T)
+        B, T, D = x.shape
+        m = attention_mask
+        # dtype 对齐
+        if m.dtype == torch.bool:
+            m = m.to(dtype=x.dtype)
+        else:
+            m = m.to(dtype=x.dtype)
+        # 尝试压缩 size=1 维度
+        if m.dim() > 2:
+            m = m.squeeze()
+        # 现在接受 1D 或 2D
+        if m.dim() == 1:
+            if m.numel() == T:
+                m = m.view(1, T).expand(B, T)
+            elif m.numel() == B:
+                m = m.view(B, 1).expand(B, T)
+            elif m.numel() == B * T:
+                m = m.view(B, T)
+            else:
+                raise ValueError(
+                    f"Attention mask 1D length {m.numel()} cannot be normalized to (B, T)={(B, T)}"
+                )
+        elif m.dim() == 2:
+            if m.shape == (B, T):
+                pass
+            elif m.shape == (1, T):
+                m = m.expand(B, T)
+            elif m.shape == (B, 1):
+                m = m.expand(B, T)
+            elif m.shape == (T, B):
+                m = m.t().contiguous()
+            else:
+                raise ValueError(
+                    f"Attention mask 2D shape {tuple(m.shape)} must be broadcastable to (B, T)={(B, T)}"
+                )
+        else:
+            raise ValueError(
+                f"Attention mask dim {m.dim()} not supported; expected 1D/2D convertible to (B, T)"
+            )
+
+        # 若仍与 (B, T) 的第二维不一致，则进行截断/扩展（优先截取末尾对齐当前序列长度）
+        if m.shape[0] != B:
+            raise ValueError(
+                f"Attention mask batch {m.shape[0]} != input batch {B}"
+            )
+        if m.shape[1] != T:
+            if m.shape[1] > T:
+                # 通常出现在 generate 步（T=1）但传入完整历史 mask 的情况
+                m = m[:, -T:]
+            elif m.shape[1] == 1:
+                m = m.expand(B, T)
+            else:
+                # 若更短且不为 1，则无法可靠广播
+                raise ValueError(
+                    f"Attention mask time {m.shape[1]} cannot match input time {T}"
+                )
+        attention_mask = m.contiguous()
     else:
-        attention_mask = torch.tensor([], device=x.device, dtype=torch.float32)
+        # 未提供 mask 时，创建满 1 的 (B, T) 掩码，避免旧版扩展对空张量形状检查失败
+        B, T, _ = x.shape
+        attention_mask = torch.ones((B, T), device=x.device, dtype=x.dtype)
 
     return _C.short_conv_fused(x, weight, bias, attention_mask, activation, residual)

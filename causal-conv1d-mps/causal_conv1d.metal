@@ -94,6 +94,20 @@ inline float silu(float x) {
     return x / (1.0f + exp(-x));
 }
 
+// BF16 <-> FP32 转换辅助函数
+inline float bf16_to_float(ushort h) {
+    uint u = (uint)h << 16;
+    return as_type<float>(u);
+}
+
+inline ushort float_to_bf16(float f) {
+    uint u = as_type<uint>(f);
+    // round-to-nearest-even
+    uint lsb = (u >> 16) & 1u;
+    u += 0x7FFFu + lsb;
+    return (ushort)(u >> 16);
+}
+
 // 简化版本：固定 width=4，不使用状态管理
 kernel void causal_conv1d_simple_kernel(
     device const float *input [[buffer(0)]],
@@ -145,6 +159,98 @@ kernel void causal_conv1d_simple_kernel(
     
     // 存储结果
     output[output_idx] = result;
+}
+
+// 简化版本 (float16)：固定 width=4
+kernel void causal_conv1d_simple_kernel_f16(
+    device const half *input [[buffer(0)]],
+    device const half *weight [[buffer(1)]],
+    device const half *bias [[buffer(2)]],
+    device half *output [[buffer(3)]],
+
+    constant uint &batch_size [[buffer(4)]],
+    constant uint &dim [[buffer(5)]],
+    constant uint &seqlen [[buffer(6)]],
+    constant bool &silu_activation [[buffer(7)]],
+
+    uint3 thread_position_in_grid [[thread_position_in_grid]]
+)
+{
+    const uint batch_id = thread_position_in_grid.x;
+    const uint channel_id = thread_position_in_grid.y;
+    const uint seq_pos = thread_position_in_grid.z;
+
+    if (batch_id >= batch_size || channel_id >= dim || seq_pos >= seqlen) {
+        return;
+    }
+
+    const uint input_base = batch_id * dim * seqlen + channel_id * seqlen;
+    const uint weight_base = channel_id * 4; // width=4
+    const uint output_idx = input_base + seq_pos;
+
+    float result = (bias != nullptr) ? (float)bias[channel_id] : 0.0f;
+
+    const uint width = 4;
+    for (uint w = 0; w < width; w++) {
+        int input_pos = (int)seq_pos - (int)(width - 1 - w);
+        if (input_pos >= 0) {
+            float input_val = (float)input[input_base + input_pos];
+            float weight_val = (float)weight[weight_base + w];
+            result += weight_val * input_val;
+        }
+    }
+
+    if (silu_activation) {
+        result = silu(result);
+    }
+
+    output[output_idx] = (half)result;
+}
+
+// 简化版本 (bfloat16)：固定 width=4
+kernel void causal_conv1d_simple_kernel_bf16(
+    device const ushort *input [[buffer(0)]],
+    device const ushort *weight [[buffer(1)]],
+    device const ushort *bias [[buffer(2)]],
+    device ushort *output [[buffer(3)]],
+
+    constant uint &batch_size [[buffer(4)]],
+    constant uint &dim [[buffer(5)]],
+    constant uint &seqlen [[buffer(6)]],
+    constant bool &silu_activation [[buffer(7)]],
+
+    uint3 thread_position_in_grid [[thread_position_in_grid]]
+)
+{
+    const uint batch_id = thread_position_in_grid.x;
+    const uint channel_id = thread_position_in_grid.y;
+    const uint seq_pos = thread_position_in_grid.z;
+
+    if (batch_id >= batch_size || channel_id >= dim || seq_pos >= seqlen) {
+        return;
+    }
+
+    const uint input_base = batch_id * dim * seqlen + channel_id * seqlen;
+    const uint weight_base = channel_id * 4; // width=4
+    const uint output_idx = input_base + seq_pos;
+
+    float result = (bias != nullptr) ? bf16_to_float(bias[channel_id]) : 0.0f;
+
+    const uint width = 4;
+    for (uint w = 0; w < width; w++) {
+        int input_pos = (int)seq_pos - (int)(width - 1 - w);
+        if (input_pos >= 0) {
+            float input_val = bf16_to_float(input[input_base + input_pos]);
+            float weight_val = bf16_to_float(weight[weight_base + w]);
+            result += weight_val * input_val;
+        }
+    }
+
+    if (silu_activation) {
+        result = silu(result);
+    }
+
+    output[output_idx] = float_to_bf16(result);
 }
 
 kernel void short_conv_fused_btd_kernel(
@@ -213,4 +319,110 @@ kernel void short_conv_fused_btd_kernel(
 
     // 5. 写回输出
     output[output_idx] = result;
+}
+
+// Fused ShortConvolution (float16 版本)
+kernel void short_conv_fused_btd_kernel_f16(
+    device const half *input [[buffer(0)]],
+    device const half *weight [[buffer(1)]],
+    device const half *bias [[buffer(2)]],
+    device const half *mask [[buffer(3)]],
+    device half *output [[buffer(4)]],
+
+    constant uint &B [[buffer(5)]],
+    constant uint &T [[buffer(6)]],
+    constant uint &D [[buffer(7)]],
+    constant bool &use_silu [[buffer(8)]],
+    constant bool &use_residual [[buffer(9)]],
+
+    uint3 gid [[thread_position_in_grid]]
+)
+{
+    const uint b = gid.x;
+    const uint t = gid.y;
+    const uint d = gid.z;
+
+    if (b >= B || t >= T || d >= D) return;
+
+    const uint W = 4;
+    const uint TD = T * D;
+    const uint output_idx = b * TD + t * D + d;
+    const uint weight_base = d * W;
+
+    float result = (bias != nullptr) ? (float)bias[d] : 0.0f;
+
+    for (uint w = 0; w < W; w++) {
+        int tt = (int)t - (int)(W - 1 - w);
+        if (tt >= 0) {
+            const uint input_idx = b * TD + (uint)tt * D + d;
+            float input_val = (float)input[input_idx];
+            if (mask != nullptr) {
+                const uint mask_idx = b * T + (uint)tt;
+                input_val *= (float)mask[mask_idx];
+            }
+            float weight_val = (float)weight[weight_base + w];
+            result += weight_val * input_val;
+        }
+    }
+
+    if (use_silu) {
+        result = silu(result);
+    }
+    if (use_residual) {
+        result += (float)input[output_idx];
+    }
+    output[output_idx] = (half)result;
+}
+
+// Fused ShortConvolution (bfloat16 版本)
+kernel void short_conv_fused_btd_kernel_bf16(
+    device const ushort *input [[buffer(0)]],
+    device const ushort *weight [[buffer(1)]],
+    device const ushort *bias [[buffer(2)]],
+    device const ushort *mask [[buffer(3)]],
+    device ushort *output [[buffer(4)]],
+
+    constant uint &B [[buffer(5)]],
+    constant uint &T [[buffer(6)]],
+    constant uint &D [[buffer(7)]],
+    constant bool &use_silu [[buffer(8)]],
+    constant bool &use_residual [[buffer(9)]],
+
+    uint3 gid [[thread_position_in_grid]]
+)
+{
+    const uint b = gid.x;
+    const uint t = gid.y;
+    const uint d = gid.z;
+
+    if (b >= B || t >= T || d >= D) return;
+
+    const uint W = 4;
+    const uint TD = T * D;
+    const uint output_idx = b * TD + t * D + d;
+    const uint weight_base = d * W;
+
+    float result = (bias != nullptr) ? bf16_to_float(bias[d]) : 0.0f;
+
+    for (uint w = 0; w < W; w++) {
+        int tt = (int)t - (int)(W - 1 - w);
+        if (tt >= 0) {
+            const uint input_idx = b * TD + (uint)tt * D + d;
+            float input_val = bf16_to_float(input[input_idx]);
+            if (mask != nullptr) {
+                const uint mask_idx = b * T + (uint)tt;
+                input_val *= bf16_to_float(mask[mask_idx]);
+            }
+            float weight_val = bf16_to_float(weight[weight_base + w]);
+            result += weight_val * input_val;
+        }
+    }
+
+    if (use_silu) {
+        result = silu(result);
+    }
+    if (use_residual) {
+        result += bf16_to_float(input[output_idx]);
+    }
+    output[output_idx] = float_to_bf16(result);
 }

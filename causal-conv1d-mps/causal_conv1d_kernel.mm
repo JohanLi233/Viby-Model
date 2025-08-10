@@ -64,7 +64,11 @@ static void ensure_metal_pipeline_initialized(id<MTLDevice> device) {
   std::vector<std::string> function_names = {
     "causal_conv1d_fwd_kernel",
     "causal_conv1d_simple_kernel",
-    "short_conv_fused_btd_kernel"
+    "causal_conv1d_simple_kernel_f16",
+    "causal_conv1d_simple_kernel_bf16",
+    "short_conv_fused_btd_kernel",
+    "short_conv_fused_btd_kernel_f16",
+    "short_conv_fused_btd_kernel_bf16"
   };
   
   for (const auto& func_name : function_names) {
@@ -121,8 +125,13 @@ torch::Tensor causal_conv1d_fwd_mps(
   TORCH_CHECK(weight.device().is_mps(), "Tensor 'weight' must be a MPS tensor");
   TORCH_CHECK(x.is_contiguous(), "Tensor 'x' must be contiguous");
   TORCH_CHECK(weight.is_contiguous(), "Tensor 'weight' must be contiguous");
-  TORCH_CHECK(x.scalar_type() == torch::kFloat, "Only float32 supported");
-  TORCH_CHECK(weight.scalar_type() == torch::kFloat, "Only float32 supported");
+  TORCH_CHECK(
+      x.scalar_type() == torch::kFloat || x.scalar_type() == torch::kHalf ||
+          x.scalar_type() == torch::kBFloat16,
+      "Only float32/float16/bfloat16 supported for x");
+  TORCH_CHECK(
+      weight.scalar_type() == x.scalar_type(),
+      "weight dtype must match x dtype");
   
   // 检查形状
   TORCH_CHECK(x.dim() == 3, "Input tensor must have shape (batch, dim, seqlen)");
@@ -132,10 +141,11 @@ torch::Tensor causal_conv1d_fwd_mps(
   if (bias.defined() && bias.numel() > 0) {
     TORCH_CHECK(bias.device().is_mps(), "Tensor 'bias' must be a MPS tensor");
     TORCH_CHECK(bias.is_contiguous(), "Tensor 'bias' must be contiguous");
-    TORCH_CHECK(bias.scalar_type() == torch::kFloat, "Only float32 supported");
+    TORCH_CHECK(bias.scalar_type() == x.scalar_type(), "bias dtype must match x dtype");
     TORCH_CHECK(bias.dim() == 1, "Bias tensor must be 1D");
     TORCH_CHECK(bias.size(0) == x.size(1), "Bias dim must match input dim");
   }
+  TORCH_CHECK(weight.size(1) == 4, "Simple kernel supports width=4");
 
   const int64_t batch_size = x.size(0);
   const int64_t dim = x.size(1);
@@ -168,8 +178,17 @@ torch::Tensor causal_conv1d_fwd_mps(
   // 注意：这里移除了未使用的params变量，因为我们使用的是简化kernel
   // ConvParams params = setup_conv_params(x, weight, result_tensor, silu_activation);
 
-  // 选择合适的kernel（简化版本）
-  id<MTLComputePipelineState> pipeline = g_pipelines["causal_conv1d_simple_kernel"];
+  // 选择合适的kernel（按 dtype）
+  id<MTLComputePipelineState> pipeline = nil;
+  if (x.scalar_type() == torch::kFloat) {
+    pipeline = g_pipelines["causal_conv1d_simple_kernel"];
+  } else if (x.scalar_type() == torch::kHalf) {
+    pipeline = g_pipelines["causal_conv1d_simple_kernel_f16"];
+  } else if (x.scalar_type() == torch::kBFloat16) {
+    pipeline = g_pipelines["causal_conv1d_simple_kernel_bf16"];
+  } else {
+    TORCH_CHECK(false, "Unsupported dtype");
+  }
   
   // 编码计算命令
   id<MTLComputeCommandEncoder> encoder = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
@@ -246,10 +265,16 @@ torch::Tensor short_conv_fused_mps(
   TORCH_CHECK(!bias.defined() || bias.device().is_mps(), "'bias' must be on MPS if provided");
   TORCH_CHECK(!mask.defined() || mask.device().is_mps(), "'mask' must be on MPS if provided");
 
-  TORCH_CHECK(x.scalar_type() == torch::kFloat, "Only float32 supported for x");
-  TORCH_CHECK(weight.scalar_type() == torch::kFloat, "Only float32 supported for weight");
-  TORCH_CHECK(!bias.defined() || bias.scalar_type() == torch::kFloat, "Only float32 supported for bias");
-  TORCH_CHECK(!mask.defined() || mask.scalar_type() == torch::kFloat, "Only float32 supported for mask");
+  TORCH_CHECK(
+      x.scalar_type() == torch::kFloat || x.scalar_type() == torch::kHalf ||
+          x.scalar_type() == torch::kBFloat16,
+      "Only float32/float16/bfloat16 supported for x");
+  TORCH_CHECK(weight.scalar_type() == x.scalar_type(), "weight dtype must match x");
+  TORCH_CHECK(!bias.defined() || bias.scalar_type() == x.scalar_type(), "bias dtype must match x");
+  // 若 mask 未定义或为空张量则跳过 dtype 校验
+  TORCH_CHECK(
+      !mask.defined() || mask.numel() == 0 || mask.scalar_type() == x.scalar_type(),
+      "mask dtype must match x");
 
   TORCH_CHECK(x.dim() == 3, "Expected x shape (B, T, D)");
   TORCH_CHECK(weight.dim() == 2, "Expected weight shape (D, W)");
@@ -263,8 +288,17 @@ torch::Tensor short_conv_fused_mps(
   if (bias.defined()) {
     TORCH_CHECK(bias.dim() == 1 && bias.size(0) == D, "bias must be (D)");
   }
-  if (mask.defined()) {
-    TORCH_CHECK(mask.dim() == 2 && mask.size(0) == B && mask.size(1) == T, "mask must be (B, T)");
+  if (mask.defined() && mask.numel() > 0) {
+    if (mask.dim() == 1) {
+      TORCH_CHECK(mask.numel() == B * T || mask.numel() == T || mask.numel() == B,
+                  "mask must be length T or B or B*T when 1D");
+    } else {
+      TORCH_CHECK(mask.dim() == 2 && ((mask.size(0) == B && mask.size(1) == T) ||
+                                      (mask.size(0) == T && mask.size(1) == B) ||
+                                      (mask.size(0) == 1 && mask.size(1) == T) ||
+                                      (mask.size(0) == B && mask.size(1) == 1)),
+                  "mask must be (B,T) or (T,B) or (1,T) or (B,1)");
+    }
   }
 
   auto x_contig = x.contiguous();
@@ -284,7 +318,16 @@ torch::Tensor short_conv_fused_mps(
   auto [m_buf, m_off] = getBufferAndOffset(m_contig);
   auto [o_buf, o_off] = getBufferAndOffset(out);
 
-  id<MTLComputePipelineState> pipeline = g_pipelines["short_conv_fused_btd_kernel"];
+  id<MTLComputePipelineState> pipeline = nil;
+  if (x.scalar_type() == torch::kFloat) {
+    pipeline = g_pipelines["short_conv_fused_btd_kernel"];
+  } else if (x.scalar_type() == torch::kHalf) {
+    pipeline = g_pipelines["short_conv_fused_btd_kernel_f16"];
+  } else if (x.scalar_type() == torch::kBFloat16) {
+    pipeline = g_pipelines["short_conv_fused_btd_kernel_bf16"];
+  } else {
+    TORCH_CHECK(false, "Unsupported dtype");
+  }
   id<MTLComputeCommandEncoder> encoder = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
   [encoder setComputePipelineState:pipeline];
 
