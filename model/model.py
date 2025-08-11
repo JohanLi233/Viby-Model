@@ -256,11 +256,12 @@ class CanonLayer(nn.Module):
 
         # Fallback to PyTorch implementation
         batch_size, seq_len, hidden_size = x.shape
-        residual = x if self.residual else torch.zeros_like(x)
 
         # Apply attention mask if provided
         if attention_mask is not None:
             x = x * attention_mask.unsqueeze(-1)
+
+        residual = x if self.residual else torch.zeros_like(x)
 
         # Convert to (batch, hidden_size, seq_len) for conv1d
         x_conv = x.transpose(1, 2)  # (B, D, T)
