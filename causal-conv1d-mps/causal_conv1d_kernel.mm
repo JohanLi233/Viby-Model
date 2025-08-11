@@ -68,7 +68,10 @@ static void ensure_metal_pipeline_initialized(id<MTLDevice> device) {
     "causal_conv1d_simple_kernel_bf16",
     "short_conv_fused_btd_kernel",
     "short_conv_fused_btd_kernel_f16",
-    "short_conv_fused_btd_kernel_bf16"
+    "short_conv_fused_btd_kernel_bf16",
+    "short_conv_update_kernel",
+    "short_conv_update_kernel_f16",
+    "short_conv_update_kernel_bf16"
   };
   
   for (const auto& func_name : function_names) {
@@ -360,6 +363,117 @@ torch::Tensor short_conv_fused_mps(
 
   return out;
 }
+
+// Stateful update function for single-token inference
+torch::Tensor short_conv_update_mps(
+    const torch::Tensor &x,
+    const torch::Tensor &conv_state,
+    const torch::Tensor &weight,
+    const torch::Tensor &bias,
+    const torch::Tensor &cache_seqlens,
+    bool silu_activation,
+    bool residual
+) {
+  TORCH_CHECK(x.device().is_mps(), "Input 'x' must be on MPS");
+  TORCH_CHECK(conv_state.device().is_mps(), "'conv_state' must be on MPS");
+  TORCH_CHECK(weight.device().is_mps(), "'weight' must be on MPS");
+  TORCH_CHECK(!bias.defined() || bias.device().is_mps(), "'bias' must be on MPS if provided");
+  TORCH_CHECK(cache_seqlens.device().is_mps(), "'cache_seqlens' must be on MPS");
+
+  TORCH_CHECK(
+      x.scalar_type() == torch::kFloat || x.scalar_type() == torch::kHalf ||
+          x.scalar_type() == torch::kBFloat16,
+      "Only float32/float16/bfloat16 supported for x");
+  TORCH_CHECK(conv_state.scalar_type() == x.scalar_type(), "conv_state dtype must match x");
+  TORCH_CHECK(weight.scalar_type() == x.scalar_type(), "weight dtype must match x");
+  TORCH_CHECK(!bias.defined() || bias.scalar_type() == x.scalar_type(), "bias dtype must match x");
+  TORCH_CHECK(cache_seqlens.scalar_type() == torch::kInt, "cache_seqlens must be int32");
+
+  TORCH_CHECK(x.dim() == 2, "Expected x shape (B, D)");
+  TORCH_CHECK(conv_state.dim() == 3, "Expected conv_state shape (B, D, STATE_LEN)");
+  TORCH_CHECK(weight.dim() == 2, "Expected weight shape (D, W)");
+  TORCH_CHECK(cache_seqlens.dim() == 1, "Expected cache_seqlens shape (B,)");
+  
+  const int64_t B = x.size(0);
+  const int64_t D = x.size(1);
+  const int64_t STATE_LEN = conv_state.size(2);
+  const int64_t W = weight.size(1);
+  
+  TORCH_CHECK(weight.size(0) == D, "weight dim must match D");
+  TORCH_CHECK(conv_state.size(0) == B && conv_state.size(1) == D, "conv_state shape mismatch");
+  TORCH_CHECK(cache_seqlens.size(0) == B, "cache_seqlens batch size mismatch");
+  TORCH_CHECK(W == 4, "Update kernel supports width=4 only");
+
+  if (bias.defined()) {
+    TORCH_CHECK(bias.dim() == 1 && bias.size(0) == D, "bias must be (D)");
+  }
+
+  auto x_contig = x.contiguous();
+  auto conv_state_contig = conv_state.contiguous();
+  auto weight_contig = weight.contiguous();
+  auto bias_contig = bias.defined() ? bias.contiguous() : bias;
+  auto cache_seqlens_contig = cache_seqlens.contiguous();
+
+  at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
+  id<MTLDevice> device = (id<MTLDevice>)stream->device();
+  ensure_metal_pipeline_initialized(device);
+
+  auto out = torch::empty_like(x_contig);
+
+  auto [x_buf, x_off] = getBufferAndOffset(x_contig);
+  auto [cs_buf, cs_off] = getBufferAndOffset(conv_state_contig);
+  auto [w_buf, w_off] = getBufferAndOffset(weight_contig);
+  auto [b_buf, b_off] = getBufferAndOffset(bias_contig);
+  auto [cl_buf, cl_off] = getBufferAndOffset(cache_seqlens_contig);
+  auto [o_buf, o_off] = getBufferAndOffset(out);
+
+  id<MTLComputePipelineState> pipeline = nil;
+  if (x.scalar_type() == torch::kFloat) {
+    pipeline = g_pipelines["short_conv_update_kernel"];
+  } else if (x.scalar_type() == torch::kHalf) {
+    pipeline = g_pipelines["short_conv_update_kernel_f16"];
+  } else if (x.scalar_type() == torch::kBFloat16) {
+    pipeline = g_pipelines["short_conv_update_kernel_bf16"];
+  } else {
+    TORCH_CHECK(false, "Unsupported dtype");
+  }
+
+  id<MTLComputeCommandEncoder> encoder = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
+  [encoder setComputePipelineState:pipeline];
+
+  // Buffers 0..5
+  [encoder setBuffer:x_buf offset:x_off atIndex:0];
+  [encoder setBuffer:cs_buf offset:cs_off atIndex:1];
+  [encoder setBuffer:w_buf offset:w_off atIndex:2];
+  [encoder setBuffer:b_buf offset:b_off atIndex:3];
+  [encoder setBuffer:cl_buf offset:cl_off atIndex:4];
+  [encoder setBuffer:o_buf offset:o_off atIndex:5];
+
+  // Scalars 6..11
+  uint32_t B_u32 = (uint32_t)B;
+  uint32_t D_u32 = (uint32_t)D;
+  uint32_t W_u32 = (uint32_t)W;
+  uint32_t STATE_LEN_u32 = (uint32_t)STATE_LEN;
+  bool use_silu = silu_activation;
+  bool use_resid = residual;
+
+  [encoder setBytes:&B_u32 length:sizeof(uint32_t) atIndex:6];
+  [encoder setBytes:&D_u32 length:sizeof(uint32_t) atIndex:7];
+  [encoder setBytes:&W_u32 length:sizeof(uint32_t) atIndex:8];
+  [encoder setBytes:&STATE_LEN_u32 length:sizeof(uint32_t) atIndex:9];
+  [encoder setBytes:&use_silu length:sizeof(bool) atIndex:10];
+  [encoder setBytes:&use_resid length:sizeof(bool) atIndex:11];
+
+  MTLSize gridSize = MTLSizeMake((NSUInteger)B, (NSUInteger)D, 1);
+  NSUInteger maxThreads = [pipeline maxTotalThreadsPerThreadgroup];
+  NSUInteger tg = MIN((NSUInteger)256, maxThreads);
+  if (tg == 0) tg = 1;
+  MTLSize tgSize = MTLSizeMake(1, tg, 1);
+  [encoder dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("causal_conv1d_fwd", &causal_conv1d_fwd_mps, 
         "Causal Conv1D forward pass using Metal compute kernel (MPS)");
@@ -367,4 +481,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Causal Conv1D with full interface compatibility");
   m.def("short_conv_fused", &short_conv_fused_mps,
         "Fused ShortConvolution (Mask+Conv+SiLU+Residual) on MPS (BTD layout)");
+  m.def("short_conv_update", &short_conv_update_mps,
+        "Single-token causal convolution update for efficient inference");
 }

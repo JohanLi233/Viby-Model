@@ -45,7 +45,7 @@ except ImportError:
     )
 
 __version__ = "0.1.0"
-__all__ = ["causal_conv1d_fwd", "short_conv_fused"]
+__all__ = ["causal_conv1d_fwd", "short_conv_fused", "short_conv_update"]
 
 
 def causal_conv1d_fwd(
@@ -259,3 +259,117 @@ def short_conv_fused(
         attention_mask = torch.ones((B, T), device=x.device, dtype=x.dtype)
 
     return _C.short_conv_fused(x, weight, bias, attention_mask, activation, residual)
+
+
+def short_conv_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[torch.Tensor] = None,
+    activation: bool = True,
+    residual: bool = True,
+) -> torch.Tensor:
+    """
+    Single-token causal convolution update for efficient inference.
+
+    Args:
+        x: Input tensor of shape (batch, dim) - single token input
+        conv_state: Convolution state cache of shape (batch, dim, state_len)
+                   This tensor will be modified in-place to update the state
+        weight: Weight tensor of shape (dim, width)
+        bias: Optional bias tensor of shape (dim,)
+        cache_seqlens: Current sequence lengths for each batch item, shape (batch,)
+                      If None, assumes all batches are at the same position
+        activation: Whether to apply SiLU activation
+        residual: Whether to add residual connection
+
+    Returns:
+        Output tensor of shape (batch, dim) - single token output
+
+    Raises:
+        RuntimeError: If MPS is not available
+        ValueError: If tensor shapes are invalid
+    """
+    if not torch.backends.mps.is_available():
+        raise RuntimeError("MPS is not available on this device")
+
+    if x.device.type != "mps":
+        raise ValueError("Input tensor must be on MPS device")
+
+    if conv_state.device.type != "mps":
+        raise ValueError("Convolution state tensor must be on MPS device")
+
+    if weight.device.type != "mps":
+        raise ValueError("Weight tensor must be on MPS device")
+
+    if bias is not None and bias.device.type != "mps":
+        raise ValueError("Bias tensor must be on MPS device")
+
+    # Validate tensor shapes
+    if x.dim() != 2:
+        raise ValueError(
+            f"Expected 2D input tensor (batch, dim), got {x.dim()}D"
+        )
+
+    if conv_state.dim() != 3:
+        raise ValueError(
+            f"Expected 3D conv_state tensor (batch, dim, state_len), got {conv_state.dim()}D"
+        )
+
+    if weight.dim() != 2:
+        raise ValueError(f"Expected 2D weight tensor (dim, width), got {weight.dim()}D")
+
+    batch, dim = x.shape
+    conv_batch, conv_dim, state_len = conv_state.shape
+    weight_dim, width = weight.shape
+
+    if batch != conv_batch or dim != conv_dim:
+        raise ValueError(
+            f"Input shape {x.shape} doesn't match conv_state batch/dim {(conv_batch, conv_dim)}"
+        )
+
+    if dim != weight_dim:
+        raise ValueError(f"Input dim {dim} does not match weight dim {weight_dim}")
+
+    if width != 4:
+        raise ValueError(f"Only width=4 is supported for update kernel, got {width}")
+
+    if bias is not None:
+        if bias.dim() != 1:
+            raise ValueError(f"Expected 1D bias tensor, got {bias.dim()}D")
+        if bias.shape[0] != dim:
+            raise ValueError(f"Bias dim {bias.shape[0]} does not match input dim {dim}")
+
+    # Handle cache_seqlens
+    if cache_seqlens is None:
+        # If not provided, create a simple increasing sequence
+        # This assumes we're processing tokens sequentially for all batches
+        cache_seqlens = torch.arange(batch, device=x.device, dtype=torch.int32)
+    else:
+        if cache_seqlens.device.type != "mps":
+            raise ValueError("cache_seqlens must be on MPS device")
+        if cache_seqlens.dim() != 1:
+            raise ValueError(f"Expected 1D cache_seqlens, got {cache_seqlens.dim()}D")
+        if cache_seqlens.shape[0] != batch:
+            raise ValueError(
+                f"cache_seqlens batch size {cache_seqlens.shape[0]} != input batch {batch}"
+            )
+        if cache_seqlens.dtype != torch.int32:
+            cache_seqlens = cache_seqlens.to(torch.int32)
+
+    # Ensure tensors are contiguous
+    x = x.contiguous()
+    conv_state = conv_state.contiguous()  # This will be modified in-place by the kernel
+    weight = weight.contiguous()
+
+    if bias is not None:
+        bias = bias.contiguous()
+    else:
+        bias = torch.tensor([], device=x.device, dtype=x.dtype)
+
+    cache_seqlens = cache_seqlens.contiguous()
+
+    return _C.short_conv_update(
+        x, conv_state, weight, bias, cache_seqlens, activation, residual
+    )

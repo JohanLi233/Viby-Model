@@ -426,3 +426,217 @@ kernel void short_conv_fused_btd_kernel_bf16(
     }
     output[output_idx] = float_to_bf16(result);
 }
+
+// ====================================================================================
+// Single-token Update Kernels (for efficient inference)
+// ====================================================================================
+
+kernel void short_conv_update_kernel(
+    device const float *x [[buffer(0)]],                // 单步输入 (B, D) - 新的 token
+    device float *conv_state [[buffer(1)]],             // 卷积状态 (B, D, STATE_LEN) - 就地更新
+    device const float *weight [[buffer(2)]],           // 权重 (D, W)
+    device const float *bias [[buffer(3)]],             // 偏置 (D) - 可选
+    device const int *cache_seqlens [[buffer(4)]],      // 各 batch 的当前序列长度 (B,)
+    device float *output [[buffer(5)]],                 // 单步输出 (B, D)
+    
+    constant uint &B [[buffer(6)]],                     // batch_size
+    constant uint &D [[buffer(7)]],                     // hidden_dim
+    constant uint &W [[buffer(8)]],                     // kernel_width (固定为4)
+    constant uint &STATE_LEN [[buffer(9)]],             // 状态缓冲区长度
+    constant bool &use_silu [[buffer(10)]],
+    constant bool &use_residual [[buffer(11)]],
+    
+    uint2 gid [[thread_position_in_grid]]               // (B, D)
+)
+{
+    const uint b = gid.x;  // batch index
+    const uint d = gid.y;  // dimension index
+    
+    // 边界检查
+    if (b >= B || d >= D) return;
+    
+    // 获取当前序列长度
+    int current_seq_len = cache_seqlens[b];
+    
+    // 计算在循环缓冲区中的写入位置
+    uint write_pos = (uint)current_seq_len % STATE_LEN;
+    
+    // 计算线性索引
+    const uint x_idx = b * D + d;
+    const uint output_idx = b * D + d;
+    const uint weight_base = d * W;
+    const uint state_base = b * D * STATE_LEN + d * STATE_LEN;
+    
+    // 读取当前输入
+    float current_input = x[x_idx];
+    
+    // 初始化结果为偏置
+    float result = (bias != nullptr) ? bias[d] : 0.0f;
+    
+    // 执行因果卷积：需要读取过去 W-1 个状态 + 当前输入
+    for (uint w = 0; w < W; w++) {
+        float input_val;
+        
+        if (w == W - 1) {
+            // 最后一个权重对应当前输入
+            input_val = current_input;
+        } else {
+            // 从循环缓冲区读取历史数据
+            // 位置计算：(write_pos - (W - 1 - w)) % STATE_LEN
+            int hist_offset = (int)(W - 1 - w);
+            int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+            uint state_idx = state_base + (uint)hist_pos;
+            input_val = conv_state[state_idx];
+        }
+        
+        float weight_val = weight[weight_base + w];
+        result += weight_val * input_val;
+    }
+    
+    // 应用激活函数
+    if (use_silu) {
+        result = silu(result);
+    }
+    
+    // 应用残差连接
+    if (use_residual) {
+        result += current_input;
+    }
+    
+    // 更新状态：将当前输入写入循环缓冲区
+    uint state_write_idx = state_base + write_pos;
+    conv_state[state_write_idx] = current_input;
+    
+    // 写入输出
+    output[output_idx] = result;
+}
+
+// Float16 版本
+kernel void short_conv_update_kernel_f16(
+    device const half *x [[buffer(0)]],
+    device half *conv_state [[buffer(1)]],
+    device const half *weight [[buffer(2)]],
+    device const half *bias [[buffer(3)]],
+    device const int *cache_seqlens [[buffer(4)]],
+    device half *output [[buffer(5)]],
+    
+    constant uint &B [[buffer(6)]],
+    constant uint &D [[buffer(7)]],
+    constant uint &W [[buffer(8)]],
+    constant uint &STATE_LEN [[buffer(9)]],
+    constant bool &use_silu [[buffer(10)]],
+    constant bool &use_residual [[buffer(11)]],
+    
+    uint2 gid [[thread_position_in_grid]]
+)
+{
+    const uint b = gid.x;
+    const uint d = gid.y;
+    
+    if (b >= B || d >= D) return;
+    
+    int current_seq_len = cache_seqlens[b];
+    uint write_pos = (uint)current_seq_len % STATE_LEN;
+    
+    const uint x_idx = b * D + d;
+    const uint output_idx = b * D + d;
+    const uint weight_base = d * W;
+    const uint state_base = b * D * STATE_LEN + d * STATE_LEN;
+    
+    float current_input = (float)x[x_idx];
+    float result = (bias != nullptr) ? (float)bias[d] : 0.0f;
+    
+    for (uint w = 0; w < W; w++) {
+        float input_val;
+        
+        if (w == W - 1) {
+            input_val = current_input;
+        } else {
+            int hist_offset = (int)(W - 1 - w);
+            int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+            uint state_idx = state_base + (uint)hist_pos;
+            input_val = (float)conv_state[state_idx];
+        }
+        
+        float weight_val = (float)weight[weight_base + w];
+        result += weight_val * input_val;
+    }
+    
+    if (use_silu) {
+        result = silu(result);
+    }
+    
+    if (use_residual) {
+        result += current_input;
+    }
+    
+    uint state_write_idx = state_base + write_pos;
+    conv_state[state_write_idx] = (half)current_input;
+    
+    output[output_idx] = (half)result;
+}
+
+// BFloat16 版本  
+kernel void short_conv_update_kernel_bf16(
+    device const ushort *x [[buffer(0)]],
+    device ushort *conv_state [[buffer(1)]],
+    device const ushort *weight [[buffer(2)]],
+    device const ushort *bias [[buffer(3)]],
+    device const int *cache_seqlens [[buffer(4)]],
+    device ushort *output [[buffer(5)]],
+    
+    constant uint &B [[buffer(6)]],
+    constant uint &D [[buffer(7)]],
+    constant uint &W [[buffer(8)]],
+    constant uint &STATE_LEN [[buffer(9)]],
+    constant bool &use_silu [[buffer(10)]],
+    constant bool &use_residual [[buffer(11)]],
+    
+    uint2 gid [[thread_position_in_grid]]
+)
+{
+    const uint b = gid.x;
+    const uint d = gid.y;
+    
+    if (b >= B || d >= D) return;
+    
+    int current_seq_len = cache_seqlens[b];
+    uint write_pos = (uint)current_seq_len % STATE_LEN;
+    
+    const uint x_idx = b * D + d;
+    const uint output_idx = b * D + d;
+    const uint weight_base = d * W;
+    const uint state_base = b * D * STATE_LEN + d * STATE_LEN;
+    
+    float current_input = bf16_to_float(x[x_idx]);
+    float result = (bias != nullptr) ? bf16_to_float(bias[d]) : 0.0f;
+    
+    for (uint w = 0; w < W; w++) {
+        float input_val;
+        
+        if (w == W - 1) {
+            input_val = current_input;
+        } else {
+            int hist_offset = (int)(W - 1 - w);
+            int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+            uint state_idx = state_base + (uint)hist_pos;
+            input_val = bf16_to_float(conv_state[state_idx]);
+        }
+        
+        float weight_val = bf16_to_float(weight[weight_base + w]);
+        result += weight_val * input_val;
+    }
+    
+    if (use_silu) {
+        result = silu(result);
+    }
+    
+    if (use_residual) {
+        result += current_input;
+    }
+    
+    uint state_write_idx = state_base + write_pos;
+    conv_state[state_write_idx] = float_to_bf16(current_input);
+    
+    output[output_idx] = float_to_bf16(result);
+}
