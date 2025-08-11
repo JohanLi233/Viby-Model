@@ -640,3 +640,1022 @@ kernel void short_conv_update_kernel_bf16(
     
     output[output_idx] = float_to_bf16(result);
 }
+
+// =====================================================================================
+// BACKWARD PASS KERNELS
+// =====================================================================================
+
+// Backward pass for basic causal conv1d (float32)
+kernel void causal_conv1d_bwd_kernel(
+    device const float *x [[buffer(0)]],           // Original input (batch, dim, seqlen)
+    device const float *weight [[buffer(1)]],      // Original weight (dim, width)
+    device const float *grad_output [[buffer(2)]], // Gradient w.r.t. output (batch, dim, seqlen)
+    device float *grad_x [[buffer(3)]],            // Gradient w.r.t. input (batch, dim, seqlen)
+    device float *grad_weight [[buffer(4)]],       // Gradient w.r.t. weight (dim, width) - accumulated
+    device const float *bias [[buffer(5)]],        // Forward bias (dim) - may be nullptr
+    device float *grad_bias [[buffer(6)]],         // Gradient w.r.t. bias (dim) - accumulated (optional)
+    
+    constant uint &batch_size [[buffer(7)]],
+    constant uint &dim [[buffer(8)]],
+    constant uint &seqlen [[buffer(9)]],
+    constant bool &silu_activation [[buffer(10)]],
+    
+    uint3 thread_position_in_grid [[thread_position_in_grid]]
+)
+{
+    const uint batch_id = thread_position_in_grid.x;
+    const uint channel_id = thread_position_in_grid.y;
+    const uint seq_pos = thread_position_in_grid.z;
+    
+    // Boundary check
+    if (batch_id >= batch_size || channel_id >= dim || seq_pos >= seqlen) {
+        return;
+    }
+    
+    const uint width = 4; // Fixed width
+    const uint input_base = batch_id * dim * seqlen + channel_id * seqlen;
+    const uint weight_base = channel_id * width;
+    const uint output_idx = input_base + seq_pos;
+    
+    // Get gradient from output
+    float grad_out = grad_output[output_idx];
+    
+    // If SiLU activation was used, we need to apply its derivative
+    if (silu_activation) {
+        // Recompute forward pass to get the pre-activation value
+        float pre_activation = 0.0f;
+        for (uint w = 0; w < width; w++) {
+            int input_pos = (int)seq_pos - (int)(width - 1 - w);
+            if (input_pos >= 0) {
+                float input_val = x[input_base + input_pos];
+                float weight_val = weight[weight_base + w];
+                pre_activation += weight_val * input_val;
+            }
+        }
+        // Add bias contribution if available
+        if (bias != nullptr) {
+            pre_activation += bias[channel_id];
+        }
+        
+        // Apply SiLU derivative: d/dx[SiLU(x)] = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+        float sigmoid_val = 1.0f / (1.0f + exp(-pre_activation));
+        grad_out *= sigmoid_val * (1.0f + pre_activation * (1.0f - sigmoid_val));
+    }
+    
+    // Compute gradient w.r.t. input (dx)
+    // For causal conv: dx[t] = sum_w(weight[w] * grad_output[t + (width - 1 - w)])
+    float dx_val = 0.0f;
+    for (uint w = 0; w < width; w++) {
+        int future_pos = (int)seq_pos + (int)(width - 1 - w);
+        if (future_pos < (int)seqlen) {
+            float future_grad = grad_output[input_base + future_pos];
+            
+            // Apply activation derivative if needed for future position
+            if (silu_activation) {
+                // Recompute forward for future position
+                float future_pre_activation = 0.0f;
+                for (uint fw = 0; fw < width; fw++) {
+                    int future_input_pos = future_pos - (int)(width - 1 - fw);
+                    if (future_input_pos >= 0) {
+                        float future_input_val = x[input_base + future_input_pos];
+                        float future_weight_val = weight[weight_base + fw];
+                        future_pre_activation += future_weight_val * future_input_val;
+                    }
+                }
+                // Add bias contribution if available
+                if (bias != nullptr) {
+                    future_pre_activation += bias[channel_id];
+                }
+                float future_sigmoid = 1.0f / (1.0f + exp(-future_pre_activation));
+                future_grad *= future_sigmoid * (1.0f + future_pre_activation * (1.0f - future_sigmoid));
+            }
+            
+            dx_val += weight[weight_base + w] * future_grad;
+        }
+    }
+    grad_x[output_idx] = dx_val;
+    
+    // Accumulate gradient w.r.t. weight (dweight) - using atomic operations
+    // dweight[w] += x[t-(width-1-w)] * grad_output[t]
+    for (uint w = 0; w < width; w++) {
+        int input_pos = (int)seq_pos - (int)(width - 1 - w);
+        if (input_pos >= 0) {
+            float input_val = x[input_base + input_pos];
+            atomic_fetch_add_explicit(
+                (device atomic<float>*)&grad_weight[weight_base + w],
+                input_val * grad_out,
+                memory_order_relaxed
+            );
+        }
+    }
+    
+    // Accumulate gradient w.r.t. bias (dbias) - using atomic operations
+    if (grad_bias != nullptr) {
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_bias[channel_id],
+            grad_out,
+            memory_order_relaxed
+        );
+    }
+}
+
+// Backward pass for basic causal conv1d (float16)
+kernel void causal_conv1d_bwd_kernel_f16(
+    device const half *x [[buffer(0)]],
+    device const half *weight [[buffer(1)]],
+    device const half *grad_output [[buffer(2)]],
+    device half *grad_x [[buffer(3)]],
+    device float *grad_weight [[buffer(4)]],     // Use float32 for accumulation
+    device const half *bias [[buffer(5)]],       // Forward bias (may be nullptr)
+    device float *grad_bias [[buffer(6)]],       // Use float32 for accumulation
+    
+    constant uint &batch_size [[buffer(7)]],
+    constant uint &dim [[buffer(8)]],
+    constant uint &seqlen [[buffer(9)]],
+    constant bool &silu_activation [[buffer(10)]],
+    
+    uint3 thread_position_in_grid [[thread_position_in_grid]]
+)
+{
+    const uint batch_id = thread_position_in_grid.x;
+    const uint channel_id = thread_position_in_grid.y;
+    const uint seq_pos = thread_position_in_grid.z;
+    
+    if (batch_id >= batch_size || channel_id >= dim || seq_pos >= seqlen) {
+        return;
+    }
+    
+    const uint width = 4;
+    const uint input_base = batch_id * dim * seqlen + channel_id * seqlen;
+    const uint weight_base = channel_id * width;
+    const uint output_idx = input_base + seq_pos;
+    
+    float grad_out = (float)grad_output[output_idx];
+    
+    // Apply SiLU derivative if needed
+    if (silu_activation) {
+        float pre_activation = 0.0f;
+        for (uint w = 0; w < width; w++) {
+            int input_pos = (int)seq_pos - (int)(width - 1 - w);
+            if (input_pos >= 0) {
+                float input_val = (float)x[input_base + input_pos];
+                float weight_val = (float)weight[weight_base + w];
+                pre_activation += weight_val * input_val;
+            }
+        }
+        if (bias != nullptr) {
+            pre_activation += (float)bias[channel_id];
+        }
+        float sigmoid_val = 1.0f / (1.0f + exp(-pre_activation));
+        grad_out *= sigmoid_val * (1.0f + pre_activation * (1.0f - sigmoid_val));
+    }
+    
+    // Compute dx
+    float dx_val = 0.0f;
+    for (uint w = 0; w < width; w++) {
+        int future_pos = (int)seq_pos + (int)(width - 1 - w);
+        if (future_pos < (int)seqlen) {
+            float future_grad = (float)grad_output[input_base + future_pos];
+            if (silu_activation) {
+                // Apply activation derivative for future position
+                float future_pre_activation = 0.0f;
+                for (uint fw = 0; fw < width; fw++) {
+                    int future_input_pos = future_pos - (int)(width - 1 - fw);
+                    if (future_input_pos >= 0) {
+                        float future_input_val = (float)x[input_base + future_input_pos];
+                        float future_weight_val = (float)weight[weight_base + fw];
+                        future_pre_activation += future_weight_val * future_input_val;
+                    }
+                }
+                if (bias != nullptr) {
+                    future_pre_activation += (float)bias[channel_id];
+                }
+                float future_sigmoid = 1.0f / (1.0f + exp(-future_pre_activation));
+                future_grad *= future_sigmoid * (1.0f + future_pre_activation * (1.0f - future_sigmoid));
+            }
+            dx_val += (float)weight[weight_base + w] * future_grad;
+        }
+    }
+    grad_x[output_idx] = (half)dx_val;
+    
+    // Accumulate dweight and dbias in float32
+    for (uint w = 0; w < width; w++) {
+        int input_pos = (int)seq_pos - (int)(width - 1 - w);
+        if (input_pos >= 0) {
+            float input_val = (float)x[input_base + input_pos];
+            atomic_fetch_add_explicit(
+                (device atomic<float>*)&grad_weight[weight_base + w],
+                input_val * grad_out,
+                memory_order_relaxed
+            );
+        }
+    }
+    
+    if (grad_bias != nullptr) {
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_bias[channel_id],
+            grad_out,
+            memory_order_relaxed
+        );
+    }
+}
+
+// Backward pass for basic causal conv1d (bfloat16)
+kernel void causal_conv1d_bwd_kernel_bf16(
+    device const ushort *x [[buffer(0)]],
+    device const ushort *weight [[buffer(1)]],
+    device const ushort *grad_output [[buffer(2)]],
+    device ushort *grad_x [[buffer(3)]],
+    device float *grad_weight [[buffer(4)]],     // Use float32 for accumulation
+    device const ushort *bias [[buffer(5)]],     // Forward bias (may be nullptr)
+    device float *grad_bias [[buffer(6)]],       // Use float32 for accumulation
+    
+    constant uint &batch_size [[buffer(7)]],
+    constant uint &dim [[buffer(8)]],
+    constant uint &seqlen [[buffer(9)]],
+    constant bool &silu_activation [[buffer(10)]],
+    
+    uint3 thread_position_in_grid [[thread_position_in_grid]]
+)
+{
+    const uint batch_id = thread_position_in_grid.x;
+    const uint channel_id = thread_position_in_grid.y;
+    const uint seq_pos = thread_position_in_grid.z;
+    
+    if (batch_id >= batch_size || channel_id >= dim || seq_pos >= seqlen) {
+        return;
+    }
+    
+    const uint width = 4;
+    const uint input_base = batch_id * dim * seqlen + channel_id * seqlen;
+    const uint weight_base = channel_id * width;
+    const uint output_idx = input_base + seq_pos;
+    
+    float grad_out = bf16_to_float(grad_output[output_idx]);
+    
+    // Apply SiLU derivative if needed
+    if (silu_activation) {
+        float pre_activation = 0.0f;
+        for (uint w = 0; w < width; w++) {
+            int input_pos = (int)seq_pos - (int)(width - 1 - w);
+            if (input_pos >= 0) {
+                float input_val = bf16_to_float(x[input_base + input_pos]);
+                float weight_val = bf16_to_float(weight[weight_base + w]);
+                pre_activation += weight_val * input_val;
+            }
+        }
+        if (bias != nullptr) {
+            pre_activation += bf16_to_float(bias[channel_id]);
+        }
+        float sigmoid_val = 1.0f / (1.0f + exp(-pre_activation));
+        grad_out *= sigmoid_val * (1.0f + pre_activation * (1.0f - sigmoid_val));
+    }
+    
+    // Compute dx
+    float dx_val = 0.0f;
+    for (uint w = 0; w < width; w++) {
+        int future_pos = (int)seq_pos + (int)(width - 1 - w);
+        if (future_pos < (int)seqlen) {
+            float future_grad = bf16_to_float(grad_output[input_base + future_pos]);
+            if (silu_activation) {
+                // Apply activation derivative for future position
+                float future_pre_activation = 0.0f;
+                for (uint fw = 0; fw < width; fw++) {
+                    int future_input_pos = future_pos - (int)(width - 1 - fw);
+                    if (future_input_pos >= 0) {
+                        float future_input_val = bf16_to_float(x[input_base + future_input_pos]);
+                        float future_weight_val = bf16_to_float(weight[weight_base + fw]);
+                        future_pre_activation += future_weight_val * future_input_val;
+                    }
+                }
+                if (bias != nullptr) {
+                    future_pre_activation += bf16_to_float(bias[channel_id]);
+                }
+                float future_sigmoid = 1.0f / (1.0f + exp(-future_pre_activation));
+                future_grad *= future_sigmoid * (1.0f + future_pre_activation * (1.0f - future_sigmoid));
+            }
+            dx_val += bf16_to_float(weight[weight_base + w]) * future_grad;
+        }
+    }
+    grad_x[output_idx] = float_to_bf16(dx_val);
+    
+    // Accumulate dweight and dbias in float32
+    for (uint w = 0; w < width; w++) {
+        int input_pos = (int)seq_pos - (int)(width - 1 - w);
+        if (input_pos >= 0) {
+            float input_val = bf16_to_float(x[input_base + input_pos]);
+            atomic_fetch_add_explicit(
+                (device atomic<float>*)&grad_weight[weight_base + w],
+                input_val * grad_out,
+                memory_order_relaxed
+            );
+        }
+    }
+    
+    if (grad_bias != nullptr) {
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_bias[channel_id],
+            grad_out,
+            memory_order_relaxed
+        );
+    }
+}
+
+// Backward pass for fused short convolution (float32)
+kernel void short_conv_fused_btd_bwd_kernel(
+    device const float *x [[buffer(0)]],           // Original input (B, T, D)
+    device const float *weight [[buffer(1)]],      // Original weight (D, W)
+    device const float *mask [[buffer(2)]],        // Attention mask (B, T)
+    device const float *grad_output [[buffer(3)]], // Gradient w.r.t. output (B, T, D)
+    device float *grad_x [[buffer(4)]],            // Gradient w.r.t. input (B, T, D)
+    device float *grad_weight [[buffer(5)]],       // Gradient w.r.t. weight (D, W) - accumulated
+    device const float *bias [[buffer(6)]],        // Forward bias (D) may be nullptr
+    device float *grad_bias [[buffer(7)]],         // Gradient w.r.t. bias (D) - accumulated
+    
+    constant uint &B [[buffer(8)]],
+    constant uint &T [[buffer(9)]],
+    constant uint &D [[buffer(10)]],
+    constant bool &use_activation [[buffer(11)]],
+    constant bool &use_residual [[buffer(12)]],
+    
+    uint3 gid [[thread_position_in_grid]]
+)
+{
+    const uint b = gid.x;
+    const uint t = gid.y;
+    const uint d = gid.z;
+    
+    if (b >= B || t >= T || d >= D) return;
+    
+    const uint W = 4;
+    const uint TD = T * D;
+    const uint output_idx = b * TD + t * D + d;
+    const uint weight_base = d * W;
+    
+    float grad_out = grad_output[output_idx];
+    
+    // If residual was used, part of gradient flows directly to input
+    float dx_residual = use_residual ? grad_out : 0.0f;
+    
+    // Compute forward pass result for activation derivative
+    float conv_result = 0.0f;
+    if (use_activation) {
+        for (uint w = 0; w < W; w++) {
+            int tt = (int)t - (int)(W - 1 - w);
+            if (tt >= 0) {
+                const uint input_idx = b * TD + (uint)tt * D + d;
+                float input_val = x[input_idx];
+                if (mask != nullptr) {
+                    const uint mask_idx = b * T + (uint)tt;
+                    input_val *= mask[mask_idx];
+                }
+                float weight_val = weight[weight_base + w];
+                conv_result += weight_val * input_val;
+            }
+        }
+        if (bias != nullptr) {
+            conv_result += bias[d];
+        }
+        // Apply SiLU derivative
+        float sigmoid_val = 1.0f / (1.0f + exp(-conv_result));
+        grad_out *= sigmoid_val * (1.0f + conv_result * (1.0f - sigmoid_val));
+    }
+    
+    // Compute gradient w.r.t. input from convolution
+    float dx_conv = 0.0f;
+    for (uint w = 0; w < W; w++) {
+        int future_t = (int)t + (int)(W - 1 - w);
+        if (future_t < (int)T) {
+            const uint future_idx = b * TD + (uint)future_t * D + d;
+            float future_grad = grad_output[future_idx];
+            
+            // Apply activation derivative for future position if needed
+            if (use_activation) {
+                // Recompute forward for future position
+                float future_conv_result = 0.0f;
+                for (uint fw = 0; fw < W; fw++) {
+                    int future_input_t = future_t - (int)(W - 1 - fw);
+                    if (future_input_t >= 0) {
+                        const uint future_input_idx = b * TD + (uint)future_input_t * D + d;
+                        float future_input_val = x[future_input_idx];
+                        if (mask != nullptr) {
+                            const uint future_mask_idx = b * T + (uint)future_input_t;
+                            future_input_val *= mask[future_mask_idx];
+                        }
+                        float future_weight_val = weight[weight_base + fw];
+                        future_conv_result += future_weight_val * future_input_val;
+                    }
+                }
+                if (bias != nullptr) {
+                    future_conv_result += bias[d];
+                }
+                float future_sigmoid = 1.0f / (1.0f + exp(-future_conv_result));
+                future_grad *= future_sigmoid * (1.0f + future_conv_result * (1.0f - future_sigmoid));
+            }
+            
+            // Apply mask to weight gradient
+            float weight_val = weight[weight_base + w];
+            if (mask != nullptr) {
+                const uint mask_idx = b * T + t;
+                weight_val *= mask[mask_idx];
+            }
+            dx_conv += weight_val * future_grad;
+        }
+    }
+    
+    grad_x[output_idx] = dx_residual + dx_conv;
+    
+    // Accumulate gradient w.r.t. weight
+    for (uint w = 0; w < W; w++) {
+        int tt = (int)t - (int)(W - 1 - w);
+        if (tt >= 0) {
+            const uint input_idx = b * TD + (uint)tt * D + d;
+            float input_val = x[input_idx];
+            if (mask != nullptr) {
+                const uint mask_idx = b * T + (uint)tt;
+                input_val *= mask[mask_idx];
+            }
+            atomic_fetch_add_explicit(
+                (device atomic<float>*)&grad_weight[weight_base + w],
+                input_val * grad_out,
+                memory_order_relaxed
+            );
+        }
+    }
+    
+    // Accumulate gradient w.r.t. bias
+    if (grad_bias != nullptr) {
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_bias[d],
+            grad_out,
+            memory_order_relaxed
+        );
+    }
+}
+
+// Backward pass for fused short convolution (float16)
+kernel void short_conv_fused_btd_bwd_kernel_f16(
+    device const half *x [[buffer(0)]],
+    device const half *weight [[buffer(1)]],
+    device const half *mask [[buffer(2)]],
+    device const half *grad_output [[buffer(3)]],
+    device half *grad_x [[buffer(4)]],
+    device float *grad_weight [[buffer(5)]],       // Use float32 for accumulation
+    device const half *bias [[buffer(6)]],         // Forward bias (may be nullptr)
+    device float *grad_bias [[buffer(7)]],         // Use float32 for accumulation
+    
+    constant uint &B [[buffer(8)]],
+    constant uint &T [[buffer(9)]],
+    constant uint &D [[buffer(10)]],
+    constant bool &use_activation [[buffer(11)]],
+    constant bool &use_residual [[buffer(12)]],
+    
+    uint3 gid [[thread_position_in_grid]]
+)
+{
+    const uint b = gid.x;
+    const uint t = gid.y;
+    const uint d = gid.z;
+    
+    if (b >= B || t >= T || d >= D) return;
+    
+    const uint W = 4;
+    const uint TD = T * D;
+    const uint output_idx = b * TD + t * D + d;
+    const uint weight_base = d * W;
+    
+    float grad_out = (float)grad_output[output_idx];
+    float dx_residual = use_residual ? grad_out : 0.0f;
+    
+    // Apply activation derivative if needed
+    if (use_activation) {
+        float conv_result = 0.0f;
+        for (uint w = 0; w < W; w++) {
+            int tt = (int)t - (int)(W - 1 - w);
+            if (tt >= 0) {
+                const uint input_idx = b * TD + (uint)tt * D + d;
+                float input_val = (float)x[input_idx];
+                if (mask != nullptr) {
+                    const uint mask_idx = b * T + (uint)tt;
+                    input_val *= (float)mask[mask_idx];
+                }
+                float weight_val = (float)weight[weight_base + w];
+                conv_result += weight_val * input_val;
+            }
+        }
+        if (bias != nullptr) {
+            conv_result += (float)bias[d];
+        }
+        float sigmoid_val = 1.0f / (1.0f + exp(-conv_result));
+        grad_out *= sigmoid_val * (1.0f + conv_result * (1.0f - sigmoid_val));
+    }
+    
+    // Compute dx from convolution
+    float dx_conv = 0.0f;
+    for (uint w = 0; w < W; w++) {
+        int future_t = (int)t + (int)(W - 1 - w);
+        if (future_t < (int)T) {
+            const uint future_idx = b * TD + (uint)future_t * D + d;
+            float future_grad = (float)grad_output[future_idx];
+            
+            if (use_activation) {
+                // Apply activation derivative for future position
+                float future_conv_result = 0.0f;
+                for (uint fw = 0; fw < W; fw++) {
+                    int future_input_t = future_t - (int)(W - 1 - fw);
+                    if (future_input_t >= 0) {
+                        const uint future_input_idx = b * TD + (uint)future_input_t * D + d;
+                        float future_input_val = (float)x[future_input_idx];
+                        if (mask != nullptr) {
+                            const uint future_mask_idx = b * T + (uint)future_input_t;
+                            future_input_val *= (float)mask[future_mask_idx];
+                        }
+                        float future_weight_val = (float)weight[weight_base + fw];
+                        future_conv_result += future_weight_val * future_input_val;
+                    }
+                }
+                if (bias != nullptr) {
+                    future_conv_result += (float)bias[d];
+                }
+                float future_sigmoid = 1.0f / (1.0f + exp(-future_conv_result));
+                future_grad *= future_sigmoid * (1.0f + future_conv_result * (1.0f - future_sigmoid));
+            }
+            
+            float weight_val = (float)weight[weight_base + w];
+            if (mask != nullptr) {
+                const uint mask_idx = b * T + t;
+                weight_val *= (float)mask[mask_idx];
+            }
+            dx_conv += weight_val * future_grad;
+        }
+    }
+    
+    grad_x[output_idx] = (half)(dx_residual + dx_conv);
+    
+    // Accumulate gradients in float32
+    for (uint w = 0; w < W; w++) {
+        int tt = (int)t - (int)(W - 1 - w);
+        if (tt >= 0) {
+            const uint input_idx = b * TD + (uint)tt * D + d;
+            float input_val = (float)x[input_idx];
+            if (mask != nullptr) {
+                const uint mask_idx = b * T + (uint)tt;
+                input_val *= (float)mask[mask_idx];
+            }
+            atomic_fetch_add_explicit(
+                (device atomic<float>*)&grad_weight[weight_base + w],
+                input_val * grad_out,
+                memory_order_relaxed
+            );
+        }
+    }
+    
+    if (grad_bias != nullptr) {
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_bias[d],
+            grad_out,
+            memory_order_relaxed
+        );
+    }
+}
+
+// Backward pass for fused short convolution (bfloat16)
+kernel void short_conv_fused_btd_bwd_kernel_bf16(
+    device const ushort *x [[buffer(0)]],
+    device const ushort *weight [[buffer(1)]],
+    device const ushort *mask [[buffer(2)]],
+    device const ushort *grad_output [[buffer(3)]],
+    device ushort *grad_x [[buffer(4)]],
+    device float *grad_weight [[buffer(5)]],       // Use float32 for accumulation
+    device const ushort *bias [[buffer(6)]],       // Forward bias (may be nullptr)
+    device float *grad_bias [[buffer(7)]],         // Use float32 for accumulation
+    
+    constant uint &B [[buffer(8)]],
+    constant uint &T [[buffer(9)]],
+    constant uint &D [[buffer(10)]],
+    constant bool &use_activation [[buffer(11)]],
+    constant bool &use_residual [[buffer(12)]],
+    
+    uint3 gid [[thread_position_in_grid]]
+)
+{
+    const uint b = gid.x;
+    const uint t = gid.y;
+    const uint d = gid.z;
+    
+    if (b >= B || t >= T || d >= D) return;
+    
+    const uint W = 4;
+    const uint TD = T * D;
+    const uint output_idx = b * TD + t * D + d;
+    const uint weight_base = d * W;
+    
+    float grad_out = bf16_to_float(grad_output[output_idx]);
+    float dx_residual = use_residual ? grad_out : 0.0f;
+    
+    // Apply activation derivative if needed
+    if (use_activation) {
+        float conv_result = 0.0f;
+        for (uint w = 0; w < W; w++) {
+            int tt = (int)t - (int)(W - 1 - w);
+            if (tt >= 0) {
+                const uint input_idx = b * TD + (uint)tt * D + d;
+                float input_val = bf16_to_float(x[input_idx]);
+                if (mask != nullptr) {
+                    const uint mask_idx = b * T + (uint)tt;
+                    input_val *= bf16_to_float(mask[mask_idx]);
+                }
+                float weight_val = bf16_to_float(weight[weight_base + w]);
+                conv_result += weight_val * input_val;
+            }
+        }
+        if (bias != nullptr) {
+            conv_result += bf16_to_float(bias[d]);
+        }
+        float sigmoid_val = 1.0f / (1.0f + exp(-conv_result));
+        grad_out *= sigmoid_val * (1.0f + conv_result * (1.0f - sigmoid_val));
+    }
+    
+    // Compute dx from convolution
+    float dx_conv = 0.0f;
+    for (uint w = 0; w < W; w++) {
+        int future_t = (int)t + (int)(W - 1 - w);
+        if (future_t < (int)T) {
+            const uint future_idx = b * TD + (uint)future_t * D + d;
+            float future_grad = bf16_to_float(grad_output[future_idx]);
+            
+            if (use_activation) {
+                // Apply activation derivative for future position
+                float future_conv_result = 0.0f;
+                for (uint fw = 0; fw < W; fw++) {
+                    int future_input_t = future_t - (int)(W - 1 - fw);
+                    if (future_input_t >= 0) {
+                        const uint future_input_idx = b * TD + (uint)future_input_t * D + d;
+                        float future_input_val = bf16_to_float(x[future_input_idx]);
+                        if (mask != nullptr) {
+                            const uint future_mask_idx = b * T + (uint)future_input_t;
+                            future_input_val *= bf16_to_float(mask[future_mask_idx]);
+                        }
+                        float future_weight_val = bf16_to_float(weight[weight_base + fw]);
+                        future_conv_result += future_weight_val * future_input_val;
+                    }
+                }
+                if (bias != nullptr) {
+                    future_conv_result += bf16_to_float(bias[d]);
+                }
+                float future_sigmoid = 1.0f / (1.0f + exp(-future_conv_result));
+                future_grad *= future_sigmoid * (1.0f + future_conv_result * (1.0f - future_sigmoid));
+            }
+            
+            float weight_val = bf16_to_float(weight[weight_base + w]);
+            if (mask != nullptr) {
+                const uint mask_idx = b * T + t;
+                weight_val *= bf16_to_float(mask[mask_idx]);
+            }
+            dx_conv += weight_val * future_grad;
+        }
+    }
+    
+    grad_x[output_idx] = float_to_bf16(dx_residual + dx_conv);
+    
+    // Accumulate gradients in float32
+    for (uint w = 0; w < W; w++) {
+        int tt = (int)t - (int)(W - 1 - w);
+        if (tt >= 0) {
+            const uint input_idx = b * TD + (uint)tt * D + d;
+            float input_val = bf16_to_float(x[input_idx]);
+            if (mask != nullptr) {
+                const uint mask_idx = b * T + (uint)tt;
+                input_val *= bf16_to_float(mask[mask_idx]);
+            }
+            atomic_fetch_add_explicit(
+                (device atomic<float>*)&grad_weight[weight_base + w],
+                input_val * grad_out,
+                memory_order_relaxed
+            );
+        }
+    }
+    
+    if (grad_bias != nullptr) {
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_bias[d],
+            grad_out,
+            memory_order_relaxed
+        );
+    }
+}
+
+// Backward pass for convolution update (float32)
+kernel void short_conv_update_bwd_kernel(
+    device const float *x [[buffer(0)]],           // Original input (B, D)
+    device const float *conv_state [[buffer(1)]],  // Original conv state (B, D, STATE_LEN)
+    device const float *weight [[buffer(2)]],      // Original weight (D, W)
+    device const int *cache_seqlens [[buffer(3)]], // Sequence lengths (B)
+    device const float *grad_output [[buffer(4)]], // Gradient w.r.t. output (B, D)
+    device float *grad_x [[buffer(5)]],            // Gradient w.r.t. input (B, D)
+    device float *grad_conv_state [[buffer(6)]],   // Gradient w.r.t. conv state (B, D, STATE_LEN)
+    device float *grad_weight [[buffer(7)]],       // Gradient w.r.t. weight (D, W) - accumulated
+    device const float *bias [[buffer(8)]],        // Forward bias (may be nullptr)
+    device float *grad_bias [[buffer(9)]],         // Gradient w.r.t. bias (D) - accumulated
+    
+    constant uint &B [[buffer(10)]],
+    constant uint &D [[buffer(11)]],
+    constant uint &W [[buffer(12)]],
+    constant uint &STATE_LEN [[buffer(13)]],
+    constant bool &use_activation [[buffer(14)]],
+    constant bool &use_residual [[buffer(15)]],
+    
+    uint2 gid [[thread_position_in_grid]]
+)
+{
+    const uint b = gid.x;
+    const uint d = gid.y;
+    
+    if (b >= B || d >= D) return;
+    
+    const uint x_idx = b * D + d;
+    const uint weight_base = d * W;
+    const uint state_base = b * D * STATE_LEN + d * STATE_LEN;
+    
+    int current_seq_len = cache_seqlens[b];
+    uint write_pos = (uint)current_seq_len % STATE_LEN;
+    
+    float current_input = x[x_idx];
+    float grad_out = grad_output[x_idx];
+    
+    // If residual was used, part of gradient flows directly to input
+    float dx_residual = use_residual ? grad_out : 0.0f;
+    
+    // Compute forward result for activation derivative
+    float conv_result = 0.0f;
+    if (use_activation) {
+        for (uint w = 0; w < W; w++) {
+            float input_val;
+            if (w == W - 1) {
+                input_val = current_input;
+            } else {
+                int hist_offset = (int)(W - 1 - w);
+                int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+                uint state_idx = state_base + (uint)hist_pos;
+                input_val = conv_state[state_idx];
+            }
+            float weight_val = weight[weight_base + w];
+            conv_result += weight_val * input_val;
+        }
+        if (bias != nullptr) {
+            conv_result += bias[d];
+        }
+        // Apply SiLU derivative
+        float sigmoid_val = 1.0f / (1.0f + exp(-conv_result));
+        grad_out *= sigmoid_val * (1.0f + conv_result * (1.0f - sigmoid_val));
+    }
+    
+    // Compute gradient w.r.t. input and conv_state
+    for (uint w = 0; w < W; w++) {
+        float weight_val = weight[weight_base + w];
+        
+        if (w == W - 1) {
+            // Gradient w.r.t. current input
+            grad_x[x_idx] = dx_residual + weight_val * grad_out;
+        } else {
+            // Gradient w.r.t. conv_state
+            int hist_offset = (int)(W - 1 - w);
+            int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+            uint state_idx = state_base + (uint)hist_pos;
+            grad_conv_state[state_idx] = weight_val * grad_out;
+        }
+    }
+    
+    // Accumulate gradient w.r.t. weight
+    for (uint w = 0; w < W; w++) {
+        float input_val;
+        if (w == W - 1) {
+            input_val = current_input;
+        } else {
+            int hist_offset = (int)(W - 1 - w);
+            int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+            uint state_idx = state_base + (uint)hist_pos;
+            input_val = conv_state[state_idx];
+        }
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_weight[weight_base + w],
+            input_val * grad_out,
+            memory_order_relaxed
+        );
+    }
+    
+    // Accumulate gradient w.r.t. bias
+    if (grad_bias != nullptr) {
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_bias[d],
+            grad_out,
+            memory_order_relaxed
+        );
+    }
+}
+
+// Backward pass for convolution update (float16)
+kernel void short_conv_update_bwd_kernel_f16(
+    device const half *x [[buffer(0)]],
+    device const half *conv_state [[buffer(1)]],
+    device const half *weight [[buffer(2)]],
+    device const int *cache_seqlens [[buffer(3)]],
+    device const half *grad_output [[buffer(4)]],
+    device half *grad_x [[buffer(5)]],
+    device half *grad_conv_state [[buffer(6)]],
+    device float *grad_weight [[buffer(7)]],       // Use float32 for accumulation
+    device const half *bias [[buffer(8)]],         // Forward bias (may be nullptr)
+    device float *grad_bias [[buffer(9)]],         // Use float32 for accumulation
+    
+    constant uint &B [[buffer(10)]],
+    constant uint &D [[buffer(11)]],
+    constant uint &W [[buffer(12)]],
+    constant uint &STATE_LEN [[buffer(13)]],
+    constant bool &use_activation [[buffer(14)]],
+    constant bool &use_residual [[buffer(15)]],
+    
+    uint2 gid [[thread_position_in_grid]]
+)
+{
+    const uint b = gid.x;
+    const uint d = gid.y;
+    
+    if (b >= B || d >= D) return;
+    
+    const uint x_idx = b * D + d;
+    const uint weight_base = d * W;
+    const uint state_base = b * D * STATE_LEN + d * STATE_LEN;
+    
+    int current_seq_len = cache_seqlens[b];
+    uint write_pos = (uint)current_seq_len % STATE_LEN;
+    
+    float current_input = (float)x[x_idx];
+    float grad_out = (float)grad_output[x_idx];
+    float dx_residual = use_residual ? grad_out : 0.0f;
+    
+    // Apply activation derivative if needed
+    if (use_activation) {
+        float conv_result = 0.0f;
+        for (uint w = 0; w < W; w++) {
+            float input_val;
+            if (w == W - 1) {
+                input_val = current_input;
+            } else {
+                int hist_offset = (int)(W - 1 - w);
+                int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+                uint state_idx = state_base + (uint)hist_pos;
+                input_val = (float)conv_state[state_idx];
+            }
+            float weight_val = (float)weight[weight_base + w];
+            conv_result += weight_val * input_val;
+        }
+        if (bias != nullptr) {
+            conv_result += (float)bias[d];
+        }
+        float sigmoid_val = 1.0f / (1.0f + exp(-conv_result));
+        grad_out *= sigmoid_val * (1.0f + conv_result * (1.0f - sigmoid_val));
+    }
+    
+    // Compute gradients
+    for (uint w = 0; w < W; w++) {
+        float weight_val = (float)weight[weight_base + w];
+        
+        if (w == W - 1) {
+            grad_x[x_idx] = (half)(dx_residual + weight_val * grad_out);
+        } else {
+            int hist_offset = (int)(W - 1 - w);
+            int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+            uint state_idx = state_base + (uint)hist_pos;
+            grad_conv_state[state_idx] = (half)(weight_val * grad_out);
+        }
+    }
+    
+    // Accumulate weight and bias gradients in float32
+    for (uint w = 0; w < W; w++) {
+        float input_val;
+        if (w == W - 1) {
+            input_val = current_input;
+        } else {
+            int hist_offset = (int)(W - 1 - w);
+            int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+            uint state_idx = state_base + (uint)hist_pos;
+            input_val = (float)conv_state[state_idx];
+        }
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_weight[weight_base + w],
+            input_val * grad_out,
+            memory_order_relaxed
+        );
+    }
+    
+    if (grad_bias != nullptr) {
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_bias[d],
+            grad_out,
+            memory_order_relaxed
+        );
+    }
+}
+
+// Backward pass for convolution update (bfloat16)
+kernel void short_conv_update_bwd_kernel_bf16(
+    device const ushort *x [[buffer(0)]],
+    device const ushort *conv_state [[buffer(1)]],
+    device const ushort *weight [[buffer(2)]],
+    device const int *cache_seqlens [[buffer(3)]],
+    device const ushort *grad_output [[buffer(4)]],
+    device ushort *grad_x [[buffer(5)]],
+    device ushort *grad_conv_state [[buffer(6)]],
+    device float *grad_weight [[buffer(7)]],       // Use float32 for accumulation
+    device const ushort *bias [[buffer(8)]],       // Forward bias (may be nullptr)
+    device float *grad_bias [[buffer(9)]],         // Use float32 for accumulation
+    
+    constant uint &B [[buffer(10)]],
+    constant uint &D [[buffer(11)]],
+    constant uint &W [[buffer(12)]],
+    constant uint &STATE_LEN [[buffer(13)]],
+    constant bool &use_activation [[buffer(14)]],
+    constant bool &use_residual [[buffer(15)]],
+    
+    uint2 gid [[thread_position_in_grid]]
+)
+{
+    const uint b = gid.x;
+    const uint d = gid.y;
+    
+    if (b >= B || d >= D) return;
+    
+    const uint x_idx = b * D + d;
+    const uint weight_base = d * W;
+    const uint state_base = b * D * STATE_LEN + d * STATE_LEN;
+    
+    int current_seq_len = cache_seqlens[b];
+    uint write_pos = (uint)current_seq_len % STATE_LEN;
+    
+    float current_input = bf16_to_float(x[x_idx]);
+    float grad_out = bf16_to_float(grad_output[x_idx]);
+    float dx_residual = use_residual ? grad_out : 0.0f;
+    
+    // Apply activation derivative if needed
+    if (use_activation) {
+        float conv_result = 0.0f;
+        for (uint w = 0; w < W; w++) {
+            float input_val;
+            if (w == W - 1) {
+                input_val = current_input;
+            } else {
+                int hist_offset = (int)(W - 1 - w);
+                int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+                uint state_idx = state_base + (uint)hist_pos;
+                input_val = bf16_to_float(conv_state[state_idx]);
+            }
+            float weight_val = bf16_to_float(weight[weight_base + w]);
+            conv_result += weight_val * input_val;
+        }
+        if (bias != nullptr) {
+            conv_result += bf16_to_float(bias[d]);
+        }
+        float sigmoid_val = 1.0f / (1.0f + exp(-conv_result));
+        grad_out *= sigmoid_val * (1.0f + conv_result * (1.0f - sigmoid_val));
+    }
+    
+    // Compute gradients
+    for (uint w = 0; w < W; w++) {
+        float weight_val = bf16_to_float(weight[weight_base + w]);
+        
+        if (w == W - 1) {
+            grad_x[x_idx] = float_to_bf16(dx_residual + weight_val * grad_out);
+        } else {
+            int hist_offset = (int)(W - 1 - w);
+            int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+            uint state_idx = state_base + (uint)hist_pos;
+            grad_conv_state[state_idx] = float_to_bf16(weight_val * grad_out);
+        }
+    }
+    
+    // Accumulate weight and bias gradients in float32
+    for (uint w = 0; w < W; w++) {
+        float input_val;
+        if (w == W - 1) {
+            input_val = current_input;
+        } else {
+            int hist_offset = (int)(W - 1 - w);
+            int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
+            uint state_idx = state_base + (uint)hist_pos;
+            input_val = bf16_to_float(conv_state[state_idx]);
+        }
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_weight[weight_base + w],
+            input_val * grad_out,
+            memory_order_relaxed
+        );
+    }
+    
+    if (grad_bias != nullptr) {
+        atomic_fetch_add_explicit(
+            (device atomic<float>*)&grad_bias[d],
+            grad_out,
+            memory_order_relaxed
+        );
+    }
+}

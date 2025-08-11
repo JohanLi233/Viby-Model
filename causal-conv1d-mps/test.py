@@ -10,6 +10,88 @@ import pytest
 import causal_conv1d_mps
 
 
+def check_gradients_numerical(
+    func,
+    inputs,
+    eps: float = 1e-3,
+    atol: float = 1e-3,
+    rtol: float = 1e-2,
+):
+    """
+    数值梯度校验（中心差分）。在 MPS 上对非线性/半精度进行更鲁棒的阈值判断。
+    返回 True/False 并打印首要差异。
+    """
+    # analytical
+    for inp in inputs:
+        if isinstance(inp, torch.Tensor) and inp.requires_grad:
+            inp.grad = None
+    out = func()
+    loss = out.sum() if out.dim() > 0 else out
+    loss.backward()
+    analytical = [
+        t.grad.clone() if isinstance(t, torch.Tensor) and t.grad is not None else None
+        for t in inputs
+    ]
+
+    # numerical
+    numerical = []
+    for inp in inputs:
+        if not isinstance(inp, torch.Tensor) or not inp.requires_grad:
+            numerical.append(None)
+            continue
+        grad = torch.zeros_like(inp)
+        flat = inp.data.view(-1)
+        gflat = grad.view(-1)
+        base = inp.data.clone().view(-1)
+        with torch.no_grad():
+            for j in range(flat.numel()):
+                flat[j] = base[j] + eps
+                out_p = func()
+                lp = out_p.sum().item() if out_p.dim() > 0 else out_p.item()
+                flat[j] = base[j] - eps
+                out_m = func()
+                lm = out_m.sum().item() if out_m.dim() > 0 else out_m.item()
+                gflat[j] = (lp - lm) / (2 * eps)
+                flat[j] = base[j]
+        numerical.append(grad)
+
+    # compare
+    all_ok = True
+    is_mps = any(
+        isinstance(t, torch.Tensor)
+        and getattr(t, "device", torch.device("cpu")).type == "mps"
+        for t in inputs
+    )
+    for i, (a, n) in enumerate(zip(analytical, numerical)):
+        if a is None and n is None:
+            continue
+        if a is None or n is None:
+            print(f"Gradient mismatch for input {i}: one is None")
+            all_ok = False
+            continue
+        if not is_mps:
+            ok = torch.allclose(a, n, atol=atol, rtol=rtol)
+        else:
+            diff = (a - n).abs()
+            max_abs = diff.max().item()
+            rel = diff / (n.abs().clamp(min=1e-3))
+            median_rel = rel.median().item()
+            ok = (max_abs <= 0.08) and (median_rel <= 0.08)
+        if not ok:
+            print(f"Gradient mismatch for input {i}:")
+            print(f"  Analytical: {a.flatten()[:5]}...")
+            print(f"  Numerical:  {n.flatten()[:5]}...")
+            print(f"  Max diff: {(a - n).abs().max().item()}")
+            if is_mps:
+                print(
+                    f"  Median rel err: {((a - n).abs() / (n.abs().clamp(min=1e-3))).median().item()}"
+                )
+            all_ok = False
+        else:
+            print(f"✓ Gradient check passed for input {i}")
+    return all_ok
+
+
 def causal_conv1d_reference(x, weight, bias=None, silu_activation=False):
     """
     使用 PyTorch 实现的参考版本（CPU）
@@ -222,3 +304,68 @@ def test_different_dtypes():
 if __name__ == "__main__":
     # 运行所有测试
     pytest.main([__file__])
+
+
+def test_gradients_causal_conv1d():
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+    device = torch.device("mps")
+    batch_size, dim, seqlen, width = 2, 8, 16, 4
+    x = torch.randn(batch_size, dim, seqlen, device=device, requires_grad=True)
+    weight = torch.randn(dim, width, device=device, requires_grad=True)
+    bias = torch.randn(dim, device=device, requires_grad=True)
+
+    def f():
+        return causal_conv1d_mps.causal_conv1d_fn(x, weight, bias, activation="silu")
+
+    ok = check_gradients_numerical(f, [x, weight, bias], eps=1e-3)
+    assert ok
+
+
+def test_gradients_short_conv_fused():
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+    device = torch.device("mps")
+    batch_size, seqlen, dim, width = 2, 8, 16, 4
+    x = torch.randn(batch_size, seqlen, dim, device=device, requires_grad=True)
+    weight = torch.randn(dim, width, device=device, requires_grad=True)
+    bias = torch.randn(dim, device=device, requires_grad=True)
+    attention_mask = torch.ones(batch_size, seqlen, device=device)
+
+    def f():
+        return causal_conv1d_mps.short_conv_fused_fn(
+            x, weight, bias, attention_mask, activation=True, residual=True
+        )
+
+    ok = check_gradients_numerical(f, [x, weight, bias], eps=1e-3)
+    assert ok
+
+
+def test_gradients_short_conv_update():
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+    device = torch.device("mps")
+    batch_size, dim, width, state_len = 2, 8, 4, 8
+    x = torch.randn(batch_size, dim, device=device, requires_grad=True)
+    conv_state = torch.randn(
+        batch_size, dim, state_len, device=device, requires_grad=True
+    )
+    weight = torch.randn(dim, width, device=device, requires_grad=True)
+    bias = torch.randn(dim, device=device, requires_grad=True)
+    cache_seqlens = torch.randint(
+        0, state_len, (batch_size,), device=device, dtype=torch.int32
+    )
+
+    def f():
+        return causal_conv1d_mps.short_conv_update_fn(
+            x,
+            conv_state.clone(),
+            weight,
+            bias,
+            cache_seqlens,
+            activation=True,
+            residual=True,
+        )
+
+    ok = check_gradients_numerical(f, [x, weight, bias], eps=1e-3)
+    assert ok

@@ -66,12 +66,21 @@ static void ensure_metal_pipeline_initialized(id<MTLDevice> device) {
     "causal_conv1d_simple_kernel",
     "causal_conv1d_simple_kernel_f16",
     "causal_conv1d_simple_kernel_bf16",
+    "causal_conv1d_bwd_kernel",
+    "causal_conv1d_bwd_kernel_f16",
+    "causal_conv1d_bwd_kernel_bf16",
     "short_conv_fused_btd_kernel",
     "short_conv_fused_btd_kernel_f16",
     "short_conv_fused_btd_kernel_bf16",
+    "short_conv_fused_btd_bwd_kernel",
+    "short_conv_fused_btd_bwd_kernel_f16",
+    "short_conv_fused_btd_bwd_kernel_bf16",
     "short_conv_update_kernel",
     "short_conv_update_kernel_f16",
-    "short_conv_update_kernel_bf16"
+    "short_conv_update_kernel_bf16",
+    "short_conv_update_bwd_kernel",
+    "short_conv_update_bwd_kernel_f16",
+    "short_conv_update_bwd_kernel_bf16"
   };
   
   for (const auto& func_name : function_names) {
@@ -478,7 +487,351 @@ torch::Tensor short_conv_update_mps(
   return out;
 }
 
+// =====================================================================================
+// BACKWARD PASS IMPLEMENTATIONS
+// =====================================================================================
+
+// Backward pass for basic causal conv1d
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> causal_conv1d_bwd_mps(
+    const torch::Tensor &x,
+    const torch::Tensor &weight,
+    const torch::Tensor &bias,
+    const torch::Tensor &grad_output,
+    bool silu_activation
+) {
+    // Input validation
+    TORCH_CHECK(x.device().is_mps(), "Tensor 'x' must be a MPS tensor");
+    TORCH_CHECK(weight.device().is_mps(), "Tensor 'weight' must be a MPS tensor");
+    TORCH_CHECK(grad_output.device().is_mps(), "Tensor 'grad_output' must be a MPS tensor");
+    TORCH_CHECK(x.is_contiguous(), "Tensor 'x' must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "Tensor 'weight' must be contiguous");
+    TORCH_CHECK(grad_output.is_contiguous(), "Tensor 'grad_output' must be contiguous");
+    
+    const int64_t batch_size = x.size(0);
+    const int64_t dim = x.size(1);
+    const int64_t seqlen = x.size(2);
+    const int64_t width = weight.size(1);
+    
+    TORCH_CHECK(width == 4, "Only width=4 supported in backward kernel");
+    
+    if (seqlen == 0) {
+        auto dx = torch::empty_like(x);
+        auto dweight = torch::zeros_like(weight);
+        auto dbias = bias.defined() && bias.numel() > 0 ? torch::zeros_like(bias) : torch::tensor({});
+        return std::make_tuple(dx, dweight, dbias);
+    }
+
+    // Use PyTorch's current MPS stream
+    at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
+    id<MTLDevice> device = (id<MTLDevice>)stream->device();
+    ensure_metal_pipeline_initialized(device);
+
+    // Create output tensors
+    auto dx = torch::empty_like(x);
+    auto dweight = torch::zeros_like(weight, torch::dtype(torch::kFloat32));
+    auto dbias = torch::Tensor();
+    if (bias.defined() && bias.numel() > 0) {
+        dbias = torch::zeros_like(bias, torch::dtype(torch::kFloat32));
+    }
+
+    // Get Metal buffers and offsets
+    auto [x_buf, x_off] = getBufferAndOffset(x);
+    auto [w_buf, w_off] = getBufferAndOffset(weight);
+    auto [grad_out_buf, grad_out_off] = getBufferAndOffset(grad_output);
+    auto [dx_buf, dx_off] = getBufferAndOffset(dx);
+    auto [dw_buf, dw_off] = getBufferAndOffset(dweight);
+    
+    id<MTLBuffer> db_buf = nil;
+    NSUInteger db_off = 0;
+    if (dbias.defined()) {
+        auto [bias_buf, bias_off] = getBufferAndOffset(dbias);
+        db_buf = bias_buf;
+        db_off = bias_off;
+    }
+
+    // Select appropriate pipeline
+    id<MTLComputePipelineState> pipeline = nil;
+    if (x.scalar_type() == torch::kFloat) {
+        pipeline = g_pipelines["causal_conv1d_bwd_kernel"];
+    } else if (x.scalar_type() == torch::kHalf) {
+        pipeline = g_pipelines["causal_conv1d_bwd_kernel_f16"];
+    } else if (x.scalar_type() == torch::kBFloat16) {
+        pipeline = g_pipelines["causal_conv1d_bwd_kernel_bf16"];
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype for backward pass");
+    }
+
+    // Encode compute command
+    id<MTLComputeCommandEncoder> encoder = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
+    [encoder setComputePipelineState:pipeline];
+
+    // Set buffers
+    [encoder setBuffer:x_buf offset:x_off atIndex:0];
+    [encoder setBuffer:w_buf offset:w_off atIndex:1];
+    [encoder setBuffer:grad_out_buf offset:grad_out_off atIndex:2];
+    [encoder setBuffer:dx_buf offset:dx_off atIndex:3];
+    [encoder setBuffer:dw_buf offset:dw_off atIndex:4];
+  // Forward bias (may be nil)
+  id<MTLBuffer> fwd_bias_buf = nil;
+  NSUInteger fwd_bias_off = 0;
+  if (bias.defined() && bias.numel() > 0) {
+      auto [b_buf2, b_off2] = getBufferAndOffset(bias);
+      fwd_bias_buf = b_buf2;
+      fwd_bias_off = b_off2;
+  }
+  [encoder setBuffer:fwd_bias_buf offset:fwd_bias_off atIndex:5];
+  // Gradient of bias (may be nil)
+  [encoder setBuffer:db_buf offset:db_off atIndex:6];
+
+    // Set parameters
+  uint32_t batch_u32 = (uint32_t)batch_size;
+  uint32_t dim_u32 = (uint32_t)dim;
+  uint32_t seqlen_u32 = (uint32_t)seqlen;
+  bool silu_flag = silu_activation;
+
+  [encoder setBytes:&batch_u32 length:sizeof(uint32_t) atIndex:7];
+  [encoder setBytes:&dim_u32 length:sizeof(uint32_t) atIndex:8];
+  [encoder setBytes:&seqlen_u32 length:sizeof(uint32_t) atIndex:9];
+  [encoder setBytes:&silu_flag length:sizeof(bool) atIndex:10];
+
+    // Dispatch threads
+    MTLSize gridSize = MTLSizeMake((NSUInteger)batch_size, (NSUInteger)dim, (NSUInteger)seqlen);
+    NSUInteger maxThreadsPerGroup = [pipeline maxTotalThreadsPerThreadgroup];
+    NSUInteger threadsPerGroup = MIN(256, maxThreadsPerGroup);
+    MTLSize threadgroupSize = MTLSizeMake(1, 1, threadsPerGroup);
+    
+    [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+
+    // Convert accumulation dtypes back to match input dtypes
+    dweight = dweight.to(weight.dtype());
+    if (dbias.defined()) {
+        dbias = dbias.to(bias.dtype());
+    }
+
+    return std::make_tuple(dx, dweight, dbias);
+}
+
+// Backward pass for fused short convolution
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> short_conv_fused_bwd_mps(
+    const torch::Tensor &x,
+    const torch::Tensor &weight,
+    const torch::Tensor &bias,
+    const torch::Tensor &attention_mask,
+    const torch::Tensor &grad_output,
+    bool activation,
+    bool residual
+) {
+    TORCH_CHECK(x.device().is_mps(), "Input 'x' must be on MPS");
+    TORCH_CHECK(weight.device().is_mps(), "'weight' must be on MPS");
+    TORCH_CHECK(grad_output.device().is_mps(), "'grad_output' must be on MPS");
+
+    const int64_t B = x.size(0);
+    const int64_t T = x.size(1);
+    const int64_t D = x.size(2);
+    const int64_t W = weight.size(1);
+
+    TORCH_CHECK(W == 4, "Backward fused kernel supports width=4 only");
+
+    if (T == 0) {
+        auto dx = torch::empty_like(x);
+        auto dweight = torch::zeros_like(weight);
+        auto dbias = bias.defined() && bias.numel() > 0 ? torch::zeros_like(bias) : torch::tensor({});
+        return std::make_tuple(dx, dweight, dbias);
+    }
+
+    at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
+    id<MTLDevice> device = (id<MTLDevice>)stream->device();
+    ensure_metal_pipeline_initialized(device);
+
+    auto dx = torch::empty_like(x);
+    auto dweight = torch::zeros_like(weight, torch::dtype(torch::kFloat32));
+    auto dbias = torch::Tensor();
+    if (bias.defined() && bias.numel() > 0) {
+        dbias = torch::zeros_like(bias, torch::dtype(torch::kFloat32));
+    }
+
+    auto [x_buf, x_off] = getBufferAndOffset(x);
+    auto [w_buf, w_off] = getBufferAndOffset(weight);
+    auto [mask_buf, mask_off] = getBufferAndOffset(attention_mask);
+    auto [grad_out_buf, grad_out_off] = getBufferAndOffset(grad_output);
+    auto [dx_buf, dx_off] = getBufferAndOffset(dx);
+    auto [dw_buf, dw_off] = getBufferAndOffset(dweight);
+    // forward bias for activation derivative
+    auto [fb_buf, fb_off] = getBufferAndOffset(bias);
+    
+    id<MTLBuffer> db_buf = nil;
+    NSUInteger db_off = 0;
+    if (dbias.defined()) {
+        auto [bias_buf, bias_off] = getBufferAndOffset(dbias);
+        db_buf = bias_buf;
+        db_off = bias_off;
+    }
+
+    id<MTLComputePipelineState> pipeline = nil;
+    if (x.scalar_type() == torch::kFloat) {
+        pipeline = g_pipelines["short_conv_fused_btd_bwd_kernel"];
+    } else if (x.scalar_type() == torch::kHalf) {
+        pipeline = g_pipelines["short_conv_fused_btd_bwd_kernel_f16"];
+    } else if (x.scalar_type() == torch::kBFloat16) {
+        pipeline = g_pipelines["short_conv_fused_btd_bwd_kernel_bf16"];
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype for fused backward pass");
+    }
+
+    id<MTLComputeCommandEncoder> encoder = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
+    [encoder setComputePipelineState:pipeline];
+
+    // Set buffers
+    [encoder setBuffer:x_buf offset:x_off atIndex:0];
+    [encoder setBuffer:w_buf offset:w_off atIndex:1];
+    [encoder setBuffer:mask_buf offset:mask_off atIndex:2];
+    [encoder setBuffer:grad_out_buf offset:grad_out_off atIndex:3];
+    [encoder setBuffer:dx_buf offset:dx_off atIndex:4];
+    [encoder setBuffer:dw_buf offset:dw_off atIndex:5];
+    [encoder setBuffer:fb_buf offset:fb_off atIndex:6];
+    [encoder setBuffer:db_buf offset:db_off atIndex:7];
+
+    // Set parameters
+    uint32_t B_u32 = (uint32_t)B;
+    uint32_t T_u32 = (uint32_t)T;
+    uint32_t D_u32 = (uint32_t)D;
+    bool use_activation = activation;
+    bool use_residual = residual;
+
+    [encoder setBytes:&B_u32 length:sizeof(uint32_t) atIndex:8];
+    [encoder setBytes:&T_u32 length:sizeof(uint32_t) atIndex:9];
+    [encoder setBytes:&D_u32 length:sizeof(uint32_t) atIndex:10];
+    [encoder setBytes:&use_activation length:sizeof(bool) atIndex:11];
+    [encoder setBytes:&use_residual length:sizeof(bool) atIndex:12];
+
+    MTLSize gridSize = MTLSizeMake((NSUInteger)B, (NSUInteger)T, (NSUInteger)D);
+    NSUInteger maxThreads = [pipeline maxTotalThreadsPerThreadgroup];
+    NSUInteger tz = MIN((NSUInteger)256, maxThreads);
+    if (tz == 0) tz = 1;
+    MTLSize tgSize = MTLSizeMake(1, 1, tz);
+    [encoder dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+
+    // Convert accumulation dtypes back to match input dtypes
+    dweight = dweight.to(weight.dtype());
+    if (dbias.defined()) {
+        dbias = dbias.to(bias.dtype());
+    }
+
+    return std::make_tuple(dx, dweight, dbias);
+}
+
+// Backward pass for convolution update (inference)
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> short_conv_update_bwd_mps(
+    const torch::Tensor &x,
+    const torch::Tensor &conv_state,
+    const torch::Tensor &weight,
+    const torch::Tensor &bias,
+    const torch::Tensor &cache_seqlens,
+    const torch::Tensor &grad_output,
+    bool activation,
+    bool residual
+) {
+    TORCH_CHECK(x.device().is_mps(), "Input 'x' must be on MPS");
+    TORCH_CHECK(conv_state.device().is_mps(), "'conv_state' must be on MPS");
+    TORCH_CHECK(weight.device().is_mps(), "'weight' must be on MPS");
+    TORCH_CHECK(grad_output.device().is_mps(), "'grad_output' must be on MPS");
+
+    const int64_t B = x.size(0);
+    const int64_t D = x.size(1);
+    const int64_t STATE_LEN = conv_state.size(2);
+    const int64_t W = weight.size(1);
+
+    TORCH_CHECK(W == 4, "Update backward kernel supports width=4 only");
+
+    at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
+    id<MTLDevice> device = (id<MTLDevice>)stream->device();
+    ensure_metal_pipeline_initialized(device);
+
+    auto dx = torch::empty_like(x);
+    auto dconv_state = torch::zeros_like(conv_state);
+    auto dweight = torch::zeros_like(weight, torch::dtype(torch::kFloat32));
+    auto dbias = torch::Tensor();
+    if (bias.defined() && bias.numel() > 0) {
+        dbias = torch::zeros_like(bias, torch::dtype(torch::kFloat32));
+    }
+
+    auto [x_buf, x_off] = getBufferAndOffset(x);
+    auto [cs_buf, cs_off] = getBufferAndOffset(conv_state);
+    auto [w_buf, w_off] = getBufferAndOffset(weight);
+    auto [cl_buf, cl_off] = getBufferAndOffset(cache_seqlens);
+    auto [grad_out_buf, grad_out_off] = getBufferAndOffset(grad_output);
+    auto [dx_buf, dx_off] = getBufferAndOffset(dx);
+    auto [dcs_buf, dcs_off] = getBufferAndOffset(dconv_state);
+    auto [dw_buf, dw_off] = getBufferAndOffset(dweight);
+    auto [fb_buf, fb_off] = getBufferAndOffset(bias);
+    
+    id<MTLBuffer> db_buf = nil;
+    NSUInteger db_off = 0;
+    if (dbias.defined()) {
+        auto [bias_buf, bias_off] = getBufferAndOffset(dbias);
+        db_buf = bias_buf;
+        db_off = bias_off;
+    }
+
+    id<MTLComputePipelineState> pipeline = nil;
+    if (x.scalar_type() == torch::kFloat) {
+        pipeline = g_pipelines["short_conv_update_bwd_kernel"];
+    } else if (x.scalar_type() == torch::kHalf) {
+        pipeline = g_pipelines["short_conv_update_bwd_kernel_f16"];
+    } else if (x.scalar_type() == torch::kBFloat16) {
+        pipeline = g_pipelines["short_conv_update_bwd_kernel_bf16"];
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype for update backward pass");
+    }
+
+    id<MTLComputeCommandEncoder> encoder = (id<MTLComputeCommandEncoder>)stream->commandEncoder();
+    [encoder setComputePipelineState:pipeline];
+
+    // Set buffers
+    [encoder setBuffer:x_buf offset:x_off atIndex:0];
+    [encoder setBuffer:cs_buf offset:cs_off atIndex:1];
+    [encoder setBuffer:w_buf offset:w_off atIndex:2];
+    [encoder setBuffer:cl_buf offset:cl_off atIndex:3];
+    [encoder setBuffer:grad_out_buf offset:grad_out_off atIndex:4];
+    [encoder setBuffer:dx_buf offset:dx_off atIndex:5];
+    [encoder setBuffer:dcs_buf offset:dcs_off atIndex:6];
+    [encoder setBuffer:dw_buf offset:dw_off atIndex:7];
+    [encoder setBuffer:fb_buf offset:fb_off atIndex:8];
+    [encoder setBuffer:db_buf offset:db_off atIndex:9];
+
+    // Set parameters
+    uint32_t B_u32 = (uint32_t)B;
+    uint32_t D_u32 = (uint32_t)D;
+    uint32_t W_u32 = (uint32_t)W;
+    uint32_t STATE_LEN_u32 = (uint32_t)STATE_LEN;
+    bool use_activation = activation;
+    bool use_residual = residual;
+
+    [encoder setBytes:&B_u32 length:sizeof(uint32_t) atIndex:10];
+    [encoder setBytes:&D_u32 length:sizeof(uint32_t) atIndex:11];
+    [encoder setBytes:&W_u32 length:sizeof(uint32_t) atIndex:12];
+    [encoder setBytes:&STATE_LEN_u32 length:sizeof(uint32_t) atIndex:13];
+    [encoder setBytes:&use_activation length:sizeof(bool) atIndex:14];
+    [encoder setBytes:&use_residual length:sizeof(bool) atIndex:15];
+
+    MTLSize gridSize = MTLSizeMake((NSUInteger)B, (NSUInteger)D, 1);
+    NSUInteger maxThreads = [pipeline maxTotalThreadsPerThreadgroup];
+    NSUInteger tg = MIN((NSUInteger)256, maxThreads);
+    if (tg == 0) tg = 1;
+    MTLSize tgSize = MTLSizeMake(1, tg, 1);
+    [encoder dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+
+    // Convert accumulation dtypes back to match input dtypes
+    dweight = dweight.to(weight.dtype());
+    if (dbias.defined()) {
+        dbias = dbias.to(bias.dtype());
+    }
+
+    return std::make_tuple(dx, dconv_state, dweight, dbias);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  // Forward pass functions
   m.def("causal_conv1d_fwd", &causal_conv1d_fwd_mps, 
         "Causal Conv1D forward pass using Metal compute kernel (MPS)");
   m.def("causal_conv1d", &causal_conv1d_mps,
@@ -487,4 +840,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Fused ShortConvolution (Mask+Conv+SiLU+Residual) on MPS (BTD layout)");
   m.def("short_conv_update", &short_conv_update_mps,
         "Single-token causal convolution update for efficient inference");
+  
+  // Backward pass functions
+  m.def("causal_conv1d_bwd", &causal_conv1d_bwd_mps,
+        "Causal Conv1D backward pass using Metal compute kernel (MPS)");
+  m.def("short_conv_fused_bwd", &short_conv_fused_bwd_mps,
+        "Fused ShortConvolution backward pass on MPS (BTD layout)");
+  m.def("short_conv_update_bwd", &short_conv_update_bwd_mps,
+        "Single-token causal convolution update backward pass for efficient inference");
 }

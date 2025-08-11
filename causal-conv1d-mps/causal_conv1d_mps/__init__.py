@@ -10,6 +10,16 @@ from pathlib import Path
 import torch
 from typing import Optional
 
+# Import autograd functions
+from .autograd import (
+    causal_conv1d_fn,
+    short_conv_fused_fn,
+    short_conv_update_fn,
+    CausalConv1dMPSFunction,
+    ShortConvFusedMPSFunction,
+    ShortConvUpdateMPSFunction,
+)
+
 
 def _ensure_metal_path_env() -> None:
     """Ensure CAUSAL_CONV1D_METAL_PATH is set to a valid .metal file.
@@ -27,7 +37,7 @@ def _ensure_metal_path_env() -> None:
     pkg_dir = Path(__file__).resolve().parent
     candidates = [
         pkg_dir.parent / "causal_conv1d.metal",  # repo layout
-        Path.cwd() / "causal_conv1d.metal",      # current working dir
+        Path.cwd() / "causal_conv1d.metal",  # current working dir
     ]
     for p in candidates:
         if p.exists():
@@ -45,7 +55,26 @@ except ImportError:
     )
 
 __version__ = "0.1.0"
-__all__ = ["causal_conv1d_fwd", "short_conv_fused", "short_conv_update"]
+
+
+__all__ = [
+    # Low-level forward functions (direct kernel calls)
+    "causal_conv1d_fwd",
+    "short_conv_fused_fwd_only",
+    "short_conv_update_fwd_only",
+    # High-level functions with autograd support
+    "causal_conv1d_fn",
+    "short_conv_fused_fn",
+    "short_conv_update_fn",
+    # Recommended API (with gradient support)
+    "causal_conv1d",
+    "short_conv_fused",
+    "short_conv_update",
+    # Autograd function classes
+    "CausalConv1dMPSFunction",
+    "ShortConvFusedMPSFunction",
+    "ShortConvUpdateMPSFunction",
+]
 
 
 def causal_conv1d_fwd(
@@ -250,9 +279,7 @@ def short_conv_fused(
 
         # 若仍与 (B, T) 的第二维不一致，则进行截断/扩展（优先截取末尾对齐当前序列长度）
         if m.shape[0] != B:
-            raise ValueError(
-                f"Attention mask batch {m.shape[0]} != input batch {B}"
-            )
+            raise ValueError(f"Attention mask batch {m.shape[0]} != input batch {B}")
         if m.shape[1] != T:
             if m.shape[1] > T:
                 # 通常出现在 generate 步（T=1）但传入完整历史 mask 的情况
@@ -320,9 +347,7 @@ def short_conv_update(
 
     # Validate tensor shapes
     if x.dim() != 2:
-        raise ValueError(
-            f"Expected 2D input tensor (batch, dim), got {x.dim()}D"
-        )
+        raise ValueError(f"Expected 2D input tensor (batch, dim), got {x.dim()}D")
 
     if conv_state.dim() != 3:
         raise ValueError(
@@ -391,3 +416,18 @@ def short_conv_update(
     return _C.short_conv_update(
         x, conv_state, weight, bias, cache_seqlens, activation, residual
     )
+
+
+# =====================================================================================
+# Compatibility aliases and recommended API
+# =====================================================================================
+
+# Keep the original forward-only functions available for explicit use
+causal_conv1d_fwd_only = causal_conv1d_fwd
+short_conv_fused_fwd_only = short_conv_fused
+short_conv_update_fwd_only = short_conv_update
+
+# For users who want gradient support, these are the recommended functions to use
+causal_conv1d = causal_conv1d_fn
+short_conv_fused = short_conv_fused_fn
+short_conv_update = short_conv_update_fn
