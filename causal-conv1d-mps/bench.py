@@ -14,6 +14,19 @@ os.environ["CAUSAL_CONV1D_METAL_PATH"] = os.path.join(
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
+# 全局 dtype 与容差（默认使用 bf16）
+DTYPE = torch.bfloat16
+ATOL_BY_DTYPE = {
+    torch.float32: 1e-4,
+    torch.float16: 5e-3,
+    torch.bfloat16: 1e-2,
+}
+
+
+def get_tolerance_for(dtype: torch.dtype) -> float:
+    return ATOL_BY_DTYPE.get(dtype, 1e-4)
+
+
 def bench_robust(fn, warmup=10, iters=50, runs=5):
     """更稳定的性能测试函数"""
     results = []
@@ -88,6 +101,7 @@ def causal_conv1d_reference(x, weight, bias=None, silu_activation=False):
 
     # 使用 F.conv1d 实现因果卷积
     x_padded = F.pad(x, (width - 1, 0))  # 左侧填充
+
     out = F.conv1d(x_padded, weight.unsqueeze(1), bias=bias, groups=dim, padding=0)
     out = out[:, :, :seqlen]  # 截取到原始长度
 
@@ -148,7 +162,8 @@ def short_conv_hf_reference(
     """
     x_in = x_btd
     if attention_mask is not None:
-        x_btd = x_btd * attention_mask.unsqueeze(-1)
+        m = attention_mask.to(dtype=x_btd.dtype)
+        x_btd = x_btd * m.unsqueeze(-1)
     y = canon_forward_reference(x_btd, weight_dw, bias_d, activation)
     if residual:
         y = x_in + y
@@ -197,7 +212,11 @@ def short_conv_mps_optimized(
     x_contig = x_btd.contiguous()
     w_contig = weight_dw.contiguous()
     b_contig = bias_d.contiguous() if bias_d is not None else torch.tensor([], device=x_btd.device, dtype=x_btd.dtype)
-    m_contig = attention_mask.to(torch.float32).contiguous() if attention_mask is not None else torch.tensor([], device=x_btd.device, dtype=torch.float32)
+    m_contig = (
+        attention_mask.to(dtype=x_btd.dtype).contiguous()
+        if attention_mask is not None
+        else torch.tensor([], device=x_btd.device, dtype=x_btd.dtype)
+    )
 
     y = mps_ext.short_conv_fused(
         x_contig, w_contig, b_contig, m_contig, activation, residual
@@ -225,9 +244,9 @@ def run_hf_like_canon_ac_bench():
     print("-" * 104)
 
     for bsz, seqlen, dim, width in configs:
-        x_btd = torch.randn(bsz, seqlen, dim, device=device, dtype=torch.float32)
-        weight_dw = torch.randn(dim, width, device=device, dtype=torch.float32)
-        bias_d = torch.randn(dim, device=device, dtype=torch.float32)
+        x_btd = torch.randn(bsz, seqlen, dim, device=device, dtype=DTYPE)
+        weight_dw = torch.randn(dim, width, device=device, dtype=DTYPE)
+        bias_d = torch.randn(dim, device=device, dtype=DTYPE)
         mask = generate_attention_mask(bsz, seqlen, device)
 
         cfg = f"B{bsz} T{seqlen} D{dim} W{width}"
@@ -248,7 +267,7 @@ def run_hf_like_canon_ac_bench():
         y_ref = run_ref()
         y_mps = run_mps()
         max_diff = torch.max(torch.abs(y_ref - y_mps)).item()
-        is_ok = max_diff < 1e-4
+        is_ok = max_diff < get_tolerance_for(DTYPE)
 
         sp = t_ref / t_mps
         std_pct = (std_mps / t_mps) * 100 if t_mps > 0 else 0
@@ -283,13 +302,13 @@ def run_hf_like_canon_b_bench():
         dv = n_kv * head_dim
         d_total = dq + dk + dv
 
-        x_q = torch.randn(bsz, seqlen, dq, device=device)
-        x_k = torch.randn(bsz, seqlen, dk, device=device)
-        x_v = torch.randn(bsz, seqlen, dv, device=device)
+        x_q = torch.randn(bsz, seqlen, dq, device=device, dtype=DTYPE)
+        x_k = torch.randn(bsz, seqlen, dk, device=device, dtype=DTYPE)
+        x_v = torch.randn(bsz, seqlen, dv, device=device, dtype=DTYPE)
         x_cat = torch.cat([x_q, x_k, x_v], dim=-1)
 
-        weight_dw = torch.randn(d_total, width, device=device)
-        bias_d = torch.randn(d_total, device=device)
+        weight_dw = torch.randn(d_total, width, device=device, dtype=DTYPE)
+        bias_d = torch.randn(d_total, device=device, dtype=DTYPE)
         mask = generate_attention_mask(bsz, seqlen, device)
 
         cfg = f"B{bsz} T{seqlen} H{n_heads} KV{n_kv} hd{head_dim} W{width}"
@@ -310,7 +329,7 @@ def run_hf_like_canon_b_bench():
         y_ref = run_ref()
         y_mps = run_mps()
         max_diff = torch.max(torch.abs(y_ref - y_mps)).item()
-        is_ok = max_diff < 1e-4
+        is_ok = max_diff < get_tolerance_for(DTYPE)
 
         sp = t_ref / t_mps
         std_pct = (std_mps / t_mps) * 100 if t_mps > 0 else 0
@@ -342,14 +361,14 @@ def run_hf_like_canon_d_bench():
 
     for bsz, seqlen, hidden_size, intermediate_size, width in configs:
         # 模拟 MLP 中 gate_proj 和 up_proj 的输出
-        gate_output = torch.randn(bsz, seqlen, intermediate_size, device=device)
-        up_output = torch.randn(bsz, seqlen, intermediate_size, device=device)
+        gate_output = torch.randn(bsz, seqlen, intermediate_size, device=device, dtype=DTYPE)
+        up_output = torch.randn(bsz, seqlen, intermediate_size, device=device, dtype=DTYPE)
         
         # CanonD 应用在连接后的输出上 (intermediate_size * 2)
         x_cat = torch.cat([gate_output, up_output], dim=-1)
         
-        weight_dw = torch.randn(intermediate_size * 2, width, device=device)
-        bias_d = torch.randn(intermediate_size * 2, device=device)
+        weight_dw = torch.randn(intermediate_size * 2, width, device=device, dtype=DTYPE)
+        bias_d = torch.randn(intermediate_size * 2, device=device, dtype=DTYPE)
         mask = generate_attention_mask(bsz, seqlen, device)
 
         cfg = f"B{bsz} T{seqlen} H{hidden_size} I{intermediate_size} W{width}"
@@ -382,7 +401,7 @@ def run_hf_like_canon_d_bench():
         max_diff_gate = torch.max(torch.abs(gate_mps - gate_ref)).item()
         max_diff_up = torch.max(torch.abs(up_mps - up_ref)).item()
         max_diff = max(max_diff_gate, max_diff_up)
-        is_ok = max_diff < 1e-4
+        is_ok = max_diff < get_tolerance_for(DTYPE)
 
         sp = t_ref / t_mps
         std_pct = (std_mps / t_mps) * 100 if t_mps > 0 else 0
@@ -402,7 +421,23 @@ def main():
     # 解析命令行参数
     parser = argparse.ArgumentParser(description="CausalConv1D MPS Benchmarks")
     parser.add_argument("--only-hf", action="store_true", help="仅运行 HuggingFace 风格的 CanonA/C、CanonB 与 CanonD 基准")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp16", "fp32"],
+        help="测试数据类型（默认 bf16）",
+    )
     args = parser.parse_args()
+
+    # 根据参数设置全局 DTYPE 与容差
+    global DTYPE
+    if args.dtype == "bf16":
+        DTYPE = torch.bfloat16
+    elif args.dtype == "fp16":
+        DTYPE = torch.float16
+    else:
+        DTYPE = torch.float32
 
     if args.only_hf:
         run_hf_like_canon_ac_bench()
@@ -429,9 +464,9 @@ def main():
     for batch, dim, seqlen, width in test_configs:
         # 创建测试数据
         torch.manual_seed(42)
-        x = torch.randn(batch, dim, seqlen, device=device, dtype=torch.float32)
-        weight = torch.randn(dim, width, device=device, dtype=torch.float32)
-        bias = torch.randn(dim, device=device, dtype=torch.float32)
+        x = torch.randn(batch, dim, seqlen, device=device, dtype=DTYPE)
+        weight = torch.randn(dim, width, device=device, dtype=DTYPE)
+        bias = torch.randn(dim, device=device, dtype=DTYPE)
 
         config_str = f"{batch}×{dim}×{seqlen}×{width}"
 
@@ -458,7 +493,7 @@ def main():
             result_mps = run_mps()
             result_torch = run_torch()
             max_diff = torch.max(torch.abs(result_mps - result_torch)).item()
-            is_correct = max_diff < 1e-4
+            is_correct = max_diff < get_tolerance_for(DTYPE)
 
             speedup = t_torch / t_mps
             std_percent_mps = (std_mps / t_mps) * 100 if t_mps > 0 else 0
@@ -490,9 +525,9 @@ def main():
     config_str = f"{batch}×{dim}×{seqlen}×{width}"
 
     torch.manual_seed(42)
-    x = torch.randn(batch, dim, seqlen, device=device, dtype=torch.float32)
-    weight = torch.randn(dim, width, device=device, dtype=torch.float32)
-    bias = torch.randn(dim, device=device, dtype=torch.float32)
+    x = torch.randn(batch, dim, seqlen, device=device, dtype=DTYPE)
+    weight = torch.randn(dim, width, device=device, dtype=DTYPE)
+    bias = torch.randn(dim, device=device, dtype=DTYPE)
 
     try:
 
@@ -547,9 +582,9 @@ def main():
     ]
 
     for bsz, seqlen, dim, width in canon_configs:
-        x_btd = torch.randn(bsz, seqlen, dim, device=device)
-        weight_dw = torch.randn(dim, width, device=device)
-        bias_d = torch.randn(dim, device=device)
+        x_btd = torch.randn(bsz, seqlen, dim, device=device, dtype=DTYPE)
+        weight_dw = torch.randn(dim, width, device=device, dtype=DTYPE)
+        bias_d = torch.randn(dim, device=device, dtype=DTYPE)
 
         cfg = f"B{bsz} T{seqlen} D{dim} W{width}"
 
@@ -574,7 +609,7 @@ def main():
         y_mps = run_mps_canon()
         y_ref = run_ref_canon()
         max_diff = torch.max(torch.abs(y_mps - y_ref)).item()
-        is_ok = max_diff < 1e-4
+        is_ok = max_diff < get_tolerance_for(DTYPE)
 
         sp = t_ref / t_mps
         std_pct = (std_mps / t_mps) * 100 if t_mps > 0 else 0
