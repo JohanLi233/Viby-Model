@@ -273,7 +273,8 @@ torch::Tensor short_conv_fused_mps(
           x.scalar_type() == torch::kBFloat16,
       "Only float32/float16/bfloat16 supported for x");
   TORCH_CHECK(weight.scalar_type() == x.scalar_type(), "weight dtype must match x");
-  TORCH_CHECK(!bias.defined() || bias.scalar_type() == x.scalar_type(), "bias dtype must match x");
+  // 允许 bias 为未定义或空张量作为“无偏置”的标记
+  TORCH_CHECK(!bias.defined() || bias.numel() == 0 || bias.scalar_type() == x.scalar_type(), "bias dtype must match x");
   // 若 mask 未定义或为空张量则跳过 dtype 校验
   TORCH_CHECK(
       !mask.defined() || mask.numel() == 0 || mask.scalar_type() == x.scalar_type(),
@@ -288,7 +289,8 @@ torch::Tensor short_conv_fused_mps(
   const int64_t W = weight.size(1);
   TORCH_CHECK(W == 4, "Fused kernel supports width=4 only");
 
-  if (bias.defined()) {
+  const bool has_bias = bias.defined() && bias.numel() > 0;
+  if (has_bias) {
     TORCH_CHECK(bias.dim() == 1 && bias.size(0) == D, "bias must be (D)");
   }
   if (mask.defined() && mask.numel() > 0) {
@@ -306,7 +308,7 @@ torch::Tensor short_conv_fused_mps(
 
   auto x_contig = x.contiguous();
   auto w_contig = weight.contiguous();
-  auto b_contig = bias.defined() ? bias.contiguous() : bias;
+  auto b_contig = has_bias ? bias.contiguous() : bias;
   auto m_contig = mask.defined() ? mask.contiguous() : mask;
 
   at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
@@ -386,7 +388,8 @@ torch::Tensor short_conv_update_mps(
       "Only float32/float16/bfloat16 supported for x");
   TORCH_CHECK(conv_state.scalar_type() == x.scalar_type(), "conv_state dtype must match x");
   TORCH_CHECK(weight.scalar_type() == x.scalar_type(), "weight dtype must match x");
-  TORCH_CHECK(!bias.defined() || bias.scalar_type() == x.scalar_type(), "bias dtype must match x");
+  // 允许 bias 为未定义或空张量
+  TORCH_CHECK(!bias.defined() || bias.numel() == 0 || bias.scalar_type() == x.scalar_type(), "bias dtype must match x");
   TORCH_CHECK(cache_seqlens.scalar_type() == torch::kInt, "cache_seqlens must be int32");
 
   TORCH_CHECK(x.dim() == 2, "Expected x shape (B, D)");
@@ -404,14 +407,15 @@ torch::Tensor short_conv_update_mps(
   TORCH_CHECK(cache_seqlens.size(0) == B, "cache_seqlens batch size mismatch");
   TORCH_CHECK(W == 4, "Update kernel supports width=4 only");
 
-  if (bias.defined()) {
+  const bool has_bias_update = bias.defined() && bias.numel() > 0;
+  if (has_bias_update) {
     TORCH_CHECK(bias.dim() == 1 && bias.size(0) == D, "bias must be (D)");
   }
 
   auto x_contig = x.contiguous();
   auto conv_state_contig = conv_state.contiguous();
   auto weight_contig = weight.contiguous();
-  auto bias_contig = bias.defined() ? bias.contiguous() : bias;
+  auto bias_contig = has_bias_update ? bias.contiguous() : bias;
   auto cache_seqlens_contig = cache_seqlens.contiguous();
 
   at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();

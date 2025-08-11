@@ -10,6 +10,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 try:
     from causal_conv1d_mps import short_conv_fused, short_conv_update
+
     HAS_CAUSAL_CONV1D_MPS = True
 except ImportError:
     HAS_CAUSAL_CONV1D_MPS = False
@@ -40,8 +41,8 @@ class VibyConfig(PretrainedConfig):
         z_loss_factor: float = 0.0001,
         sliding_window: int = 128,
         canon_set: str = "ABCD",
-        canon_bias: bool = True,
-        canon_activation: bool = True,
+        canon_bias: bool = False,
+        canon_activation: bool = False,
         canon_kernel: int = 4,
         canon_residual: bool = True,
         **kwargs,

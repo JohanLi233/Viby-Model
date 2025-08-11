@@ -1,17 +1,9 @@
-import os
-import sys
 import time
 import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
-import causal_conv1d_mps._C as mps_ext
-
-# 设置环境变量和路径
-os.environ["CAUSAL_CONV1D_METAL_PATH"] = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "causal_conv1d.metal"
-)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import causal_conv1d_mps as ccmps
 
 
 # 全局 dtype 与容差（默认使用 bf16）
@@ -189,7 +181,7 @@ def short_conv_mps_like(
     if attention_mask is not None:
         x_btd = x_btd * attention_mask.unsqueeze(-1)
     x_bdt = x_btd.movedim(-1, -2).contiguous()
-    y_bdt = mps_ext.causal_conv1d_fwd(
+    y_bdt = ccmps.causal_conv1d_fwd(
         x_bdt, weight_dw.contiguous(), bias_d.contiguous() if bias_d is not None else None, activation
     )
     y = y_bdt.movedim(-2, -1)
@@ -211,15 +203,9 @@ def short_conv_mps_optimized(
     """
     x_contig = x_btd.contiguous()
     w_contig = weight_dw.contiguous()
-    b_contig = bias_d.contiguous() if bias_d is not None else torch.tensor([], device=x_btd.device, dtype=x_btd.dtype)
-    m_contig = (
-        attention_mask.to(dtype=x_btd.dtype).contiguous()
-        if attention_mask is not None
-        else torch.tensor([], device=x_btd.device, dtype=x_btd.dtype)
-    )
 
-    y = mps_ext.short_conv_fused(
-        x_contig, w_contig, b_contig, m_contig, activation, residual
+    y = ccmps.short_conv_fused(
+        x_contig, w_contig, bias_d, attention_mask, activation, residual
     )
     return y
 
@@ -473,7 +459,7 @@ def main():
         try:
             # MPS 实现
             def run_mps():
-                return mps_ext.causal_conv1d_fwd(
+                return ccmps.causal_conv1d_fwd(
                     x.contiguous(), weight.contiguous(), bias.contiguous(), False
                 )
 
@@ -532,7 +518,7 @@ def main():
     try:
 
         def run_mps_silu():
-            return mps_ext.causal_conv1d_fwd(
+            return ccmps.causal_conv1d_fwd(
                 x.contiguous(), weight.contiguous(), bias.contiguous(), True
             )
 
@@ -591,7 +577,7 @@ def main():
         def run_mps_canon():
             # 转为 [B, D, T] 路径以复用核
             x_bdt = x_btd.movedim(-1, -2).contiguous()
-            y_bdt = mps_ext.causal_conv1d_fwd(
+            y_bdt = ccmps.causal_conv1d_fwd(
                 x_bdt, weight_dw.contiguous(), bias_d.contiguous(), True
             )
             return y_bdt.movedim(-2, -1)

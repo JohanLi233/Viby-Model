@@ -103,6 +103,12 @@ def causal_conv1d_fwd(
         if bias.shape[0] != dim:
             raise ValueError(f"Bias dim {bias.shape[0]} does not match input dim {dim}")
 
+    # Align dtypes: kernel requires weight/bias to match x.dtype
+    if weight.dtype != x.dtype:
+        weight = weight.to(dtype=x.dtype)
+    if bias is not None and bias.dtype != x.dtype:
+        bias = bias.to(dtype=x.dtype)
+
     # Ensure tensors are contiguous
     x = x.contiguous()
     weight = weight.contiguous()
@@ -184,6 +190,12 @@ def short_conv_fused(
             raise ValueError(
                 f"Attention mask shape {attention_mask.shape} does not match input shape ({batch}, {seqlen})"
             )
+
+    # Align dtypes to x
+    if weight.dtype != x.dtype:
+        weight = weight.to(dtype=x.dtype)
+    if bias is not None and bias.dtype != x.dtype:
+        bias = bias.to(dtype=x.dtype)
 
     # Ensure tensors are contiguous and prepare empty tensors if needed
     x = x.contiguous()
@@ -357,6 +369,12 @@ def short_conv_update(
             )
         if cache_seqlens.dtype != torch.int32:
             cache_seqlens = cache_seqlens.to(torch.int32)
+
+    # Align dtypes to x
+    if weight.dtype != x.dtype:
+        weight = weight.to(dtype=x.dtype)
+    if bias is not None and bias.dtype != x.dtype:
+        bias = bias.to(dtype=x.dtype)
 
     # Ensure tensors are contiguous
     x = x.contiguous()
