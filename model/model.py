@@ -399,14 +399,36 @@ class Attention(nn.Module):
 
         # Key padding mask：由 attention_mask 推导（1=保留，0=填充 → True 表示屏蔽）
         if attention_mask is not None:
+            # 目标 key 长度
+            tk = attn_scores.size(-1)
+
             if attention_mask.dim() == 2:
-                key_padding_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(1)
-                # [B, 1, 1, Tk] 可广播到 [B, H, Tq, Tk]
+                # [B, T] → 调整到与 tk 一致
+                am = attention_mask
+                if am.size(1) != tk:
+                    if am.size(1) < tk:
+                        pad_len = tk - am.size(1)
+                        pad = torch.ones((am.size(0), pad_len), dtype=am.dtype, device=am.device)
+                        am = torch.cat([am, pad], dim=1)
+                    else:
+                        # 超长则取末尾的 tk 段（通常与当前 K 对齐）
+                        am = am[:, -tk:]
+                key_padding_mask = (am == 0).unsqueeze(1).unsqueeze(1)  # [B,1,1,Tk]
             else:
-                # 已经是更高维度的掩码时，尽力广播
-                key_padding_mask = attention_mask.to(torch.bool)
-                if key_padding_mask.dim() == 3:
-                    key_padding_mask = key_padding_mask.unsqueeze(1)
+                # 已经是更高维度的掩码时，尽力广播并对齐 tk
+                kpm = attention_mask.to(torch.bool)
+                if kpm.dim() == 3:
+                    kpm = kpm.unsqueeze(1)  # [B,1,Tq,Tk] or [B,1,1,Tk]
+                if kpm.size(-1) != tk:
+                    if kpm.size(-1) < tk:
+                        pad_shape = list(kpm.shape)
+                        pad_shape[-1] = tk - kpm.size(-1)
+                        pad = torch.zeros(pad_shape, dtype=kpm.dtype, device=kpm.device)
+                        kpm = torch.cat([kpm, pad], dim=-1)
+                    else:
+                        kpm = kpm[..., -tk:]
+                key_padding_mask = kpm
+
             attn_scores = attn_scores.masked_fill(
                 key_padding_mask, torch.finfo(attn_scores.dtype).min
             )
@@ -511,7 +533,6 @@ class VibyBlock(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.self_attn = Attention(config)
 
-        self.layer_id = layer_id
         self.default_sliding_window = config.sliding_window
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -535,6 +556,7 @@ class VibyBlock(nn.Module):
         self,
         hidden_states,
         position_embeddings,
+        layer_id: int,
         past_key_value=None,
         use_cache=False,
         attention_mask=None,
@@ -549,7 +571,7 @@ class VibyBlock(nn.Module):
             normed_hidden_states = self.canon_a(normed_hidden_states, attention_mask)
         
         # sliding window 策略：参考 gpt-oss，仅对偶数层启用，默认窗口 128
-        sliding_window = self.default_sliding_window if (self.layer_id % 2 == 0) else 0
+        sliding_window = self.default_sliding_window if (layer_id % 2 == 0) else 0
         attn_output, present_key_value = self.self_attn(
             normed_hidden_states,
             position_embeddings,
@@ -646,6 +668,7 @@ class VibyModel(nn.Module):
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
+                layer_id=layer_idx,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
                 attention_mask=attention_mask,
