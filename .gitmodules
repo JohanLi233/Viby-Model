@@ -1,0 +1,3 @@
+[submodule "causal-conv1d-mps"]
+	path = causal-conv1d-mps
+	url = git@github.com:JohanLi233/causal-conv1d-mps.git
