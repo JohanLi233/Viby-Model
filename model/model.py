@@ -29,7 +29,7 @@ class VibyConfig(PretrainedConfig):
         eos_token_id: int = 2,
         hidden_act: str = "silu",
         hidden_size: int = 640,
-        intermediate_size: int = 1280,
+        intermediate_size: int = 1792,
         max_position_embeddings: int = 32768,
         original_max_position_embeddings: int = 1024,
         num_attention_heads: int = 8,
@@ -39,7 +39,7 @@ class VibyConfig(PretrainedConfig):
         rms_norm_eps: float = 1e-05,
         rope_theta: float = 1000000.0,
         rope_scaling: Optional[dict] = None,
-        z_loss_factor: float = 0.0001,
+        z_loss_factor: float = 0.0,
         sliding_window: int = 128,
         canon_set: str = "ABCD",
         canon_bias: bool = False,
@@ -805,7 +805,7 @@ class FeedForward(nn.Module):
     def __init__(self, config: VibyConfig):
         super().__init__()
         self.gate_proj = nn.Linear(
-            config.hidden_size, config.intermediate_size * 2, bias=False
+            config.hidden_size, config.intermediate_size, bias=False
         )
         self.up_proj = nn.Linear(
             config.hidden_size, config.intermediate_size, bias=False
@@ -815,25 +815,12 @@ class FeedForward(nn.Module):
         )
         self.dropout = nn.Dropout(config.dropout)
         self.act_fn = ACT2FN.get(config.hidden_act, torch.nn.functional.silu)
-        # SwiGLU parameters
-        self.swiglu_alpha = 1.702
-        self.swiglu_limit = 7.0
 
         # Canon D layer for gate and up projections
         if "D" in config.canon_set:
-            self.canon_d = CanonLayer(config.intermediate_size * 3, config, name="d")
+            self.canon_d = CanonLayer(config.intermediate_size * 2, config, name="d")
         else:
             self.canon_d = None
-
-    @staticmethod
-    def swiglu_clamp(
-        x: torch.Tensor, alpha: float = 1.702, limit: float = 7.0
-    ) -> torch.Tensor:
-        x_glu, x_linear = x[..., ::2], x[..., 1::2]
-        x_glu = x_glu.clamp(min=None, max=limit)
-        x_linear = x_linear.clamp(min=-limit, max=limit)
-        out_glu = x_glu * torch.sigmoid(alpha * x_glu)
-        return out_glu * (x_linear + 1)
 
     def forward(
         self,
@@ -842,7 +829,6 @@ class FeedForward(nn.Module):
         cache: Optional[Cache] = None,
         layer_idx: Optional[int] = None,
     ):
-        # Use clamp-ed SwiGLU with gate-up structure
         gated = self.gate_proj(x)
         up = self.up_proj(x)
 
@@ -859,7 +845,8 @@ class FeedForward(nn.Module):
             gated = gate_up_processed[..., : gated.shape[-1]]
             up = gate_up_processed[..., gated.shape[-1] :]
 
-        h = self.swiglu_clamp(gated, alpha=self.swiglu_alpha, limit=self.swiglu_limit)
+        # Standard SwiGLU: SiLU(gate) * up
+        h = F.silu(gated)
         out = self.down_proj(h * up)
         return self.dropout(out)
 
