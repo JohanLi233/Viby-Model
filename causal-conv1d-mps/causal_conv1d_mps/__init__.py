@@ -156,7 +156,6 @@ def short_conv_fused(
     bias: Optional[torch.Tensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     activation: bool = True,
-    residual: bool = True,
 ) -> torch.Tensor:
     """
     Fused short convolution operation for common (B, T, D) layout usage.
@@ -167,10 +166,9 @@ def short_conv_fused(
         bias: Optional bias tensor of shape (dim,)
         attention_mask: Optional attention mask of shape (batch, seqlen)
         activation: Whether to apply SiLU activation
-        residual: Whether to add residual connection
 
     Returns:
-        Output tensor of shape (batch, seqlen, dim)
+        Output tensor of shape (batch, seqlen, dim) - pure convolution result
 
     Raises:
         RuntimeError: If MPS is not available
@@ -297,7 +295,7 @@ def short_conv_fused(
         B, T, _ = x.shape
         attention_mask = torch.ones((B, T), device=x.device, dtype=x.dtype)
 
-    return _C.short_conv_fused(x, weight, bias, attention_mask, activation, residual)
+    return _C.short_conv_fused(x, weight, bias, attention_mask, activation)
 
 
 def short_conv_update(
@@ -307,7 +305,6 @@ def short_conv_update(
     bias: Optional[torch.Tensor] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
     activation: bool = True,
-    residual: bool = True,
 ) -> torch.Tensor:
     """
     Single-token causal convolution update for efficient inference.
@@ -321,7 +318,6 @@ def short_conv_update(
         cache_seqlens: Current sequence lengths for each batch item, shape (batch,)
                       If None, assumes all batches are at the same position
         activation: Whether to apply SiLU activation
-        residual: Whether to add residual connection
 
     Returns:
         Output tensor of shape (batch, dim) - single token output
@@ -414,7 +410,7 @@ def short_conv_update(
     cache_seqlens = cache_seqlens.contiguous()
 
     return _C.short_conv_update(
-        x, conv_state, weight, bias, cache_seqlens, activation, residual
+        x, conv_state, weight, bias, cache_seqlens, activation
     )
 
 

@@ -273,7 +273,7 @@ kernel void causal_conv1d_simple_kernel_bf16(
 
 kernel void short_conv_fused_btd_kernel(
     // Inputs
-    device const float *input [[buffer(0)]],     // (B, T, D) original input (for residual)
+    device const float *input [[buffer(0)]],     // (B, T, D) original input
     device const float *weight [[buffer(1)]],    // (D, W=4) weights
     device const float *bias [[buffer(2)]],      // (D) bias (optional)
     device const float *mask [[buffer(3)]],      // (B, T) Attention mask (optional)
@@ -284,7 +284,6 @@ kernel void short_conv_fused_btd_kernel(
     constant uint &T [[buffer(6)]],
     constant uint &D [[buffer(7)]],
     constant bool &use_silu [[buffer(8)]],
-    constant bool &use_residual [[buffer(9)]],
 
     // Thread position, grid organized as (B, T, D)
     uint3 gid [[thread_position_in_grid]]
@@ -330,12 +329,7 @@ kernel void short_conv_fused_btd_kernel(
         result = silu(result);
     }
 
-    // 4. Residual connection
-    if (use_residual) {
-        result += input[output_idx];
-    }
-
-    // 5. Write back output
+    // 4. Write back output
     output[output_idx] = result;
 }
 
@@ -354,7 +348,6 @@ kernel void short_conv_fused_btd_kernel_tiled(
     constant uint &T [[buffer(6)]],
     constant uint &D [[buffer(7)]],
     constant bool &use_silu [[buffer(8)]],
-    constant bool &use_residual [[buffer(9)]],
 
     // Thread organization and position information
     uint3 gid [[thread_position_in_grid]],
@@ -463,12 +456,6 @@ kernel void short_conv_fused_btd_kernel_tiled(
         result = silu(result);
     }
     
-    // Apply residual connection
-    if (use_residual) {
-        // Residual connection uses the original input at the current time step (t, d)
-        result += input[output_idx];
-    }
-    
     // Write output
     output[output_idx] = result;
 }
@@ -485,7 +472,6 @@ kernel void short_conv_fused_btd_kernel_f16(
     constant uint &T [[buffer(6)]],
     constant uint &D [[buffer(7)]],
     constant bool &use_silu [[buffer(8)]],
-    constant bool &use_residual [[buffer(9)]],
 
     uint3 gid [[thread_position_in_grid]]
 )
@@ -520,9 +506,6 @@ kernel void short_conv_fused_btd_kernel_f16(
     if (use_silu) {
         result = silu(result);
     }
-    if (use_residual) {
-        result += (float)input[output_idx];
-    }
     output[output_idx] = (half)result;
 }
 
@@ -538,7 +521,6 @@ kernel void short_conv_fused_btd_kernel_bf16(
     constant uint &T [[buffer(6)]],
     constant uint &D [[buffer(7)]],
     constant bool &use_silu [[buffer(8)]],
-    constant bool &use_residual [[buffer(9)]],
 
     uint3 gid [[thread_position_in_grid]]
 )
@@ -573,9 +555,6 @@ kernel void short_conv_fused_btd_kernel_bf16(
     if (use_silu) {
         result = silu(result);
     }
-    if (use_residual) {
-        result += bf16_to_float(input[output_idx]);
-    }
     output[output_idx] = float_to_bf16(result);
 }
 
@@ -596,7 +575,6 @@ kernel void short_conv_update_kernel(
     constant uint &W [[buffer(8)]],                   // kernel_width (fixed to 4)
     constant uint &STATE_LEN [[buffer(9)]],           // state buffer length
     constant bool &use_silu [[buffer(10)]],
-    constant bool &use_residual [[buffer(11)]],
     
     uint2 gid [[thread_position_in_grid]]             // (B, D)
 )
@@ -650,11 +628,6 @@ kernel void short_conv_update_kernel(
         result = silu(result);
     }
     
-    // Apply residual connection
-    if (use_residual) {
-        result += current_input;
-    }
-    
     // Update state: write current input to circular buffer
     uint state_write_idx = state_base + write_pos;
     conv_state[state_write_idx] = current_input;
@@ -677,7 +650,6 @@ kernel void short_conv_update_kernel_f16(
     constant uint &W [[buffer(8)]],
     constant uint &STATE_LEN [[buffer(9)]],
     constant bool &use_silu [[buffer(10)]],
-    constant bool &use_residual [[buffer(11)]],
     
     uint2 gid [[thread_position_in_grid]]
 )
@@ -718,10 +690,6 @@ kernel void short_conv_update_kernel_f16(
         result = silu(result);
     }
     
-    if (use_residual) {
-        result += current_input;
-    }
-    
     uint state_write_idx = state_base + write_pos;
     conv_state[state_write_idx] = (half)current_input;
     
@@ -742,7 +710,6 @@ kernel void short_conv_update_kernel_bf16(
     constant uint &W [[buffer(8)]],
     constant uint &STATE_LEN [[buffer(9)]],
     constant bool &use_silu [[buffer(10)]],
-    constant bool &use_residual [[buffer(11)]],
     
     uint2 gid [[thread_position_in_grid]]
 )
@@ -781,10 +748,6 @@ kernel void short_conv_update_kernel_bf16(
     
     if (use_silu) {
         result = silu(result);
-    }
-    
-    if (use_residual) {
-        result += current_input;
     }
     
     uint state_write_idx = state_base + write_pos;
@@ -1345,8 +1308,6 @@ kernel void causal_conv1d_bwd_kernel_hierarchical(
     }
     
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // No need for final reduction since we're writing directly to global memory
 }
 
 
@@ -1365,7 +1326,6 @@ kernel void short_conv_fused_btd_bwd_kernel(
     constant uint &T [[buffer(9)]],
     constant uint &D [[buffer(10)]],
     constant bool &use_activation [[buffer(11)]],
-    constant bool &use_residual [[buffer(12)]],
     
     uint3 gid [[thread_position_in_grid]]
 )
@@ -1382,9 +1342,6 @@ kernel void short_conv_fused_btd_bwd_kernel(
     const uint weight_base = d * W;
     
     float grad_out = grad_output[output_idx];
-    
-    // If residual was used, part of gradient flows directly to input
-    float dx_residual = use_residual ? grad_out : 0.0f;
     
     // Compute forward pass result for activation derivative
     float conv_result = 0.0f;
@@ -1452,7 +1409,7 @@ kernel void short_conv_fused_btd_bwd_kernel(
         }
     }
     
-    grad_x[output_idx] = dx_residual + dx_conv;
+    grad_x[output_idx] = dx_conv;
     
     // Accumulate gradient w.r.t. weight
     for (uint w = 0; w < W; w++) {
@@ -1497,7 +1454,6 @@ kernel void short_conv_fused_btd_bwd_kernel_f16(
     constant uint &T [[buffer(9)]],
     constant uint &D [[buffer(10)]],
     constant bool &use_activation [[buffer(11)]],
-    constant bool &use_residual [[buffer(12)]],
     
     uint3 gid [[thread_position_in_grid]]
 )
@@ -1514,7 +1470,6 @@ kernel void short_conv_fused_btd_bwd_kernel_f16(
     const uint weight_base = d * W;
     
     float grad_out = (float)grad_output[output_idx];
-    float dx_residual = use_residual ? grad_out : 0.0f;
     
     // Apply activation derivative if needed
     if (use_activation) {
@@ -1579,7 +1534,7 @@ kernel void short_conv_fused_btd_bwd_kernel_f16(
         }
     }
     
-    grad_x[output_idx] = (half)(dx_residual + dx_conv);
+    grad_x[output_idx] = (half)(dx_conv);
     
     // Accumulate gradients in float32
     for (uint w = 0; w < W; w++) {
@@ -1623,7 +1578,6 @@ kernel void short_conv_fused_btd_bwd_kernel_bf16(
     constant uint &T [[buffer(9)]],
     constant uint &D [[buffer(10)]],
     constant bool &use_activation [[buffer(11)]],
-    constant bool &use_residual [[buffer(12)]],
     
     uint3 gid [[thread_position_in_grid]]
 )
@@ -1640,7 +1594,6 @@ kernel void short_conv_fused_btd_bwd_kernel_bf16(
     const uint weight_base = d * W;
     
     float grad_out = bf16_to_float(grad_output[output_idx]);
-    float dx_residual = use_residual ? grad_out : 0.0f;
     
     // Apply activation derivative if needed
     if (use_activation) {
@@ -1705,7 +1658,7 @@ kernel void short_conv_fused_btd_bwd_kernel_bf16(
         }
     }
     
-    grad_x[output_idx] = float_to_bf16(dx_residual + dx_conv);
+    grad_x[output_idx] = float_to_bf16(dx_conv);
     
     // Accumulate gradients in float32
     for (uint w = 0; w < W; w++) {
@@ -1752,7 +1705,6 @@ kernel void short_conv_update_bwd_kernel(
     constant uint &W [[buffer(12)]],
     constant uint &STATE_LEN [[buffer(13)]],
     constant bool &use_activation [[buffer(14)]],
-    constant bool &use_residual [[buffer(15)]],
     
     uint2 gid [[thread_position_in_grid]]
 )
@@ -1771,9 +1723,6 @@ kernel void short_conv_update_bwd_kernel(
     
     float current_input = x[x_idx];
     float grad_out = grad_output[x_idx];
-    
-    // If residual was used, part of gradient flows directly to input
-    float dx_residual = use_residual ? grad_out : 0.0f;
     
     // Compute forward result for activation derivative
     float conv_result = 0.0f;
@@ -1805,7 +1754,7 @@ kernel void short_conv_update_bwd_kernel(
         
         if (w == W - 1) {
             // Gradient w.r.t. current input
-            grad_x[x_idx] = dx_residual + weight_val * grad_out;
+            grad_x[x_idx] = weight_val * grad_out;
         } else {
             // Gradient w.r.t. conv_state
             int hist_offset = (int)(W - 1 - w);
@@ -1861,7 +1810,6 @@ kernel void short_conv_update_bwd_kernel_f16(
     constant uint &W [[buffer(12)]],
     constant uint &STATE_LEN [[buffer(13)]],
     constant bool &use_activation [[buffer(14)]],
-    constant bool &use_residual [[buffer(15)]],
     
     uint2 gid [[thread_position_in_grid]]
 )
@@ -1880,7 +1828,6 @@ kernel void short_conv_update_bwd_kernel_f16(
     
     float current_input = (float)x[x_idx];
     float grad_out = (float)grad_output[x_idx];
-    float dx_residual = use_residual ? grad_out : 0.0f;
     
     // Apply activation derivative if needed
     if (use_activation) {
@@ -1910,7 +1857,7 @@ kernel void short_conv_update_bwd_kernel_f16(
         float weight_val = (float)weight[weight_base + w];
         
         if (w == W - 1) {
-            grad_x[x_idx] = (half)(dx_residual + weight_val * grad_out);
+            grad_x[x_idx] = (half)(weight_val * grad_out);
         } else {
             int hist_offset = (int)(W - 1 - w);
             int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;
@@ -1964,7 +1911,6 @@ kernel void short_conv_update_bwd_kernel_bf16(
     constant uint &W [[buffer(12)]],
     constant uint &STATE_LEN [[buffer(13)]],
     constant bool &use_activation [[buffer(14)]],
-    constant bool &use_residual [[buffer(15)]],
     
     uint2 gid [[thread_position_in_grid]]
 )
@@ -1983,7 +1929,6 @@ kernel void short_conv_update_bwd_kernel_bf16(
     
     float current_input = bf16_to_float(x[x_idx]);
     float grad_out = bf16_to_float(grad_output[x_idx]);
-    float dx_residual = use_residual ? grad_out : 0.0f;
     
     // Apply activation derivative if needed
     if (use_activation) {
@@ -2013,7 +1958,7 @@ kernel void short_conv_update_bwd_kernel_bf16(
         float weight_val = bf16_to_float(weight[weight_base + w]);
         
         if (w == W - 1) {
-            grad_x[x_idx] = float_to_bf16(dx_residual + weight_val * grad_out);
+            grad_x[x_idx] = float_to_bf16(weight_val * grad_out);
         } else {
             int hist_offset = (int)(W - 1 - w);
             int hist_pos = ((int)write_pos - hist_offset + (int)STATE_LEN) % (int)STATE_LEN;

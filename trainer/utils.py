@@ -8,9 +8,8 @@ import math
 import time
 import torch
 import torch.distributed as dist
-from torch import optim
 from typing import Tuple
-from .muon import Muon, SingleDeviceMuon
+from .muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 
 
 def Logger(content):
@@ -226,96 +225,78 @@ class MultiOptimizer(torch.optim.Optimizer):
 
 def create_mixed_optimizer(model, args, ddp=False, training_type="pretrain"):
     """
-    创建混合优化器（Muon + AdamW）
-
-    Args:
-        model: 模型
-        args: 参数配置
-        ddp: 是否分布式训练
-        training_type: 训练类型 ("pretrain" 或 "sft")
+    创建混合优化器 (MuonWithAuxAdam), 遵循官方示例分组
+    - Muon: 用于核心的2D权重矩阵
+    - AdamW: 用于所有其他参数 (嵌入、Canon、LayerNorm、偏置等)
     """
-    Logger("正在为优化器进行参数分组...")
+    Logger("正在为优化器进行参数分组 (官方 MuonWithAuxAdam 风格)...")
 
-    # 统一枚举参数，便于精确分组并避免重复
+    # 统一枚举所有参数
     named_params = list(model.named_parameters())
 
-    # 1. Muon 优化器处理的参数：所有中间层的 2D 权重矩阵 + Canon 权重
-    # 通过名称排除嵌入层、输出头
     muon_params = [
         p
-        for n, p in named_params
-        if (p.ndim == 2 and "embed" not in n and "lm_head" not in n)
-        or ("canon_" in n and p.ndim > 1)
+        for _, p in named_params
+        if p.ndim >= 2
     ]
+    muon_params_set = set(muon_params)
 
-    # 2. 嵌入层参数
-    embed_params = [p for n, p in named_params if "embed" in n]
-
-    # 3. 标量参数（如 LayerNorm、偏置项等），排除 embed，但包含 canon 的 bias
-    scalar_params = [
-        p for n, p in named_params if p.ndim < 2 and "embed" not in n
-    ]
+    # 2. 所有其他参数 (for AdamW)
+    adamw_params = [p for p in model.parameters() if p not in muon_params_set]
 
     Logger("参数分组完成：")
-    Logger(f"  - Muon 参数组: {len(muon_params)} 个张量")
-    Logger(f"  - 嵌入层参数组: {len(embed_params)} 个张量")
-    Logger(f"  - 标量参数组: {len(scalar_params)} 个张量")
+    Logger(f"  - Muon 参数组 (核心权重): {len(muon_params)} 个张量")
+    Logger(f"  - AdamW 参数组 (其他所有参数): {len(adamw_params)} 个张量")
 
-    # 创建混合优化器
-    optimizers = []
+    # 根据官方示例创建 param_groups
+    param_groups = []
 
-    # 初始化 Muon 优化器
-    if muon_params:
-        if training_type == "sft":
-            # SFT: args.learning_rate 已经设置为较小值 (0.001)，相比预训练 (0.01) 降低了10倍
-            muon_lr = args.learning_rate
-        else:
-            # 预训练: 使用标准学习率 (0.01)
-            muon_lr = args.learning_rate
-
-        if ddp:
-            muon_optimizer = Muon(
-                muon_params, lr=muon_lr, momentum=0.95, weight_decay=0
-            )
-        else:
-            muon_optimizer = SingleDeviceMuon(
-                muon_params, lr=muon_lr, momentum=0.95, weight_decay=0
-            )
-        optimizers.append(muon_optimizer)
-
-    # 初始化 AdamW 优化器，包含多个精细分组
-    adamw_param_groups = []
-
+    # 学习率和衰减配置
+    # 官方示例为 Muon 设置了较高的 LR，为 AdamW 设置了低很多的 LR。
     if training_type == "sft":
-        # SFT 的学习率倍数设置 - 使用较小的学习率防止灾难性遗忘
-        embed_lr_mult = 0.1  # 嵌入层需要特别小心，避免破坏预训练的词汇表征
-        scalar_lr_mult = 0.3  # 标量参数（如 LayerNorm）可以适度调整
-        weight_decay = 0.01  # SFT 使用较小的权重衰减
+        # 对于SFT，我们为AdamW参数使用一个非常小的学习率倍数
+        adam_lr_mult = 0.015  # 0.02 * 0.015 = 3e-4, 模拟官方示例
+        muon_wd = 0.01
+        adam_wd = 0.01
+    else:  # pretrain
+        # 预训练时，AdamW的学习率也应该远小于Muon
+        adam_lr_mult = 0.1
+        muon_wd = 0.01
+        adam_wd = 0.1
+
+    # Muon 参数组
+    if muon_params:
+        param_groups.append(
+            dict(
+                params=muon_params,
+                use_muon=True,
+                lr=args.learning_rate,  # Muon 使用基础学习率 (e.g., 0.02)
+                momentum=0.95,
+                weight_decay=muon_wd,
+            )
+        )
+
+    # AdamW 参数组 (所有非Muon参数)
+    if adamw_params:
+        param_groups.append(
+            dict(
+                params=adamw_params,
+                use_muon=False,
+                lr=args.learning_rate * adam_lr_mult,  # AdamW 使用一个较小的LR
+                betas=(0.9, 0.95),
+                eps=1e-8,
+                weight_decay=adam_wd,
+            )
+        )
+
+    if not param_groups:
+        raise ValueError("没有创建任何参数组，请检查模型和参数分组逻辑")
+
+    # 根据 DDP 状态选择合适的优化器
+    if ddp:
+        optimizer = MuonWithAuxAdam(param_groups)
     else:
-        # 预训练的学习率倍数设置 - 从零开始学习，需要较大学习率
-        embed_lr_mult = 1.0  # 嵌入层需要充分学习词汇表征（权重绑定，输出头共享此参数）
-        scalar_lr_mult = 1.0  # 标量参数使用基准学习率
-        weight_decay = 0.1  # 预训练使用较大的权重衰减防止过拟合
-
-    if embed_params:
-        adamw_param_groups.append(
-            {"params": embed_params, "lr": args.learning_rate * embed_lr_mult}
-        )
-    if scalar_params:
-        adamw_param_groups.append(
-            {"params": scalar_params, "lr": args.learning_rate * scalar_lr_mult}
-        )
-
-    if adamw_param_groups:
-        adamw_optimizer = optim.AdamW(
-            adamw_param_groups,
-            betas=(0.9, 0.95),
-            eps=1e-8,
-            weight_decay=weight_decay,
-        )
-        optimizers.append(adamw_optimizer)
-
-    optimizer = MultiOptimizer(optimizers)
+        optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
 
     # 为学习率调度器存储初始学习率
     Logger("为学习率调度器存储初始学习率...")

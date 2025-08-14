@@ -269,14 +269,13 @@ static inline std::pair<id<MTLBuffer>, NSUInteger> getBufferAndOffset(const torc
     return {buffer, offset};
 }
 
-// Fused ShortConvolution (B, T, D): Mask + Conv (W=4) + SiLU + Residual
+// Fused ShortConvolution (B, T, D): Mask + Conv (W=4) + SiLU
 torch::Tensor short_conv_fused_mps(
     const torch::Tensor &x,
     const torch::Tensor &weight,
     const torch::Tensor &bias,
     const torch::Tensor &mask,
-    bool silu_activation,
-    bool residual
+    bool silu_activation
 ) {
   TORCH_CHECK(x.device().is_mps(), "Input 'x' must be on MPS");
   TORCH_CHECK(weight.device().is_mps(), "'weight' must be on MPS");
@@ -363,18 +362,16 @@ torch::Tensor short_conv_fused_mps(
   [encoder setBuffer:m_buf offset:m_off atIndex:3];
   [encoder setBuffer:o_buf offset:o_off atIndex:4];
 
-  // Scalars 5..9
+  // Scalars 5..8
   uint32_t B_u32 = (uint32_t)B;
   uint32_t T_u32 = (uint32_t)T;
   uint32_t D_u32 = (uint32_t)D;
   bool use_silu = silu_activation;
-  bool use_resid = residual;
 
   [encoder setBytes:&B_u32 length:sizeof(uint32_t) atIndex:5];
   [encoder setBytes:&T_u32 length:sizeof(uint32_t) atIndex:6];
   [encoder setBytes:&D_u32 length:sizeof(uint32_t) atIndex:7];
   [encoder setBytes:&use_silu length:sizeof(bool) atIndex:8];
-  [encoder setBytes:&use_resid length:sizeof(bool) atIndex:9];
 
   MTLSize gridSize = MTLSizeMake((NSUInteger)B, (NSUInteger)T, (NSUInteger)D);
   NSUInteger maxThreads = [pipeline maxTotalThreadsPerThreadgroup];
@@ -404,8 +401,7 @@ torch::Tensor short_conv_update_mps(
     const torch::Tensor &weight,
     const torch::Tensor &bias,
     const torch::Tensor &cache_seqlens,
-    bool silu_activation,
-    bool residual
+    bool silu_activation
 ) {
   TORCH_CHECK(x.device().is_mps(), "Input 'x' must be on MPS");
   TORCH_CHECK(conv_state.device().is_mps(), "'conv_state' must be on MPS");
@@ -484,20 +480,18 @@ torch::Tensor short_conv_update_mps(
   [encoder setBuffer:cl_buf offset:cl_off atIndex:4];
   [encoder setBuffer:o_buf offset:o_off atIndex:5];
 
-  // Scalars 6..11
+  // Scalars 6..10
   uint32_t B_u32 = (uint32_t)B;
   uint32_t D_u32 = (uint32_t)D;
   uint32_t W_u32 = (uint32_t)W;
   uint32_t STATE_LEN_u32 = (uint32_t)STATE_LEN;
   bool use_silu = silu_activation;
-  bool use_resid = residual;
 
   [encoder setBytes:&B_u32 length:sizeof(uint32_t) atIndex:6];
   [encoder setBytes:&D_u32 length:sizeof(uint32_t) atIndex:7];
   [encoder setBytes:&W_u32 length:sizeof(uint32_t) atIndex:8];
   [encoder setBytes:&STATE_LEN_u32 length:sizeof(uint32_t) atIndex:9];
   [encoder setBytes:&use_silu length:sizeof(bool) atIndex:10];
-  [encoder setBytes:&use_resid length:sizeof(bool) atIndex:11];
 
   MTLSize gridSize = MTLSizeMake((NSUInteger)B, (NSUInteger)D, 1);
   NSUInteger maxThreads = [pipeline maxTotalThreadsPerThreadgroup];
@@ -675,8 +669,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> short_conv_fused_bwd_mps
     const torch::Tensor &bias,
     const torch::Tensor &attention_mask,
     const torch::Tensor &grad_output,
-    bool activation,
-    bool residual
+    bool activation
 ) {
     TORCH_CHECK(x.device().is_mps(), "Input 'x' must be on MPS");
     TORCH_CHECK(weight.device().is_mps(), "'weight' must be on MPS");
@@ -753,13 +746,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> short_conv_fused_bwd_mps
     uint32_t T_u32 = (uint32_t)T;
     uint32_t D_u32 = (uint32_t)D;
     bool use_activation = activation;
-    bool use_residual = residual;
 
     [encoder setBytes:&B_u32 length:sizeof(uint32_t) atIndex:8];
     [encoder setBytes:&T_u32 length:sizeof(uint32_t) atIndex:9];
     [encoder setBytes:&D_u32 length:sizeof(uint32_t) atIndex:10];
     [encoder setBytes:&use_activation length:sizeof(bool) atIndex:11];
-    [encoder setBytes:&use_residual length:sizeof(bool) atIndex:12];
 
     MTLSize gridSize = MTLSizeMake((NSUInteger)B, (NSUInteger)T, (NSUInteger)D);
     NSUInteger maxThreads = [pipeline maxTotalThreadsPerThreadgroup];
@@ -785,8 +776,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> short_con
     const torch::Tensor &bias,
     const torch::Tensor &cache_seqlens,
     const torch::Tensor &grad_output,
-    bool activation,
-    bool residual
+    bool activation
 ) {
     TORCH_CHECK(x.device().is_mps(), "Input 'x' must be on MPS");
     TORCH_CHECK(conv_state.device().is_mps(), "'conv_state' must be on MPS");
@@ -862,14 +852,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> short_con
     uint32_t W_u32 = (uint32_t)W;
     uint32_t STATE_LEN_u32 = (uint32_t)STATE_LEN;
     bool use_activation = activation;
-    bool use_residual = residual;
 
     [encoder setBytes:&B_u32 length:sizeof(uint32_t) atIndex:10];
     [encoder setBytes:&D_u32 length:sizeof(uint32_t) atIndex:11];
     [encoder setBytes:&W_u32 length:sizeof(uint32_t) atIndex:12];
     [encoder setBytes:&STATE_LEN_u32 length:sizeof(uint32_t) atIndex:13];
     [encoder setBytes:&use_activation length:sizeof(bool) atIndex:14];
-    [encoder setBytes:&use_residual length:sizeof(bool) atIndex:15];
 
     MTLSize gridSize = MTLSizeMake((NSUInteger)B, (NSUInteger)D, 1);
     NSUInteger maxThreads = [pipeline maxTotalThreadsPerThreadgroup];
@@ -894,7 +882,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("causal_conv1d", &causal_conv1d_mps,
         "Causal Conv1D with full interface compatibility");
   m.def("short_conv_fused", &short_conv_fused_mps,
-        "Fused ShortConvolution (Mask+Conv+SiLU+Residual) on MPS (BTD layout)");
+        "Fused ShortConvolution (Mask+Conv+SiLU) on MPS (BTD layout)");
   m.def("short_conv_update", &short_conv_update_mps,
         "Single-token causal convolution update for efficient inference");
   

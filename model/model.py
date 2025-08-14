@@ -10,7 +10,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache, DynamicCache
 
 try:
-    from causal_conv1d_mps import short_conv_fused, short_conv_update
+    from causal_conv1d_mps import short_conv_fused, short_conv_update  # type: ignore
 
     HAS_CAUSAL_CONV1D_MPS = True
 except ImportError:
@@ -45,7 +45,6 @@ class VibyConfig(PretrainedConfig):
         canon_bias: bool = False,
         canon_activation: bool = False,
         canon_kernel: int = 4,
-        canon_residual: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -71,7 +70,6 @@ class VibyConfig(PretrainedConfig):
         self.canon_bias = canon_bias
         self.canon_activation = canon_activation
         self.canon_kernel = canon_kernel
-        self.canon_residual = canon_residual
 
 
 # (z_loss_cross_entropy and RoPE helper functions remain the same)
@@ -199,7 +197,6 @@ class CanonLayer(nn.Module):
         self.kernel_size = config.canon_kernel
         self.bias = config.canon_bias
         self.activation = config.canon_activation
-        self.residual = config.canon_residual
 
         self.weight = nn.Parameter(torch.randn(hidden_size, 1, self.kernel_size))
         if self.bias:
@@ -308,7 +305,6 @@ class CanonLayer(nn.Module):
                     bias=self.bias_param,
                     cache_seqlens=cache_seqlens,
                     activation=self.activation,
-                    residual=self.residual,
                 )
                 # Increment seqlens for next step
                 if cache is not None and layer_idx is not None:
@@ -338,8 +334,6 @@ class CanonLayer(nn.Module):
         batch_size, hidden_size = x.shape
         kernel_size = self.kernel_size
 
-        residual = x if self.residual else torch.zeros_like(x)
-
         # Initialize result with bias
         if self.bias_param is not None:
             # Use clone for safety with in-place operations
@@ -361,7 +355,7 @@ class CanonLayer(nn.Module):
         if self.activation:
             result = F.silu(result)
 
-        return result + residual
+        return result
 
     def forward(
         self,
@@ -425,7 +419,6 @@ class CanonLayer(nn.Module):
                     bias=self.bias_param,
                     attention_mask=processed_attention_mask,
                     activation=self.activation,
-                    residual=self.residual,
                 )
 
                 # [FIX] Update cache state for prefill stage
@@ -494,7 +487,6 @@ class CanonLayer(nn.Module):
                 current_mask = attention_mask[:, -seq_len:]
                 x = x * current_mask.unsqueeze(-1)
 
-        residual = x if self.residual else torch.zeros_like(x)
         x_conv = x.transpose(1, 2)  # (B, D, T)
 
         # [FIX] Handle history concatenation for correct convolution computation
@@ -566,7 +558,7 @@ class CanonLayer(nn.Module):
         # Convert back to (batch, seq_len, hidden_size)
         output = x_conv_output.transpose(1, 2)
 
-        return output + residual
+        return output
 
 
 # (The rest of the classes: Attention, FeedForward, VibyBlock, VibyModel, VibyForCausalLM remain unchanged from the user's provided code, as the fixes were localized to CanonLayer. They are included below for completeness.)
@@ -663,12 +655,13 @@ class Attention(nn.Module):
             )  # (B, T, total_dim)
 
             # Apply Canon B with HF Cache
-            qkv_processed = self.canon_b(
+            canon_b_output = self.canon_b(
                 qkv_concat,
                 attention_mask=attention_mask,
                 cache=past_key_value,
                 layer_idx=layer_idx,
             )
+            qkv_processed = qkv_concat + canon_b_output
 
             # Split back to Q, K, V
             q_dim = self.n_local_heads * self.head_dim
@@ -835,12 +828,13 @@ class FeedForward(nn.Module):
         # Apply Canon D if enabled
         if self.canon_d is not None and layer_idx is not None:
             gate_up_concat = torch.cat([gated, up], dim=-1)
-            gate_up_processed = self.canon_d(
+            canon_d_output = self.canon_d(
                 gate_up_concat,
                 attention_mask=attention_mask,
                 cache=cache,
                 layer_idx=layer_idx,
             )
+            gate_up_processed = gate_up_concat + canon_d_output
             # Split back
             gated = gate_up_processed[..., : gated.shape[-1]]
             up = gate_up_processed[..., gated.shape[-1] :]
@@ -889,17 +883,19 @@ class VibyBlock(nn.Module):
     ):
         residual = hidden_states
 
-        # Pre-attention processing
-        normed_hidden_states = self.input_layernorm(hidden_states)
-
-        # Apply Canon A if enabled
+        # Apply Canon A before normalization if enabled
+        h_with_canon = hidden_states
         if self.canon_a is not None:
-            normed_hidden_states = self.canon_a(
-                normed_hidden_states,
+            canon_a_output = self.canon_a(
+                hidden_states,
                 attention_mask=attention_mask,
                 cache=past_key_value,
                 layer_idx=layer_id,
             )
+            h_with_canon = h_with_canon + canon_a_output
+
+        # Pre-attention processing - normalize the canon-modified hidden states
+        normed_hidden_states = self.input_layernorm(h_with_canon)
 
         # Sliding window strategy
         sliding_window = self.default_sliding_window if (layer_id % 2 == 0) else 0
@@ -916,16 +912,19 @@ class VibyBlock(nn.Module):
 
         # Pre-MLP processing
         residual = hidden_states
-        normed_hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # Apply Canon C if enabled
+        # Apply Canon C before normalization if enabled
+        h_with_canon = hidden_states
         if self.canon_c is not None:
-            normed_hidden_states = self.canon_c(
-                normed_hidden_states,
+            canon_c_output = self.canon_c(
+                hidden_states,
                 attention_mask=attention_mask,
                 cache=past_key_value,
                 layer_idx=layer_id,
             )
+            h_with_canon = h_with_canon + canon_c_output
+
+        normed_hidden_states = self.post_attention_layernorm(h_with_canon)
 
         mlp_output = self.mlp(
             normed_hidden_states,

@@ -6,7 +6,6 @@ import os
 import time
 import torch
 import torch.distributed as dist
-from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from contextlib import nullcontext
@@ -78,9 +77,11 @@ class BaseTrainer:
         device_type = (
             "cuda"
             if "cuda" in str(self.device)
-            else "mps" if "mps" in str(self.device) else "cpu"
+            else "mps"
+            if "mps" in str(self.device)
+            else "cpu"
         )
-        
+
         # 混合精度训练（MPS 也启用 GradScaler）
         use_grad_scaler = device_type in ("cuda", "mps") and (
             self.args.dtype in ["float16", "bfloat16"]
@@ -221,12 +222,20 @@ class BaseTrainer:
                     # 安全打印 autocast dtype
                     dev_str = str(self.device)
                     dev_type = (
-                        "cuda" if "cuda" in dev_str else "mps" if "mps" in dev_str else "cpu"
+                        "cuda"
+                        if "cuda" in dev_str
+                        else "mps"
+                        if "mps" in dev_str
+                        else "cpu"
                     )
                     try:
-                        if dev_type == "cuda" and hasattr(torch, "get_autocast_gpu_dtype"):
+                        if dev_type == "cuda" and hasattr(
+                            torch, "get_autocast_gpu_dtype"
+                        ):
                             Logger(f"Autocast dtype: {torch.get_autocast_gpu_dtype()}")
-                        elif dev_type == "cpu" and hasattr(torch, "get_autocast_cpu_dtype"):
+                        elif dev_type == "cpu" and hasattr(
+                            torch, "get_autocast_cpu_dtype"
+                        ):
                             Logger(f"Autocast dtype: {torch.get_autocast_cpu_dtype()}")
                         else:
                             Logger("Autocast dtype: n/a")
@@ -255,7 +264,9 @@ class BaseTrainer:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.args.grad_clip
                     )
-                    last_grad_norm = float(grad_norm)  # Update last calculated grad norm
+                    last_grad_norm = float(
+                        grad_norm
+                    )  # Update last calculated grad norm
 
                     if hasattr(self.optimizer, "optimizers"):
                         for opt in self.optimizer.optimizers:
@@ -314,6 +325,7 @@ class BaseTrainer:
 
     def train(self, train_loader, wandb=None):
         """主训练循环"""
+        # torch.autograd.set_detect_anomaly(True)
         iter_per_epoch = len(train_loader)
         total_training_steps = self.args.epochs * iter_per_epoch
         Logger(f"训练总步数: {total_training_steps}, 每轮步数: {iter_per_epoch}")

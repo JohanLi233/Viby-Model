@@ -155,7 +155,7 @@ class ShortConvFusedMPSFunction(torch.autograd.Function):
     """
     PyTorch autograd function for fused short convolution with MPS backend.
     
-    This function combines masking, convolution, activation, and residual connection
+    This function combines masking, convolution, and activation
     in a single fused kernel for efficiency.
     """
     
@@ -167,7 +167,6 @@ class ShortConvFusedMPSFunction(torch.autograd.Function):
         bias: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         activation: bool = True,
-        residual: bool = True,
     ) -> torch.Tensor:
         """
         Forward pass for fused short convolution.
@@ -179,10 +178,9 @@ class ShortConvFusedMPSFunction(torch.autograd.Function):
             bias: Optional bias tensor of shape (dim,)
             attention_mask: Optional attention mask of shape (batch, seqlen)
             activation: Whether to apply SiLU activation
-            residual: Whether to add residual connection
             
         Returns:
-            Output tensor of shape (batch, seqlen, dim)
+            Output tensor of shape (batch, seqlen, dim) - pure convolution result
         """
         if not torch.backends.mps.is_available():
             raise RuntimeError("MPS is not available on this device")
@@ -295,10 +293,9 @@ class ShortConvFusedMPSFunction(torch.autograd.Function):
         # Save tensors for backward pass
         ctx.save_for_backward(x, weight, bias, attention_mask)
         ctx.activation = activation
-        ctx.residual = residual
         
         # Call forward kernel
-        output = _C.short_conv_fused(x, weight, bias, attention_mask, activation, residual)
+        output = _C.short_conv_fused(x, weight, bias, attention_mask, activation)
         
         return output
 
@@ -316,7 +313,6 @@ class ShortConvFusedMPSFunction(torch.autograd.Function):
         """
         x, weight, bias, attention_mask = ctx.saved_tensors
         activation = ctx.activation
-        residual = ctx.residual
         
         # Ensure grad_output is contiguous
         grad_output = grad_output.contiguous()
@@ -324,17 +320,16 @@ class ShortConvFusedMPSFunction(torch.autograd.Function):
         # Call backward kernel
         dx, dweight, dbias = _C.short_conv_fused_bwd(
             x, weight, bias, attention_mask, 
-            grad_output, activation, residual
+            grad_output, activation
         )
         
-        # Return gradients for (x, weight, bias, attention_mask, activation, residual)
+        # Return gradients for (x, weight, bias, attention_mask, activation)
         return (
             dx,
             dweight, 
             dbias if (bias.numel() > 0) else None,
             None,  # attention_mask (no gradient needed)
             None,  # activation
-            None,  # residual
         )
 
 
@@ -354,7 +349,6 @@ class ShortConvUpdateMPSFunction(torch.autograd.Function):
         bias: Optional[torch.Tensor] = None,
         cache_seqlens: Optional[torch.Tensor] = None,
         activation: bool = True,
-        residual: bool = True,
     ) -> torch.Tensor:
         """
         Forward pass for convolution update.
@@ -367,7 +361,6 @@ class ShortConvUpdateMPSFunction(torch.autograd.Function):
             bias: Optional bias tensor of shape (dim,)
             cache_seqlens: Current sequence lengths for each batch item, shape (batch,)
             activation: Whether to apply SiLU activation
-            residual: Whether to add residual connection
             
         Returns:
             Output tensor of shape (batch, dim) - single token output
@@ -452,11 +445,10 @@ class ShortConvUpdateMPSFunction(torch.autograd.Function):
         original_conv_state = conv_state.clone()
         ctx.save_for_backward(x, original_conv_state, weight, bias, cache_seqlens)
         ctx.activation = activation
-        ctx.residual = residual
         
         # Call forward kernel (modifies conv_state in-place)
         output = _C.short_conv_update(
-            x, conv_state, weight, bias, cache_seqlens, activation, residual
+            x, conv_state, weight, bias, cache_seqlens, activation
         )
         
         return output
@@ -475,7 +467,6 @@ class ShortConvUpdateMPSFunction(torch.autograd.Function):
         """
         x, conv_state, weight, bias, cache_seqlens = ctx.saved_tensors
         activation = ctx.activation
-        residual = ctx.residual
         
         # Ensure grad_output is contiguous
         grad_output = grad_output.contiguous()
@@ -483,10 +474,10 @@ class ShortConvUpdateMPSFunction(torch.autograd.Function):
         # Call backward kernel
         dx, dconv_state, dweight, dbias = _C.short_conv_update_bwd(
             x, conv_state, weight, bias, 
-            cache_seqlens, grad_output, activation, residual
+            cache_seqlens, grad_output, activation
         )
         
-        # Return gradients for (x, conv_state, weight, bias, cache_seqlens, activation, residual)
+        # Return gradients for (x, conv_state, weight, bias, cache_seqlens, activation)
         return (
             dx,
             dconv_state,
@@ -494,7 +485,6 @@ class ShortConvUpdateMPSFunction(torch.autograd.Function):
             dbias if (bias.numel() > 0) else None,
             None,  # cache_seqlens (no gradient needed)
             None,  # activation
-            None,  # residual
         )
 
 
@@ -541,7 +531,6 @@ def short_conv_fused_fn(
     bias: Optional[torch.Tensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     activation: bool = True,
-    residual: bool = True,
 ) -> torch.Tensor:
     """
     Fused short convolution with automatic differentiation support.
@@ -552,13 +541,12 @@ def short_conv_fused_fn(
         bias: Optional bias tensor of shape (dim,)
         attention_mask: Optional attention mask of shape (batch, seqlen)
         activation: Whether to apply SiLU activation
-        residual: Whether to add residual connection
         
     Returns:
-        Output tensor of shape (batch, seqlen, dim)
+        Output tensor of shape (batch, seqlen, dim) - pure convolution result
     """
     return ShortConvFusedMPSFunction.apply(
-        x, weight, bias, attention_mask, activation, residual
+        x, weight, bias, attention_mask, activation
     )
 
 
@@ -569,7 +557,6 @@ def short_conv_update_fn(
     bias: Optional[torch.Tensor] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
     activation: bool = True,
-    residual: bool = True,
 ) -> torch.Tensor:
     """
     Convolution update with automatic differentiation support.
@@ -581,11 +568,10 @@ def short_conv_update_fn(
         bias: Optional bias tensor of shape (dim,)
         cache_seqlens: Current sequence lengths for each batch item, shape (batch,)
         activation: Whether to apply SiLU activation
-        residual: Whether to add residual connection
         
     Returns:
         Output tensor of shape (batch, dim) - single token output
     """
     return ShortConvUpdateMPSFunction.apply(
-        x, conv_state, weight, bias, cache_seqlens, activation, residual
+        x, conv_state, weight, bias, cache_seqlens, activation
     )
