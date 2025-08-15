@@ -228,7 +228,7 @@ def main():
         "--device", default="cuda" if torch.cuda.is_available() else "cpu", type=str
     )
     parser.add_argument("--hidden_size", default=640, type=int)
-    parser.add_argument("--num_hidden_layers", default=16, type=int)
+    parser.add_argument("--num_hidden_layers", default=18, type=int)
     parser.add_argument("--max_seq_len", default=1024, type=int)
     parser.add_argument("--history_cnt", default=0, type=int, help="保留的对话历史轮次数量（0代表无历史）")
     parser.add_argument(

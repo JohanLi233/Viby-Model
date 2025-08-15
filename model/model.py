@@ -27,20 +27,20 @@ class VibyConfig(PretrainedConfig):
         dropout: float = 0.0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
-        hidden_act: str = "silu",
+        hidden_act: str = "gelu_pytorch_tanh",
         hidden_size: int = 640,
-        intermediate_size: int = 1792,
+        intermediate_size: int = 2048,
         max_position_embeddings: int = 32768,
         original_max_position_embeddings: int = 1024,
-        num_attention_heads: int = 8,
-        num_hidden_layers: int = 16,
-        num_key_value_heads: int = 2,
+        num_attention_heads: int = 4,
+        num_hidden_layers: int = 18,
+        num_key_value_heads: int = 1,
         vocab_size: int = 6400,
-        rms_norm_eps: float = 1e-05,
+        rms_norm_eps: float = 1e-06,
         rope_theta: float = 1000000.0,
         rope_scaling: Optional[dict] = None,
         z_loss_factor: float = 0.0,
-        sliding_window: int = 128,
+        sliding_window: int = 512,
         canon_set: str = "ABCD",
         canon_bias: bool = False,
         canon_activation: bool = False,
@@ -922,7 +922,7 @@ class VibyBlock(nn.Module):
             )
 
         # Sliding window strategy
-        sliding_window = self.default_sliding_window if (layer_id % 2 == 0) else 0
+        sliding_window = 0 if (layer_id + 1) % 6 == 0 else self.default_sliding_window
         attn_output, present_attn_kv = self.self_attn(
             normed_hidden_states,
             position_embeddings,
