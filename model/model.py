@@ -328,7 +328,7 @@ class CanonLayer(nn.Module):
         # Fallback PyTorch implementation
         # _pytorch_step modifies conv_state in-place using x_token (which is now masked).
         output = self._pytorch_step(x_token, conv_state).unsqueeze(1)
-        return output, conv_state  # Return state
+        return x + output, conv_state  # Return state
 
     def _pytorch_step(self, x: torch.Tensor, conv_state: torch.Tensor) -> torch.Tensor:
         """PyTorch implementation of single step"""
@@ -560,7 +560,7 @@ class CanonLayer(nn.Module):
         # Convert back to (batch, seq_len, hidden_size)
         output = x_conv_output.transpose(1, 2)
 
-        return output
+        return x + output
 
 
 # (The rest of the classes: Attention, FeedForward, VibyBlock, VibyModel, VibyForCausalLM remain unchanged from the user's provided code, as the fixes were localized to CanonLayer. They are included below for completeness.)
