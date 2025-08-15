@@ -36,6 +36,7 @@ def _ensure_metal_path_env() -> None:
 
     pkg_dir = Path(__file__).resolve().parent
     candidates = [
+        pkg_dir / "causal_conv1d.metal",  # package directory (current location)
         pkg_dir.parent / "causal_conv1d.metal",  # repo layout
         Path.cwd() / "causal_conv1d.metal",  # current working dir
     ]
