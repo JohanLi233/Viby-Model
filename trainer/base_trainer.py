@@ -97,8 +97,9 @@ class BaseTrainer:
             self.ctx = torch.autocast(device_type="mps", dtype=dtype)
 
         # 创建优化器
+        use_muon_clip = getattr(self.args, 'use_muon_clip', False)
         self.optimizer = create_mixed_optimizer(
-            self.model, self.args, self.ddp, self.training_type
+            self.model, self.args, self.ddp, self.training_type, use_muon_clip
         )
 
         # 处理检查点恢复
@@ -175,7 +176,6 @@ class BaseTrainer:
         base_step_offset_for_speed = skip_steps
         valid_loss_steps = 0
         last_grad_norm = 0.0  # Store last calculated gradient norm
-        max_logit = 0.0
 
         self.model.train()
 
@@ -210,7 +210,27 @@ class BaseTrainer:
                     attention_mask=attn_mask,
                 )
                 loss = res.loss  # 使用模型返回的loss
-                max_logit = res.logits.max().item()
+                
+                # 获取真实的注意力 max logit（用于 QK-Clip）
+                attention_max_logit = 0.0
+                
+                # 更新注意力统计信息（如果启用了 MuonClip）
+                if hasattr(self.optimizer, 'apply_qk_clip'):
+                    # 获取原始模型（去掉包装）
+                    model_for_stats = self.model
+                    if hasattr(self.model, 'module'):
+                        model_for_stats = self.model.module
+                    if hasattr(model_for_stats, '_orig_mod'):
+                        model_for_stats = model_for_stats._orig_mod
+                    
+                    if hasattr(model_for_stats, 'update_attention_stats_from_forward'):
+                        # 现在这会更新并聚合 model_for_stats.attention_max_logits
+                        model_for_stats.update_attention_stats_from_forward()
+                        
+                        # [更改] 从聚合的张量中获取最大 logit 用于日志记录
+                        if hasattr(model_for_stats, 'attention_max_logits'):
+                             # 我们取当前缓冲区状态的最大值
+                             attention_max_logit = model_for_stats.attention_max_logits.max().item()
 
                 if (
                     step == 0 and epoch == self.start_epoch
@@ -268,12 +288,41 @@ class BaseTrainer:
                         grad_norm
                     )  # Update last calculated grad norm
 
+                    # 对于 MuonClip 优化器，先设置模型引用
+                    if hasattr(self.optimizer, 'apply_qk_clip'):
+                        # 获取原始模型（去掉 DDP 和 compile 包装）
+                        model_to_pass = self.model
+                        if hasattr(self.model, 'module'):
+                            model_to_pass = self.model.module
+                        if hasattr(model_to_pass, '_orig_mod'):
+                            model_to_pass = model_to_pass._orig_mod
+                        
+                        # 临时设置模型引用
+                        self.optimizer._temp_model_ref = model_to_pass
+                    
                     if hasattr(self.optimizer, "optimizers"):
                         for opt in self.optimizer.optimizers:
                             self.scaler.step(opt)
                     else:
                         self.scaler.step(self.optimizer)
                     self.scaler.update()
+
+                    # [添加] 在更新之后重置 QK-Clip 统计缓冲区
+                    if hasattr(self.optimizer, 'apply_qk_clip'):
+                        # 获取原始模型（去掉 DDP 和 compile 包装）
+                        model_to_pass = self.model
+                        if hasattr(self.model, 'module'):
+                            model_to_pass = self.model.module
+                        if hasattr(model_to_pass, '_orig_mod'):
+                            model_to_pass = model_to_pass._orig_mod
+                        
+                        if model_to_pass is not None and hasattr(model_to_pass, 'attention_max_logits'):
+                            # 将缓冲区重置为零，为下一个累积周期做准备
+                            model_to_pass.attention_max_logits.data.zero_()
+                    
+                    # 清理临时引用
+                    if hasattr(self.optimizer, '_temp_model_ref'):
+                         self.optimizer._temp_model_ref = None
                 else:
                     self.scaler.update()
 
@@ -294,6 +343,14 @@ class BaseTrainer:
                 # 使用上次计算的梯度范数
                 grad_norm_to_log = last_grad_norm
 
+                # 获取 QK-Clip 统计信息（如果使用 MuonClip 优化器）
+                qk_clip_stats = None
+                if hasattr(self.optimizer, 'qk_clip_stats'):
+                    qk_clip_stats = self.optimizer.qk_clip_stats.copy()
+
+                # 使用注意力 max logit 用于日志记录
+                logit_to_log = attention_max_logit
+                
                 log_training_progress(
                     epoch,
                     step,
@@ -304,8 +361,9 @@ class BaseTrainer:
                     self.args,
                     wandb,
                     grad_norm_to_log,
-                    max_logit,
+                    logit_to_log,
                     base_step_offset=base_step_offset_for_speed,
+                    qk_clip_stats=qk_clip_stats,
                 )
 
             # 模型保存

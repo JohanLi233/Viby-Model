@@ -45,6 +45,12 @@ def add_common_args(parser):
     )
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--max_seq_len", default=1024, type=int)
+    
+    # MuonClip 优化器相关参数
+    parser.add_argument("--use_muon_clip", action="store_true", 
+                       help="使用 MuonClip 优化器而不是标准 Muon")
+    parser.add_argument("--qk_clip_tau", type=float, default=25.0, 
+                       help="QK-Clip 阈值，默认 25.0")
 
 
 def get_pretrain_parser():

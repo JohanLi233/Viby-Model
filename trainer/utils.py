@@ -9,7 +9,12 @@ import time
 import torch
 import torch.distributed as dist
 from typing import Tuple
-from .muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
+from .muon import (
+    MuonWithAuxAdam,
+    SingleDeviceMuonWithAuxAdam,
+    MuonClip,
+    SingleDeviceMuonClip,
+)
 
 
 def Logger(content):
@@ -150,7 +155,9 @@ def load_checkpoint(checkpoint_path, model, optimizer, scaler, args):
     # 如要求重置优化器，则从step 0开始
     if getattr(args, "reset_optimizer", False):
         start_step = 0
-        Logger("reset_optimizer set: optimizer/scaler states not loaded; start_step reset to 0")
+        Logger(
+            "reset_optimizer set: optimizer/scaler states not loaded; start_step reset to 0"
+        )
 
     Logger(f"Resumed from epoch {start_epoch}, next_step {start_step}")
 
@@ -223,22 +230,23 @@ class MultiOptimizer(torch.optim.Optimizer):
             scaler.unscale_(opt)
 
 
-def create_mixed_optimizer(model, args, ddp=False, training_type="pretrain"):
+def create_mixed_optimizer(
+    model, args, ddp=False, training_type="pretrain", use_muon_clip=False
+):
     """
-    创建混合优化器 (MuonWithAuxAdam), 遵循官方示例分组
-    - Muon: 用于核心的2D权重矩阵
+    创建混合优化器，支持 MuonWithAuxAdam 或 MuonClip
+    - Muon/MuonClip: 用于核心的2D权重矩阵
     - AdamW: 用于所有其他参数 (嵌入、Canon、LayerNorm、偏置等)
+
+    参数:
+        use_muon_clip: 如果为 True, 使用 MuonClip 优化器; 否则使用标准 Muon
     """
-    Logger("正在为优化器进行参数分组 (官方 MuonWithAuxAdam 风格)...")
+    Logger("正在为优化器进行参数分组")
 
     # 统一枚举所有参数
     named_params = list(model.named_parameters())
 
-    muon_params = [
-        p
-        for _, p in named_params
-        if p.ndim >= 2
-    ]
+    muon_params = [p for _, p in named_params if p.ndim >= 2]
     muon_params_set = set(muon_params)
 
     # 2. 所有其他参数 (for AdamW)
@@ -251,8 +259,6 @@ def create_mixed_optimizer(model, args, ddp=False, training_type="pretrain"):
     # 根据官方示例创建 param_groups
     param_groups = []
 
-    # 学习率和衰减配置
-    # 官方示例为 Muon 设置了较高的 LR，为 AdamW 设置了低很多的 LR。
     if training_type == "sft":
         # 对于SFT，我们为AdamW参数使用一个非常小的学习率倍数
         adam_lr_mult = 0.015  # 0.02 * 0.015 = 3e-4, 模拟官方示例
@@ -260,9 +266,9 @@ def create_mixed_optimizer(model, args, ddp=False, training_type="pretrain"):
         adam_wd = 0.01
     else:  # pretrain
         # 预训练时，AdamW的学习率也应该远小于Muon
-        adam_lr_mult = 0.1
+        adam_lr_mult = 0.015
         muon_wd = 0.01
-        adam_wd = 0.1
+        adam_wd = 0.01
 
     # Muon 参数组
     if muon_params:
@@ -270,7 +276,7 @@ def create_mixed_optimizer(model, args, ddp=False, training_type="pretrain"):
             dict(
                 params=muon_params,
                 use_muon=True,
-                lr=args.learning_rate,  # Muon 使用基础学习率 (e.g., 0.02)
+                lr=args.learning_rate,  # Muon 使用基础学习率 (e.g., 0.01)
                 momentum=0.95,
                 weight_decay=muon_wd,
             )
@@ -292,11 +298,25 @@ def create_mixed_optimizer(model, args, ddp=False, training_type="pretrain"):
     if not param_groups:
         raise ValueError("没有创建任何参数组，请检查模型和参数分组逻辑")
 
-    # 根据 DDP 状态选择合适的优化器
-    if ddp:
-        optimizer = MuonWithAuxAdam(param_groups)
+    # 根据 DDP 状态和优化器类型选择合适的优化器
+    if use_muon_clip:
+        # 使用 MuonClip 优化器
+        tau = getattr(args, "qk_clip_tau", 25.0)  # 默认 tau = 25.0
+        if ddp:
+            optimizer = MuonClip(param_groups, tau=tau)
+        else:
+            optimizer = SingleDeviceMuonClip(param_groups, tau=tau)
+
+        # 启用模型的注意力统计信息收集
+        if hasattr(model, "enable_attention_stats_collection"):
+            model.enable_attention_stats_collection()
+            Logger(f"已启用注意力统计信息收集，QK-Clip 阈值: {tau}")
     else:
-        optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+        # 使用标准 Muon 优化器
+        if ddp:
+            optimizer = MuonWithAuxAdam(param_groups)
+        else:
+            optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
 
     # 为学习率调度器存储初始学习率
     Logger("为学习率调度器存储初始学习率...")
@@ -337,6 +357,7 @@ def log_training_progress(
     grad_norm=0.0,
     max_logit=0.0,
     base_step_offset: int = 0,
+    qk_clip_stats=None,
 ):
     """统一的训练进度日志记录"""
     spend_time = time.time() - start_time
@@ -345,31 +366,38 @@ def log_training_progress(
     steps_per_sec = effective_steps_done / spend_time if spend_time > 0 else 0.0
     tokens_per_sec = steps_per_sec * args.batch_size * args.max_seq_len
 
-    Logger(
-        "Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.2e} grad_norm:{:.3f} max_logit:{:.3f} step/s:{:.2f} tokens/s:{:.0f} eta:{}min".format(
-            epoch + 1,
-            args.epochs,
-            step,
-            iter_per_epoch,
-            current_loss,
-            optimizer.param_groups[-1]["lr"],
-            grad_norm,
-            max_logit,
-            steps_per_sec,
-            tokens_per_sec,
-            int((iter_per_epoch - step - 1) / max(steps_per_sec, 1e-8) / 60),
-        )
+    # 构建基本日志信息
+    log_msg = "Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.2e} grad_norm:{:.3f} max_logit:{:.3f} step/s:{:.2f} tokens/s:{:.0f} eta:{}min".format(
+        epoch + 1,
+        args.epochs,
+        step,
+        iter_per_epoch,
+        current_loss,
+        optimizer.param_groups[-1]["lr"],
+        grad_norm,
+        max_logit,
+        steps_per_sec,
+        tokens_per_sec,
+        int((iter_per_epoch - step - 1) / max(steps_per_sec, 1e-8) / 60),
     )
 
+    # 添加 QK-Clip 统计信息（如果可用）
+    if qk_clip_stats is not None:
+        activations = qk_clip_stats.get("current_step_activations", 0)
+        if activations > 0:
+            log_msg += f" QK-Clip: {activations} activated"
+
+    Logger(log_msg)
+
     if wandb is not None:
-        wandb.log(
-            {
-                "loss": current_loss,
-                "lr": optimizer.param_groups[-1]["lr"],
-                "steps_per_sec": steps_per_sec,
-                "tokens_per_sec": tokens_per_sec,
-                "grad_norm": grad_norm,
-                "max_logit": max_logit,
-                "epoch": epoch + 1,
-            }
-        )
+        log_dict = {
+            "loss": current_loss,
+            "lr": optimizer.param_groups[-1]["lr"],
+            "steps_per_sec": steps_per_sec,
+            "tokens_per_sec": tokens_per_sec,
+            "grad_norm": grad_norm,
+            "max_logit": max_logit,
+            "epoch": epoch + 1,
+        }
+
+        wandb.log(log_dict)

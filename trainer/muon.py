@@ -149,6 +149,377 @@ class SingleDeviceMuon(torch.optim.Optimizer):
         return loss
 
 
+class MuonClip(torch.optim.Optimizer):
+    """
+    MuonClip - Muon + QK-Clip 优化器，结合了 Muon 优化器的高效性与 QK-Clip 机制的稳定性
+    
+    基于 Kimi K2 技术报告的实现，通过监控注意力 logits 并在超过阈值时重新缩放
+    查询和键的投影权重来防止注意力 logit 爆炸，确保训练稳定性。
+    
+    参数:
+        param_groups: 参数组列表，包含 use_muon 标志
+        tau: QK-Clip 阈值，默认 25.0
+    """
+
+    def __init__(self, param_groups, tau=25.0):
+        # 首先验证和设置参数组
+        for group in param_groups:
+            assert "use_muon" in group
+            if group["use_muon"]:
+                group["params"] = sorted(
+                    group["params"], key=lambda x: x.size(), reverse=True
+                )
+                # 默认值
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(
+                    ["params", "lr", "momentum", "weight_decay", "use_muon"]
+                )
+            else:
+                # 默认值
+                group["lr"] = group.get("lr", 3e-4)
+                group["betas"] = group.get("betas", (0.9, 0.95))
+                group["eps"] = group.get("eps", 1e-10)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(
+                    ["params", "lr", "betas", "eps", "weight_decay", "use_muon"]
+                )
+        
+        super().__init__(param_groups, dict())
+        self.tau = tau
+        self.qk_clip_stats = {
+            'current_step_activations': 0,  # 当前步骤的激活次数
+            'current_step_checks': 0,  # 当前步骤的检查次数
+        }
+        self._temp_model_ref = None  # 临时模型引用
+        
+    def apply_qk_clip(self, model):
+        """
+        Fully vectorized QK-Clip mechanism for improved efficiency.
+        """
+        if not hasattr(model, 'attention_max_logits') or model.attention_max_logits is None:
+            return
+
+        max_logits_tensor = model.attention_max_logits  # (num_layers, num_heads)
+
+        # DDP Synchronization: Ensure all ranks use the global maximum logit.
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(max_logits_tensor, op=dist.ReduceOp.MAX)
+
+        tau = self.tau
+        tau_tensor = torch.tensor(tau, device=max_logits_tensor.device, dtype=max_logits_tensor.dtype)
+
+        # Vectorized Scaling Calculation
+        # Ensure numerical stability. Clamp logits to a small positive value.
+        stable_logits = torch.clamp(max_logits_tensor, min=1e-6)
+
+        # Calculate potential scaling factors: sqrt(tau / logits)
+        all_scaling_factors = torch.sqrt(tau_tensor / stable_logits)
+        
+        # Cap the scaling factors at 1.0 (We only scale down).
+        all_scaling_factors = torch.clamp(all_scaling_factors, max=1.0)
+
+        # Statistics Collection
+        # Identify how many heads required scaling (activation)
+        activations = (all_scaling_factors < (1.0 - 1e-7)).sum().item()
+        total_checks = max_logits_tensor.numel()
+        
+        self.qk_clip_stats['current_step_activations'] += activations
+        self.qk_clip_stats['current_step_checks'] += total_checks
+
+        if activations == 0:
+            return
+
+        # Vectorized Weight Update
+        with torch.no_grad():
+            for layer_idx, layer in enumerate(model.model.layers):
+                attention = layer.self_attn
+                H_D = attention.head_dim
+                H_Q = attention.n_local_heads
+                H_KV = attention.n_local_kv_heads
+                N_rep = attention.n_rep
+
+                # Get the scaling factors for Q heads in this layer
+                q_scaling = all_scaling_factors[layer_idx, :H_Q] # (H_Q,)
+
+                # Optimization: Skip layer if no scaling is needed
+                if (q_scaling == 1.0).all():
+                    continue
+
+                # Vectorized Q Scaling
+                # Expand scaling factors: (H_Q,) -> (H_Q*H_D,)
+                # Using expand is memory-efficient as it uses strides instead of copying data.
+                # (H_Q, 1) -> expand to (H_Q, H_D) -> reshape to (H_Q*H_D,)
+                q_scaling_expanded = q_scaling.unsqueeze(1).expand(-1, H_D).reshape(-1)
+                
+                # Apply scaling using broadcasting: weight *= scaling_vector.unsqueeze(1)
+                q_weight_dtype = attention.q_proj.weight.dtype
+                # Use .data for in-place modification within no_grad context
+                attention.q_proj.weight.data *= q_scaling_expanded.unsqueeze(1).to(q_weight_dtype)
+
+                # Vectorized K Scaling (GQA aggregation)
+                
+                if N_rep > 1:
+                    # Reshape Q scaling factors: (H_Q,) -> (H_KV, N_rep)
+                    q_scaling_grouped = q_scaling.view(H_KV, N_rep)
+                    # Aggregate using min (find the most aggressive scaling needed in the group)
+                    # .values extracts the tensor from the named tuple returned by torch.min
+                    k_scaling = torch.min(q_scaling_grouped, dim=1).values # (H_KV,)
+                else:
+                    # MHA case (N_rep == 1)
+                    k_scaling = q_scaling
+
+                # Expand K scaling factors: (H_KV,) -> (H_KV*H_D,)
+                k_scaling_expanded = k_scaling.unsqueeze(1).expand(-1, H_D).reshape(-1)
+
+                # Apply scaling
+                k_weight_dtype = attention.k_proj.weight.dtype
+                attention.k_proj.weight.data *= k_scaling_expanded.unsqueeze(1).to(k_weight_dtype)
+
+    @torch.no_grad()
+    def step(self, closure=None, model=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        # 重置当前步骤的统计
+        self.qk_clip_stats['current_step_activations'] = 0
+        self.qk_clip_stats['current_step_checks'] = 0
+        
+        # 使用临时设置的模型引用（如果可用）
+        if model is None and hasattr(self, '_temp_model_ref') and self._temp_model_ref is not None:
+            model = self._temp_model_ref
+
+        # 第一步：执行标准的 Muon/Adam 更新
+        for group in self.param_groups:
+            if group["use_muon"]:
+                params = group["params"]
+                params_pad = params + [torch.empty_like(params[-1])] * (
+                    dist.get_world_size() - len(params) % dist.get_world_size()
+                )
+                for base_i in range(len(params))[:: dist.get_world_size()]:
+                    if base_i + dist.get_rank() < len(params):
+                        p = params[base_i + dist.get_rank()]
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(p)  
+                        state = self.state[p]
+                        if len(state) == 0:
+                            state["momentum_buffer"] = torch.zeros_like(p)
+                        update = muon_update(
+                            p.grad,
+                            state["momentum_buffer"],
+                            beta=group["momentum"],
+                            nesterov=True,
+                        )
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                    dist.all_gather(
+                        params_pad[base_i : base_i + dist.get_world_size()],
+                        params_pad[base_i + dist.get_rank()],
+                    )
+            else:
+                for p in group["params"]:
+                    if p.grad is None:
+                        p.grad = torch.zeros_like(p) 
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = 0
+                    state["step"] += 1
+                    update = adam_update(
+                        p.grad,
+                        state["exp_avg"],
+                        state["exp_avg_sq"],
+                        state["step"],
+                        group["betas"],
+                        group["eps"],
+                    )
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+        
+        # 第二步：应用 QK-Clip 机制
+        if model is not None:
+            self.apply_qk_clip(model)
+
+        return loss
+
+
+class SingleDeviceMuonClip(torch.optim.Optimizer):
+    """
+    MuonClip 的单设备版本，用于非分布式训练
+    """
+
+    def __init__(self, param_groups, tau=25.0):
+        for group in param_groups:
+            assert "use_muon" in group
+            if group["use_muon"]:
+                # 默认值
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(
+                    ["params", "lr", "momentum", "weight_decay", "use_muon"]
+                )
+            else:
+                # 默认值
+                group["lr"] = group.get("lr", 3e-4)
+                group["betas"] = group.get("betas", (0.9, 0.95))
+                group["eps"] = group.get("eps", 1e-10)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(
+                    ["params", "lr", "betas", "eps", "weight_decay", "use_muon"]
+                )
+        
+        super().__init__(param_groups, dict())
+        self.tau = tau
+        self.qk_clip_stats = {
+            'current_step_activations': 0,  # 当前步骤的激活次数
+            'current_step_checks': 0,  # 当前步骤的检查次数
+        }
+        self._temp_model_ref = None  # 临时模型引用
+
+    def apply_qk_clip(self, model):
+        """
+        Fully vectorized QK-Clip mechanism for improved efficiency.
+        """
+        if not hasattr(model, 'attention_max_logits') or model.attention_max_logits is None:
+            return
+
+        max_logits_tensor = model.attention_max_logits  # (num_layers, num_heads)
+
+        tau = self.tau
+        tau_tensor = torch.tensor(tau, device=max_logits_tensor.device, dtype=max_logits_tensor.dtype)
+
+        # Vectorized Scaling Calculation
+        # Ensure numerical stability. Clamp logits to a small positive value.
+        stable_logits = torch.clamp(max_logits_tensor, min=1e-6)
+
+        # Calculate potential scaling factors: sqrt(tau / logits)
+        all_scaling_factors = torch.sqrt(tau_tensor / stable_logits)
+        
+        # Cap the scaling factors at 1.0 (We only scale down).
+        all_scaling_factors = torch.clamp(all_scaling_factors, max=1.0)
+
+        # Statistics Collection
+        # Identify how many heads required scaling (activation)
+        activations = (all_scaling_factors < (1.0 - 1e-7)).sum().item()
+        total_checks = max_logits_tensor.numel()
+        
+        self.qk_clip_stats['current_step_activations'] += activations
+        self.qk_clip_stats['current_step_checks'] += total_checks
+
+        if activations == 0:
+            return
+
+        # Vectorized Weight Update
+        with torch.no_grad():
+            for layer_idx, layer in enumerate(model.model.layers):
+                attention = layer.self_attn
+                H_D = attention.head_dim
+                H_Q = attention.n_local_heads
+                H_KV = attention.n_local_kv_heads
+                N_rep = attention.n_rep
+
+                # Get the scaling factors for Q heads in this layer
+                q_scaling = all_scaling_factors[layer_idx, :H_Q] # (H_Q,)
+
+                # Optimization: Skip layer if no scaling is needed
+                if (q_scaling == 1.0).all():
+                    continue
+
+                # Vectorized Q Scaling
+                # Expand scaling factors: (H_Q,) -> (H_Q*H_D,)
+                # Using expand is memory-efficient as it uses strides instead of copying data.
+                # (H_Q, 1) -> expand to (H_Q, H_D) -> reshape to (H_Q*H_D,)
+                q_scaling_expanded = q_scaling.unsqueeze(1).expand(-1, H_D).reshape(-1)
+                
+                # Apply scaling using broadcasting: weight *= scaling_vector.unsqueeze(1)
+                q_weight_dtype = attention.q_proj.weight.dtype
+                # Use .data for in-place modification within no_grad context
+                attention.q_proj.weight.data *= q_scaling_expanded.unsqueeze(1).to(q_weight_dtype)
+
+                # Vectorized K Scaling (GQA aggregation)
+                
+                if N_rep > 1:
+                    # Reshape Q scaling factors: (H_Q,) -> (H_KV, N_rep)
+                    q_scaling_grouped = q_scaling.view(H_KV, N_rep)
+                    # Aggregate using min (find the most aggressive scaling needed in the group)
+                    # .values extracts the tensor from the named tuple returned by torch.min
+                    k_scaling = torch.min(q_scaling_grouped, dim=1).values # (H_KV,)
+                else:
+                    # MHA case (N_rep == 1)
+                    k_scaling = q_scaling
+
+                # Expand K scaling factors: (H_KV,) -> (H_KV*H_D,)
+                k_scaling_expanded = k_scaling.unsqueeze(1).expand(-1, H_D).reshape(-1)
+
+                # Apply scaling
+                k_weight_dtype = attention.k_proj.weight.dtype
+                attention.k_proj.weight.data *= k_scaling_expanded.unsqueeze(1).to(k_weight_dtype)
+
+    @torch.no_grad()
+    def step(self, closure=None, model=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        # 重置当前步骤的统计
+        self.qk_clip_stats['current_step_activations'] = 0
+        self.qk_clip_stats['current_step_checks'] = 0
+        
+        # 使用临时设置的模型引用（如果可用）
+        if model is None and hasattr(self, '_temp_model_ref') and self._temp_model_ref is not None:
+            model = self._temp_model_ref
+
+        # 第一步：执行标准的 Muon/Adam 更新
+        for group in self.param_groups:
+            if group["use_muon"]:
+                for p in group["params"]:
+                    if p.grad is None:
+                        p.grad = torch.zeros_like(p) 
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                    update = muon_update(
+                        p.grad,
+                        state["momentum_buffer"],
+                        beta=group["momentum"],
+                        nesterov=True,
+                    )
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+            else:
+                for p in group["params"]:
+                    if p.grad is None:
+                        p.grad = torch.zeros_like(p) 
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = 0
+                    state["step"] += 1
+                    update = adam_update(
+                        p.grad,
+                        state["exp_avg"],
+                        state["exp_avg_sq"],
+                        state["step"],
+                        group["betas"],
+                        group["eps"],
+                    )
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+        
+        # 第二步：应用 QK-Clip 机制
+        if model is not None:
+            self.apply_qk_clip(model)
+
+        return loss
+
+
 def adam_update(grad, buf1, buf2, step, betas, eps):
     buf1.lerp_(grad, 1 - betas[0])
     buf2.lerp_(grad.square(), 1 - betas[1])

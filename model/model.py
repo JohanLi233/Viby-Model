@@ -305,6 +305,7 @@ class CanonLayer(nn.Module):
                     bias=self.bias_param,
                     cache_seqlens=cache_seqlens,
                     activation=self.activation,
+                    residual=True,
                 )
                 # Increment seqlens for next step
                 if cache is not None and layer_idx is not None:
@@ -419,6 +420,7 @@ class CanonLayer(nn.Module):
                     bias=self.bias_param,
                     attention_mask=processed_attention_mask,
                     activation=self.activation,
+                    residual=True,
                 )
 
                 # [FIX] Update cache state for prefill stage
@@ -621,6 +623,18 @@ class Attention(nn.Module):
             self.canon_b = CanonLayer(total_dim, args, name="b")
         else:
             self.canon_b = None
+            
+        # QK-Clip: 标志是否收集注意力统计信息
+        self._collect_attention_stats = False
+    
+    
+    def enable_attention_stats_collection(self):
+        """启用注意力统计信息收集"""
+        self._collect_attention_stats = True
+    
+    def disable_attention_stats_collection(self):
+        """禁用注意力统计信息收集"""
+        self._collect_attention_stats = False
 
     def forward(
         self,
@@ -655,13 +669,12 @@ class Attention(nn.Module):
             )  # (B, T, total_dim)
 
             # Apply Canon B with HF Cache
-            canon_b_output = self.canon_b(
+            qkv_processed = self.canon_b(
                 qkv_concat,
                 attention_mask=attention_mask,
                 cache=past_key_value,
                 layer_idx=layer_idx,
             )
-            qkv_processed = qkv_concat + canon_b_output
 
             # Split back to Q, K, V
             q_dim = self.n_local_heads * self.head_dim
@@ -695,19 +708,33 @@ class Attention(nn.Module):
         key = repeat_kv(xk, self.n_rep)
         value = repeat_kv(xv, self.n_rep)
 
-        # (The attention calculation logic remains the same as the original prompt)
-
         # Dropout 概率（与 F.sdpa 语义一致，只在训练时生效）
         dropout_p = self.dropout if self.training else 0.0
 
         # YaRN 温度缩放：等价于对 Q 做温度缩放
         if self.attn_softmax_temp != 1.0:
-            xq = xq / self.attn_softmax_temp
+            temp_scale = torch.tensor(self.attn_softmax_temp, dtype=xq.dtype, device=xq.device)
+            xq = xq / temp_scale
 
         # 手写 attention：QK^T / sqrt(d)
         d = self.head_dim
-        scale = 1.0 / math.sqrt(d)
+        # 确保 scale 与张量有相同的数据类型和设备
+        scale = torch.tensor(1.0 / math.sqrt(d), dtype=xq.dtype, device=xq.device)
         attn_scores = torch.einsum("bhqd,bhkd->bhqk", xq, key) * scale
+        
+        # QK-Clip: 计算并存储每个头的最大 logit 值
+        # 注意：为了与 torch.compile 兼容，我们延迟统计收集到训练循环中
+        if layer_idx is not None and getattr(self, '_collect_attention_stats', False):
+            # 获取当前批次中每个头的最大 logit
+            # FIX: Cast to float32 before max to avoid inductor bug on MPS with bfloat16
+            max_logits_per_head = torch.max(attn_scores.view(bsz, self.n_local_heads, -1).to(torch.float32), dim=-1)[0]
+            batch_max_logits = torch.max(max_logits_per_head, dim=0)[0]  # (n_local_heads,)
+            
+            # 存储到模型属性中，供后续使用（避免在编译图中处理）
+            self._current_attention_logits = {
+                'layer_idx': layer_idx,
+                'max_logits': batch_max_logits
+            }
 
         # 始终应用因果掩码（decoder-only）
         tq = attn_scores.size(-2)
@@ -828,13 +855,12 @@ class FeedForward(nn.Module):
         # Apply Canon D if enabled
         if self.canon_d is not None and layer_idx is not None:
             gate_up_concat = torch.cat([gated, up], dim=-1)
-            canon_d_output = self.canon_d(
+            gate_up_processed = self.canon_d(
                 gate_up_concat,
                 attention_mask=attention_mask,
                 cache=cache,
                 layer_idx=layer_idx,
             )
-            gate_up_processed = gate_up_concat + canon_d_output
             # Split back
             gated = gate_up_processed[..., : gated.shape[-1]]
             up = gate_up_processed[..., gated.shape[-1] :]
@@ -883,19 +909,17 @@ class VibyBlock(nn.Module):
     ):
         residual = hidden_states
 
-        # Apply Canon A before normalization if enabled
-        h_with_canon = hidden_states
+        # Pre-attention processing - normalize first
+        normed_hidden_states = self.input_layernorm(hidden_states)
+        
+        # Apply Canon A after normalization if enabled
         if self.canon_a is not None:
-            canon_a_output = self.canon_a(
-                hidden_states,
+            normed_hidden_states = self.canon_a(
+                normed_hidden_states,
                 attention_mask=attention_mask,
                 cache=past_key_value,
                 layer_idx=layer_id,
             )
-            h_with_canon = h_with_canon + canon_a_output
-
-        # Pre-attention processing - normalize the canon-modified hidden states
-        normed_hidden_states = self.input_layernorm(h_with_canon)
 
         # Sliding window strategy
         sliding_window = self.default_sliding_window if (layer_id % 2 == 0) else 0
@@ -913,18 +937,17 @@ class VibyBlock(nn.Module):
         # Pre-MLP processing
         residual = hidden_states
 
-        # Apply Canon C before normalization if enabled
-        h_with_canon = hidden_states
+        # Normalize first
+        normed_hidden_states = self.post_attention_layernorm(hidden_states)
+        
+        # Apply Canon C after normalization if enabled
         if self.canon_c is not None:
-            canon_c_output = self.canon_c(
-                hidden_states,
+            normed_hidden_states = self.canon_c(
+                normed_hidden_states,
                 attention_mask=attention_mask,
                 cache=past_key_value,
                 layer_idx=layer_id,
             )
-            h_with_canon = h_with_canon + canon_c_output
-
-        normed_hidden_states = self.post_attention_layernorm(h_with_canon)
 
         mlp_output = self.mlp(
             normed_hidden_states,
@@ -1044,12 +1067,102 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
         # Tie weights
         self.model.embed_tokens.weight = self.lm_head.weight
 
+        # 为 MuonClip 优化器初始化 QK-Clip 统计缓冲区
+        # 形状: (num_layers, num_heads)。使用 float32 以保证精度和稳定性。
+        self.register_buffer(
+            "attention_max_logits",
+            torch.zeros(
+                (config.num_hidden_layers, config.num_attention_heads),
+                dtype=torch.float32
+            ),
+            persistent=False # 不保存到checkpoint
+        )
+
         # Initialize canon layers if present
         self.apply(self._init_canon_layers)
 
     def _init_canon_layers(self, module):
         if isinstance(module, CanonLayer):
             module.reset_parameters()
+    
+    def enable_attention_stats_collection(self):
+        """为所有注意力层启用统计信息收集"""
+        # 初始化全局统计存储
+        self.attention_logit_stats = {}
+        
+        for layer in self.model.layers:
+            layer.self_attn.enable_attention_stats_collection()
+            # 设置统计收集回调
+            layer.self_attn._stats_callback = self._collect_attention_stats
+    
+    def disable_attention_stats_collection(self):
+        """为所有注意力层禁用统计信息收集"""
+        for layer in self.model.layers:
+            layer.self_attn.disable_attention_stats_collection()
+            if hasattr(layer.self_attn, '_stats_callback'):
+                delattr(layer.self_attn, '_stats_callback')
+    
+    def _collect_attention_stats(self, layer_idx, stats):
+        """收集注意力统计信息的回调函数"""
+        if not hasattr(self, 'attention_logit_stats'):
+            self.attention_logit_stats = {}
+        
+        layer_key = f'layer_{layer_idx}'
+        self.attention_logit_stats[layer_key] = stats
+    
+    def get_attention_stats(self):
+        """获取注意力统计信息"""
+        if not hasattr(self, 'attention_logit_stats'):
+            self.attention_logit_stats = {}
+        return self.attention_logit_stats
+    
+    def update_attention_stats_from_forward(self):
+        """
+        为 QK-Clip 更新和聚合注意力统计数据（最大logits）。
+        """
+        if not hasattr(self, 'attention_max_logits'):
+            return
+
+        current_batch_max_logits = []
+        
+        # 从各层收集统计数据
+        for layer_idx, layer in enumerate(self.model.layers):
+            attention = layer.self_attn
+            if hasattr(attention, '_current_attention_logits'):
+                logit_info = attention._current_attention_logits
+                if logit_info['layer_idx'] == layer_idx:
+                    # 分离并确保为 float32
+                    max_logits = logit_info['max_logits'].detach().to(torch.float32)
+                    current_batch_max_logits.append(max_logits)
+
+        if current_batch_max_logits:
+            # 堆叠成一个张量 (num_layers, num_heads)
+            batch_stats_tensor = torch.stack(current_batch_max_logits, dim=0).to(self.attention_max_logits.device)
+            
+            # 关键：使用 torch.maximum 进行梯度累积聚合。
+            # 使用 .data 对缓冲区进行原地更新，而不跟踪 autograd。
+            self.attention_max_logits.data = torch.maximum(
+                self.attention_max_logits.data,
+                batch_stats_tensor
+            )
+
+            # 向后兼容：同时更新字典格式的统计信息用于日志记录
+            if not hasattr(self, 'attention_logit_stats'):
+                self.attention_logit_stats = {}
+            
+            for layer_idx, max_logits in enumerate(current_batch_max_logits):
+                layer_key = f'layer_{layer_idx}'
+                if layer_key not in self.attention_logit_stats:
+                    self.attention_logit_stats[layer_key] = {}
+                
+                for head_idx in range(len(max_logits)):
+                    head_key = f'head_{head_idx}'
+                    self.attention_logit_stats[layer_key][head_key] = max_logits[head_idx].item()
+
+        # 清理注意力模块上的临时存储
+        for layer in self.model.layers:
+             if hasattr(layer.self_attn, '_current_attention_logits'):
+                 delattr(layer.self_attn, '_current_attention_logits')
 
     def forward(
         self,
