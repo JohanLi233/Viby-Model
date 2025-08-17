@@ -57,7 +57,9 @@ def get_lr_and_momentum(
         progress = float(step - warmup_steps) / float(
             max(1, total_steps - warmup_steps)
         )
-        lr_multiplier = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # 设置最小学习率为峰值的10%，而不是衰减到0
+        min_lr_ratio = 0.1
+        lr_multiplier = min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
     # --- 动量调度 (仅用于Muon) ---
     momentum = final_momentum

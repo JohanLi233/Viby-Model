@@ -611,8 +611,8 @@ class Attention(nn.Module):
         self.sliding_window_default = args.sliding_window
 
         # QK normalization layers (like Qwen3)
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        # self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        # self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
         # Canon B layer for QKV projections
         if "B" in args.canon_set:
@@ -653,8 +653,8 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
-        xq = self.q_norm(xq)
-        xk = self.k_norm(xk)
+        # xq = self.q_norm(xq)
+        # xk = self.k_norm(xk)
 
         # Apply Canon B if enabled
         if self.canon_b is not None and layer_idx is not None:
