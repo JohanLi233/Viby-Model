@@ -9,22 +9,13 @@ from transformers import PreTrainedModel, GenerationMixin  # type: ignore
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache, DynamicCache
 
-# Try CUDA version first, then fall back to MPS version
 try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update  # type: ignore
-
-    HAS_CAUSAL_CONV1D_CUDA = True
-    HAS_CAUSAL_CONV1D_MPS = False
+    from causal_conv1d_mps import short_conv_fused, short_conv_update  # type: ignore
+    HAS_CAUSAL_CONV1D_MPS = True
 except ImportError:
-    HAS_CAUSAL_CONV1D_CUDA = False
-    try:
-        from causal_conv1d_mps import causal_conv1d_fn, causal_conv1d_update  # type: ignore
-
-        HAS_CAUSAL_CONV1D_MPS = True
-    except ImportError:
-        HAS_CAUSAL_CONV1D_MPS = False
-        causal_conv1d_fn = None
-        causal_conv1d_update = None
+    HAS_CAUSAL_CONV1D_MPS = False
+    short_conv_fused = None
+    short_conv_update = None
 
 
 class VibyConfig(PretrainedConfig):
@@ -289,7 +280,7 @@ class CanonLayer(nn.Module):
         if (
             HAS_CAUSAL_CONV1D_MPS
             and x.device.type == "mps"
-            and causal_conv1d_update is not None
+            and short_conv_update is not None
             and self.kernel_size == 4
         ):
             try:
@@ -306,13 +297,14 @@ class CanonLayer(nn.Module):
                     cache_seqlens = torch.zeros(
                         batch_size, dtype=torch.int32, device=x.device
                     )
-                output = causal_conv1d_update(
+                output = short_conv_update(
                     x=x_token,  # Use the masked token
                     conv_state=conv_state,
                     weight=self.weight.squeeze(1),
                     bias=self.bias_param,
-                    activation="silu" if self.activation else None,
                     cache_seqlens=cache_seqlens,
+                    activation=self.activation,
+                    residual=True,
                 )
                 # Increment seqlens for next step
                 if cache is not None and layer_idx is not None:
@@ -421,16 +413,14 @@ class CanonLayer(nn.Module):
                     processed_attention_mask = processed_attention_mask.to(
                         device=x.device
                     )
-                # Convert to (batch, dim, seqlen) format for causal_conv1d_fn
-                x_transposed = x.transpose(1, 2)
-                output = causal_conv1d_fn(
-                    x=x_transposed,
+                output = short_conv_fused(
+                    x=x,
                     weight=self.weight.squeeze(1),
                     bias=self.bias_param,
-                    activation="silu" if self.activation else None,
+                    attention_mask=processed_attention_mask,
+                    activation=self.activation,
+                    residual=True,
                 )
-                # Convert back to (batch, seqlen, dim) and add residual
-                output = output.transpose(1, 2) + x
 
                 # [FIX] Update cache state for prefill stage
                 if cache is not None and layer_idx is not None:
@@ -632,14 +622,15 @@ class Attention(nn.Module):
             self.canon_b = CanonLayer(total_dim, args, name="b")
         else:
             self.canon_b = None
-
+            
         # QK-Clip: 标志是否收集注意力统计信息
         self._collect_attention_stats = False
-
+    
+    
     def enable_attention_stats_collection(self):
         """启用注意力统计信息收集"""
         self._collect_attention_stats = True
-
+    
     def disable_attention_stats_collection(self):
         """禁用注意力统计信息收集"""
         self._collect_attention_stats = False
@@ -721,9 +712,7 @@ class Attention(nn.Module):
 
         # YaRN 温度缩放：等价于对 Q 做温度缩放
         if self.attn_softmax_temp != 1.0:
-            temp_scale = torch.tensor(
-                self.attn_softmax_temp, dtype=xq.dtype, device=xq.device
-            )
+            temp_scale = torch.tensor(self.attn_softmax_temp, dtype=xq.dtype, device=xq.device)
             xq = xq / temp_scale
 
         # 手写 attention：QK^T / sqrt(d)
@@ -731,23 +720,19 @@ class Attention(nn.Module):
         # 确保 scale 与张量有相同的数据类型和设备
         scale = torch.tensor(1.0 / math.sqrt(d), dtype=xq.dtype, device=xq.device)
         attn_scores = torch.einsum("bhqd,bhkd->bhqk", xq, key) * scale
-
+        
         # QK-Clip: 计算并存储每个头的最大 logit 值
         # 注意：为了与 torch.compile 兼容，我们延迟统计收集到训练循环中
-        if layer_idx is not None and getattr(self, "_collect_attention_stats", False):
+        if layer_idx is not None and getattr(self, '_collect_attention_stats', False):
             # 获取当前批次中每个头的最大 logit
             # FIX: Cast to float32 before max to avoid inductor bug on MPS with bfloat16
-            max_logits_per_head = torch.max(
-                attn_scores.view(bsz, self.n_local_heads, -1).to(torch.float32), dim=-1
-            )[0]
-            batch_max_logits = torch.max(max_logits_per_head, dim=0)[
-                0
-            ]  # (n_local_heads,)
-
+            max_logits_per_head = torch.max(attn_scores.view(bsz, self.n_local_heads, -1).to(torch.float32), dim=-1)[0]
+            batch_max_logits = torch.max(max_logits_per_head, dim=0)[0]  # (n_local_heads,)
+            
             # 存储到模型属性中，供后续使用（避免在编译图中处理）
             self._current_attention_logits = {
-                "layer_idx": layer_idx,
-                "max_logits": batch_max_logits,
+                'layer_idx': layer_idx,
+                'max_logits': batch_max_logits
             }
 
         # 始终应用因果掩码（decoder-only）
@@ -925,7 +910,7 @@ class VibyBlock(nn.Module):
 
         # Pre-attention processing - normalize first
         normed_hidden_states = self.input_layernorm(hidden_states)
-
+        
         # Apply Canon A after normalization if enabled
         if self.canon_a is not None:
             normed_hidden_states = self.canon_a(
@@ -953,7 +938,7 @@ class VibyBlock(nn.Module):
 
         # Normalize first
         normed_hidden_states = self.post_attention_layernorm(hidden_states)
-
+        
         # Apply Canon C after normalization if enabled
         if self.canon_c is not None:
             normed_hidden_states = self.canon_c(
@@ -1087,9 +1072,9 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
             "attention_max_logits",
             torch.zeros(
                 (config.num_hidden_layers, config.num_attention_heads),
-                dtype=torch.float32,
+                dtype=torch.float32
             ),
-            persistent=False,  # 不保存到checkpoint
+            persistent=False # 不保存到checkpoint
         )
 
         # Initialize canon layers if present
@@ -1098,88 +1083,85 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
     def _init_canon_layers(self, module):
         if isinstance(module, CanonLayer):
             module.reset_parameters()
-
+    
     def enable_attention_stats_collection(self):
         """为所有注意力层启用统计信息收集"""
         # 初始化全局统计存储
         self.attention_logit_stats = {}
-
+        
         for layer in self.model.layers:
             layer.self_attn.enable_attention_stats_collection()
             # 设置统计收集回调
             layer.self_attn._stats_callback = self._collect_attention_stats
-
+    
     def disable_attention_stats_collection(self):
         """为所有注意力层禁用统计信息收集"""
         for layer in self.model.layers:
             layer.self_attn.disable_attention_stats_collection()
-            if hasattr(layer.self_attn, "_stats_callback"):
-                delattr(layer.self_attn, "_stats_callback")
-
+            if hasattr(layer.self_attn, '_stats_callback'):
+                delattr(layer.self_attn, '_stats_callback')
+    
     def _collect_attention_stats(self, layer_idx, stats):
         """收集注意力统计信息的回调函数"""
-        if not hasattr(self, "attention_logit_stats"):
+        if not hasattr(self, 'attention_logit_stats'):
             self.attention_logit_stats = {}
-
-        layer_key = f"layer_{layer_idx}"
+        
+        layer_key = f'layer_{layer_idx}'
         self.attention_logit_stats[layer_key] = stats
-
+    
     def get_attention_stats(self):
         """获取注意力统计信息"""
-        if not hasattr(self, "attention_logit_stats"):
+        if not hasattr(self, 'attention_logit_stats'):
             self.attention_logit_stats = {}
         return self.attention_logit_stats
-
+    
     def update_attention_stats_from_forward(self):
         """
         为 QK-Clip 更新和聚合注意力统计数据（最大logits）。
         """
-        if not hasattr(self, "attention_max_logits"):
+        if not hasattr(self, 'attention_max_logits'):
             return
 
         current_batch_max_logits = []
-
+        
         # 从各层收集统计数据
         for layer_idx, layer in enumerate(self.model.layers):
             attention = layer.self_attn
-            if hasattr(attention, "_current_attention_logits"):
+            if hasattr(attention, '_current_attention_logits'):
                 logit_info = attention._current_attention_logits
-                if logit_info["layer_idx"] == layer_idx:
+                if logit_info['layer_idx'] == layer_idx:
                     # 分离并确保为 float32
-                    max_logits = logit_info["max_logits"].detach().to(torch.float32)
+                    max_logits = logit_info['max_logits'].detach().to(torch.float32)
                     current_batch_max_logits.append(max_logits)
 
         if current_batch_max_logits:
             # 堆叠成一个张量 (num_layers, num_heads)
-            batch_stats_tensor = torch.stack(current_batch_max_logits, dim=0).to(
-                self.attention_max_logits.device
-            )
-
+            batch_stats_tensor = torch.stack(current_batch_max_logits, dim=0).to(self.attention_max_logits.device)
+            
             # 关键：使用 torch.maximum 进行梯度累积聚合。
             # 使用 .data 对缓冲区进行原地更新，而不跟踪 autograd。
             self.attention_max_logits.data = torch.maximum(
-                self.attention_max_logits.data, batch_stats_tensor
+                self.attention_max_logits.data,
+                batch_stats_tensor
             )
 
             # 向后兼容：同时更新字典格式的统计信息用于日志记录
-            if not hasattr(self, "attention_logit_stats"):
+            if not hasattr(self, 'attention_logit_stats'):
                 self.attention_logit_stats = {}
-
+            
             for layer_idx, max_logits in enumerate(current_batch_max_logits):
-                layer_key = f"layer_{layer_idx}"
+                layer_key = f'layer_{layer_idx}'
                 if layer_key not in self.attention_logit_stats:
                     self.attention_logit_stats[layer_key] = {}
-
+                
                 for head_idx in range(len(max_logits)):
-                    head_key = f"head_{head_idx}"
-                    self.attention_logit_stats[layer_key][head_key] = max_logits[
-                        head_idx
-                    ].item()
+                    head_key = f'head_{head_idx}'
+                    self.attention_logit_stats[layer_key][head_key] = max_logits[head_idx].item()
 
         # 清理注意力模块上的临时存储
         for layer in self.model.layers:
-            if hasattr(layer.self_attn, "_current_attention_logits"):
-                delattr(layer.self_attn, "_current_attention_logits")
+             if hasattr(layer.self_attn, '_current_attention_logits'):
+                 delattr(layer.self_attn, '_current_attention_logits')
 
     def forward(
         self,

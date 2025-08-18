@@ -535,73 +535,57 @@ def causal_conv1d_fn(
     )
 
 
-def causal_conv1d_update(
+def short_conv_fused_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    activation: bool = True,
+    residual: bool = True,
+) -> torch.Tensor:
+    """
+    Fused short convolution with automatic differentiation support.
+    
+    Args:
+        x: Input tensor of shape (batch, seqlen, dim)
+        weight: Weight tensor of shape (dim, width)
+        bias: Optional bias tensor of shape (dim,)
+        attention_mask: Optional attention mask of shape (batch, seqlen)
+        activation: Whether to apply SiLU activation
+        residual: Whether to add residual connection
+        
+    Returns:
+        Output tensor of shape (batch, seqlen, dim)
+    """
+    return ShortConvFusedMPSFunction.apply(
+        x, weight, bias, attention_mask, activation, residual
+    )
+
+
+def short_conv_update_fn(
     x: torch.Tensor,
     conv_state: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    activation: Optional[str] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
-    conv_state_indices: Optional[torch.Tensor] = None,
+    activation: bool = True,
+    residual: bool = True,
 ) -> torch.Tensor:
     """
-    x: (batch, dim) or (batch, dim, seqlen)
-    conv_state: (batch, dim, state_len), where state_len >= width - 1
-    weight: (dim, width)
-    bias: (dim,)
-    cache_seqlens: (batch,), dtype int32.
-        If not None, the conv_state is treated as a circular buffer.
-        The conv_state will be updated by copying x to the conv_state starting at the index
-        @cache_seqlens % state_len.
-    conv_state_indices: (batch,), dtype int32
-        If None, the conv_state is a larger tensor along the batch dim, 
-        and we are selecting the batch coords specified by conv_state_indices.
-        Useful for a continuous batching scenario.
-
-    out: (batch, dim) or (batch, dim, seqlen)
+    Convolution update with automatic differentiation support.
+    
+    Args:
+        x: Input tensor of shape (batch, dim) - single token input
+        conv_state: Convolution state cache of shape (batch, dim, state_len)
+        weight: Weight tensor of shape (dim, width)
+        bias: Optional bias tensor of shape (dim,)
+        cache_seqlens: Current sequence lengths for each batch item, shape (batch,)
+        activation: Whether to apply SiLU activation
+        residual: Whether to add residual connection
+        
+    Returns:
+        Output tensor of shape (batch, dim) - single token output
     """
-    if activation not in [None, "silu", "swish"]:
-        raise NotImplementedError("activation must be None, silu, or swish")
-    
-    # Convert activation string to boolean for internal function
-    activation_bool = activation in ["silu", "swish"]
-    
-    # Handle unsupported conv_state_indices parameter
-    if conv_state_indices is not None:
-        raise NotImplementedError("conv_state_indices not supported in MPS version")
-    
-    # Handle variable input dimensions to match CUDA API
-    unsqueeze = x.dim() == 2
-    if unsqueeze:
-        x = x.unsqueeze(-1)
-    
-    # Note: For MPS version, we assume (batch, dim) input format
-    # but CUDA version expects (batch, dim, seqlen), so we transpose x if needed
-    if x.dim() == 3 and x.shape[1] > x.shape[2]:  # Likely (batch, dim, seqlen)
-        x = x.transpose(1, 2)  # Convert to (batch, seqlen, dim)
-    
-    if x.dim() == 3:
-        # For multi-token input, we need to process sequentially
-        # This is a simplified implementation - full support would require kernel changes
-        batch, seqlen, dim = x.shape
-        outputs = []
-        for i in range(seqlen):
-            token_x = x[:, i, :]  # (batch, dim)
-            token_out = ShortConvUpdateMPSFunction.apply(
-                token_x, conv_state, weight, bias, cache_seqlens, activation_bool, False
-            )
-            outputs.append(token_out)
-        result = torch.stack(outputs, dim=1)  # (batch, seqlen, dim)
-        if not unsqueeze:
-            result = result.transpose(1, 2)  # Convert back to (batch, dim, seqlen)
-    else:
-        # Single token case
-        result = ShortConvUpdateMPSFunction.apply(
-            x.squeeze(-1) if x.dim() == 3 else x, conv_state, weight, bias, cache_seqlens, activation_bool, False
-        )
-    
-    if unsqueeze and result.dim() > 2:
-        result = result.squeeze(-1)
-    
-    return result
-
+    return ShortConvUpdateMPSFunction.apply(
+        x, conv_state, weight, bias, cache_seqlens, activation, residual
+    )
