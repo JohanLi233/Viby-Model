@@ -135,7 +135,7 @@ def test_causal_conv1d_mps(dim, seqlen, width, has_bias, silu_activation, itype)
     else:
         bias = None
 
-    out_mps = causal_conv1d_mps.causal_conv1d_fwd(x, weight, bias, silu_activation)
+    out_mps = causal_conv1d_mps.causal_conv1d_fn(x, weight, bias, activation="silu" if silu_activation else None)
 
     out_ref = causal_conv1d_reference(x, weight, bias, silu_activation)
     out_ref = out_ref.to(device=device, dtype=itype)
@@ -207,13 +207,13 @@ def test_edge_cases():
     weight = torch.randn(1, 4, device=device, dtype=torch.float32)
     bias = torch.randn(1, device=device, dtype=torch.float32)
 
-    result = causal_conv1d_mps.causal_conv1d_fwd(x, weight, bias, False)
+    result = causal_conv1d_mps.causal_conv1d_fn(x, weight, bias)
     assert result.shape == (1, 1, 1)
 
     x = torch.randn(2, 3, 5, device=device, dtype=torch.float32)
     weight = torch.randn(3, 4, device=device, dtype=torch.float32)
 
-    result = causal_conv1d_mps.causal_conv1d_fwd(x, weight, None, False)
+    result = causal_conv1d_mps.causal_conv1d_fn(x, weight, None)
     assert result.shape == (2, 3, 5)
 
 
@@ -227,13 +227,13 @@ def test_error_handling():
     weight = torch.randn(5, 4, device=device, dtype=torch.float32)
 
     with pytest.raises(ValueError, match="does not match"):
-        causal_conv1d_mps.causal_conv1d_fwd(x, weight, None, False)
+        causal_conv1d_mps.causal_conv1d_fn(x, weight, None)
 
     x_2d = torch.randn(4, 8, device=device, dtype=torch.float32)
     weight = torch.randn(4, 4, device=device, dtype=torch.float32)
 
     with pytest.raises(ValueError, match="Expected 3D input tensor"):
-        causal_conv1d_mps.causal_conv1d_fwd(x_2d, weight, None, False)
+        causal_conv1d_mps.causal_conv1d_fn(x_2d, weight, None)
 
 
 def test_different_dtypes():
@@ -247,7 +247,7 @@ def test_different_dtypes():
     weight = torch.randn(dim, width, device=device, dtype=torch.float32)
     bias = torch.randn(dim, device=device, dtype=torch.float32)
 
-    result = causal_conv1d_mps.causal_conv1d_fwd(x, weight, bias, False)
+    result = causal_conv1d_mps.causal_conv1d_fn(x, weight, bias)
     assert result.dtype == torch.float32
     assert result.shape == (batch, dim, seqlen)
 
@@ -283,7 +283,7 @@ def test_gradients_short_conv_fused():
     attention_mask = torch.ones(batch_size, seqlen, device=device)
 
     def f():
-        return causal_conv1d_mps.short_conv_fused_fn(
+        return causal_conv1d_mps.short_conv_fused(
             x, weight, bias, attention_mask, activation=True, residual=True
         )
 
@@ -307,14 +307,13 @@ def test_gradients_short_conv_update():
     )
 
     def f():
-        return causal_conv1d_mps.short_conv_update_fn(
+        return causal_conv1d_mps.causal_conv1d_update(
             x,
             conv_state.clone(),
             weight,
             bias,
-            cache_seqlens,
-            activation=True,
-            residual=True,
+            activation="silu",
+            cache_seqlens=cache_seqlens,
         )
 
     ok = check_gradients_numerical(f, [x, weight, bias], eps=1e-3)

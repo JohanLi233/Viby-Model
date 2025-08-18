@@ -176,11 +176,11 @@ def short_conv_mps_like(
     if attention_mask is not None:
         x_btd = x_btd * attention_mask.unsqueeze(-1)
     x_bdt = x_btd.movedim(-1, -2).contiguous()
-    y_bdt = ccmps.causal_conv1d_fwd(
+    y_bdt = ccmps.causal_conv1d_fn(
         x_bdt,
         weight_dw.contiguous(),
         bias_d.contiguous() if bias_d is not None else None,
-        activation,
+        activation="silu" if activation else None,
     )
     y = y_bdt.movedim(-2, -1)
     if residual:
@@ -500,8 +500,8 @@ def main():
         try:
             # MPS implementation
             def run_mps():
-                return ccmps.causal_conv1d_fwd(
-                    x.contiguous(), weight.contiguous(), bias.contiguous(), False
+                return ccmps.causal_conv1d_fn(
+                    x.contiguous(), weight.contiguous(), bias.contiguous()
                 )
 
             # PyTorch reference implementation
@@ -559,8 +559,8 @@ def main():
     try:
 
         def run_mps_silu():
-            return ccmps.causal_conv1d_fwd(
-                x.contiguous(), weight.contiguous(), bias.contiguous(), True
+            return ccmps.causal_conv1d_fn(
+                x.contiguous(), weight.contiguous(), bias.contiguous(), activation="silu"
             )
 
         def run_torch_silu():
@@ -618,8 +618,8 @@ def main():
         def run_mps_canon():
             # Convert to [B, D, T] path to reuse kernel
             x_bdt = x_btd.movedim(-1, -2).contiguous()
-            y_bdt = ccmps.causal_conv1d_fwd(
-                x_bdt, weight_dw.contiguous(), bias_d.contiguous(), True
+            y_bdt = ccmps.causal_conv1d_fn(
+                x_bdt, weight_dw.contiguous(), bias_d.contiguous(), activation="silu"
             )
             return y_bdt.movedim(-2, -1)
 

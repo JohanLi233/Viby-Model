@@ -303,8 +303,8 @@ def main():
 
     messages = []
     for prompt in (prompts if test_mode == 0 else iter(lambda: input("👶: "), "")):
-        setup_seed(random.randint(0, 2048))
-        # setup_seed(2025)  # 如需固定每次输出则换成【固定】的随机种子
+        # setup_seed(random.randint(0, 2048))
+        setup_seed(2025)  # 如需固定每次输出则换成【固定】的随机种子
         if test_mode == 0:
             print(f"👶: {prompt}")
 

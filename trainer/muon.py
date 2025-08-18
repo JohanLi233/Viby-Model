@@ -243,7 +243,8 @@ class MuonClip(torch.optim.Optimizer):
         # [MODIFICATION] Use gamma directly for more aggressive scaling, instead of torch.sqrt(gamma).
         # This provides a stronger corrective force when logits explode, changing the scaling
         # from quadratic (sqrt(gamma)^2) to linear (gamma), which should be more effective.
-        all_scaling_factors = gamma  # torch.sqrt(gamma)
+        # all_scaling_factors = gamma  # torch.sqrt(gamma)
+        all_scaling_factors = torch.sqrt(gamma)
 
         # Cap the scaling factors at 1.0 (We only scale down).
         all_scaling_factors = torch.clamp(all_scaling_factors, max=1.0)
