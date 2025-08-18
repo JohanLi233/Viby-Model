@@ -17,6 +17,18 @@ except ImportError:
     short_conv_fused = None
     short_conv_update = None
 
+# Optional CUDA causal-conv1d support
+try:
+    from causal_conv1d import (
+        causal_conv1d_fn as cuda_causal_conv1d_fn,
+        causal_conv1d_update as cuda_causal_conv1d_update,
+    )  # type: ignore
+    HAS_CAUSAL_CONV1D_CUDA = True
+except ImportError:
+    HAS_CAUSAL_CONV1D_CUDA = False
+    cuda_causal_conv1d_fn = None  # type: ignore
+    cuda_causal_conv1d_update = None  # type: ignore
+
 
 class VibyConfig(PretrainedConfig):
     model_type = "viby"
@@ -277,6 +289,34 @@ class CanonLayer(nn.Module):
             )
 
         # Try MPS kernel for single token update (only supported for kernel_size == 4)
+        # Try CUDA kernel for single token update (kernel_size in [2, 3, 4])
+        if (
+            HAS_CAUSAL_CONV1D_CUDA
+            and x.device.type == "cuda"
+            and cuda_causal_conv1d_update is not None
+            and self.kernel_size in (2, 3, 4)
+        ):
+            try:
+                # Ensure conv_state has correct width for CUDA kernel
+                if conv_state is None or conv_state.size(-1) != self.kernel_size:
+                    conv_state = torch.zeros(
+                        batch_size, hidden_size, self.kernel_size, device=x.device, dtype=x.dtype
+                    )
+                y = cuda_causal_conv1d_update(
+                    x=x_token,
+                    conv_state=conv_state,
+                    weight=self.weight.squeeze(1),
+                    bias=self.bias_param,
+                    activation="silu" if self.activation else None,
+                )
+                # Return with residual
+                return (x_token + y).unsqueeze(1), conv_state
+            except Exception as e:
+                print(
+                    f"Warning: CUDA update kernel failed ({e}), falling back to other implementations"
+                )
+
+        # Try MPS kernel for single token update (only supported for kernel_size == 4)
         if (
             HAS_CAUSAL_CONV1D_MPS
             and x.device.type == "mps"
@@ -381,7 +421,80 @@ class CanonLayer(nn.Module):
             self._set_canon_cache(cache, layer_idx, cache_name, conv_state)
             return result
 
-        # [FIX] Try MPS kernel ONLY if conv_state is None (no history).
+        # [FIX] Try CUDA/MPS kernel ONLY if conv_state is None (no history).
+        # CUDA fused prefill
+        if HAS_CAUSAL_CONV1D_CUDA and x.device.type == "cuda" and conv_state is None:
+            try:
+                processed_attention_mask = attention_mask
+                if attention_mask is not None:
+                    batch_size, seq_len = x.shape[:2]
+                    if attention_mask.shape != (batch_size, seq_len):
+                        if attention_mask.shape[0] == batch_size:
+                            if attention_mask.shape[1] > seq_len:
+                                processed_attention_mask = attention_mask[:, -seq_len:]
+                            elif attention_mask.shape[1] < seq_len:
+                                pad_len = seq_len - attention_mask.shape[1]
+                                pad = torch.ones(
+                                    (batch_size, pad_len),
+                                    device=attention_mask.device,
+                                    dtype=attention_mask.dtype,
+                                )
+                                processed_attention_mask = torch.cat(
+                                    [attention_mask, pad], dim=1
+                                )
+                        else:
+                            processed_attention_mask = None
+
+                if (
+                    processed_attention_mask is not None
+                    and processed_attention_mask.device != x.device
+                ):
+                    processed_attention_mask = processed_attention_mask.to(device=x.device)
+
+                if processed_attention_mask is not None:
+                    masked_x = x * processed_attention_mask.unsqueeze(-1)
+                else:
+                    masked_x = x
+
+                x_conv = masked_x.transpose(1, 2)  # (B, D, T)
+                y_conv = cuda_causal_conv1d_fn(
+                    x=x_conv,
+                    weight=self.weight.squeeze(1),
+                    bias=self.bias_param,
+                    activation="silu" if self.activation else None,
+                    seq_idx=None,
+                )
+                output = y_conv.transpose(1, 2)  # (B, T, D)
+
+                # Initialize/update cache state for decode stage
+                if cache is not None and layer_idx is not None:
+                    conv_state = torch.zeros(
+                        batch_size,
+                        self.hidden_size,
+                        self.kernel_size,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                    # Use masked inputs to populate state to avoid padding leakage
+                    if processed_attention_mask is not None:
+                        masked_x_conv = masked_x.transpose(1, 2)  # (B, D, T)
+                    else:
+                        masked_x_conv = x_conv
+
+                    if seq_len <= self.kernel_size:
+                        conv_state[:, :, -seq_len:] = masked_x_conv
+                    else:
+                        conv_state[:, :, :] = masked_x_conv[:, :, -self.kernel_size:]
+
+                    self._set_canon_cache(cache, layer_idx, cache_name, conv_state)
+
+                return x + output
+            except Exception as e:
+                print(
+                    f"Warning: CUDA fused kernel failed ({e}), falling back to other implementations"
+                )
+
+        # MPS fused prefill
         if HAS_CAUSAL_CONV1D_MPS and x.device.type == "mps" and conv_state is None:
             try:
                 # (Attention mask processing logic from original code is preserved here)

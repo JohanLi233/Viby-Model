@@ -419,16 +419,11 @@ def short_conv_update(
     )
 
 
-# =====================================================================================
-# Compatibility aliases and recommended API
-# =====================================================================================
-
-# Keep the original forward-only functions available for explicit use
-causal_conv1d_fwd_only = causal_conv1d_fwd
+# Rename the forward-only functions to make it clear they don't have gradients
 short_conv_fused_fwd_only = short_conv_fused
 short_conv_update_fwd_only = short_conv_update
 
-# For users who want gradient support, these are the recommended functions to use
-causal_conv1d = causal_conv1d_fn
-short_conv_fused = short_conv_fused_fn
-short_conv_update = short_conv_update_fn
+# Replace the public API with autograd-enabled versions
+from .autograd import short_conv_fused_fn as short_conv_fused
+from .autograd import short_conv_update_fn as short_conv_update
+from .autograd import causal_conv1d_fn as causal_conv1d
