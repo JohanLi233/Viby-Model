@@ -316,7 +316,7 @@ def main() -> None:
     # 加载tokenizer
     print("加载本地tokenizer")
     try:
-        tokenizer = AutoTokenizer.from_pretrained("model/")
+        tokenizer = AutoTokenizer.from_pretrained("../model/")
     except Exception as e:
         print(f"Error loading tokenizer: {e}")
         return

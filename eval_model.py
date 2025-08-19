@@ -246,7 +246,7 @@ def main():
     )
     parser.add_argument(
         "--original_max_seq_len",
-        default=512,
+        default=1024,
         type=int,
         help="Original context length before scaling",
     )

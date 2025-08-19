@@ -8,4 +8,5 @@ dependencies = [
     "torch>=2.7.1",
     "transformers>=4.54.1",
     "wandb>=0.21.0",
+    "zhconv>=1.4.3",
 ]
