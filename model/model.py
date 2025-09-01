@@ -722,10 +722,6 @@ class Attention(nn.Module):
         self.sinks = nn.Parameter(torch.zeros(self.n_local_heads))
         self.sliding_window_default = args.sliding_window
 
-        # QK normalization layers (like Qwen3)
-        # self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-        # self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-
         # Canon B layer for QKV projections
         if "B" in args.canon_set:
             total_dim = (
@@ -764,9 +760,6 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
-
-        # xq = self.q_norm(xq)
-        # xk = self.k_norm(xk)
 
         # Apply Canon B if enabled
         if self.canon_b is not None and layer_idx is not None:
@@ -1273,8 +1266,8 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
 
         # 清理注意力模块上的临时存储
         for layer in self.model.layers:
-             if hasattr(layer.self_attn, '_current_attention_logits'):
-                 delattr(layer.self_attn, '_current_attention_logits')
+            if hasattr(layer.self_attn, '_current_attention_logits'):
+                delattr(layer.self_attn, '_current_attention_logits')
 
     def forward(
         self,
@@ -1359,7 +1352,7 @@ class VibyForCausalLM(PreTrainedModel, GenerationMixin):
                                 0, beam_idx
                             )
                 # Keep per-layer seqlens in sync
-                if attr_name.startswith("canon_cache_") and attr_name.endswith(
+                elif attr_name.startswith("canon_cache_") and attr_name.endswith(
                     "_seqlens"
                 ):
                     seqlens_list = getattr(past_key_values, attr_name)

@@ -113,6 +113,27 @@ def get_sft_parser():
     return parser
 
 
+def get_dpo_parser():
+    """获取DPO参数解析器"""
+    parser = argparse.ArgumentParser(description="Viby DPO Training")
+    add_common_args(parser)
+
+    # DPO特定参数
+    parser.set_defaults(
+        epochs=2,
+        batch_size=4,
+        learning_rate=1e-8,  # DPO学习率通常很小
+        accumulation_steps=1,
+        max_seq_len=1024,
+    )
+
+    parser.add_argument("--wandb_project", type=str, default="Viby-DPO")
+    parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl")
+    parser.add_argument("--dpo_beta", type=float, default=0.1, help="DPO beta parameter")
+    
+    return parser
+
+
 def setup_training_args(args, training_type="pretrain"):
     """设置训练参数"""
     import os
@@ -125,6 +146,8 @@ def setup_training_args(args, training_type="pretrain"):
     # 设置wandb运行名称
     if training_type == "pretrain":
         args.wandb_run_name = f"Viby-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+    elif training_type == "dpo":
+        args.wandb_run_name = f"Viby-DPO-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
     else:
         args.wandb_run_name = f"Viby-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
 
