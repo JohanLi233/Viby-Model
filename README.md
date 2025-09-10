@@ -1,5 +1,7 @@
 # Viby
 
+[![Model on HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue)](https://huggingface.co/JohanLi233/viby)
+
 A compact ~1M parameter language model featuring **causal convolution layers** for efficient sequence modeling.
 
 ## Key Features
