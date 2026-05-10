@@ -17,6 +17,14 @@ def add_common_args(parser):
         "--device", type=str, default="cuda:0" if torch.cuda.is_available() else "mps"
     )
     parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--compile_model", action="store_true", default=True)
+    parser.add_argument("--no_compile", action="store_false", dest="compile_model")
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default=None,
+        help="torch.compile mode. Defaults to max-autotune on CUDA and default mode elsewhere.",
+    )
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--ddp", action="store_true")
@@ -26,7 +34,7 @@ def add_common_args(parser):
     parser.add_argument(
         "--profile", action="store_true", help="Enable performance profiling"
     )
-    parser.add_argument("--pin_memory", action="store_true", default=True)
+    parser.add_argument("--pin_memory", action="store_true", default=None)
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--persistent_workers", action="store_true", default=True)
     parser.add_argument("--log_interval", type=int, default=100)
@@ -46,6 +54,40 @@ def add_common_args(parser):
     )
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--max_seq_len", default=1024, type=int)
+    parser.add_argument("--use_moe", action="store_true", default=True)
+    parser.add_argument("--no_moe", action="store_false", dest="use_moe")
+    parser.add_argument("--num_experts", type=int, default=4)
+    parser.add_argument("--num_experts_per_tok", type=int, default=1)
+    parser.add_argument(
+        "--moe_intermediate_size",
+        type=int,
+        default=None,
+        help="Defaults to the dense FFN intermediate_size.",
+    )
+    parser.add_argument("--router_aux_loss_coef", type=float, default=5e-4)
+    parser.add_argument(
+        "--router_scoring_func",
+        type=str,
+        default="sqrtsoftplus",
+        choices=("sqrtsoftplus", "sigmoid", "softmax"),
+    )
+    parser.add_argument("--routed_scaling_factor", type=float, default=1.0)
+    parser.add_argument("--swiglu_limit", type=float, default=None)
+    parser.add_argument("--use_deepseek_v4_attention", action="store_true", default=True)
+    parser.add_argument(
+        "--no_deepseek_v4_attention",
+        action="store_false",
+        dest="use_deepseek_v4_attention",
+    )
+    parser.add_argument("--q_lora_rank", type=int, default=None)
+    parser.add_argument("--o_groups", type=int, default=4)
+    parser.add_argument("--o_lora_rank", type=int, default=None)
+    parser.add_argument("--attention_sink", action="store_true", default=False)
+    parser.add_argument("--no_attention_sink", action="store_false", dest="attention_sink")
+    parser.add_argument("--use_mhc", action="store_true", default=True)
+    parser.add_argument("--no_mhc", action="store_false", dest="use_mhc")
+    parser.add_argument("--mtp_depth", type=int, default=0)
+    parser.add_argument("--mtp_loss_weight", type=float, default=0.3)
 
     # MuonClip 优化器相关参数
     parser.add_argument(
@@ -182,5 +224,8 @@ def setup_training_args(args, training_type="pretrain"):
     base_seed = 1337
     torch.manual_seed(base_seed)
     torch.cuda.manual_seed(base_seed)
+
+    if args.pin_memory is None:
+        args.pin_memory = str(args.device).startswith("cuda")
 
     return args

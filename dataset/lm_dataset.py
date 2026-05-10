@@ -73,11 +73,9 @@ class PretrainDataset(Dataset):
         input_ids = encoding.input_ids.squeeze()
         loss_mask = input_ids != self.tokenizer.pad_token_id
 
-        # 优化tensor创建，避免重复转换
-        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
-        X = input_ids_tensor[:-1]
-        Y = input_ids_tensor[1:]
-        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
+        X = input_ids[:-1].long()
+        Y = input_ids[1:].long()
+        loss_mask = loss_mask[1:].long()
         return X, Y, loss_mask
 
 

@@ -39,6 +39,26 @@ if __name__ == "__main__":
         max_position_embeddings=args.max_seq_len,
         original_max_position_embeddings=args.original_max_seq_len,
         rope_scaling=build_sft_rope_scaling(args),
+        use_moe=args.use_moe,
+        num_experts=args.num_experts,
+        num_experts_per_tok=args.num_experts_per_tok,
+        router_aux_loss_coef=args.router_aux_loss_coef,
+        router_scoring_func=args.router_scoring_func,
+        routed_scaling_factor=args.routed_scaling_factor,
+        swiglu_limit=args.swiglu_limit,
+        use_deepseek_v4_attention=args.use_deepseek_v4_attention,
+        attention_sink=args.attention_sink,
+        use_mhc=args.use_mhc,
+        o_groups=args.o_groups,
+        mtp_depth=args.mtp_depth,
+        mtp_loss_weight=args.mtp_loss_weight,
+        **({"q_lora_rank": args.q_lora_rank} if args.q_lora_rank is not None else {}),
+        **({"o_lora_rank": args.o_lora_rank} if args.o_lora_rank is not None else {}),
+        **(
+            {"moe_intermediate_size": args.moe_intermediate_size}
+            if args.moe_intermediate_size is not None
+            else {}
+        ),
     )
 
     # 初始化模型

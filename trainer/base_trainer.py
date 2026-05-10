@@ -292,10 +292,7 @@ class BaseTrainer:
 
                 loss = loss / self.args.accumulation_steps
 
-            # 记录有效步骤
-            current_loss_mask_sum = loss_mask.sum().item()
-            if current_loss_mask_sum > 0:
-                valid_loss_steps += 1
+            valid_loss_steps += 1
 
             # 反向传播
             self.scaler.scale(loss).backward()
