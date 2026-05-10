@@ -16,59 +16,29 @@ def transfer_cache_to_device(cache, target_device):
     if cache is None:
         return None
 
-    # Create a new cache on target device
-    from transformers.cache_utils import DynamicCache
-
-    new_cache = DynamicCache()
-
-    # Handle new cache format (v4.56+)
-    if hasattr(cache, "layers") and cache.layers:
-        # New format: cache.layers[layer_idx].keys, cache.layers[layer_idx].values
-        for layer_idx, layer in enumerate(cache.layers):
-            if (
-                layer is not None
-                and hasattr(layer, "keys")
-                and hasattr(layer, "values")
-            ):
-                keys = layer.keys.to(target_device) if layer.keys is not None else None
-                values = (
-                    layer.values.to(target_device) if layer.values is not None else None
-                )
-                new_cache.update(keys, values, layer_idx)
-            else:
-                new_cache.update(None, None, layer_idx)
-
-    # Transfer Canon cache states
-    if hasattr(cache, "__dict__"):
-        for attr_name, attr_value in cache.__dict__.items():
-            if attr_name.startswith("canon_cache_") and isinstance(attr_value, list):
-                new_attr_list = []
-                for state in attr_value:
-                    if state is not None:
-                        new_attr_list.append(state.to(target_device))
-                    else:
-                        new_attr_list.append(None)
-                setattr(new_cache, attr_name, new_attr_list)
-            elif attr_name not in ["layers"]:
-                # Transfer other attributes (like _max_layers, etc.)
-                setattr(new_cache, attr_name, attr_value)
-
-    return new_cache
+    return [
+        None
+        if layer_cache is None
+        else tuple(state.to(target_device) for state in layer_cache)
+        for layer_cache in cache
+    ]
 
 
 def init_model(args):
     # Validate model_mode
     modes = {0: "pretrain", 1: "full_sft"}
     if args.model_mode not in modes:
-        print(f"错误：不支持的模型模式 {args.model_mode}，支持的模式：{list(modes.keys())}")
+        print(
+            f"错误：不支持的模型模式 {args.model_mode}，支持的模式：{list(modes.keys())}"
+        )
         exit(1)
-    
+
     # Check if tokenizer directory exists
     tokenizer_path = "./model/"
     if not os.path.exists(tokenizer_path):
         print(f"错误：找不到tokenizer目录: {tokenizer_path}")
         exit(1)
-        
+
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     ckp = f"./{args.out_dir}/{modes[args.model_mode]}_{args.hidden_size}.pth"
 
@@ -107,7 +77,7 @@ def init_model(args):
         print(f"错误：找不到模型检查点文件: {ckp}")
         print("请检查文件路径是否正确，或者确保模型已经训练完成。")
         exit(1)
-    
+
     # Load checkpoint first
     checkpoint = torch.load(ckp, map_location="cpu")
 
@@ -142,7 +112,7 @@ def init_model(args):
         generation_model = generation_model.eval().to(generation_device)
 
         model_for_counting = prefill_model
-        
+
         return_value = {
             "prefill_model": prefill_model,
             "generation_model": generation_model,
@@ -156,7 +126,7 @@ def init_model(args):
         model.load_state_dict(state_dict, strict=True)
         model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
         model = model.eval().to(args.device)
-        
+
         model_for_counting = model
         return_value = model
 
@@ -230,7 +200,12 @@ def main():
     parser.add_argument("--hidden_size", default=640, type=int)
     parser.add_argument("--num_hidden_layers", default=18, type=int)
     parser.add_argument("--max_seq_len", default=1024, type=int)
-    parser.add_argument("--history_cnt", default=0, type=int, help="保留的对话历史轮次数量（0代表无历史）")
+    parser.add_argument(
+        "--history_cnt",
+        default=0,
+        type=int,
+        help="保留的对话历史轮次数量（0代表无历史）",
+    )
     parser.add_argument(
         "--model_mode",
         default=1,
@@ -302,7 +277,7 @@ def main():
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
     messages = []
-    for prompt in (prompts if test_mode == 0 else iter(lambda: input("👶: "), "")):
+    for prompt in prompts if test_mode == 0 else iter(lambda: input("👶: "), ""):
         setup_seed(random.randint(0, 2048))
         # setup_seed(2025)  # 如需固定每次输出则换成【固定】的随机种子
         if test_mode == 0:
@@ -310,7 +285,7 @@ def main():
 
         # 先添加当前的用户输入
         messages.append({"role": "user", "content": prompt})
-        
+
         # 然后根据 history_cnt 对整个消息历史进行截断（按对话轮次）
         if args.history_cnt > 0:
             # 一个完整的对话轮次是2条消息 (user, assistant)

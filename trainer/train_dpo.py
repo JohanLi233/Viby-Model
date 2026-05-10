@@ -7,13 +7,17 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import warnings
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
-from transformers import AutoTokenizer
 from model.model import VibyConfig, VibyForCausalLM
 from dataset.lm_dataset import DPODataset
 from .base_trainer import BaseTrainer
 from .config import get_dpo_parser, setup_training_args
-from .utils import Logger
+from .utils import (
+    build_model_and_tokenizer,
+    init_wandb,
+    load_model_weights,
+    log_training_progress,
+    move_model_to_device,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -68,66 +72,29 @@ def dpo_loss(ref_log_probs, log_probs, mask, beta):
 
 def init_model(lm_config, args):
     """初始化模型和tokenizer，加载SFT权重"""
-    model_path = getattr(args, 'model_path', '../model/')
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-    # 初始化模型
-    model = VibyForCausalLM(lm_config)
-
-    # 设置设备与dtype
-    target_dtype = None
-    if args.dtype == "bfloat16":
-        target_dtype = torch.bfloat16
-    elif args.dtype == "float16":
-        target_dtype = torch.float16
-    if target_dtype is not None:
-        model = model.to(device=args.device, dtype=target_dtype)  # type: ignore
-    else:
-        model = model.to(device=args.device)  # type: ignore
-
-    # 加载SFT模型
-    sft_checkpoint_name = getattr(args, 'sft_checkpoint', f'full_sft_{lm_config.hidden_size}.pth')
-    ckp = f"{args.save_dir}/{sft_checkpoint_name}"
-
-    if os.path.exists(ckp):
-        # 如果是完整的检查点文件
-        checkpoint = torch.load(ckp, map_location=args.device)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-        else:
-            # 旧格式，直接是状态字典
-            model.load_state_dict(checkpoint, strict=False)
-    else:
-        Logger(f"Warning: SFT checkpoint {ckp} not found, starting from scratch")
+    sft_checkpoint_name = getattr(
+        args,
+        "sft_checkpoint",
+        f"full_sft_{lm_config.hidden_size}.pth",
+    )
+    model, tokenizer = build_model_and_tokenizer(
+        lm_config,
+        args,
+        checkpoint_name=sft_checkpoint_name,
+        checkpoint_label="SFT checkpoint",
+    )
 
     # 初始化参考模型
-    ref_model = VibyForCausalLM(lm_config)
-    if target_dtype is not None:
-        ref_model = ref_model.to(device=args.device, dtype=target_dtype)  # type: ignore
-    else:
-        ref_model = ref_model.to(device=args.device)  # type: ignore
-
-    # 参考模型加载相同的SFT权重
-    if os.path.exists(ckp):
-        checkpoint = torch.load(ckp, map_location=args.device)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            ref_model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-        else:
-            ref_model.load_state_dict(checkpoint, strict=False)
-
+    ref_model = move_model_to_device(VibyForCausalLM(lm_config), args)
+    load_model_weights(
+        ref_model,
+        os.path.join(args.save_dir, sft_checkpoint_name),
+        args.device,
+        strict=False,
+        label="SFT checkpoint",
+    )
     ref_model.eval()
     ref_model.requires_grad_(False)
-
-    # 编译模型以提升性能
-    model = torch.compile(model)
-
-    # 计算参数量
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    Logger(
-        f"总参数量：{total_params / 1e6:.3f}M, 可训练参数量：{trainable_params / 1e6:.3f}M"
-    )
 
     return model, ref_model, tokenizer
 
@@ -139,7 +106,7 @@ class DPOTrainer(BaseTrainer):
         # 先初始化父类
         super().__init__(args, model, tokenizer, lm_config, "dpo")
         self.ref_model = ref_model
-        self.beta = getattr(args, 'dpo_beta', 0.1)
+        self.beta = getattr(args, "dpo_beta", 0.1)
 
     def train_epoch(
         self,
@@ -153,7 +120,7 @@ class DPOTrainer(BaseTrainer):
     ):
         """DPO训练一个epoch"""
         import time
-        from .utils import apply_lr_schedule, log_training_progress
+        from .utils import apply_lr_schedule
 
         start_time = time.time()
         base_step_offset_for_speed = skip_steps
@@ -168,12 +135,14 @@ class DPOTrainer(BaseTrainer):
                 continue
 
             # 非阻塞数据传输
-            x_chosen = batch['x_chosen'].to(self.args.device, non_blocking=True)
-            x_rejected = batch['x_rejected'].to(self.args.device, non_blocking=True)
-            y_chosen = batch['y_chosen'].to(self.args.device, non_blocking=True)
-            y_rejected = batch['y_rejected'].to(self.args.device, non_blocking=True)
-            mask_chosen = batch['mask_chosen'].to(self.args.device, non_blocking=True)
-            mask_rejected = batch['mask_rejected'].to(self.args.device, non_blocking=True)
+            x_chosen = batch["x_chosen"].to(self.args.device, non_blocking=True)
+            x_rejected = batch["x_rejected"].to(self.args.device, non_blocking=True)
+            y_chosen = batch["y_chosen"].to(self.args.device, non_blocking=True)
+            y_rejected = batch["y_rejected"].to(self.args.device, non_blocking=True)
+            mask_chosen = batch["mask_chosen"].to(self.args.device, non_blocking=True)
+            mask_rejected = batch["mask_rejected"].to(
+                self.args.device, non_blocking=True
+            )
 
             # 合并数据
             x = torch.cat([x_chosen, x_rejected], dim=0)
@@ -227,27 +196,7 @@ class DPOTrainer(BaseTrainer):
 
             # 梯度累积和更新
             if (step + 1) % self.args.accumulation_steps == 0:
-                grad_norm = 0.0
-                if valid_loss_steps > 0:
-                    if hasattr(self.optimizer, "unscale_gradients"):
-                        self.optimizer.unscale_gradients(self.scaler)
-                    else:
-                        self.scaler.unscale_(self.optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.args.grad_clip
-                    )
-                    last_grad_norm = float(grad_norm)
-
-                    if hasattr(self.optimizer, "optimizers"):
-                        for opt in self.optimizer.optimizers:
-                            self.scaler.step(opt)
-                    else:
-                        self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.scaler.update()
-
-                self.optimizer.zero_grad(set_to_none=True)
+                last_grad_norm = self._optimizer_step(valid_loss_steps)
                 valid_loss_steps = 0
 
             # 性能分析
@@ -274,20 +223,7 @@ class DPOTrainer(BaseTrainer):
                 )
 
             # 模型保存
-            if (step + 1) % self.args.save_interval == 0 and (
-                not self.ddp or dist.get_rank() == 0
-            ):
-                from .utils import save_checkpoint
-                save_checkpoint(
-                    self.model,
-                    self.optimizer,
-                    self.scaler,
-                    epoch,
-                    step,
-                    self.args,
-                    self.lm_config,
-                    self.training_type,
-                )
+            self._save_if_needed(epoch, step)
 
 
 if __name__ == "__main__":
@@ -311,16 +247,7 @@ if __name__ == "__main__":
     train_ds = DPODataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_loader = trainer.create_data_loader(train_ds)
 
-    # 初始化wandb
-    wandb = None
-    if args.use_wandb and (not trainer.ddp or trainer.ddp_local_rank == 0):
-        try:
-            import wandb
-
-            wandb.init(project=args.wandb_project, name=args.wandb_run_name)
-        except ImportError:
-            Logger("Warning: wandb not installed, logging disabled")
-            wandb = None
+    wandb = init_wandb(args, trainer)
 
     # 开始训练
     trainer.train(train_loader, wandb)

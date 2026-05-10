@@ -9,6 +9,8 @@ import time
 import torch
 import torch.distributed as dist
 from typing import Tuple
+from transformers import AutoTokenizer
+from model.model import VibyForCausalLM
 from .muon import (
     MuonWithAuxAdam,
     SingleDeviceMuonWithAuxAdam,
@@ -30,6 +32,130 @@ def Logger(content):
 def set_ddp_flag(is_ddp: bool):
     """设置DDP标志，供Logger使用"""
     Logger._ddp_initialized = is_ddp
+
+
+def unwrap_model(model):
+    """Return the underlying model behind DDP and torch.compile wrappers."""
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        model = model.module
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    return model
+
+
+def get_target_dtype(dtype_name: str):
+    if dtype_name == "bfloat16":
+        return torch.bfloat16
+    if dtype_name == "float16":
+        return torch.float16
+    return None
+
+
+def move_model_to_device(model, args):
+    target_dtype = get_target_dtype(getattr(args, "dtype", ""))
+    if target_dtype is not None:
+        return model.to(device=args.device, dtype=target_dtype)
+    return model.to(device=args.device)
+
+
+def log_parameter_count(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    Logger(
+        f"总参数量：{total_params / 1e6:.3f}M, 可训练参数量：{trainable_params / 1e6:.3f}M"
+    )
+
+
+def load_model_weights(
+    model, checkpoint_path, device, strict=False, label="checkpoint"
+):
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        Logger(f"Warning: {label} {checkpoint_path} not found, starting from scratch")
+        return False
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = (
+        checkpoint["model_state_dict"]
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint
+        else checkpoint
+    )
+    unwrap_model(model).load_state_dict(state_dict, strict=strict)
+    Logger(f"Loaded {label}: {checkpoint_path}")
+    return True
+
+
+def build_model_and_tokenizer(
+    lm_config,
+    args,
+    checkpoint_name=None,
+    checkpoint_label="checkpoint",
+    compile_mode=None,
+    strict=False,
+):
+    model_path = getattr(args, "model_path", "../model/")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = move_model_to_device(VibyForCausalLM(lm_config), args)
+
+    if checkpoint_name is not None:
+        checkpoint_path = os.path.join(args.save_dir, checkpoint_name)
+        load_model_weights(
+            model,
+            checkpoint_path,
+            args.device,
+            strict=strict,
+            label=checkpoint_label,
+        )
+
+    if compile_mode is not None:
+        model = torch.compile(model, mode=compile_mode)
+    elif getattr(args, "compile_model", True):
+        model = torch.compile(model)
+
+    log_parameter_count(model)
+    return model, tokenizer
+
+
+def init_wandb(args, trainer):
+    if not args.use_wandb or (trainer.ddp and trainer.ddp_local_rank != 0):
+        return None
+    try:
+        import wandb
+
+        wandb.init(project=args.wandb_project, name=args.wandb_run_name)
+        return wandb
+    except ImportError:
+        Logger("Warning: wandb not installed, logging disabled")
+        return None
+
+
+def update_attention_stats(model, optimizer):
+    if not hasattr(optimizer, "apply_qk_clip"):
+        return 0.0
+
+    model_for_stats = unwrap_model(model)
+    if not hasattr(model_for_stats, "update_attention_stats_from_forward"):
+        return 0.0
+
+    model_for_stats.update_attention_stats_from_forward()
+    if hasattr(model_for_stats, "attention_max_logits"):
+        return model_for_stats.attention_max_logits.max().item()
+    return 0.0
+
+
+def prepare_qk_clip_step(model, optimizer):
+    if hasattr(optimizer, "apply_qk_clip"):
+        optimizer._temp_model_ref = unwrap_model(model)
+
+
+def reset_qk_clip_stats(model, optimizer):
+    if not hasattr(optimizer, "apply_qk_clip"):
+        return
+
+    model = unwrap_model(model)
+    if hasattr(model, "attention_max_logits"):
+        model.attention_max_logits.data.zero_()
+    if hasattr(optimizer, "_temp_model_ref"):
+        optimizer._temp_model_ref = None
 
 
 def get_lr_and_momentum(
@@ -59,7 +185,9 @@ def get_lr_and_momentum(
         )
         # 设置最小学习率为峰值的10%，而不是衰减到0
         min_lr_ratio = 0.1
-        lr_multiplier = min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        lr_multiplier = min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
 
     # --- 动量调度 (仅用于Muon) ---
     momentum = final_momentum
@@ -85,18 +213,7 @@ def save_checkpoint(
 
     ckp = os.path.join(args.save_dir, ckp_filename)
 
-    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-        # 获取原始模型（跳过DDP和compile包装）
-        original_model = model.module
-        if hasattr(original_model, "_orig_mod"):
-            original_model = original_model._orig_mod
-        state_dict = original_model.state_dict()
-    else:
-        # 获取原始模型（跳过compile包装）
-        original_model = model
-        if hasattr(original_model, "_orig_mod"):
-            original_model = original_model._orig_mod
-        state_dict = original_model.state_dict()
+    state_dict = unwrap_model(model).state_dict()
 
     # 保存检查点，包含更多信息
     checkpoint = {
@@ -127,19 +244,8 @@ def load_checkpoint(checkpoint_path, model, optimizer, scaler, args):
 
     checkpoint = torch.load(checkpoint_path, map_location=args.device)
 
-    # 加载模型状态到原始模型
-    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-        # 获取原始模型（跳过DDP和compile包装）
-        original_model = model.module
-        if hasattr(original_model, "_orig_mod"):
-            original_model = original_model._orig_mod
-        original_model.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        # 获取原始模型（跳过compile包装）
-        original_model = model
-        if hasattr(original_model, "_orig_mod"):
-            original_model = original_model._orig_mod
-        original_model.load_state_dict(checkpoint["model_state_dict"])
+    # 加载模型状态到未包装模型
+    unwrap_model(model).load_state_dict(checkpoint["model_state_dict"])
 
     # 加载优化器与scaler状态（如未指定重置）
     if not getattr(args, "reset_optimizer", False):
@@ -238,7 +344,7 @@ def create_mixed_optimizer(
     """
     创建混合优化器，支持 MuonWithAuxAdam 或 MuonClip
     - Muon/MuonClip: 用于核心的2D权重矩阵
-    - AdamW: 用于所有其他参数 (嵌入、Canon、LayerNorm、偏置等)
+    - AdamW: 用于所有其他参数 (嵌入、LayerNorm、偏置等)
 
     参数:
         use_muon_clip: 如果为 True, 使用 MuonClip 优化器; 否则使用标准 Muon

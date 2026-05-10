@@ -4,6 +4,7 @@
 
 import argparse
 import torch
+from .utils import Logger
 
 
 def add_common_args(parser):
@@ -45,12 +46,16 @@ def add_common_args(parser):
     )
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--max_seq_len", default=1024, type=int)
-    
+
     # MuonClip 优化器相关参数
-    parser.add_argument("--use_muon_clip", action="store_true", 
-                       help="使用 MuonClip 优化器而不是标准 Muon")
-    parser.add_argument("--qk_clip_tau", type=float, default=25.0, 
-                       help="QK-Clip 阈值，默认 25.0")
+    parser.add_argument(
+        "--use_muon_clip",
+        action="store_true",
+        help="使用 MuonClip 优化器而不是标准 Muon",
+    )
+    parser.add_argument(
+        "--qk_clip_tau", type=float, default=25.0, help="QK-Clip 阈值，默认 25.0"
+    )
 
 
 def get_pretrain_parser():
@@ -129,9 +134,31 @@ def get_dpo_parser():
 
     parser.add_argument("--wandb_project", type=str, default="Viby-DPO")
     parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl")
-    parser.add_argument("--dpo_beta", type=float, default=0.1, help="DPO beta parameter")
-    
+    parser.add_argument(
+        "--dpo_beta", type=float, default=0.1, help="DPO beta parameter"
+    )
+
     return parser
+
+
+def build_sft_rope_scaling(args):
+    """Build YaRN config for SFT and update args.max_seq_len when enabled."""
+    if not (args.max_seq_len >= 2048 or args.enable_yarn):
+        return None
+
+    if not hasattr(args, "yarn_scaling_factor") or args.yarn_scaling_factor == 2.0:
+        args.yarn_scaling_factor = args.max_seq_len / args.original_max_seq_len
+
+    rope_scaling = {
+        "type": "yarn",
+        "factor": args.yarn_scaling_factor,
+        "beta_fast": getattr(args, "yarn_beta_fast", 32.0),
+        "beta_slow": getattr(args, "yarn_beta_slow", 1.0),
+    }
+    Logger(
+        f"[YaRN] 启用上下文扩展: {args.original_max_seq_len} → {args.max_seq_len} (scaling factor: {args.yarn_scaling_factor})"
+    )
+    return rope_scaling
 
 
 def setup_training_args(args, training_type="pretrain"):
