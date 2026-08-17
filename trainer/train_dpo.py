@@ -5,18 +5,20 @@ __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import warnings
-import torch
-import torch.nn.functional as F
+import mlx.core as mx
+import mlx.nn as nn
 from model.model import VibyConfig, VibyForCausalLM
 from dataset.lm_dataset import DPODataset
 from .base_trainer import BaseTrainer
 from .config import get_dpo_parser, setup_training_args
 from .utils import (
+    Logger,
+    build_config_from_sidecar,
     build_model_and_tokenizer,
+    convert_model_dtype,
     init_wandb,
     load_model_weights,
     log_training_progress,
-    move_model_to_device,
 )
 
 warnings.filterwarnings("ignore")
@@ -32,8 +34,9 @@ def logits_to_log_probs(logits, labels):
     返回:
         log_probs: (batch_size, seq_len) 的对数概率
     """
-    log_probs = F.log_softmax(logits, dim=2)
-    log_probs = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
+    logits_f = logits.astype(mx.float32)
+    log_probs = logits_f - mx.logsumexp(logits_f, axis=-1, keepdims=True)
+    log_probs = mx.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
     return log_probs
 
 
@@ -50,9 +53,10 @@ def dpo_loss(ref_log_probs, log_probs, mask, beta):
         标量损失
     """
     # 序列级平均log概率，避免除零
-    lengths = mask.sum(dim=1).clamp_min(1)
-    ref_seq_logp = (ref_log_probs * mask).sum(dim=1) / lengths
-    seq_logp = (log_probs * mask).sum(dim=1) / lengths
+    mask_f = mask.astype(mx.float32)
+    lengths = mx.maximum(mask_f.sum(axis=1), 1.0)
+    ref_seq_logp = (ref_log_probs * mask_f).sum(axis=1) / lengths
+    seq_logp = (log_probs * mask_f).sum(axis=1) / lengths
 
     # 前半为chosen，后半为rejected
     batch_size = ref_seq_logp.shape[0]
@@ -66,16 +70,16 @@ def dpo_loss(ref_log_probs, log_probs, mask, beta):
     pi_logratios = chosen - rejected
     ref_logratios = chosen_ref - rejected_ref
     logits = pi_logratios - ref_logratios
-    loss = -F.logsigmoid(beta * logits).mean()
+    loss = -nn.log_sigmoid(beta * logits).mean()
     return loss
 
 
 def init_model(lm_config, args):
     """初始化模型和tokenizer，加载SFT权重"""
-    sft_checkpoint_name = getattr(
-        args,
-        "sft_checkpoint",
-        f"full_sft_{lm_config.hidden_size}.pth",
+    sft_checkpoint_name = (
+        args.sft_checkpoint
+        if getattr(args, "sft_checkpoint", None)
+        else f"full_sft_{lm_config.hidden_size}.safetensors"
     )
     model, tokenizer = build_model_and_tokenizer(
         lm_config,
@@ -85,16 +89,17 @@ def init_model(lm_config, args):
     )
 
     # 初始化参考模型
-    ref_model = move_model_to_device(VibyForCausalLM(lm_config), args)
+    ref_model = VibyForCausalLM(lm_config)
+    convert_model_dtype(ref_model, getattr(args, "dtype", ""))
+    # 与 policy 模型共用同一 config，严格加载：配置不一致时应直接报错，
+    # 而不是静默跳过缺失参数
     load_model_weights(
         ref_model,
         os.path.join(args.save_dir, sft_checkpoint_name),
-        args.device,
-        strict=False,
+        strict=True,
         label="SFT checkpoint",
     )
     ref_model.eval()
-    ref_model.requires_grad_(False)
 
     return model, ref_model, tokenizer
 
@@ -103,10 +108,29 @@ class DPOTrainer(BaseTrainer):
     """DPO训练器，继承自BaseTrainer"""
 
     def __init__(self, args, model, ref_model, tokenizer, lm_config):
+        # beta 需在 super().__init__（内部构建 loss 函数）之前设置
+        self.beta = getattr(args, "dpo_beta", 0.1)
         # 先初始化父类
         super().__init__(args, model, tokenizer, lm_config, "dpo")
         self.ref_model = ref_model
-        self.beta = getattr(args, "dpo_beta", 0.1)
+
+    def _dpo_loss_fn(self, model, x, y, mask, attn_mask, ref_log_probs):
+        """DPO loss 函数（value_and_grad 的目标）"""
+        res = model(
+            input_ids=x,
+            attention_mask=attn_mask,
+        )
+        log_probs = logits_to_log_probs(res.logits, y)
+        log_probs = log_probs * mask
+        loss = dpo_loss(ref_log_probs, log_probs, mask, self.beta)
+        return loss / self.args.accumulation_steps
+
+    def _build_loss_and_grad(self):
+        fn = nn.value_and_grad(self.model, self._dpo_loss_fn)
+        if getattr(self.args, "compile_model", False):
+            Logger("使用 mx.compile 编译 loss 函数")
+            fn = mx.compile(fn)
+        return fn
 
     def train_epoch(
         self,
@@ -115,41 +139,36 @@ class DPOTrainer(BaseTrainer):
         iter_per_epoch,
         total_training_steps,
         wandb=None,
-        profiler=None,
         skip_steps=0,
     ):
         """DPO训练一个epoch"""
         import time
+
+        import mlx.optimizers as optim
+        from mlx.utils import tree_map
+
         from .utils import apply_lr_schedule
 
         start_time = time.time()
         base_step_offset_for_speed = skip_steps
-        valid_loss_steps = 0
+        accum_grads = None
+        accum_count = 0
         last_grad_norm = 0.0
 
         self.model.train()
+        self.ref_model.eval()
 
         for step, batch in enumerate(train_loader):
             # 跳过步骤（恢复训练时）
             if step < skip_steps:
                 continue
 
-            # 非阻塞数据传输
-            x_chosen = batch["x_chosen"].to(self.args.device, non_blocking=True)
-            x_rejected = batch["x_rejected"].to(self.args.device, non_blocking=True)
-            y_chosen = batch["y_chosen"].to(self.args.device, non_blocking=True)
-            y_rejected = batch["y_rejected"].to(self.args.device, non_blocking=True)
-            mask_chosen = batch["mask_chosen"].to(self.args.device, non_blocking=True)
-            mask_rejected = batch["mask_rejected"].to(
-                self.args.device, non_blocking=True
-            )
-
             # 合并数据
-            x = torch.cat([x_chosen, x_rejected], dim=0)
-            y = torch.cat([y_chosen, y_rejected], dim=0)
-            mask = torch.cat([mask_chosen, mask_rejected], dim=0)
+            x = mx.concatenate([batch["x_chosen"], batch["x_rejected"]], axis=0)
+            y = mx.concatenate([batch["y_chosen"], batch["y_rejected"]], axis=0)
+            mask = mx.concatenate([batch["mask_chosen"], batch["mask_rejected"]], axis=0)
 
-            # 应用学习率调度
+            # 应用学习率调度（每微批 step 应用）
             global_step = epoch * iter_per_epoch + step
             apply_lr_schedule(
                 self.optimizer,
@@ -158,51 +177,42 @@ class DPOTrainer(BaseTrainer):
                 self.args.warmup_iters,
             )
 
-            # 前向传播
-            with self.ctx:
-                # 参考模型前向传播（不计算梯度）
-                with torch.no_grad():
-                    attn_mask = (x != self.tokenizer.pad_token_id).long()
-                    ref_res = self.ref_model(
-                        input_ids=x,
-                        attention_mask=attn_mask,
-                    )
-                    ref_logits = ref_res.logits
+            # 参考模型前向传播（不走 value_and_grad，不会计算梯度）
+            attn_mask = (x != self.tokenizer.pad_token_id).astype(mx.int32)
+            ref_res = self.ref_model(
+                input_ids=x,
+                attention_mask=attn_mask,
+            )
+            ref_log_probs = logits_to_log_probs(ref_res.logits, y)
+            ref_log_probs = ref_log_probs * mask
+            mx.eval(ref_log_probs)
 
-                ref_log_probs = logits_to_log_probs(ref_logits, y)
-                ref_log_probs = ref_log_probs * mask
+            # 当前模型前向 + 反向（loss 内部已除以 accumulation_steps）
+            loss, grads = self._loss_and_grad(
+                self.model, x, y, mask, attn_mask, ref_log_probs
+            )
+            # 立即物化本微批的 loss/grads 并释放反向图（与 BaseTrainer 同理，
+            # 避免 accumulation_steps 个惰性图同时存活导致显存倍增）
+            mx.eval(loss, grads)
 
-                # 当前模型前向传播
-                attn_mask = (x != self.tokenizer.pad_token_id).long()
-                res = self.model(
-                    input_ids=x,
-                    attention_mask=attn_mask,
-                )
-                logits = res.logits
-                log_probs = logits_to_log_probs(logits, y)
-                log_probs = log_probs * mask
+            # 梯度累加
+            accum_grads = (
+                grads
+                if accum_grads is None
+                else tree_map(mx.add, accum_grads, grads)
+            )
+            accum_count += 1
 
-                # 计算DPO损失
-                loss = dpo_loss(ref_log_probs, log_probs, mask, self.beta)
-                loss = loss / self.args.accumulation_steps
-
-            valid_loss_steps += 1
-
-            # 反向传播
-            self.scaler.scale(loss).backward()
-
-            # 梯度累积和更新
+            # 梯度累积窗口结束，执行更新
             if (step + 1) % self.args.accumulation_steps == 0:
-                last_grad_norm = self._optimizer_step(valid_loss_steps)
-                valid_loss_steps = 0
-
-            # 性能分析
-            if profiler is not None:
-                profiler.step()
+                last_grad_norm = self._optimizer_step(accum_grads, accum_count)
+                accum_grads = None
+                accum_count = 0
 
             # 日志记录
             if step % self.args.log_interval == 0:
-                current_loss = loss.item() * self.args.accumulation_steps
+                mx.eval(loss)
+                current_loss = float(loss.item()) * self.args.accumulation_steps
                 grad_norm_to_log = last_grad_norm
 
                 log_training_progress(
@@ -215,7 +225,6 @@ class DPOTrainer(BaseTrainer):
                     self.args,
                     wandb,
                     grad_norm_to_log,
-                    0.0,  # attention_max_logit placeholder
                     base_step_offset=base_step_offset_for_speed,
                 )
 
@@ -229,30 +238,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args = setup_training_args(args, "dpo")
 
-    # 创建模型配置
-    lm_config = VibyConfig(
-        max_position_embeddings=args.max_seq_len,
-        use_moe=args.use_moe,
-        num_experts=args.num_experts,
-        num_experts_per_tok=args.num_experts_per_tok,
-        router_aux_loss_coef=args.router_aux_loss_coef,
-        router_scoring_func=args.router_scoring_func,
-        routed_scaling_factor=args.routed_scaling_factor,
-        swiglu_limit=args.swiglu_limit,
-        use_deepseek_v4_attention=args.use_deepseek_v4_attention,
-        attention_sink=args.attention_sink,
-        use_mhc=args.use_mhc,
-        o_groups=args.o_groups,
-        mtp_depth=args.mtp_depth,
-        mtp_loss_weight=args.mtp_loss_weight,
-        **({"q_lora_rank": args.q_lora_rank} if args.q_lora_rank is not None else {}),
-        **({"o_lora_rank": args.o_lora_rank} if args.o_lora_rank is not None else {}),
-        **(
-            {"moe_intermediate_size": args.moe_intermediate_size}
-            if args.moe_intermediate_size is not None
-            else {}
-        ),
+    # 优先从 SFT checkpoint 的 sidecar config 继承模型结构（含 YaRN/
+    # rope_scaling），CLI 显式传入的参数优先；无 sidecar 时回退库默认值。
+    checkpoint_name = (
+        args.sft_checkpoint
+        if getattr(args, "sft_checkpoint", None)
+        else f"full_sft_{args.hidden_size}.safetensors"
     )
+    cfg, has_sidecar = build_config_from_sidecar(args, checkpoint_name)
+    # DPO 上下文不低于 SFT 的实际上下文，保证继承 YaRN/rope 配置时行为一致
+    cfg["max_position_embeddings"] = max(
+        args.max_seq_len, cfg.get("max_position_embeddings", 0)
+    )
+    lm_config = VibyConfig.from_dict(cfg) if has_sidecar else VibyConfig(**cfg)
 
     # 初始化模型
     model, ref_model, tokenizer = init_model(lm_config, args)
@@ -276,6 +274,3 @@ if __name__ == "__main__":
 #
 # 自定义配置:
 # python train_dpo.py --data_path ../dataset/dpo.jsonl --max_seq_len 1024 --batch_size 4 --accumulation_steps 1 --learning_rate 1e-8
-#
-# 分布式训练:
-# torchrun --nproc_per_node 2 train_dpo.py

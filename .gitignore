@@ -1,5 +1,4 @@
 /out
-canon/
 wandb
 # Created by https://www.toptal.com/developers/gitignore/api/python,macos,linux,visualstudiocode
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,macos,linux,visualstudiocode
@@ -244,3 +243,10 @@ pyrightconfig.json
 .ionide
 
 # End of https://www.toptal.com/developers/gitignore/api/python,macos,linux,visualstudiocode
+.cache/
+
+
+# research artifacts (checkpoints & eval caches)
+/research_runs/
+/out_exp/
+*.safetensors

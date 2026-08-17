@@ -1,0 +1,35 @@
+round	date	duration_s	params_m	final_loss	tokens_per_s	last_step	notes
+round00_baseline	2026-08-15 20:30	604	60.967	11.916	21301	780	用户基线命令原样(compile默认开,同步dataloader,attn_res/sparse/linear关) 【无效:compile闭包bug,权重全程未更新,仅作存档】
+round01_fixed	2026-08-15 20:46	604	60.967	8.199	21505	780	修复compile权重更新bug后重跑基线(compile开+异步dataloader,其余同用户命令)
+round02_value_res	2026-08-15 20:57	601	60.967	8.123	21608	780	架构实验:value residual(后续层可学习混入第一层V,+8标量参数),其余同round01
+round03_bs32	2026-08-15 21:08	603	60.967	7.978	21296	380	吞吐实验:batch32/accum4(等效批量不变),叠加value_res 【不采纳:吞吐21296≈round02的21608无增益,同步数loss差异在噪声内】
+round04_attnres	2026-08-15 21:25	605	60.988	9.293	18636	680	架构实验:AttnRes开启+compile实测兼容+value_res 【不采纳:10分钟预算内loss 9.293远差于8.123,query零初始化需更长训练才能回本,且吞吐-14%】
+round05_warmup20	2026-08-15 21:37	604	60.967	7.786	20838	760	超参实验:warmup_iters 100->20,叠加value_res,其余同round02 【采纳:同步数对比稳定低~0.07,非噪声】
+round06_hybrid	2026-08-15 21:39	1	79.363				架构实验:混合注意力开启(sparse+linear分支) 【无效:参数量79.4M超61M约束(+30%),且SparseLinearAttention不支持value_res启动即crash,不采纳】
+round07_lr015	2026-08-15 21:51	603	60.967	7.992	21528	780	超参实验:peak lr 0.01->0.015,叠加value_res+warmup20 【不采纳:尾部均值略优(8.03 vs 8.09)但终点loss更差,整体噪声内,30分钟轮求稳用0.01】
+round08_attnres_30m	2026-08-15 22:23	1806	60.988	9.939	18734	2060	30分钟决胜轮:AttnRes复测+value_res+warmup20 【不采纳(终局):30分钟仍loss 8.8-11.5剧烈震荡,grad_norm峰值444,lr0.01下不稳定,且吞吐-13%】
+round09_best_30m	2026-08-15 22:55	1804	72.468	7.285	19694	2160	30分钟最终验证 【无效:config.py默认use_deepseek_v4_attention在22:17被改为False,KV头1->4,参数量72.5M超61M约束,loss 7.285系多19%参数换来,不作比较】
+round10_mtp0	2026-08-15 23:22	601	53.690	5.932	26200	940	口径实验:mtp_depth=0(默认1,报告loss=主loss+0.3*mtp_loss,mTP天然高loss抬高报告值),对齐用户历史wandb主loss口径(2000步<3);value_res+warmup20+显式deepseek_v4
+round11_best61m_30m	2026-08-16 00:06	1803	60.967	7.403	21603	2360	【最终采纳】30分钟最优配置:value_res+warmup20+mtp1+deepseek_v4(MQA,61M合规),报告loss含0.3*mtp(纯主loss约5.2),checkpoint已部署到./out并验证可加载
+round12_attn_gate	2026-08-16 00:49	605	61.023	7.881	21232	780	架构筛选:注意力输出门(逐head sigmoid,零初始化)+value_res+warmup20 【存疑:尾部均值7.90优于round05的8.09但终点略差,带入组合轮复验】
+round13_unet_skip	2026-08-16 01:04	607	60.968	8.150	21429	780	架构筛选:U-net跨层跳跃(λ零初始化)+value_res+warmup20 【不采纳:尾部均值8.13 vs round05的8.09,噪声内无收益】
+round15_repro_orig	2026-08-16 01:42	1801	63.912	5.516	23142	2020	忠实复现初始commit基础架构:GQA+无sparse/linear/attn_res/value_res+无mtp(初始commit模型无mtp,历史loss为纯主CE)+batch32+seq640+accum1+lr0.01+warmup100;目标2000步loss<3
+round16_repro_fixed_opt	2026-08-16 02:34	1801	63.912	2.690	22830	2000	优化器分组修复后忠实复现:嵌入/输出头回AdamW(lr0.01,wd0.1)+标量lr恢复0.01+Muon wd0,架构同round15(GQA无mtp,32x640,accum1),目标2000步loss<3
+round17_value_res	2026-08-16 03:06	1802	63.912	2.675	22903	2000	新基线(round16: v1优化器,8Lx768,GQA,mtp0,32x640,accum1,30min→2.69@2000)上叠加value_res(第一层V跨层可学习混合),目标<2.69@2000
+round18_smear	2026-08-16 03:39	1802	63.913	0.000	22700	1980	【否决:标签泄漏】smear_gate混入下一token的embedding,tanh(g)→1后h_t≈emb(x_{t+1}),tied lm_head直接复制答案,120步内loss 9.2→0.006,grad_norm→0;非真实学习
+round19_smear_prev	2026-08-16 04:13	1801	63.913	2.646	22641	1980	修复后smear_gate(混入前一token,因果安全)+value_res,对比round17基线2.675@2000;round18(next-token版)因标签泄漏否决
+round20_canon	2026-08-16 04:48	1802	63.912	2.673	22802	2000	round17基线(value_res,2.675@2000)上叠加canonABCD(深度因果卷积k4残差,历史torch版默认机制),目标<2.675@2000;round19 smear_prev中性(2.646@1980,噪声内)不采纳
+round21_cosine2k	2026-08-16 05:20	1801	63.912	2.487	22684	1980	value_res+cosine衰减终点对齐2000步(--lr_decay_steps 2000,原44159步下lr几乎恒定为0.01),预期显著降低终值loss;对比基线2.675@2000
+round22_attn_gate	2026-08-16 05:52	1802	63.961	2.518	22507	1960	round21基线(value_res+cosine2k,2.487@1980)上叠加attn_gate(注意力输出逐head输入条件sigmoid门,零初始化),目标<2.487
+round23_combo	2026-08-16 06:25	1802	63.961	2.565	22417	1960	【否决min_lr0】尾部均值(1880+五步)2.474 vs round22的2.440;地板0导致末段lr≈5e-5梯度饥饿,丧失尾部收敛;保持0.1
+round24_lr015	2026-08-16 06:57	1802	63.961	2.525	22506	1960	【否决:无差异】峰值lr 0.015与0.01曲线逐点重合(尾部均值2.443 vs 2.440),Muon正交化使更新尺度对lr不敏感;保持0.01
+round25_deep16	2026-08-16 07:29	1801	75.636	2.520	16632	1460	【否决:限时预算下深度亏损】尾部均值2.530 vs 2.440;深度每步优(1200步2.410 vs 2.480)但tokens 29.9M vs 40.2M,+18%参数不值;8Lx768胜
+round26_seq1024	2026-08-16 08:03	1801	63.961	3.034	20935	1820	【否决:padding浪费加剧】尾部均值2.679;无打包下seq1024有67%padding;根源:文档中位仅338token;促使实现序列打包
+round27_packed	2026-08-16 08:44	1802	63.961	2.213	22005	1920	【采纳:大赢】尾部均值2.336 vs 2.440(-0.10),400步起全面领先(400:3.14 vs 3.41);序列打包是第二大杠杆
+round28_packed_seq1024	2026-08-16 09:22	2122	63.961	2.167	20082	1760	【采纳】尾部均值2.302 vs 2.336(-0.034),逐步全面领先;打包后长上下文纯收益;当前最佳配方
+round30_mtp1	2026-08-16 10:18	1803	72.523	3.119	18085	1580	round27配方(PPL9.38最佳:打包+seq640+bs32+value_res+attn_gate+cosine)+mtp1(默认开)作为后续基线;lr_decay_steps 1700预估mtp开销-15%步数;判据改用PPL
+round14_accum1	2026-08-16 01:08					99	【无效:未完成】10分钟run在step 99被杀,日志被后续启动覆盖,无可记录指标;checkpoint已删除
+round29_confirm	2026-08-16 09:31					199	【无效:未完成】30分钟run在step 199被杀,日志被后续启动覆盖,无可记录指标;checkpoint已删除
+round31_mla	2026-08-16 12:06	1802	73.187	3.305	16911	1480	【否决:等时等步双输】MLA替换GQA(kv_lora192+rope32,73.2M);PPL10.52 vs round30的9.66(-8.9%),等步@1480 loss 3.305 vs 3.233,吞吐-6.5%;小尺度下上投影纯增算力,缓存优势未实现(缓存上投影后K/V反比GQA大2.3倍)
+round32_mla_docmask	2026-08-16 12:28	603	73.187	3.660	16322	460	MLA基线+doc_mask首秀,460步@10min,PPL17.81;loss口径屏蔽边界位置故结构性偏低,且lr500步衰减到底vs对照锚round31@500(lr仍8.7e-3,loss3.910)存在调度混淆,doc_mask孤立贡献不可测(对照轮round33被用户取消,留待需要时补)
+round33_mla_nodoc	2026-08-16 12:42	602	73.187	3.874	16606	480	【doc_mask对照组】同round32配方无doc_mask:PPL20.16 vs round32的17.81(-11.6%),CE差-0.124nats;步数反多480vs460仍输;doc_mask采纳,入run_round.sh基线

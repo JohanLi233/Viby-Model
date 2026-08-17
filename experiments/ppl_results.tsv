@@ -1,0 +1,37 @@
+round	date	n_docs	tokens	mean_ce	overall_ppl	doc_ppl	eval_s	ckpt	notes
+round11_best61m_30m	2026-08-16 09:39	2000	706855	5.9426	380.9117	378.1639	19.3	out_exp/round11_best61m_30m/pretrain_768.safetensors	尾部2000篇holdout
+round28_packed_seq1024	2026-08-16 09:41	2000	706855	2.2682	9.6618	9.5564	15.3	out_exp/round28_packed_seq1024/pretrain_768.safetensors	尾部2000篇holdout
+round16_repro_fixed_opt	2026-08-16 09:42	2000	706645	2.5922	13.3592	13.2096	23.0	out_exp/round16_repro_fixed_opt/pretrain_768.safetensors	尾部2000篇holdout
+round17_value_res	2026-08-16 09:42	2000	706645	2.5561	12.8861	12.7336	18.6	out_exp/round17_value_res/pretrain_768.safetensors	尾部2000篇holdout
+round21_cosine2k	2026-08-16 09:43	2000	706645	2.4069	11.1000	10.9730	17.1	out_exp/round21_cosine2k/pretrain_768.safetensors	尾部2000篇holdout
+round22_attn_gate	2026-08-16 09:43	2000	706645	2.4056	11.0853	10.9655	16.3	out_exp/round22_attn_gate/pretrain_768.safetensors	尾部2000篇holdout
+round27_packed	2026-08-16 09:44	2000	706645	2.2388	9.3821	9.2776	16.5	out_exp/round27_packed/pretrain_768.safetensors	尾部2000篇holdout
+round30_mtp1	2026-08-16 10:23	2000	706645	2.2683	9.6633	9.5484	25.6	out_exp/round30_mtp1/pretrain_768.safetensors	round27配方+mtp1,1589步,报告loss含0.3mtp
+round31_mla	2026-08-16 12:07	2000	706645	2.3536	10.5238	10.4075	21.7	out_exp/round31_mla/pretrain_768.safetensors	MLA(kv_lora192+rope32)替换GQA,1486步;对比round30=9.6633/round27=9.3821
+round32_mla_docmask	2026-08-16 12:30	2000	706645	2.8796	17.8075	17.4839	25.2	out_exp/round32_mla_docmask/pretrain_768.safetensors	MLA+doc_mask,460步@10min;对比锚:round31(30min)PPL10.52,其10min时点step500 loss3.910
+round33_mla_nodoc	2026-08-16 12:43	2000	706645	3.0036	20.1574	19.7675	20.4	out_exp/round33_mla_nodoc/pretrain_768.safetensors	MLA无doc_mask,480步@10min;round32(doc_mask)对照,PPL对比17.81
+current_out_step5699	2026-08-16 16:53	2000	817184	1.9369	6.9375	7.1631	20.1	out/pretrain_768.safetensors	当前最强检查点基线
+r030_dense28M_0.1B	2026-08-16 19:37	2000	817184	3.5819	35.9433	37.9385	12.0	research_runs/r030_dense28M_0.1B/pretrain_512.safetensors	dense 512x6 @0.1B slice; ΔW screening anchor (iso-N iso-D)
+r031_loop28M_film_0.1B	2026-08-16 20:45	2000	817184	3.4926	32.8723	34.6771	19.2	research_runs/r031_loop28M_film_0.1B/pretrain_512.safetensors	loop 512x6 x2 FiLM-only @0.1B; ΔW control (identical except dw)
+r031_loop28M_film_0.1B_k2	2026-08-16 20:59	2000	817184	3.4926	32.8723	34.6771	20.9	research_runs/r031_loop28M_film_0.1B/pretrain_512.safetensors	H4 train_k=2 deploy_k=2; loop_k_override prefix-slice load
+h4_smoke	2026-08-16 21:10	50	19876	7.5524	1905.3307	1965.2675	0.8	research_runs/r031_loop28M_film_0.1B/pretrain_512.safetensors	H4 路径 smoke
+r042_hrm768_H2L3_step1899	2026-08-16 22:50	2000	817184	3.7889	44.2056	46.7028	25.7	research_runs/r042_hrm768_P1_H2L3_0.1B/pretrain_768.safetensors	HRM faithful op killed at step1899; main train 2.40-2.47 vs dense r030@1900 2.33
+r044_san384x44_none_10M	2026-08-16 23:15	2000	817184	6.3672	582.4007	595.1677	27.7	research_runs/r044_san384x44_none_10M/pretrain_384.safetensors	SAN smoke: ffn=none h=384 L=44 kv160 ZCN+resgate+san_init emb_scale=7.68 lr0.02 @10M max8min
+r045_dense512x6_10M	2026-08-16 23:20	2000	817184	6.0482	423.3371	430.2353	10.4	research_runs/r045_dense512x6_10M/pretrain_512.safetensors	dense 512x6 baseline @10M slice; matched data/schedule for SAN screening
+r046_san384x44_none_10M	2026-08-16 23:40	2000	817184	6.1485	468.0145	480.0283	28.2	research_runs/r046_san384x44_none_10M/pretrain_384.safetensors	SAN ffn=none h=384 L=44 N=28.45M @10M full; ZCN+resgate+san_init emb_scale=7.68 lr0.02
+r047_san384x44_had_10M	2026-08-17 00:04	2000	817184	6.0613	428.9506	438.2086	57.4	research_runs/r047_san384x44_had_10M/pretrain_384.safetensors	SAN+Hadamard(dense H old ckpt) @10M full; loose-load after FWHT upgrade
+r049_dense512x6_had_34M	2026-08-17 00:31	2000	817184	4.3022	73.8589	76.9059	9.5	research_runs/r049_dense512x6_had_34M/pretrain_512.safetensors	dense-Hadamard 512x6 N=10.6M @34M; iso-matmul-FLOPs vs r045 dense@10M; FWHT mixer
+r050_dense512x6_had_10M	2026-08-17 00:34	2000	817184	6.1479	467.7246	477.3071	8.4	research_runs/r050_dense512x6_had_10M/pretrain_512.safetensors	dense-Hadamard 512x6 N=10.6M @10M; iso-D ablation vs r045 dense@10M
+r051_dense896x8_had_10M	2026-08-17 00:43	2000	817184	6.0086	406.8969	416.3993	21.2	research_runs/r051_dense896x8_had_10M/pretrain_896.safetensors	dense-Hadamard h=896 L=8 N=28.87M @10M; iso-N near-iso-FLOPs vs dense512x6 (FWHT mixer)
+r052_dense512x6_had_26M	2026-08-17 00:54	2000	817184	4.6162	101.1082	106.4970	11.3	research_runs/r052_dense512x6_had_26M/pretrain_512.safetensors	dense-Hadamard 512x6 N=10.62M @26M; strict iso-total-FLOPs vs r045 dense@10M
+r053_dense896x8_had_sand_10M	2026-08-17 01:03	2000	817184	5.2969	199.7172	209.6863	23.3	research_runs/r053_dense896x8_had_sand_10M/pretrain_896.safetensors	dense-Hadamard h=896 L=8 + sandwich_norm @10M; paper ablation free -0.009 nats
+r054_dense896x8_had_sand_0.1B	2026-08-17 02:37	2000	817184	3.5591	35.1318	37.0021	20.4	research_runs/r054_dense896x8_had_sand_0.1B/pretrain_896.safetensors	dense-Hadamard h=896 L=8 + sandwich_norm @0.1B; verification of r053 CE 5.2969 vs dense 6.0482
+r056_dense512x6_had_sand_26M	2026-08-17 02:46	2000	817184	4.4964	89.6918	94.9759	8.9	research_runs/r056_dense512x6_had_sand_26M/pretrain_512.safetensors	dense-Hadamard 512x6 + sandwich_norm @26M; small-N iso-FLOPs sandwich ablation vs r052
+r055_dense896x8_had_sand_10M_s2	2026-08-17 02:55	2000	817184	5.4261	227.2536	236.6197	19.8	research_runs/r055_dense896x8_had_sand_10M_s2/pretrain_896.safetensors	r053 repeat seed=2: dense-Hadamard h896 L8 + sandwich @10M
+r057_dense512x6_10M_s2	2026-08-17 02:59	2000	817184	6.0892	441.0622	447.5072	9.1	research_runs/r057_dense512x6_10M_s2/pretrain_512.safetensors	dense 512x6 @10M seed=2; seed-noise floor for r053 comparison
+r058_dense512x6_had_sand_full	2026-08-17 05:55	2000	817184	2.2761	9.7384	10.1039	7.2	research_runs/r058_dense512x6_had_sand_full/pretrain_512.safetensors	dense-Hadamard 512x6 + sandwich_norm @343M full epoch; small-N long-D scaling probe
+r059_dense384x6_had_sand_34M	2026-08-17 09:22	2000	817184	4.2174	67.8592	71.2909	6.5	research_runs/r059_dense384x6_had_sand_34M/pretrain_384.safetensors	small-N grid: denseHad 384x6 N=7.18M @34M
+r063_dense384x6_had_sand_10M	2026-08-17 09:37	2000	817184	5.8114	334.0800	346.9271	10.2	research_runs/r063_dense384x6_had_sand_10M/pretrain_384.safetensors	lean-Engram screen control: denseHad 384x6 +sandwich @10M
+r064_dense384x6_had_sand_eng_10M	2026-08-17 09:42	2000	817184	5.8349	342.0400	353.7173	16.1	research_runs/r064_dense384x6_had_sand_eng_10M/pretrain_384.safetensors	lean Engram on denseHad 384x6 +sandwich @10M: site(2) orders(2,3) slots4096 sub128, +1.2M table params; B1 knowledge arm
+r065_dense384x6_had_sand_eng_34M	2026-08-17 10:01	2000	817184	4.2564	70.5563	74.1622	19.3	research_runs/r065_dense384x6_had_sand_eng_34M/pretrain_384.safetensors	lean Engram @34M: site(2) orders(2,3) slots4096 sub128 on denseHad 384x6 +sandwich; control=r059 CE 4.2174; tests if knowledge-memory gain needs longer D
+r066_dense384x6_had_sand_eng2_34M	2026-08-17 10:22	2000	817184	4.2273	68.5300	72.0521	15.6	research_runs/r066_dense384x6_had_sand_eng2_34M/pretrain_384.safetensors	engram-v2: value_proj zero-init + orders(1,2,3) slots8192 heads2 sub64 (+3.4M, N=10.36M) on denseHad 384x6 sand @34M; control=r059 CE 4.2174

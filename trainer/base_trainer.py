@@ -1,28 +1,146 @@
 """
-基础训练器类，提供通用的训练逻辑
+基础训练器类，提供通用的训练逻辑（MLX 单设备版）
 """
 
 import os
+import queue
+import threading
 import time
-import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
-from contextlib import nullcontext
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
+
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+import numpy as np
+from mlx.utils import tree_map
+from .muon import create_mixed_optimizer
 from .utils import (
     Logger,
     save_checkpoint,
     load_checkpoint,
     find_latest_checkpoint,
-    create_mixed_optimizer,
     apply_lr_schedule,
     log_training_progress,
     set_ddp_flag,
-    prepare_qk_clip_step,
-    reset_qk_clip_stats,
-    update_attention_stats,
 )
+
+_SENTINEL = object()
+
+
+def _collate_numpy(samples):
+    """样本堆叠为 numpy batch（纯 CPU 工作，在后台线程执行）"""
+    first = samples[0]
+    if isinstance(first, dict):
+        return {
+            key: np.stack([np.asarray(sample[key]) for sample in samples])
+            for key in first
+        }
+    return tuple(
+        np.stack([np.asarray(sample[i]) for sample in samples])
+        for i in range(len(first))
+    )
+
+
+def _to_mx(batch):
+    """numpy batch -> mx.array（在主线程执行，开销极小）"""
+    if isinstance(batch, dict):
+        return {key: mx.array(value) for key, value in batch.items()}
+    return tuple(mx.array(value) for value in batch)
+
+
+class _PrefetchIterator:
+    """后台线程预取：样本读取 + tokenize + numpy 堆叠全部在后台完成，
+    主线程取到的是就绪的 numpy batch，与 GPU 计算重叠。"""
+
+    def __init__(self, loader):
+        self.loader = loader
+        self._queue = queue.Queue(maxsize=loader.prefetch_batches)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._produce, daemon=True)
+        self._thread.start()
+
+    def _put(self, item):
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def _produce(self):
+        loader = self.loader
+        try:
+            n = len(loader.dataset)
+            indices = (
+                np.random.permutation(n) if loader.shuffle else np.arange(n)
+            )
+            with ThreadPoolExecutor(max_workers=loader.num_workers) as pool:
+                for start in range(0, n, loader.batch_size):
+                    if self._stop.is_set():
+                        return
+                    batch_indices = indices[start : start + loader.batch_size]
+                    if loader.drop_last and len(batch_indices) < loader.batch_size:
+                        break
+                    samples = list(
+                        pool.map(lambda i: loader.dataset[int(i)], batch_indices)
+                    )
+                    self._put(_collate_numpy(samples))
+                    if self._stop.is_set():
+                        return
+        except Exception as e:  # 把后台异常传递给主线程
+            self._put(e)
+            return
+        self._put(_SENTINEL)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self._queue.get()
+        if item is _SENTINEL:
+            self._stop.set()
+            raise StopIteration
+        if isinstance(item, Exception):
+            self._stop.set()
+            raise item
+        return _to_mx(item)
+
+    def __del__(self):
+        self._stop.set()
+
+
+class MLXDataLoader:
+    """简单的单设备数据加载器（异步预取版）。
+
+    每个 epoch 迭代时重新 shuffle，按 batch_size 切分，drop_last。
+    数据准备（读文件 + tokenize + 堆叠）在后台线程池完成，
+    主线程只做 numpy -> mx.array 转换，避免 GPU 等待数据。
+    """
+
+    def __init__(
+        self,
+        dataset,
+        batch_size,
+        shuffle=True,
+        drop_last=True,
+        prefetch_batches=4,
+        num_workers=8,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.prefetch_batches = prefetch_batches
+        self.num_workers = num_workers
+
+    def __len__(self):
+        n = len(self.dataset)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        return _PrefetchIterator(self)
 
 
 class BaseTrainer:
@@ -35,85 +153,82 @@ class BaseTrainer:
         self.lm_config = lm_config
         self.training_type = training_type
 
-        # 初始化分布式训练
-        self.ddp = int(os.environ.get("RANK", -1)) != -1
+        # 单设备 MLX 训练，无分布式概念（保留属性以兼容调用方）
+        self.ddp = False
         self.ddp_local_rank = 0
         self.device = args.device
 
-        if self.ddp:
-            self._init_distributed_mode()
-
-        set_ddp_flag(self.ddp)
+        set_ddp_flag(False)
 
         # 初始化训练组件
         self._init_training_components()
 
-    def _init_distributed_mode(self):
-        """初始化分布式训练模式"""
-        # 根据可用硬件选择合适的后端
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend)
-        self.ddp_local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        # 训练时长预算（max_train_minutes）的起始时间，train() 开始时设置
+        self._train_start_time = None
 
-        if torch.cuda.is_available():
-            self.device = f"cuda:{self.ddp_local_rank}"
-            torch.cuda.set_device(self.ddp_local_rank)
-            self.args.device = torch.device(self.device)
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            # MPS 暂不支持 NCCL，使用 Gloo，并保持单设备 'mps'
-            self.device = "mps"
-            self.args.device = torch.device("mps")
-        else:
-            self.device = "cpu"
-            self.args.device = torch.device("cpu")
-
-        # 设置随机种子
-        base_seed = 1337
-        rank = dist.get_rank()
-        torch.manual_seed(base_seed + rank)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(base_seed + rank)
+    def _time_limit_exceeded(self):
+        """是否已达最长训练时长（分钟）。未设置或训练未开始时返回 False。"""
+        limit = getattr(self.args, "max_train_minutes", None)
+        if not limit or self._train_start_time is None:
+            return False
+        return (time.time() - self._train_start_time) >= limit * 60
 
     def _init_training_components(self):
         """初始化训练组件"""
-        # 自动类型转换上下文
-        device_type = (
-            "cuda"
-            if "cuda" in str(self.device)
-            else "mps"
-            if "mps" in str(self.device)
-            else "cpu"
-        )
-
-        # 混合精度训练（MPS 也启用 GradScaler）
-        use_grad_scaler = device_type in ("cuda", "mps") and (
-            self.args.dtype in ["float16", "bfloat16"]
-        )
-        self.scaler = torch.amp.GradScaler(enabled=use_grad_scaler)  # type: ignore
-        if device_type == "cpu":
-            self.ctx = nullcontext()
-        elif device_type == "cuda":
-            dtype = torch.bfloat16 if self.args.dtype == "bfloat16" else torch.float16
-            self.ctx = torch.autocast(device_type="cuda", dtype=dtype)
-        elif device_type == "mps":
-            dtype = torch.bfloat16 if self.args.dtype == "bfloat16" else torch.float16
-            self.ctx = torch.autocast(device_type="mps", dtype=dtype)
-
         # 创建优化器
-        use_muon_clip = getattr(self.args, "use_muon_clip", False)
-        self.optimizer = create_mixed_optimizer(
-            self.model, self.args, self.ddp, self.training_type, use_muon_clip
-        )
+        if getattr(self.args, "optimizer", "muon") == "adamw":
+            from .muon import create_adamw_optimizer
+            self.optimizer = create_adamw_optimizer(
+                self.model, self.args, self.training_type
+            )
+        else:
+            self.optimizer = create_mixed_optimizer(
+                self.model, self.args, self.training_type
+            )
+
+        # loss + 梯度函数（mx.compile 默认启用）
+        self._loss_and_grad = self._build_loss_and_grad()
 
         # 处理检查点恢复
         self.start_epoch, self.start_step = self._handle_checkpoint_resume()
 
-        # 包装DDP
-        if self.ddp:
-            self.model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}  # type: ignore
-            self.model = DistributedDataParallel(
-                self.model, device_ids=[self.ddp_local_rank]
-            )
+    def _loss_fn(self, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None):
+        """训练 loss 函数（model 走闭包引用）
+
+        返回 (加权和 loss / accumulation_steps, mtp 分量 loss)。
+        mtp 分量仅作日志展示、不缩放；无 MTP 时返回 0 常量，
+        保持 compile 图结构稳定。
+        """
+        res = self.model(
+            input_ids=X,
+            labels=Y,
+            loss_mask=loss_mask,
+            attention_mask=attn_mask,
+            mask_has_pad=mask_has_pad,
+            segment_ids=seg_ids,
+        )
+        mtp_loss = res.mtp_loss if res.mtp_loss is not None else mx.array(0.0)
+        return res.loss / self.args.accumulation_steps, mtp_loss
+
+    def _loss_and_grad_with_params(self, params, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None):
+        """参数显式作为入参的 loss 函数（value_and_grad 的目标）。
+
+        不能用 nn.value_and_grad + mx.compile：那样 params 通过闭包
+        （model.trainable_parameters()）被 compile 捕获为常量，梯度永远
+        基于初始权重、优化器更新完全无效。显式传参后参数成为运行时输入。
+        mask_has_pad 是 python bool，作为编译期常量（最多两个图变体）。
+        """
+        self.model.update(params)
+        return self._loss_fn(X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids)
+
+    def _build_loss_and_grad(self):
+        fn = mx.value_and_grad(self._loss_and_grad_with_params)
+        use_compile = getattr(self.args, "compile_model", False)
+        if use_compile:
+            Logger("使用 mx.compile 编译 loss 函数")
+            fn = mx.compile(fn)
+        self._compiled = use_compile
+        return fn
 
     def _handle_checkpoint_resume(self):
         """处理检查点恢复"""
@@ -123,7 +238,7 @@ class BaseTrainer:
         if self.args.resume:
             if os.path.exists(self.args.resume):
                 start_epoch, start_step = load_checkpoint(
-                    self.args.resume, self.model, self.optimizer, self.scaler, self.args
+                    self.args.resume, self.model, self.optimizer, self.args
                 )
             else:
                 Logger(
@@ -136,7 +251,6 @@ class BaseTrainer:
                     latest_checkpoint,
                     self.model,
                     self.optimizer,
-                    self.scaler,
                     self.args,
                 )
             else:
@@ -146,60 +260,33 @@ class BaseTrainer:
 
     def create_data_loader(self, dataset):
         """创建数据加载器"""
-        train_sampler = DistributedSampler(dataset) if self.ddp else None
-        return DataLoader(
+        return MLXDataLoader(
             dataset,
             batch_size=self.args.batch_size,
-            pin_memory=getattr(self.args, "pin_memory", True),
+            shuffle=True,
             drop_last=True,
-            shuffle=(train_sampler is None),
-            num_workers=getattr(self.args, "num_workers", 1),
-            sampler=train_sampler,
-            prefetch_factor=(
-                getattr(self.args, "prefetch_factor", 2)
-                if getattr(self.args, "num_workers", 1) > 0
-                else None
-            ),
-            persistent_workers=getattr(self.args, "persistent_workers", True)
-            and getattr(self.args, "num_workers", 1) > 0,
         )
 
-    def _optimizer_step(self, valid_loss_steps):
-        if valid_loss_steps <= 0:
-            self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
+    def _optimizer_step(self, accum_grads, accum_count):
+        """累积窗口结束：梯度裁剪 + 优化器更新"""
+        if accum_count <= 0 or accum_grads is None:
             return 0.0
 
-        if hasattr(self.optimizer, "unscale_gradients"):
-            self.optimizer.unscale_gradients(self.scaler)
-        else:
-            self.scaler.unscale_(self.optimizer)
+        # 每个微批的 loss 已除以 accumulation_steps，
+        # 累加的梯度即窗口平均梯度，无需再除
+        grads, grad_norm = optim.clip_grad_norm(accum_grads, self.args.grad_clip)
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), self.args.grad_clip
-        )
-        prepare_qk_clip_step(self.model, self.optimizer)
+        self.optimizer.update(self.model, grads)
 
-        if hasattr(self.optimizer, "optimizers"):
-            for opt in self.optimizer.optimizers:
-                self.scaler.step(opt)
-        else:
-            self.scaler.step(self.optimizer)
-        self.scaler.update()
-
-        reset_qk_clip_stats(self.model, self.optimizer)
-        self.optimizer.zero_grad(set_to_none=True)
+        mx.eval(self.model.parameters(), self.optimizer.state)
         return float(grad_norm)
 
     def _save_if_needed(self, epoch, step):
         if (step + 1) % self.args.save_interval != 0:
             return
-        if self.ddp and dist.get_rank() != 0:
-            return
         save_checkpoint(
             self.model,
             self.optimizer,
-            self.scaler,
             epoch,
             step,
             self.args,
@@ -214,115 +301,106 @@ class BaseTrainer:
         iter_per_epoch,
         total_training_steps,
         wandb=None,
-        profiler: Optional[torch.profiler.profile] = None,
         skip_steps: int = 0,
     ):
         """训练一个epoch"""
         start_time = time.time()
         base_step_offset_for_speed = skip_steps
-        valid_loss_steps = 0
+        accum_grads = None
+        accum_count = 0
         last_grad_norm = 0.0  # Store last calculated gradient norm
 
         self.model.train()
 
-        for step, (X, Y, loss_mask) in enumerate(train_loader):
+        for step, batch in enumerate(train_loader):
             # 跳过步骤（恢复训练时）
             if step < skip_steps:
                 continue
+            # doc_mask 打包模式下 dataset 多返回一项 segment_ids
+            if len(batch) == 4:
+                X, Y, loss_mask, seg_ids = batch
+            else:
+                X, Y, loss_mask = batch
+                seg_ids = None
 
-            # 非阻塞数据传输
-            X = X.to(self.args.device, non_blocking=True)
-            Y = Y.to(self.args.device, non_blocking=True)
-            loss_mask = loss_mask.to(self.args.device, non_blocking=True)
-
-            # 应用学习率调度
+            # 应用学习率调度（每微批 step 应用）
             global_step = epoch * iter_per_epoch + step
             apply_lr_schedule(
                 self.optimizer,
                 global_step,
                 total_training_steps,
                 self.args.warmup_iters,
+                min_lr_ratio=getattr(self.args, "min_lr_ratio", 0.1),
             )
 
-            # 前向传播
-            with self.ctx:
-                # 构造 attention_mask，屏蔽 PAD 位置
-                attn_mask = (X != self.tokenizer.pad_token_id).long()
-                # 直接将 labels、loss_mask、attention_mask 传递给模型
-                res = self.model(
-                    input_ids=X,
-                    labels=Y,
-                    loss_mask=loss_mask,
-                    attention_mask=attn_mask,
-                )
-                loss = res.loss  # 使用模型返回的loss
+            # 构造 attention_mask，屏蔽 PAD 位置
+            attn_mask = (X != self.tokenizer.pad_token_id).astype(mx.int32)
+            # mx.compile 图内不允许 .item() host sync，在 eager 侧算好传入；
+            # eager 模式下模型内部也会做同样的判断，成本相同
+            mask_has_pad = bool(mx.any(attn_mask != 1).item())
 
-                attention_max_logit = update_attention_stats(self.model, self.optimizer)
+            # 前向 + 反向（loss 内部已除以 accumulation_steps）
+            # 参数显式传入：compile 下保证梯度基于当前权重而非初始快照
+            # mtp_loss 是辅助输出，仅用于日志展示，不参与梯度
+            params = self.model.trainable_parameters()
+            (loss, mtp_loss), grads = self._loss_and_grad(
+                params, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids
+            )
+            if self._compiled:
+                # compiled fn 内部的 model.update(params) 只在 trace 时执行，
+                # 会把无 primitive 的占位数组留在 module 上；立即用真实参数
+                # 恢复，避免污染后续 optimizer step 的 eval
+                self.model.update(params)
 
-                if (
-                    step == 0 and epoch == self.start_epoch
-                ):  # 只在训练开始时打印一次即可
-                    Logger("--- Verification ---")
-                    Logger(f"Tensor dtype inside autocast context: {res.logits.dtype}")
-                    Logger(f"Expected dtype: {self.args.dtype}")
-                    Logger(f"Device: {self.device}")
-                    # 安全打印 autocast dtype
-                    dev_str = str(self.device)
-                    dev_type = (
-                        "cuda"
-                        if "cuda" in dev_str
-                        else "mps"
-                        if "mps" in dev_str
-                        else "cpu"
-                    )
-                    try:
-                        if dev_type == "cuda" and hasattr(
-                            torch, "get_autocast_gpu_dtype"
-                        ):
-                            Logger(f"Autocast dtype: {torch.get_autocast_gpu_dtype()}")
-                        elif dev_type == "cpu" and hasattr(
-                            torch, "get_autocast_cpu_dtype"
-                        ):
-                            Logger(f"Autocast dtype: {torch.get_autocast_cpu_dtype()}")
-                        else:
-                            Logger("Autocast dtype: n/a")
-                    except Exception:
-                        Logger("Autocast dtype: n/a")
-                    Logger("--------------------")
+            # 立即物化本微批的 loss/grads 并释放反向图。MLX 是惰性求值，
+            # 若不 eval，accumulation_steps 个微批的前向+反向图会全部存活到
+            # optimizer step，显存按窗口大小成倍增长。
+            mx.eval(loss, mtp_loss, grads)
 
-                loss = loss / self.args.accumulation_steps
+            # 梯度累加
+            accum_grads = (
+                grads
+                if accum_grads is None
+                else tree_map(mx.add, accum_grads, grads)
+            )
+            accum_count += 1
 
-            valid_loss_steps += 1
-
-            # 反向传播
-            self.scaler.scale(loss).backward()
-
-            # 梯度累积和更新
+            # 梯度累积窗口结束，执行更新
             if (step + 1) % self.args.accumulation_steps == 0:
-                last_grad_norm = self._optimizer_step(valid_loss_steps)
-                valid_loss_steps = 0
+                last_grad_norm = self._optimizer_step(accum_grads, accum_count)
+                accum_grads = None
+                accum_count = 0
 
-            # 性能分析
-            if profiler is not None:
-                profiler.step()
+                # 时长预算只在窗口边界检查：中途停止会丢掉已累加但未更新的梯度
+                if self._time_limit_exceeded():
+                    Logger(
+                        f"已达最长训练时长 {self.args.max_train_minutes} 分钟，"
+                        f"在梯度累积窗口边界（epoch {epoch + 1}, step {step}）停止训练"
+                    )
+                    save_checkpoint(
+                        self.model,
+                        self.optimizer,
+                        epoch,
+                        step,
+                        self.args,
+                        self.lm_config,
+                        self.training_type,
+                    )
+                    return True
 
             # 日志记录
             if step % self.args.log_interval == 0:
                 # 无论何时记录，都计算当前微批次的原始损失值
-                # loss.item() 是已经被 accumulation_steps 缩放过的损失
+                # loss 是已经被 accumulation_steps 缩放过的损失
                 # 将其乘回去，就得到了当前单个微批次的原始损失，确保日志值量级一致
-                current_loss = loss.item() * self.args.accumulation_steps
+                mx.eval(loss)
+                current_loss = float(loss.item()) * self.args.accumulation_steps
+                # MTP 分量（未加权）仅在开启 MTP 时展示
+                has_mtp = getattr(self.lm_config, "mtp_depth", 0) > 0
+                current_mtp_loss = float(mtp_loss.item()) if has_mtp else None
 
                 # 使用上次计算的梯度范数
                 grad_norm_to_log = last_grad_norm
-
-                # 获取 QK-Clip 统计信息（如果使用 MuonClip 优化器）
-                qk_clip_stats = None
-                if hasattr(self.optimizer, "qk_clip_stats"):
-                    qk_clip_stats = self.optimizer.qk_clip_stats.copy()
-
-                # 使用注意力 max logit 用于日志记录
-                logit_to_log = attention_max_logit
 
                 log_training_progress(
                     epoch,
@@ -334,68 +412,66 @@ class BaseTrainer:
                     self.args,
                     wandb,
                     grad_norm_to_log,
-                    logit_to_log,
                     base_step_offset=base_step_offset_for_speed,
-                    qk_clip_stats=qk_clip_stats,
+                    mtp_loss=current_mtp_loss,
                 )
 
             # 模型保存
             self._save_if_needed(epoch, step)
 
+        return False
+
     def train(self, train_loader, wandb=None):
         """主训练循环"""
-        # torch.autograd.set_detect_anomaly(True)
         iter_per_epoch = len(train_loader)
         total_training_steps = self.args.epochs * iter_per_epoch
+        # 短时训练（如 --max_train_minutes 限时跑）时，用 --lr_decay_steps 把
+        # cosine 衰减的终点对齐到实际会跑的步数，否则 lr 几乎不衰减
+        lr_decay_steps = getattr(self.args, "lr_decay_steps", None)
+        if lr_decay_steps:
+            total_training_steps = lr_decay_steps
         Logger(f"训练总步数: {total_training_steps}, 每轮步数: {iter_per_epoch}")
+        if getattr(self.args, "max_train_minutes", None):
+            Logger(f"最长训练时长: {self.args.max_train_minutes} 分钟")
 
-        # 设置性能分析器
-        profiler = None
-        if getattr(self.args, "profile", False) and (
-            not self.ddp or dist.get_rank() == 0
-        ):
-            profiler = torch.profiler.profile(
-                schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    "./log/profiler"
-                ),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True,
+        self._train_start_time = time.time()
+        time_limit_hit = False
+
+        for epoch in range(self.start_epoch, self.args.epochs):
+            # 计算需要跳过的步骤
+            skip_steps = self.start_step if epoch == self.start_epoch else 0
+
+            time_limit_hit = self.train_epoch(
+                epoch,
+                train_loader,
+                iter_per_epoch,
+                total_training_steps,
+                wandb,
+                skip_steps,
             )
-            profiler.start()
 
-        try:
-            for epoch in range(self.start_epoch, self.args.epochs):
-                # 设置分布式采样器的epoch
-                if (
-                    self.ddp
-                    and hasattr(train_loader, "sampler")
-                    and train_loader.sampler is not None
-                ):
-                    train_loader.sampler.set_epoch(epoch)
+            # 重置start_step
+            if epoch == self.start_epoch:
+                self.start_step = 0
 
-                # 计算需要跳过的步骤
-                skip_steps = self.start_step if epoch == self.start_epoch else 0
+            if time_limit_hit:
+                break
 
-                self.train_epoch(
-                    epoch,
-                    train_loader,
-                    iter_per_epoch,
-                    total_training_steps,
-                    wandb,
-                    profiler,
-                    skip_steps,
-                )
-
-                # 重置start_step
-                if epoch == self.start_epoch:
-                    self.start_step = 0
-
-                # 清理缓存
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-        finally:
-            if profiler is not None:
-                profiler.stop()
+        # 训练结束保存最后一个检查点（若最后一个步恰好按 save_interval 已保存则跳过；
+        # 因时长限制停止时已保存过，不再重复保存）
+        if (
+            not time_limit_hit
+            and self.args.epochs > 0
+            and iter_per_epoch > 0
+            and iter_per_epoch % self.args.save_interval != 0
+        ):
+            last_epoch = max(self.start_epoch, self.args.epochs - 1)
+            save_checkpoint(
+                self.model,
+                self.optimizer,
+                last_epoch,
+                iter_per_epoch - 1,
+                self.args,
+                self.lm_config,
+                self.training_type,
+            )
