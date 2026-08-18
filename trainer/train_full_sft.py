@@ -9,7 +9,7 @@ from model.model import VibyConfig
 from dataset.lm_dataset import SFTDataset
 from .base_trainer import BaseTrainer
 from .config import build_sft_rope_scaling, get_sft_parser, setup_training_args
-from .utils import build_config_from_sidecar, build_model_and_tokenizer, init_wandb
+from .utils import build_config_from_sidecar, build_model_and_tokenizer, init_swanlab
 
 warnings.filterwarnings("ignore")
 
@@ -64,10 +64,12 @@ if __name__ == "__main__":
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_loader = trainer.create_data_loader(train_ds)
 
-    wandb = init_wandb(args, trainer)
+    swanlab = init_swanlab(args, trainer)
 
     # 开始训练
-    trainer.train(train_loader, wandb)
+    trainer.train(train_loader, swanlab)
+    if swanlab is not None:
+        swanlab.finish()
 
 # 执行命令示例:
 #

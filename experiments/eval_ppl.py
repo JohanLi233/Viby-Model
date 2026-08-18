@@ -6,6 +6,8 @@
 - 仅用主模型 logits 计算 next-token CE（不含 MTP 辅助 loss），因此 mtp0/mtp1
   的 checkpoint 可以公平对比，而训练日志的报告 loss 口径不同不可直接比。
 - 主指标为全体 token 加权平均 CE 的指数（overall PPL），辅以逐篇均值 PPL。
+- 模型带 engram 时按训练口径注入；生成（缓存解码）路径同样注入（n-gram
+  窗口携带），因此 PPL 与生成测的是同一函数。
 
 用法：
   uv run experiments/eval_ppl.py --ckpt out_exp/round28_packed_seq1024/pretrain_768.safetensors \
@@ -48,7 +50,9 @@ def load_eval_docs(data_path: str, n_docs: int):
 
 def main():
     parser = argparse.ArgumentParser(description="Viby held-out PPL evaluation")
-    parser.add_argument("--ckpt", required=True, type=str, help="safetensors 检查点路径")
+    parser.add_argument(
+        "--ckpt", required=True, type=str, help="safetensors 检查点路径"
+    )
     parser.add_argument(
         "--data_path",
         # HQ 语料已于 2026-08-16 删除，主力数据换为 t2t_mini；评估集=该文件
@@ -86,6 +90,7 @@ def main():
     if not os.path.exists(sidecar):
         # step 快照没有独立 sidecar，回退到 canonical pretrain_{hidden}.json
         import re
+
         canonical = re.sub(r"_step\d+$", "", os.path.splitext(args.ckpt)[0]) + ".json"
         if os.path.exists(canonical):
             sidecar = canonical
@@ -131,7 +136,9 @@ def main():
             doc_ids.append(ids)
     print(
         f"[ppl] {os.path.basename(os.path.dirname(args.ckpt))}: "
-        f"{len(doc_ids)} docs, mtp_depth={config.mtp_depth}, 加载+tokenize {time.time() - t0:.1f}s"
+        f"{len(doc_ids)} docs, mtp_depth={config.mtp_depth}, "
+        f"engram={'on' if model.model.engrams else 'off'}, "
+        f"加载+tokenize {time.time() - t0:.1f}s"
     )
 
     total_ce = 0.0

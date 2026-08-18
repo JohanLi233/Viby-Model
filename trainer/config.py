@@ -55,7 +55,7 @@ def add_common_args(parser):
         help="使用 mx.compile 编译 loss 函数（默认开启）",
     )
     parser.add_argument("--no_compile", action="store_false", dest="compile_model")
-    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--use_swanlab", action="store_true", default=True)
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--accumulation_steps", type=int, default=1)
@@ -70,11 +70,27 @@ def add_common_args(parser):
     parser.add_argument("--log_interval", type=int, default=8)
     parser.add_argument("--save_interval", type=int, default=100)
     parser.add_argument(
+        "--cache_limit_gb",
+        type=float,
+        default=0,
+        help="Metal 分配器空闲块缓存上限（GB），0=不限制。"
+        "上限内的释放块常驻复用、不归还 OS；过大在 bs16x640 以上的"
+        "大配置会挤占活跃内存（实测最优点 24G，峰值+缓存≈40G）",
+    )
+    parser.add_argument(
         "--max_train_minutes",
         type=float,
         default=None,
         help="最长训练时长（分钟）。到时后在当前梯度累积窗口边界停止并保存 "
         "checkpoint（不会因 resume 丢梯度）；默认不限制",
+    )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="最多训练多少个微批 step（与日志 (step/N) 同口径）。到步数后在当前"
+        "梯度累积窗口边界停止并保存 checkpoint；默认不限制。lr 调度不压缩，"
+        "便于与同调度全量跑的早期 step 直接对比",
     )
     parser.add_argument(
         "--lr_decay_steps",
@@ -143,6 +159,13 @@ def add_common_args(parser):
         help="muon = Muon+AdamW 混合（核心矩阵 Muon）；adamw = 全参数 AdamW",
     )
     parser.add_argument(
+        "--muon_ns_steps",
+        type=int,
+        default=5,
+        help="Muon Newton-Schulz 迭代步数（默认 5 对齐原版；减到 3 整步快 ~5%，"
+        "但正交化精度下降、训练动力学改变）",
+    )
+    parser.add_argument(
         "--loop_k",
         type=int,
         default=1,
@@ -179,14 +202,27 @@ def add_common_args(parser):
         "--hrm_bp_cycles",
         type=str,
         default=None,
-        help="HRM 训练梯度路由：逗号分隔的每 H cycle 尾部回传 L cycle 数；"
-        "默认全部回传",
+        help="HRM 训练梯度路由：逗号分隔的每 H cycle 尾部回传 L cycle 数；默认全部回传",
     )
     parser.add_argument(
         "--hrm_emb_scale",
         type=float,
         default=1.0,
         help="HRM 输入 embedding 缩放；默认 1.0（MLX 初始化与 HF 不同）",
+    )
+    parser.add_argument(
+        "--hrm_cycle_router",
+        type=int,
+        default=0,
+        help="HRM×MoE CycleRouter：router 增加 per-cycle 专家偏置（零初始化），"
+        "让专家按迭代特化；仅 HRM 模式生效",
+    )
+    parser.add_argument(
+        "--hrm_cycle_film",
+        type=int,
+        default=0,
+        help="HRM CycleFiLM：每次 stack 调用前做 per-cycle scale/shift（零初始化）；"
+        "仅 HRM 模式生效",
     )
     parser.add_argument(
         "--ffn_type",
@@ -248,6 +284,48 @@ def add_common_args(parser):
         help="Engram 每 order 的表头数；0=按 hidden_size 自动",
     )
     parser.add_argument("--engram_sub_dim", type=int, default=128)
+    parser.add_argument(
+        "--n_routed_experts",
+        type=int,
+        default=0,
+        help="DeepSeekMoE 路由专家数；>0 时第 n_dense_layers 层起 FFN 换为 MoE",
+    )
+    parser.add_argument(
+        "--num_experts_per_tok",
+        type=int,
+        default=6,
+        help="MoE 每 token 激活的路由专家数（V4 为 6）",
+    )
+    parser.add_argument(
+        "--n_shared_experts",
+        type=int,
+        default=1,
+        help="MoE 共享专家数（中间维 = moe_intermediate_size × n_shared_experts）",
+    )
+    parser.add_argument(
+        "--moe_intermediate_size",
+        type=int,
+        default=None,
+        help="MoE 单个路由专家中间维；默认取 intermediate_size",
+    )
+    parser.add_argument(
+        "--n_dense_layers",
+        type=int,
+        default=1,
+        help="MoE 模型的前若干 dense FFN 层数（V3/V4 风格）",
+    )
+    parser.add_argument(
+        "--routed_scaling_factor",
+        type=float,
+        default=2.5,
+        help="MoE 路由权重缩放因子（sigmoid 归一化后乘该系数）",
+    )
+    parser.add_argument(
+        "--moe_bias_update_rate",
+        type=float,
+        default=0.001,
+        help="无辅助损失负载均衡的偏置更新步长 u（每优化器步按负载统计更新）；<=0 关闭",
+    )
 
 
 def get_pretrain_parser():
@@ -261,10 +339,10 @@ def get_pretrain_parser():
         batch_size=32,
         learning_rate=0.01,
         accumulation_steps=8,
-        max_seq_len=1024,
+        max_seq_len=2048,
     )
 
-    parser.add_argument("--wandb_project", type=str, default="Viby-Pretrain")
+    parser.add_argument("--swanlab_project", type=str, default="Viby-Pretrain")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl")
 
     return parser
@@ -304,6 +382,8 @@ def get_sft_parser():
         hrm_L_cycles=None,
         hrm_bp_cycles=None,
         hrm_emb_scale=None,
+        hrm_cycle_router=None,
+        hrm_cycle_film=None,
         ffn_type=None,
         zero_centered_norm=None,
         use_res_gate=None,
@@ -315,9 +395,16 @@ def get_sft_parser():
         engram_heads=None,
         engram_slots=None,
         engram_sub_dim=None,
+        n_routed_experts=None,
+        num_experts_per_tok=None,
+        n_shared_experts=None,
+        moe_intermediate_size=None,
+        n_dense_layers=None,
+        routed_scaling_factor=None,
+        moe_bias_update_rate=None,
     )
 
-    parser.add_argument("--wandb_project", type=str, default="Viby-Full-SFT")
+    parser.add_argument("--swanlab_project", type=str, default="Viby-Full-SFT")
     parser.add_argument("--data_path", type=str, default="../dataset/sft_512.jsonl")
     parser.add_argument(
         "--pretrain_checkpoint",
@@ -390,6 +477,8 @@ def get_dpo_parser():
         hrm_L_cycles=None,
         hrm_bp_cycles=None,
         hrm_emb_scale=None,
+        hrm_cycle_router=None,
+        hrm_cycle_film=None,
         ffn_type=None,
         zero_centered_norm=None,
         use_res_gate=None,
@@ -401,9 +490,16 @@ def get_dpo_parser():
         engram_heads=None,
         engram_slots=None,
         engram_sub_dim=None,
+        n_routed_experts=None,
+        num_experts_per_tok=None,
+        n_shared_experts=None,
+        moe_intermediate_size=None,
+        n_dense_layers=None,
+        routed_scaling_factor=None,
+        moe_bias_update_rate=None,
     )
 
-    parser.add_argument("--wandb_project", type=str, default="Viby-DPO")
+    parser.add_argument("--swanlab_project", type=str, default="Viby-DPO")
     parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl")
     parser.add_argument(
         "--dpo_beta", type=float, default=0.1, help="DPO beta parameter"
@@ -459,6 +555,8 @@ def setup_training_args(args, training_type="pretrain"):
         raise ValueError("max_seq_len 必须大于 0")
     if args.max_train_minutes is not None and args.max_train_minutes <= 0:
         raise ValueError("max_train_minutes 必须大于 0（或不传入以禁用时间限制）")
+    if getattr(args, "max_steps", None) is not None and args.max_steps <= 0:
+        raise ValueError("max_steps 必须大于 0（或不传入以禁用步数限制）")
 
     # checkpoint 保存点必须落在梯度累积窗口边界上：窗口中间保存的 checkpoint
     # 不含已累加但未更新的梯度，resume 时这部分梯度会永久丢失
@@ -479,13 +577,11 @@ def setup_training_args(args, training_type="pretrain"):
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # 设置wandb运行名称
-    if training_type == "pretrain":
-        args.wandb_run_name = f"Viby-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-    elif training_type == "dpo":
-        args.wandb_run_name = f"Viby-DPO-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-    else:
-        args.wandb_run_name = f"Viby-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+    # 设置 swanlab 运行名称：out_dir 基名（通常即实验轮次名）+ 关键配置
+    run_tag = os.path.basename(os.path.normpath(args.out_dir))
+    args.swanlab_run_name = (
+        f"{run_tag}-E{args.epochs}-BS{args.batch_size}-LR{args.learning_rate}"
+    )
 
     # 设置随机种子（MLX 单设备）
     base_seed = getattr(args, "seed", 1337)

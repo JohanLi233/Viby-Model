@@ -13,6 +13,43 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 _thread_files = threading.local()
 
 
+def _tokenizer_cache_fingerprint(tokenizer) -> str:
+    """打包语料缓存键中的 tokenizer 指纹。
+
+    打包 id 与 seg 是「分词器输出」的派生缓存，但旧键只包含数据文件
+    (path, mtime, size, max_length)：同一份数据换 tokenizer（或改 vocab）
+    后会静默命中旧 token id 缓存。这里把完整 vocab 映射纳入键，避免
+    换词表后继续使用错误打包。
+    """
+    import hashlib
+
+    vocab = getattr(tokenizer, "get_vocab", None)
+    try:
+        payload = (
+            json.dumps(vocab(), sort_keys=True, ensure_ascii=False)
+            if vocab is not None
+            else repr(
+                (
+                    getattr(tokenizer, "vocab_size", None),
+                    getattr(tokenizer, "bos_token_id", None),
+                    getattr(tokenizer, "eos_token_id", None),
+                    getattr(tokenizer, "pad_token_id", None),
+                )
+            )
+        )
+    except Exception:
+        payload = repr(
+            (
+                getattr(tokenizer, "name_or_path", None),
+                getattr(tokenizer, "vocab_size", None),
+                getattr(tokenizer, "bos_token_id", None),
+                getattr(tokenizer, "eos_token_id", None),
+                getattr(tokenizer, "pad_token_id", None),
+            )
+        )
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def pre_processing_chat(conversations, add_system_ratio=0.2):
     """与 MiniMind 对齐：对话预处理。
 
@@ -67,7 +104,11 @@ def _read_line_at_offset(data_path: str, offset: int) -> str:
 
 class PretrainDataset:
     def __init__(
-        self, data_path, tokenizer, max_length=1024, cache_size: Optional[int] = 1000,
+        self,
+        data_path,
+        tokenizer,
+        max_length=1024,
+        cache_size: Optional[int] = 1000,
         pack_sequences: bool = False,
         doc_mask: bool = False,
     ):
@@ -97,7 +138,7 @@ class PretrainDataset:
         st = os.stat(self.data_path)
         key = hashlib.md5(
             f"{os.path.abspath(self.data_path)}:{st.st_mtime_ns}:{st.st_size}:"
-            f"{self.max_length}:packed".encode()
+            f"{self.max_length}:{_tokenizer_cache_fingerprint(self.tokenizer)}:packed".encode()
         ).hexdigest()
         cache_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache"
@@ -108,7 +149,9 @@ class PretrainDataset:
     def _build_packed(self) -> np.ndarray:
         cache_path = self._packed_cache_path()
         if os.path.exists(cache_path):
-            return np.load(cache_path)
+            # mmap 只读映射：2.7G 级别的打包语料由文件页缓存承载，不占
+            # 匿名内存（内存压力下可直接驱逐，不会转化为 swap 写入压力）
+            return np.load(cache_path, mmap_mode="r")
 
         eos_id = self.tokenizer.eos_token_id
         texts = []
@@ -139,9 +182,8 @@ class PretrainDataset:
         文档 id（eos 归属于其文档）。块内只需相等性，全局 id 即可。"""
         cache_path = self._segs_cache_path()
         if os.path.exists(cache_path):
-            return np.load(cache_path)
+            return np.load(cache_path, mmap_mode="r")  # 同 _build_packed
 
-        eos_id = self.tokenizer.eos_token_id
         texts = []
         with open(self.data_path, "rb") as f:
             for line in f:

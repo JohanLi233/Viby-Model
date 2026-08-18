@@ -16,7 +16,7 @@ from .utils import (
     build_config_from_sidecar,
     build_model_and_tokenizer,
     convert_model_dtype,
-    init_wandb,
+    init_swanlab,
     load_model_weights,
     log_training_progress,
 )
@@ -114,11 +114,20 @@ class DPOTrainer(BaseTrainer):
         super().__init__(args, model, tokenizer, lm_config, "dpo")
         self.ref_model = ref_model
 
-    def _dpo_loss_fn(self, model, x, y, mask, attn_mask, ref_log_probs):
-        """DPO loss 函数（value_and_grad 的目标）"""
-        res = model(
+    def _dpo_loss_fn(self, params, x, y, mask, attn_mask, mask_has_pad, ref_log_probs):
+        """DPO loss 函数（value_and_grad 的目标）。
+
+        params 必须显式作为第一个入参：mx.compile 会捕获 Python 闭包里的
+        常量，若走 nn.value_and_grad(model, ...) + mx.compile，梯度会永远
+        基于 trace 时的初始权重，优化器更新完全无效。
+        mask_has_pad 在 eager 侧计算后以 python bool 传入（compile 图内
+        不允许 .item() host sync）。
+        """
+        self.model.update(params)
+        res = self.model(
             input_ids=x,
             attention_mask=attn_mask,
+            mask_has_pad=mask_has_pad,
         )
         log_probs = logits_to_log_probs(res.logits, y)
         log_probs = log_probs * mask
@@ -126,8 +135,16 @@ class DPOTrainer(BaseTrainer):
         return loss / self.args.accumulation_steps
 
     def _build_loss_and_grad(self):
-        fn = nn.value_and_grad(self.model, self._dpo_loss_fn)
-        if getattr(self.args, "compile_model", False):
+        fn = mx.value_and_grad(self._dpo_loss_fn)
+        use_compile = getattr(self.args, "compile_model", False)
+        if use_compile and getattr(self, "_moe_gates", []):
+            Logger(
+                "MoE 稀疏桶前向含数据依赖形状（host sync），mx.compile 不可用，"
+                "自动回退 eager；如要 compile 请关闭 MoE"
+            )
+            use_compile = False
+        self._compiled = bool(use_compile)
+        if use_compile:
             Logger("使用 mx.compile 编译 loss 函数")
             fn = mx.compile(fn)
         return fn
@@ -138,13 +155,12 @@ class DPOTrainer(BaseTrainer):
         train_loader,
         iter_per_epoch,
         total_training_steps,
-        wandb=None,
+        swanlab=None,
         skip_steps=0,
     ):
         """DPO训练一个epoch"""
         import time
 
-        import mlx.optimizers as optim
         from mlx.utils import tree_map
 
         from .utils import apply_lr_schedule
@@ -166,7 +182,9 @@ class DPOTrainer(BaseTrainer):
             # 合并数据
             x = mx.concatenate([batch["x_chosen"], batch["x_rejected"]], axis=0)
             y = mx.concatenate([batch["y_chosen"], batch["y_rejected"]], axis=0)
-            mask = mx.concatenate([batch["mask_chosen"], batch["mask_rejected"]], axis=0)
+            mask = mx.concatenate(
+                [batch["mask_chosen"], batch["mask_rejected"]], axis=0
+            )
 
             # 应用学习率调度（每微批 step 应用）
             global_step = epoch * iter_per_epoch + step
@@ -179,27 +197,34 @@ class DPOTrainer(BaseTrainer):
 
             # 参考模型前向传播（不走 value_and_grad，不会计算梯度）
             attn_mask = (x != self.tokenizer.pad_token_id).astype(mx.int32)
+            # mx.compile 图内不允许 .item() host sync，在 eager 侧预计算
+            mask_has_pad = bool(mx.any(attn_mask != 1).item())
             ref_res = self.ref_model(
                 input_ids=x,
                 attention_mask=attn_mask,
+                mask_has_pad=mask_has_pad,
             )
             ref_log_probs = logits_to_log_probs(ref_res.logits, y)
             ref_log_probs = ref_log_probs * mask
             mx.eval(ref_log_probs)
 
-            # 当前模型前向 + 反向（loss 内部已除以 accumulation_steps）
+            # 当前模型前向 + 反向（loss 内部已除以 accumulation_steps）。
+            # 参数显式传入：compile 下保证梯度基于当前权重而非初始快照。
+            params = self.model.trainable_parameters()
             loss, grads = self._loss_and_grad(
-                self.model, x, y, mask, attn_mask, ref_log_probs
+                params, x, y, mask, attn_mask, mask_has_pad, ref_log_probs
             )
+            if self._compiled:
+                # compiled fn 内部的 model.update(params) 只在 trace 时执行，
+                # 会把占位数组留在 module 上；立即恢复真实参数
+                self.model.update(params)
             # 立即物化本微批的 loss/grads 并释放反向图（与 BaseTrainer 同理，
             # 避免 accumulation_steps 个惰性图同时存活导致显存倍增）
             mx.eval(loss, grads)
 
             # 梯度累加
             accum_grads = (
-                grads
-                if accum_grads is None
-                else tree_map(mx.add, accum_grads, grads)
+                grads if accum_grads is None else tree_map(mx.add, accum_grads, grads)
             )
             accum_count += 1
 
@@ -223,7 +248,7 @@ class DPOTrainer(BaseTrainer):
                     self.optimizer,
                     start_time,
                     self.args,
-                    wandb,
+                    swanlab,
                     grad_norm_to_log,
                     base_step_offset=base_step_offset_for_speed,
                 )
@@ -262,10 +287,12 @@ if __name__ == "__main__":
     train_ds = DPODataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_loader = trainer.create_data_loader(train_ds)
 
-    wandb = init_wandb(args, trainer)
+    swanlab = init_swanlab(args, trainer)
 
     # 开始训练
-    trainer.train(train_loader, wandb)
+    trainer.train(train_loader, swanlab)
+    if swanlab is not None:
+        swanlab.finish()
 
 # 执行命令示例:
 #

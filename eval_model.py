@@ -18,8 +18,10 @@ warnings.filterwarnings("ignore")
 class TextStreamer:
     """简单的流式输出器，替代 transformers TextStreamer。
 
-    累积生成的 token，每次 put() 时对已生成序列做增量 decode，
-    只打印新解出的文本（避免多字节 token 被拆开）。
+    累积生成的 token，每次 put() 时对全量已生成序列重新 decode，
+    只打印新解出的文本。byte-level BPE 中一个汉字常由 2~3 个 byte
+    token 拼成：若 decode 结果以替换字符  结尾，说明末尾还有半个
+    多字节字符，先不打印，等后续 token 补全后再一起输出。
     """
 
     def __init__(self, tokenizer, skip_prompt=True, skip_special_tokens=True):
@@ -39,13 +41,13 @@ class TextStreamer:
             self._prompt_skipped = True
             return
         self._token_ids.extend(arr.tolist())
-        if len(self._token_ids) <= 1:
-            return
-        # 保留最后一个 token：多字节 token 尚未完整时 decode 会得到替换字符，
-        # 因此只打印除最后一个 token 之外的、可完整解码的前缀。
         text = self.tokenizer.decode(
-            self._token_ids[:-1], skip_special_tokens=self.skip_special_tokens
+            self._token_ids, skip_special_tokens=self.skip_special_tokens
         )
+        # 末尾的  是尚未拼完的多字节字符，截掉等补全（不能打印，
+        # 否则 _print_len 会越过它，补全后的汉字反而再也打不出来）
+        if text.endswith(""):
+            text = text[:-1]
         new_text = text[self._print_len :]
         if new_text:
             print(new_text, end="", flush=True)
@@ -114,7 +116,9 @@ def init_model(args):
             f"错误：在 {args.out_dir} 中找不到 {modes[args.model_mode]}_*.safetensors "
             "检查点（已尝试 latest_checkpoint.txt 与 hidden_size 精确匹配）"
         )
-        print("注意：旧的 .pth 检查点不再兼容，请使用训练脚本新保存的 safetensors 格式。")
+        print(
+            "注意：旧的 .pth 检查点不再兼容，请使用训练脚本新保存的 safetensors 格式。"
+        )
         exit(1)
 
     sidecar = os.path.splitext(ckp)[0] + ".json"
@@ -165,6 +169,18 @@ def init_model(args):
             use_attn_gate=getattr(args, "use_attn_gate", False),
             mtp_depth=getattr(args, "mtp_depth", 0),
             mtp_loss_weight=getattr(args, "mtp_loss_weight", 0.3),
+            engram_layers=(
+                tuple(int(x) for x in args.engram_layers.split(","))
+                if args.engram_layers
+                else ()
+            ),
+            engram_orders=(
+                tuple(int(x) for x in args.engram_orders.split(","))
+                if args.engram_orders
+                else ()
+            ),
+            engram_slots=getattr(args, "engram_slots", 8192),
+            engram_sub_dim=getattr(args, "engram_sub_dim", 128),
             **(
                 {"head_dim": args.head_dim}
                 if getattr(args, "head_dim", None) is not None
@@ -261,6 +277,11 @@ def main():
         help="MTP 投机解码每轮草稿的 token 数（默认 3，对齐 DeepSeek V4 等主流配置；"
         "需配合 --use_mtp_speculative，模型只有 1 个 MTP 模块时会循环复用）",
     )
+    # fallback 配置（无 sidecar 时）需要的 engram 参数
+    parser.add_argument("--engram_layers", default="", type=str)
+    parser.add_argument("--engram_orders", default="", type=str)
+    parser.add_argument("--engram_slots", default=8192, type=int)
+    parser.add_argument("--engram_sub_dim", default=128, type=int)
     parser.add_argument(
         "--model_mode",
         default=0,
@@ -320,6 +341,17 @@ def main():
     print(f"[device] 默认计算设备: {mx.default_device()}")
 
     model, tokenizer = init_model(args)
+
+    if model.model.engrams:
+        eng = model.model.engrams[0]
+        print(
+            f"[engram] layers={model.config.engram_layers} "
+            f"orders={model.config.engram_orders} slots={eng.slots} "
+            f"sub_dim={eng.sub_dim}; 缓存解码注入=开（prefill 全位置 + "
+            f"decode/投机验证 n-gram 窗口）"
+        )
+    else:
+        print("[engram] 模型无 engram 模块")
 
     prompts = get_prompt_datas(args)
     test_mode = int(input("[0] 自动测试\n[1] 手动输入\n"))
@@ -391,16 +423,15 @@ def main():
         if args.use_mtp_speculative and hasattr(model, "_last_spec_stats"):
             stats = model._last_spec_stats
             acc = stats["accepted"] / max(stats["drafted"], 1)
-            print(f"\n[MTP speculative] 草稿接受率: {acc:.1%} "
-                  f"({stats['accepted']}/{stats['drafted']}，"
-                  f"每轮草稿 {args.num_speculative_tokens})")
+            print(
+                f"\n[MTP speculative] 草稿接受率: {acc:.1%} "
+                f"({stats['accepted']}/{stats['drafted']}，"
+                f"每轮草稿 {args.num_speculative_tokens})"
+            )
 
         gen_len = generated_ids.shape[1] - slice_start
         tps = gen_len / elapsed if elapsed > 0 else 0.0
-        print(
-            f"[TPS] 生成 {gen_len} tokens，耗时 {elapsed:.2f}s，"
-            f"{tps:.2f} tokens/s"
-        )
+        print(f"[TPS] 生成 {gen_len} tokens，耗时 {elapsed:.2f}s，{tps:.2f} tokens/s")
         if perf_stats is not None:
             perf_stats.append((gen_len, elapsed, tps))
 

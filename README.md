@@ -4,8 +4,10 @@
 
 架构为 decoder-only Transformer：MLA（Multi-head Latent Attention，
 DeepSeek V2/V3 风格）+ RoPE（解耦位置键）+ RMSNorm + SwiGLU + QK-norm，
-可选 value residual、注意力输出门（attn gate）与 MTP
+可选 value residual、注意力输出门（attn gate）、MoE FFN
+（DeepSeekMoE，V3/V4 风格）与 MTP
 （multi-token prediction，默认开启 depth=1，推理侧可用于投机解码加速）。
+推理侧默认开启 absorbed MLA decode（latent 空间打分，KV 读取 ~7× 缩减）。
 
 ## 组件
 
@@ -27,7 +29,50 @@ DeepSeek V2/V3 风格）+ RoPE（解耦位置键）+ RMSNorm + SwiGLU + QK-norm�
 --mtp_loss_weight 0.3
 --pack_sequences       # 预训练序列打包（消除 padding 浪费）
 --doc_mask             # 打包时屏蔽跨文档注意力与边界 loss（需配合 --pack_sequences）
+# DeepSeekMoE（V3/V4 风格）：
+--n_routed_experts 32      # 路由专家数（>0 时第 n_dense_layers 层起 FFN 换为 MoE）
+--num_experts_per_tok 6    # 每 token 激活专家数（V4 为 6）
+--n_shared_experts 1       # 共享专家数（中间维 = moe_intermediate_size × 该值）
+--moe_intermediate_size 104  # 单个路由专家中间维（默认取 intermediate_size）
+--n_dense_layers 1         # 前若干 dense FFN 层
+--routed_scaling_factor 2.5  # sigmoid 归一化后的路由权重缩放
+--moe_bias_update_rate 0.001 # 无辅助损失负载均衡的偏置更新步长（<=0 关闭）
 ```
+
+注：MoE 的路由专家前向是稀疏分段 GEMM（每 token 只算 top-k 个专家），
+含数据依赖形状，因此 MoE 模型训练时 `mx.compile` 自动回退 eager
+（dense 模型不受影响）。推理（generate/eval）本来就是 eager，无差异。
+
+训练侧优化（对 MoE/dense 均生效，默认启用）：
+- BatchedMuon：同形状权重堆叠批量跑 Newton-Schulz（kernel 数从
+  ~16×张量数 降到 ~16×形状组数），数学上与逐张量 NS 等价（bf16 舍入
+  级差异）；`--muon_ns_steps` 可调迭代步数（默认 5，对齐原版）。
+- `--cache_limit_gb`（默认 24，0=不限）：Metal 分配器空闲块缓存上限。
+  上限内的释放块常驻复用、不归还 OS，避免每步"释放-重分配"抖动
+  （bs16x640 实测 10G→24G 提速 4.5%，峰值 14.8G + 缓存 ≈ 39G）。
+  大 batch 配置注意峰值+缓存上限不要超物理内存。
+- MoE 专家 gate/up 投影合并为单次 GEMM（数学严格等价）；稀疏桶路径用
+  argsort 排名（替代 (G,E) one-hot+cumsum），输出端 f32 scatter-add
+  直接累加回 token（省 padded 加权缓冲与 gather+sumK 往返）。
+- MLA 投影合并：q/kv_down/k_rope 单 GEMM（768→1248）、k_up/v_up 单
+  GEMM（192→1536），数学严格等价；Muon 侧按行段分段 NS 保持逐矩阵
+  语义（分段 vs 逐矩阵基类单步 diff ~2e-7）。旧 checkpoint 的拆分
+  权重在加载时自动拼接 remap。
+- engram 注入门/掩码链降回残差 dtype 再乘加：修复残差流从注入层起
+  被抬成 f32 的泄漏（曾使整步慢 18%、峰值内存 +3G）。
+100M MoE 配置（bs8×512, bf16, M4 Max）实测：fwd+bwd 243→199ms/步
+（16.8K→20.6K tok/s）；含 optimizer + 真实数据管线完整步
+11.5K→15.3K tok/s（本轮累计 +87%），已反超 dense-73M 的 13.8K
+（MoE 激活参数仅其 46%）。
+
+MoE 推理前向按 (token,choice) 对数 G = B×T×top_k 分三条路径：
+- `G <= 512`（decode/极小批量）：手写融合 Metal kernel（router 打分+top-k、
+  SwiGLU、加权合并共 3 个 kernel，只读 top-k 命中专家权重；simdgroup
+  合并访存 + simd_sum 归约）。不可微，仅推理；JIT 编译失败自动回退，
+  `router.collect_stats` 开启（训练负载统计）时也不走本路径。
+  实测 100M 配置 decode 503→622 tok/s（+24%）。
+- `G <= 4096`（小 prefill）：稠密全专家广播 matmul。
+- 更大（训练/大 prefill）：(E,C,D) padded 桶稀疏 batched GEMM。
 
 ## 训练
 

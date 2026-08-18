@@ -70,6 +70,32 @@ def _is_non_strict_key(key: str) -> bool:
     return any(key == k or key.endswith("." + k) for k in _NON_STRICT_WEIGHT_KEYS)
 
 
+def _remap_split_attn_keys(weights, model_shapes, label, checkpoint_path):
+    """旧 checkpoint 的 MLA 拆分投影（q/kv_down/k_rope、k_up/v_up）合并为
+    当前模型的 qkv_proj / kv_up_proj 单矩阵（nn.Linear 权重 (out,in)，
+    按 out 维拼接，顺序与 Attention 合并路径的 split 一致）。"""
+    _SPLIT_PARTS = {
+        "qkv_proj.weight": (
+            "q_proj.weight",
+            "kv_down_proj.weight",
+            "k_rope_proj.weight",
+        ),
+        "kv_up_proj.weight": ("k_up_proj.weight", "v_up_proj.weight"),
+    }
+    for merged, parts in _SPLIT_PARTS.items():
+        for key in list(model_shapes):
+            if not key.endswith(merged) or key in weights:
+                continue
+            prefix = key[: -len(merged)]
+            part_keys = [prefix + p for p in parts]
+            if all(p in weights for p in part_keys):
+                weights[key] = mx.concatenate(
+                    [weights.pop(p) for p in part_keys], axis=0
+                )
+                Logger(f"{label} 合并旧拆分投影 -> {key}")
+    return weights
+
+
 def load_model_weights(
     model,
     checkpoint_path,
@@ -93,6 +119,7 @@ def load_model_weights(
 
     weights = dict(mx.load(checkpoint_path).items())
     model_shapes = {k: v.shape for k, v in tree_flatten(model.parameters())}
+    weights = _remap_split_attn_keys(weights, model_shapes, label, checkpoint_path)
 
     loaded = {}
     skipped = []
@@ -232,6 +259,15 @@ _ARCH_ARG_KEYS = (
     "engram_heads",
     "engram_slots",
     "engram_sub_dim",
+    "n_routed_experts",
+    "num_experts_per_tok",
+    "n_shared_experts",
+    "moe_intermediate_size",
+    "n_dense_layers",
+    "routed_scaling_factor",
+    "moe_bias_update_rate",
+    "hrm_cycle_router",
+    "hrm_cycle_film",
 )
 
 
@@ -268,17 +304,37 @@ def build_config_from_sidecar(args, checkpoint_name):
     return cfg, sidecar is not None
 
 
-def init_wandb(args, trainer):
-    if not args.use_wandb or getattr(trainer, "ddp", False):
+def init_swanlab(args, trainer):
+    if not args.use_swanlab or getattr(trainer, "ddp", False):
         return None
     try:
-        import wandb
-
-        wandb.init(project=args.wandb_project, name=args.wandb_run_name)
-        return wandb
+        import swanlab
     except ImportError:
-        Logger("Warning: wandb not installed, logging disabled")
+        Logger("Warning: swanlab not installed, logging disabled")
         return None
+
+    # 详细上报超参数：全部 CLI 参数 + 模型配置 + 参数量
+    def _clean(d):
+        return {
+            k: v
+            for k, v in d.items()
+            if v is None or isinstance(v, (str, int, float, bool))
+        }
+
+    config = {f"args.{k}": v for k, v in _clean(vars(args)).items()}
+    lm_cfg = getattr(trainer, "lm_config", None)
+    if lm_cfg is not None:
+        config.update({f"model.{k}": v for k, v in _clean(vars(lm_cfg)).items()})
+    try:
+        config["model.params_total_m"] = round(trainer.model.num_parameters() / 1e6, 3)
+    except Exception:
+        pass
+    swanlab.init(
+        project=args.swanlab_project,
+        experiment_name=args.swanlab_run_name,
+        config=config,
+    )
+    return swanlab
 
 
 def get_lr_and_momentum(
@@ -347,7 +403,9 @@ def _optimizer_hparams(optimizer):
     return hparams
 
 
-def save_checkpoint(model, optimizer, epoch, step, args, lm_config, training_type="pretrain"):
+def save_checkpoint(
+    model, optimizer, epoch, step, args, lm_config, training_type="pretrain"
+):
     """统一的检查点保存函数（safetensors 格式）"""
     model.eval()
 
@@ -464,7 +522,9 @@ def find_latest_checkpoint(save_dir):
     return None
 
 
-def apply_lr_schedule(optimizer, global_step, total_training_steps, warmup_iters, min_lr_ratio=0.1):
+def apply_lr_schedule(
+    optimizer, global_step, total_training_steps, warmup_iters, min_lr_ratio=0.1
+):
     """应用学习率调度（每微批 step 调用一次）"""
     lr_multiplier, current_momentum = get_lr_and_momentum(
         global_step,
@@ -493,15 +553,17 @@ def log_training_progress(
     optimizer,
     start_time,
     args,
-    wandb=None,
+    swanlab=None,
     grad_norm=0.0,
     base_step_offset: int = 0,
     mtp_loss=None,
+    extra=None,
 ):
     """统一的训练进度日志记录
 
     current_loss 是含 MTP 加权的总 loss；mtp_loss 为未加权分量（可选）。
     展示格式保持 `loss:<总>` 开头以兼容 results.tsv 的解析。
+    extra：调用方附加的详细指标 dict（MoE 负载/内存等），一并上报 swanlab。
     """
     spend_time = time.time() - start_time
     # 使用相对步数计算速率，避免 resume 后跳过的步导致速率异常
@@ -531,17 +593,20 @@ def log_training_progress(
 
     Logger(log_msg)
 
-    if wandb is not None:
+    if swanlab is not None:
         log_dict = {
             "loss": current_loss,
             "lr": current_lr,
             "steps_per_sec": steps_per_sec,
             "tokens_per_sec": tokens_per_sec,
+            "eta_min": int((iter_per_epoch - step - 1) / max(steps_per_sec, 1e-8) / 60),
             "grad_norm": grad_norm,
             "epoch": epoch + 1,
         }
         if mtp_loss is not None:
             log_dict["mtp_loss"] = mtp_loss
             log_dict["main_loss"] = main_loss
+        if extra:
+            log_dict.update(extra)
 
-        wandb.log(log_dict)
+        swanlab.log(log_dict, step=epoch * iter_per_epoch + step)

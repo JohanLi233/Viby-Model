@@ -9,7 +9,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
-import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
 from mlx.utils import tree_map
@@ -71,9 +70,7 @@ class _PrefetchIterator:
         loader = self.loader
         try:
             n = len(loader.dataset)
-            indices = (
-                np.random.permutation(n) if loader.shuffle else np.arange(n)
-            )
+            indices = np.random.permutation(n) if loader.shuffle else np.arange(n)
             with ThreadPoolExecutor(max_workers=loader.num_workers) as pool:
                 for start in range(0, n, loader.batch_size):
                     if self._stop.is_set():
@@ -178,6 +175,7 @@ class BaseTrainer:
         # 创建优化器
         if getattr(self.args, "optimizer", "muon") == "adamw":
             from .muon import create_adamw_optimizer
+
             self.optimizer = create_adamw_optimizer(
                 self.model, self.args, self.training_type
             )
@@ -186,8 +184,32 @@ class BaseTrainer:
                 self.model, self.args, self.training_type
             )
 
-        # loss + 梯度函数（mx.compile 默认启用）
+        # MoE 无辅助损失负载均衡：开启 router 负载统计（图节点随 loss 输出），
+        # 供 _optimizer_step 按 V3 规则更新 expert_bias
+        self._moe_bias_rate = float(
+            getattr(self.lm_config, "moe_bias_update_rate", 0.0) or 0.0
+        )
+        self._moe_gates = (
+            self.model.moe_gates() if hasattr(self.model, "moe_gates") else []
+        )
+        if self._moe_bias_rate > 0:
+            for gate in self._moe_gates:
+                gate.collect_stats = True
+
+        # loss + 梯度函数（mx.compile 默认启用；MoE 稀疏分段前向含数据依赖
+        # 形状，无法 trace，见 _build_loss_and_grad 的自动回退）
         self._loss_and_grad = self._build_loss_and_grad()
+
+        # Metal 分配器缓存上限（--cache_limit_gb，默认 24GB，0=不限）：
+        # 上限内的空闲块常驻复用、不归还 OS，避免每步"释放-重分配"抖动
+        # （bs16x640 实测 10G→24G 提速 4.5%；该配置峰值 14.8G，峰值+缓存
+        # ≈39G）。历史上设限是为防 optimizer 临时 buffer 污染 freelist
+        # 拖慢激活分配（243→442ms/步）；BatchedMuon 批量化后临时块少且
+        # 形状固定，各档上限扫描均未复现污染。大 batch 配置注意
+        # 峰值+缓存上限不要超过物理内存。
+        cache_gb = float(getattr(self.args, "cache_limit_gb", 24.0))
+        if cache_gb > 0:
+            mx.set_cache_limit(int(cache_gb * 1024**3))
 
         # 处理检查点恢复
         self.start_epoch, self.start_step = self._handle_checkpoint_resume()
@@ -195,9 +217,10 @@ class BaseTrainer:
     def _loss_fn(self, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None):
         """训练 loss 函数（model 走闭包引用）
 
-        返回 (加权和 loss / accumulation_steps, mtp 分量 loss)。
-        mtp 分量仅作日志展示、不缩放；无 MTP 时返回 0 常量，
-        保持 compile 图结构稳定。
+        返回 (加权和 loss / accumulation_steps, mtp 分量 loss, moe 负载统计)。
+        mtp 分量仅作日志展示、不缩放；无 MTP 时返回 0 常量。
+        moe 负载统计为各 router 每专家 token 计数拼接向量，供无辅助损失
+        偏置均衡更新；无 MoE 时返回零长占位，保持 compile 图结构稳定。
         """
         res = self.model(
             input_ids=X,
@@ -208,9 +231,14 @@ class BaseTrainer:
             segment_ids=seg_ids,
         )
         mtp_loss = res.mtp_loss if res.mtp_loss is not None else mx.array(0.0)
-        return res.loss / self.args.accumulation_steps, mtp_loss
+        moe_stats = self.model.moe_load_stats() if self._moe_gates else None
+        if moe_stats is None:
+            moe_stats = mx.zeros((0,), dtype=mx.float32)
+        return res.loss / self.args.accumulation_steps, mtp_loss, moe_stats
 
-    def _loss_and_grad_with_params(self, params, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None):
+    def _loss_and_grad_with_params(
+        self, params, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None
+    ):
         """参数显式作为入参的 loss 函数（value_and_grad 的目标）。
 
         不能用 nn.value_and_grad + mx.compile：那样 params 通过闭包
@@ -224,6 +252,12 @@ class BaseTrainer:
     def _build_loss_and_grad(self):
         fn = mx.value_and_grad(self._loss_and_grad_with_params)
         use_compile = getattr(self.args, "compile_model", False)
+        if use_compile and self._moe_gates:
+            Logger(
+                "MoE 稀疏桶前向含数据依赖形状（host sync），mx.compile 不可用，"
+                "自动回退 eager；如要 compile 请关闭 MoE"
+            )
+            use_compile = False
         if use_compile:
             Logger("使用 mx.compile 编译 loss 函数")
             fn = mx.compile(fn)
@@ -267,8 +301,8 @@ class BaseTrainer:
             drop_last=True,
         )
 
-    def _optimizer_step(self, accum_grads, accum_count):
-        """累积窗口结束：梯度裁剪 + 优化器更新"""
+    def _optimizer_step(self, accum_grads, accum_count, moe_stats=None):
+        """累积窗口结束：梯度裁剪 + 优化器更新 + MoE 路由偏置更新"""
         if accum_count <= 0 or accum_grads is None:
             return 0.0
 
@@ -278,7 +312,16 @@ class BaseTrainer:
 
         self.optimizer.update(self.model, grads)
 
+        # 无辅助损失负载均衡：b_i ← b_i − u·sign(load_i − mean_load)。
+        # 梯度累积窗口内用最后一个微批的负载统计更新一次（V3 每步更新的近似）
+        if self._moe_bias_rate > 0 and moe_stats is not None and moe_stats.size > 0:
+            self.model.update_moe_biases(moe_stats, self._moe_bias_rate)
+
         mx.eval(self.model.parameters(), self.optimizer.state)
+        # 注：optimizer step 的临时 buffer 治理由 __init__ 里的
+        # mx.set_cache_limit（--cache_limit_gb）统一负责；不要在这里每步
+        # mx.clear_cache()——那会把 fwd+bwd 可复用的激活缓存块一并清掉，
+        # 实测反而更慢。
         return float(grad_norm)
 
     def _save_if_needed(self, epoch, step):
@@ -300,7 +343,7 @@ class BaseTrainer:
         train_loader,
         iter_per_epoch,
         total_training_steps,
-        wandb=None,
+        swanlab=None,
         skip_steps: int = 0,
     ):
         """训练一个epoch"""
@@ -309,6 +352,7 @@ class BaseTrainer:
         accum_grads = None
         accum_count = 0
         last_grad_norm = 0.0  # Store last calculated gradient norm
+        last_moe_stats = None  # 最近微批的 MoE 负载统计（偏置更新用）
 
         self.model.train()
 
@@ -343,7 +387,7 @@ class BaseTrainer:
             # 参数显式传入：compile 下保证梯度基于当前权重而非初始快照
             # mtp_loss 是辅助输出，仅用于日志展示，不参与梯度
             params = self.model.trainable_parameters()
-            (loss, mtp_loss), grads = self._loss_and_grad(
+            (loss, mtp_loss, moe_stats), grads = self._loss_and_grad(
                 params, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids
             )
             if self._compiled:
@@ -355,26 +399,45 @@ class BaseTrainer:
             # 立即物化本微批的 loss/grads 并释放反向图。MLX 是惰性求值，
             # 若不 eval，accumulation_steps 个微批的前向+反向图会全部存活到
             # optimizer step，显存按窗口大小成倍增长。
-            mx.eval(loss, mtp_loss, grads)
+            mx.eval(loss, mtp_loss, moe_stats, grads)
+            last_moe_stats = moe_stats
 
             # 梯度累加
             accum_grads = (
-                grads
-                if accum_grads is None
-                else tree_map(mx.add, accum_grads, grads)
+                grads if accum_grads is None else tree_map(mx.add, accum_grads, grads)
             )
             accum_count += 1
 
             # 梯度累积窗口结束，执行更新
             if (step + 1) % self.args.accumulation_steps == 0:
-                last_grad_norm = self._optimizer_step(accum_grads, accum_count)
+                last_grad_norm = self._optimizer_step(
+                    accum_grads, accum_count, moe_stats=last_moe_stats
+                )
                 accum_grads = None
                 accum_count = 0
+                last_moe_stats = None
 
-                # 时长预算只在窗口边界检查：中途停止会丢掉已累加但未更新的梯度
+                # 时长/步数预算只在窗口边界检查：中途停止会丢掉已累加但未更新的梯度
                 if self._time_limit_exceeded():
                     Logger(
                         f"已达最长训练时长 {self.args.max_train_minutes} 分钟，"
+                        f"在梯度累积窗口边界（epoch {epoch + 1}, step {step}）停止训练"
+                    )
+                    save_checkpoint(
+                        self.model,
+                        self.optimizer,
+                        epoch,
+                        step,
+                        self.args,
+                        self.lm_config,
+                        self.training_type,
+                    )
+                    return True
+
+                max_steps = getattr(self.args, "max_steps", None)
+                if max_steps and (epoch * iter_per_epoch + step + 1) >= max_steps:
+                    Logger(
+                        f"已达最大步数 {max_steps}（微批口径），"
                         f"在梯度累积窗口边界（epoch {epoch + 1}, step {step}）停止训练"
                     )
                     save_checkpoint(
@@ -402,6 +465,42 @@ class BaseTrainer:
                 # 使用上次计算的梯度范数
                 grad_norm_to_log = last_grad_norm
 
+                # 详细指标（swanlab 上报 + VIBY_DEBUG_MEM stderr 打印共用一份
+                # 计算）：MoE 分 gate 负载最大值、单次桶容量峰值、内存三件套
+                debug_mem = bool(os.environ.get("VIBY_DEBUG_MEM"))
+                extra = None
+                if swanlab is not None or debug_mem:
+                    act = mx.get_active_memory() / 2**30
+                    cache = mx.get_cache_memory() / 2**30
+                    peak = mx.get_peak_memory() / 2**30
+                    gate_max = [
+                        float(g.last_load.max())
+                        for g in self._moe_gates
+                        if g.last_load is not None
+                    ]
+                    # 各 MoE 模块本窗口见过的最大单次桶容量（决定 (E,C,D) 峰值）
+                    cmax = 0
+                    for m in self.model.modules():
+                        v = getattr(m, "_c_max_seen", None)
+                        if v:
+                            cmax = max(cmax, v)
+                            m._c_max_seen = 0
+                    extra = {
+                        "mem/active_gb": round(act, 3),
+                        "mem/cache_gb": round(cache, 3),
+                        "mem/peak_gb": round(peak, 3),
+                        "moe/call_c_max": cmax,
+                    }
+                    for gi, v in enumerate(gate_max):
+                        extra[f"moe/gate{gi}_max_load_k"] = round(v / 2**10, 3)
+                    if debug_mem:
+                        Logger(
+                            f"[mem] active={act:.2f}G cache={cache:.2f}G "
+                            f"peak={peak:.2f}G "
+                            f"gate_maxK={'/'.join(f'{v / 2**10:.1f}' for v in gate_max)} "
+                            f"callC={cmax}"
+                        )
+
                 log_training_progress(
                     epoch,
                     step,
@@ -410,10 +509,11 @@ class BaseTrainer:
                     self.optimizer,
                     start_time,
                     self.args,
-                    wandb,
+                    swanlab,
                     grad_norm_to_log,
                     base_step_offset=base_step_offset_for_speed,
                     mtp_loss=current_mtp_loss,
+                    extra=extra,
                 )
 
             # 模型保存
@@ -421,7 +521,7 @@ class BaseTrainer:
 
         return False
 
-    def train(self, train_loader, wandb=None):
+    def train(self, train_loader, swanlab=None):
         """主训练循环"""
         iter_per_epoch = len(train_loader)
         total_training_steps = self.args.epochs * iter_per_epoch
@@ -446,7 +546,7 @@ class BaseTrainer:
                 train_loader,
                 iter_per_epoch,
                 total_training_steps,
-                wandb,
+                swanlab,
                 skip_steps,
             )
 

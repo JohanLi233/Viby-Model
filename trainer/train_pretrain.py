@@ -9,7 +9,7 @@ from model.model import VibyConfig
 from dataset.lm_dataset import PretrainDataset
 from .base_trainer import BaseTrainer
 from .config import get_pretrain_parser, setup_training_args
-from .utils import build_model_and_tokenizer, init_wandb
+from .utils import build_model_and_tokenizer, init_swanlab
 
 warnings.filterwarnings("ignore")
 
@@ -42,6 +42,8 @@ if __name__ == "__main__":
     hrm_bp_cycles = _parse_hrm_bp_cycles(getattr(args, "hrm_bp_cycles", None))
     engram_layers = _parse_int_tuple(getattr(args, "engram_layers", ""))
     engram_orders = _parse_int_tuple(getattr(args, "engram_orders", "2,3"))
+    if getattr(args, "doc_mask", False) and not getattr(args, "pack_sequences", False):
+        raise ValueError("--doc_mask 必须与 --pack_sequences 同时使用")
 
     # 创建模型配置
     lm_config = VibyConfig(
@@ -63,6 +65,8 @@ if __name__ == "__main__":
         hrm_L_cycles=args.hrm_L_cycles,
         hrm_bp_cycles=hrm_bp_cycles,
         hrm_emb_scale=args.hrm_emb_scale,
+        hrm_cycle_router=args.hrm_cycle_router,
+        hrm_cycle_film=args.hrm_cycle_film,
         ffn_type=args.ffn_type,
         zero_centered_norm=args.zero_centered_norm,
         use_res_gate=args.use_res_gate,
@@ -74,6 +78,13 @@ if __name__ == "__main__":
         engram_heads=args.engram_heads,
         engram_slots=args.engram_slots,
         engram_sub_dim=args.engram_sub_dim,
+        n_routed_experts=args.n_routed_experts,
+        num_experts_per_tok=args.num_experts_per_tok,
+        n_shared_experts=args.n_shared_experts,
+        moe_intermediate_size=args.moe_intermediate_size,
+        n_dense_layers=args.n_dense_layers,
+        routed_scaling_factor=args.routed_scaling_factor,
+        moe_bias_update_rate=args.moe_bias_update_rate,
         **({"head_dim": args.head_dim} if args.head_dim is not None else {}),
         **(
             {"intermediate_size": args.intermediate_size}
@@ -98,10 +109,12 @@ if __name__ == "__main__":
     )
     train_loader = trainer.create_data_loader(train_ds)
 
-    wandb = init_wandb(args, trainer)
+    swanlab = init_swanlab(args, trainer)
 
     # 开始训练
-    trainer.train(train_loader, wandb)
+    trainer.train(train_loader, swanlab)
+    if swanlab is not None:
+        swanlab.finish()
 
 # 执行命令示例:
 #

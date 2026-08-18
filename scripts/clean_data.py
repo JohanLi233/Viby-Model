@@ -18,12 +18,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)
-    ap.add_argument("--model_id", default="yuyijiong/LFM2.5-Encoder-350M-corpus-cleaner")
+    ap.add_argument(
+        "--model_id", default="yuyijiong/LFM2.5-Encoder-350M-corpus-cleaner"
+    )
     ap.add_argument("--max_docs", type=int, default=150000)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--max_length", type=int, default=8192)
-    ap.add_argument("--min_keep_chars", type=int, default=100,
-                    help="清洗后少于此字符数的文档整条丢弃")
+    ap.add_argument(
+        "--min_keep_chars",
+        type=int,
+        default=100,
+        help="清洗后少于此字符数的文档整条丢弃",
+    )
     args = ap.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -67,9 +73,7 @@ def main():
 
             for text, offs, labs in zip(batch, offsets, labels):
                 ranges = [
-                    (s, e)
-                    for (s, e), lab in zip(offs, labs)
-                    if lab == 0 and e > s
+                    (s, e) for (s, e), lab in zip(offs, labs) if lab == 0 and e > s
                 ]
                 ranges.sort()
                 merged = []
