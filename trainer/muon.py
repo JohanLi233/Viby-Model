@@ -236,7 +236,12 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     参数分组：
     - Muon：ndim >= 2 且非嵌入/输出头/router 的核心权重矩阵，wd=0
     - AdamW(embed)：lr = args.learning_rate，wd=0.1
-    - AdamW(router)：lr = args.learning_rate * 0.05（MOE_ROUTER_LR_MULT 可调），wd=0.1
+    - AdamW(cycle router)：CycleDeltaRouter 的 U/V_c，lr = args.learning_rate
+      * cycle_router_lr_mult（默认 0.1，MOE_CYCLE_ROUTER_LR_MULT 可调）
+    - AdamW(router)：base router/expert_bias，lr = args.learning_rate * 0.05
+      （MOE_ROUTER_LR_MULT 可调），wd=0.1
+    - AdamW(engram)：n-gram table/key/value/taps，lr = args.learning_rate
+      * engram_lr_mult（默认 1.0），wd=0.1
     - AdamW(scalar)：lr = args.learning_rate，wd=0.1
     （SFT 时 embed/scalar lr 分别乘 0.1/0.3，wd=0.01）
     """
@@ -256,32 +261,57 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         # 推向失衡（实测 top-1 桶容量 C 从 ~6K 漂到 13K+，(E,C,D) 缓冲膨胀
         # 顶爆内存、吞吐掉 ~30%）；单独小 lr AdamW 组，靠 bias 均衡项兜底
         # hrm_film（per-cycle FiLM 向量堆叠）同理不是矩阵语义，归 AdamW 标量组
+        # engram table 是 3D 哈希记忆，也不是 Muon 的矩阵语义，走独立 AdamW
         return (
             arr.ndim >= 2
             and not _is_embed(path, arr)
             and ".experts." not in path
             and ".router." not in path
+            and ".engrams." not in path
             and "hrm_film" not in path
         )
 
     def _is_router(path, arr):
         return ".router." in path
 
+    def _is_engram(path, arr):
+        return ".engrams." in path
+
+    def _is_cycle_router(path, arr):
+        # CycleDeltaRouter 的 U/V_c 需要比 base router 更高的 lr。
+        # base router 必须慢速移动，否则 E=112 细粒度路由会失衡；
+        # cycle delta 是零初始化低秩项，参数少且初始不影响选择，
+        # 可以用 10× router lr 真正学会特化。
+        return ".router." in path and ("cycle_u" in path or "cycle_v" in path)
+
     muon_count = sum(1 for p, a in trainable if _is_muon(p, a))
     embed_count = sum(1 for p, a in trainable if _is_embed(p, a) and not _is_muon(p, a))
+    cycle_router_count = sum(
+        1 for p, a in trainable if _is_cycle_router(p, a) and not _is_muon(p, a)
+    )
     router_count = sum(
-        1 for p, a in trainable if _is_router(p, a) and not _is_muon(p, a)
+        1
+        for p, a in trainable
+        if _is_router(p, a) and not _is_cycle_router(p, a) and not _is_muon(p, a)
+    )
+    engram_count = sum(
+        1 for p, a in trainable if _is_engram(p, a) and not _is_muon(p, a)
     )
     scalar_count = sum(
         1
         for p, a in trainable
-        if not _is_muon(p, a) and not _is_embed(p, a) and not _is_router(p, a)
+        if not _is_muon(p, a)
+        and not _is_embed(p, a)
+        and not _is_router(p, a)
+        and not _is_engram(p, a)
     )
 
     Logger("参数分组完成：")
     Logger(f"  - Muon 参数组 (核心权重): {muon_count} 个张量")
     Logger(f"  - 嵌入层参数组: {embed_count} 个张量")
+    Logger(f"  - CycleRouter 参数组: {cycle_router_count} 个张量")
     Logger(f"  - MoE router 参数组: {router_count} 个张量")
+    Logger(f"  - Engram 参数组: {engram_count} 个张量")
     Logger(f"  - 标量参数组: {scalar_count} 个张量")
 
     if training_type == "sft":
@@ -294,6 +324,15 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     # bias 均衡项压得住负载。可用 MOE_ROUTER_LR_MULT 覆盖。
     router_lr_mult = float(
         os.environ.get("MOE_ROUTER_LR_MULT", getattr(args, "router_lr_mult", 0.05))
+    )
+    cycle_router_lr_mult = float(
+        os.environ.get(
+            "MOE_CYCLE_ROUTER_LR_MULT",
+            getattr(args, "cycle_router_lr_mult", 0.1),
+        )
+    )
+    engram_lr_mult = float(
+        os.environ.get("ENGRAM_LR_MULT", getattr(args, "engram_lr_mult", 1.0))
     )
 
     muon_opt = BatchedMuon(
@@ -309,8 +348,20 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         eps=1e-8,
         weight_decay=adam_wd,
     )
+    adamw_cycle_router = optim.AdamW(
+        learning_rate=args.learning_rate * cycle_router_lr_mult,
+        betas=[0.9, 0.95],
+        eps=1e-8,
+        weight_decay=adam_wd,
+    )
     adamw_router = optim.AdamW(
         learning_rate=args.learning_rate * router_lr_mult,
+        betas=[0.9, 0.95],
+        eps=1e-8,
+        weight_decay=adam_wd,
+    )
+    adamw_engram = optim.AdamW(
+        learning_rate=args.learning_rate * engram_lr_mult,
         betas=[0.9, 0.95],
         eps=1e-8,
         weight_decay=adam_wd,
@@ -325,16 +376,39 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     # 为学习率调度器存储初始学习率
     muon_opt.base_lr = args.learning_rate
     adamw_embed.base_lr = args.learning_rate * embed_lr_mult
+    adamw_cycle_router.base_lr = args.learning_rate * cycle_router_lr_mult
     adamw_router.base_lr = args.learning_rate * router_lr_mult
+    adamw_engram.base_lr = args.learning_rate * engram_lr_mult
     adamw_scalar.base_lr = args.learning_rate * scalar_lr_mult
 
     # MultiOptimizer: filters 数量 = len(optimizers) - 1，按顺序首个命中生效，
     # 未命中任何 filter 的参数落到最后一组。
-    # 空组必须剔除（纯 dense 配置无 router 参数）：mlx MultiOptimizer 对空组
-    # 会在首次 step 的 state init 抛 IndexError。
-    optimizers = [muon_opt, adamw_embed, adamw_router, adamw_scalar]
-    counts = [muon_count, embed_count, router_count, scalar_count]
-    filters_all = [_is_muon, _is_embed, _is_router, None]
+    # 空组必须剔除（如 CycleRouter 关闭时无 cycle 参数）：mlx MultiOptimizer
+    # 对空组会在首次 step 的 state init 抛 IndexError。
+    optimizers = [
+        muon_opt,
+        adamw_embed,
+        adamw_cycle_router,
+        adamw_router,
+        adamw_engram,
+        adamw_scalar,
+    ]
+    counts = [
+        muon_count,
+        embed_count,
+        cycle_router_count,
+        router_count,
+        engram_count,
+        scalar_count,
+    ]
+    filters_all = [
+        _is_muon,
+        _is_embed,
+        _is_cycle_router,
+        _is_router,
+        _is_engram,
+        None,
+    ]
     keep = [
         i
         for i, (c, f) in enumerate(zip(counts, filters_all))

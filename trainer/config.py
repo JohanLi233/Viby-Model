@@ -55,7 +55,8 @@ def add_common_args(parser):
         help="使用 mx.compile 编译 loss 函数（默认开启）",
     )
     parser.add_argument("--no_compile", action="store_false", dest="compile_model")
-    parser.add_argument("--use_swanlab", action="store_true", default=True)
+    parser.add_argument("--use_swanlab", action="store_true")
+    parser.add_argument("--no_swanlab", dest="use_swanlab", action="store_false")
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--accumulation_steps", type=int, default=1)
@@ -162,34 +163,14 @@ def add_common_args(parser):
         "--muon_ns_steps",
         type=int,
         default=5,
-        help="Muon Newton-Schulz 迭代步数（默认 5 对齐原版；减到 3 整步快 ~5%，"
+        help="Muon Newton-Schulz 迭代步数（默认 5 对齐原版；减到 3 整步快 ~5%%，"
         "但正交化精度下降、训练动力学改变）",
-    )
-    parser.add_argument(
-        "--loop_k",
-        type=int,
-        default=1,
-        help="深度循环次数：layer 栈重复执行 loop_k 次；>1 时启用 per-step FiLM",
-    )
-    parser.add_argument(
-        "--dw_rank",
-        type=int,
-        default=0,
-        help="ΔW-Loop 步条件低秩权重再生的秩；>0 且 loop_k>1 时启用"
-        "（参数代价 ≈ r·(in+out)+k·r 每矩阵）",
-    )
-    parser.add_argument(
-        "--ws_loop",
-        type=int,
-        default=0,
-        help="W-Scale-Loop 步条件对角权重缩放；>0 且 loop_k>1 时启用"
-        "（参数代价 ≈ k·(in+out) 每矩阵，s 全 1 初始化）",
     )
     parser.add_argument(
         "--hrm_H_cycles",
         type=int,
         default=0,
-        help="HRM 模式高循环次数；>0 时启用双状态层次循环，"
+        help="HRM 高循环次数（必须 >0，唯一支持的架构）；"
         "num_hidden_layers 表示每个 stack 的真实层数",
     )
     parser.add_argument(
@@ -211,58 +192,49 @@ def add_common_args(parser):
         help="HRM 输入 embedding 缩放；默认 1.0（MLX 初始化与 HF 不同）",
     )
     parser.add_argument(
+        "--hrm_state_norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="HRM 状态混合前对 z_L/z_H 分别 RMS 归一化（默认开启，抗共同分量增长）",
+    )
+    parser.add_argument(
+        "--hrm_input_skip",
+        type=float,
+        default=0.0,
+        help="每个 HRM cycle 向注入状态额外加 skip·rms(embed(x))；默认关闭，"
+        "由 hrm_token_gate_scale 承担 token 记忆",
+    )
+    parser.add_argument(
+        "--hrm_token_gate_scale",
+        type=float,
+        default=0.1,
+        help="stack 输出与 rms(embed(x)) 的门控残差比例："
+        "z <- (1-g)·z + g·x0（默认 0.1）",
+    )
+    parser.add_argument(
         "--hrm_cycle_router",
         type=int,
         default=0,
-        help="HRM×MoE CycleRouter：router 增加 per-cycle 专家偏置（零初始化），"
-        "让专家按迭代特化；仅 HRM 模式生效",
+        help="HRM×MoE CycleRouter：让专家按迭代特化；仅 HRM 模式生效",
+    )
+    parser.add_argument(
+        "--hrm_cycle_router_rank",
+        type=int,
+        default=0,
+        help="CycleDeltaRouter 的低秩维度（推荐 8~16）；"
+        "--hrm_cycle_router 开启时必须 >0",
+    )
+    parser.add_argument(
+        "--cycle_router_lr_mult",
+        type=float,
+        default=0.1,
+        help="CycleDeltaRouter U/V_c 相对 base lr 的倍数（仅优化器分组，非模型配置）",
     )
     parser.add_argument(
         "--hrm_cycle_film",
         type=int,
         default=0,
-        help="HRM CycleFiLM：每次 stack 调用前做 per-cycle scale/shift（零初始化）；"
-        "仅 HRM 模式生效",
-    )
-    parser.add_argument(
-        "--ffn_type",
-        type=str,
-        default="swiglu",
-        choices=["swiglu", "none", "hadamard"],
-        help="FFN 类型：swiglu=标准 FFN；none=SAN 纯注意力（FFN 参数重配到深度）；"
-        "hadamard=固定 Hadamard 变换 + 对角缩放（Needle 2）",
-    )
-    parser.add_argument(
-        "--zero_centered_norm",
-        action="store_true",
-        default=False,
-        help="SAN 组件：ZCN(z)=(1+γ)z/RMS(z)，γ 零初始化",
-    )
-    parser.add_argument(
-        "--use_res_gate",
-        action="store_true",
-        default=False,
-        help="SAN 组件：注意力残差标量门 y=x+σ(g)·attn_out，g 零初始化",
-    )
-    parser.add_argument(
-        "--sandwich_norm",
-        action="store_true",
-        default=False,
-        help="Post-attention sandwich norm：注意力输出先 norm 再加残差"
-        "（SAN 论文消融唯一正收益变体，-0.009 nats）",
-    )
-    parser.add_argument(
-        "--san_res_init",
-        action="store_true",
-        default=False,
-        help="SAN 组件：o_proj 深度缩放初始化（方差 ∝ 1/(2L)）",
-    )
-    parser.add_argument(
-        "--emb_scale",
-        type=float,
-        default=1.0,
-        help="非 HRM 模式的 embedding 缩放（SAN 用 0.02*hidden_size 对齐 "
-        "Needle 的 normal(0.02)*sqrt(d) 有效尺度）",
+        help="HRM CycleFiLM：每次 stack 调用前做 per-cycle scale/shift（零初始化）",
     )
     parser.add_argument(
         "--engram_layers",
@@ -285,10 +257,28 @@ def add_common_args(parser):
     )
     parser.add_argument("--engram_sub_dim", type=int, default=128)
     parser.add_argument(
+        "--engram_scale",
+        type=float,
+        default=1.0,
+        help="Engram 注入幅度的显式缩放（value_proj 之外的调节旋钮）",
+    )
+    parser.add_argument(
+        "--engram_lr_mult",
+        type=float,
+        default=1.0,
+        help="Engram 参数组相对 base lr 的倍数（独立 AdamW 组，ENGRAM_LR_MULT 可覆盖）",
+    )
+    parser.add_argument(
+        "--engram_inject_every_cycle",
+        action="store_true",
+        default=False,
+        help="HRM 下 engram 每个 L cycle 都注入（旧行为）；默认只在初始状态注入一次",
+    )
+    parser.add_argument(
         "--n_routed_experts",
         type=int,
         default=0,
-        help="DeepSeekMoE 路由专家数；>0 时第 n_dense_layers 层起 FFN 换为 MoE",
+        help="DeepSeekMoE 路由专家数（必须 >0，所有层均为 MoE）",
     )
     parser.add_argument(
         "--num_experts_per_tok",
@@ -309,16 +299,56 @@ def add_common_args(parser):
         help="MoE 单个路由专家中间维；默认取 intermediate_size",
     )
     parser.add_argument(
-        "--n_dense_layers",
-        type=int,
-        default=1,
-        help="MoE 模型的前若干 dense FFN 层数（V3/V4 风格）",
-    )
-    parser.add_argument(
         "--routed_scaling_factor",
         type=float,
         default=2.5,
         help="MoE 路由权重缩放因子（sigmoid 归一化后乘该系数）",
+    )
+    parser.add_argument(
+        "--moe_router_noise",
+        type=float,
+        default=0.05,
+        help="训练期 router 选择分高斯抖动（只影响 top-k 选择，不进入权重），"
+        "默认 0.05；0.1 更稳但早期 loss 下降更慢，0 关闭",
+    )
+    parser.add_argument(
+        "--moe_aux_loss_weight",
+        type=float,
+        default=0.001,
+        help="MoE 软负载均衡辅助损失权重（router-only，只回传 router/CycleDelta）；"
+        "0 关闭",
+    )
+    parser.add_argument(
+        "--moe_router_logit_norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="路由 logits 逐 token 标准化（默认开启，防 sigmoid 饱和）",
+    )
+    parser.add_argument(
+        "--moe_router_logit_temp",
+        type=float,
+        default=1.0,
+        help="logits 标准化后的温度/标准差",
+    )
+    parser.add_argument(
+        "--moe_diversity_loss_weight",
+        type=float,
+        default=0.01,
+        help="router 输入 token 多样性正则权重；0 关闭",
+    )
+    parser.add_argument(
+        "--cycle_delta_max",
+        type=float,
+        default=0.0,
+        help="CycleDeltaRouter 的 delta logits 逐 token RMS 上限（实验性）；"
+        "默认 0 不限制——r073 探针中 clamp 反而加重 MTP 槽位集中",
+    )
+    parser.add_argument(
+        "--scale_logits_by_emb_scale",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="实验开关：tied embedding 时对 logits 乘 1/hrm_emb_scale，把初始 "
+        "CE 拉回 ln V 附近，但会显著放慢早期 loss 下降；默认关闭",
     )
     parser.add_argument(
         "--moe_bias_update_rate",
@@ -375,31 +405,34 @@ def get_sft_parser():
     parser.set_defaults(
         use_value_res=None,
         use_attn_gate=None,
-        loop_k=None,
-        dw_rank=None,
-        ws_loop=None,
         hrm_H_cycles=None,
         hrm_L_cycles=None,
         hrm_bp_cycles=None,
         hrm_emb_scale=None,
+        hrm_state_norm=None,
+        hrm_input_skip=None,
+        hrm_token_gate_scale=None,
         hrm_cycle_router=None,
+        hrm_cycle_router_rank=None,
         hrm_cycle_film=None,
-        ffn_type=None,
-        zero_centered_norm=None,
-        use_res_gate=None,
-        sandwich_norm=None,
-        san_res_init=None,
-        emb_scale=None,
         engram_layers=None,
         engram_orders=None,
         engram_heads=None,
         engram_slots=None,
         engram_sub_dim=None,
+        engram_scale=None,
+        engram_inject_every_cycle=None,
+        scale_logits_by_emb_scale=None,
+        moe_router_noise=None,
+        moe_aux_loss_weight=None,
+        moe_router_logit_norm=None,
+        moe_router_logit_temp=None,
+        moe_diversity_loss_weight=None,
+        cycle_delta_max=None,
         n_routed_experts=None,
         num_experts_per_tok=None,
         n_shared_experts=None,
         moe_intermediate_size=None,
-        n_dense_layers=None,
         routed_scaling_factor=None,
         moe_bias_update_rate=None,
     )
@@ -470,31 +503,34 @@ def get_dpo_parser():
     parser.set_defaults(
         use_value_res=None,
         use_attn_gate=None,
-        loop_k=None,
-        dw_rank=None,
-        ws_loop=None,
         hrm_H_cycles=None,
         hrm_L_cycles=None,
         hrm_bp_cycles=None,
         hrm_emb_scale=None,
+        hrm_state_norm=None,
+        hrm_input_skip=None,
+        hrm_token_gate_scale=None,
         hrm_cycle_router=None,
+        hrm_cycle_router_rank=None,
         hrm_cycle_film=None,
-        ffn_type=None,
-        zero_centered_norm=None,
-        use_res_gate=None,
-        sandwich_norm=None,
-        san_res_init=None,
-        emb_scale=None,
         engram_layers=None,
         engram_orders=None,
         engram_heads=None,
         engram_slots=None,
         engram_sub_dim=None,
+        engram_scale=None,
+        engram_inject_every_cycle=None,
+        scale_logits_by_emb_scale=None,
+        moe_router_noise=None,
+        moe_aux_loss_weight=None,
+        moe_router_logit_norm=None,
+        moe_router_logit_temp=None,
+        moe_diversity_loss_weight=None,
+        cycle_delta_max=None,
         n_routed_experts=None,
         num_experts_per_tok=None,
         n_shared_experts=None,
         moe_intermediate_size=None,
-        n_dense_layers=None,
         routed_scaling_factor=None,
         moe_bias_update_rate=None,
     )

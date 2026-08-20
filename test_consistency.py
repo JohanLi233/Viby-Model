@@ -1,16 +1,12 @@
 """架构正确性回归测试（不依赖训练数据，随机初始化的小模型即可运行）。
 
-覆盖：
+模型仅支持 HRM+MoE 架构（H/L 双栈层次循环 + 全 MoE FFN）。覆盖：
 1. 因果性：prefill T 与 prefill T+K 的前 T 个 logits 必须一致；
 2. prefill == 分段 prefill == 逐 token decode（use_cache 一致性）；
 3. padding 等价性：左/右 padding 下有效位置的 logits 与无 padding 一致；
 4. SFT / DPO loss mask：从首个内容 token 监督到 <|im_end|> 为止，
-   不多掩码下一轮的 <|im_start|>。
-5. ΔW-Loop（loop_k>1 + dw_rank>0）：参数审计、V=0 初始化等价、
-   delta 通路接线与 LoRA 式启动动力学（V=0 时仅 dw_v 收梯度）。
-
-前向类测试同时覆盖纯基础架构与当前基线机制（value_res / attn_gate / mtp /
-loop_k + dw_rank）。
+   不多掩码下一轮的 <|im_start|>；
+5. Engram / MTP 草稿 cache / MoE 三路径 / CycleRouter / CycleFiLM 专项。
 
 运行：python test_consistency.py
 """
@@ -19,91 +15,47 @@ import sys
 
 import numpy as np
 import mlx.core as mx
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_unflatten
 
-from model.model import VibyConfig, VibyForCausalLM, engram_indices_mx
+from model.model import (
+    MoEFeedForward,
+    VibyConfig,
+    VibyForCausalLM,
+    engram_indices_mx,
+)
 
 ATOL = 2e-3  # float32 下不同分块/增量路径的浮点误差上限
 
-# 前向类测试覆盖的架构变体
+# 前向类测试覆盖的架构变体（tiny_config 基座已是 HRM+MoE，这里只叠加开关）
 ARCH_VARIANTS = {
-    "plain": {},
-    "value_res+attn_gate+mtp": {
+    # 基线：HRM 双栈循环 + 全 MoE
+    "hrm2L2+moe": {},
+    # 基线机制组合：value_res + attn_gate + MTP
+    "hrm2L2+moe+vr+gate+mtp": {
         "use_value_res": True,
         "use_attn_gate": True,
         "mtp_depth": 1,
     },
-    "loop2+dw8": {
-        "loop_k": 2,
-        "dw_rank": 8,
-    },
-    "loop2+ws": {
-        "loop_k": 2,
-        "ws_loop": 1,
-    },
-    "loop2+dw8+ws": {
-        "loop_k": 2,
-        "dw_rank": 8,
-        "ws_loop": 1,
-    },
-    "hrm1L2": {
-        "hrm_H_cycles": 1,
-        "hrm_L_cycles": 2,
-    },
-    "hrm2L2+had+sand+eng": {
-        "hrm_H_cycles": 2,
-        "hrm_L_cycles": 2,
-        "ffn_type": "hadamard",
-        "sandwich_norm": 1,
-        "use_value_res": True,
-        "use_attn_gate": True,
-        "engram_layers": (1,),
-        "engram_orders": (1, 2, 3),
-        "engram_slots": 32,
-        "engram_sub_dim": 16,
-    },
-    "san": {
-        "ffn_type": "none",
-        "zero_centered_norm": 1,
-        "use_res_gate": 1,
-        "sandwich_norm": 1,
-        "san_res_init": 1,
-    },
-    "moe": {
-        "n_routed_experts": 8,
-        "num_experts_per_tok": 2,
-        "moe_intermediate_size": 48,
-        "n_dense_layers": 1,
-    },
-    # 100M V4 风格配置的同款组合：MoE + MLA + engram + value_res + attn_gate + mtp
-    "moe+eng+mtp+vr+gate": {
-        "n_routed_experts": 8,
-        "num_experts_per_tok": 2,
-        "moe_intermediate_size": 48,
-        "n_dense_layers": 1,
-        "engram_layers": (1,),
-        "engram_orders": (2, 3),
-        "engram_slots": 32,
-        "engram_sub_dim": 16,
-        "use_value_res": True,
-        "use_attn_gate": True,
-        "mtp_depth": 1,
-    },
-    # HRM×MoE（r070）：双状态循环 + MoE 双栈 + CycleRouter + CycleFiLM
-    "hrm2L2+moe+cycle": {
-        "hrm_H_cycles": 2,
-        "hrm_L_cycles": 2,
-        "n_routed_experts": 8,
-        "num_experts_per_tok": 2,
-        "moe_intermediate_size": 48,
-        "n_dense_layers": 0,
+    # r073 同款组合：CycleDeltaRouter + CycleFiLM + engram + vres + gate + MTP
+    "hrm2L2+moe+cycle+eng": {
         "hrm_cycle_router": 1,
+        "hrm_cycle_router_rank": 4,
         "hrm_cycle_film": 1,
         "engram_layers": (0,),
         "engram_orders": (2, 3),
         "engram_slots": 32,
         "engram_sub_dim": 16,
+        "use_value_res": True,
+        "use_attn_gate": True,
         "mtp_depth": 1,
+    },
+    # engram 旧行为消融：每个 L cycle 重读注入
+    "hrm2L2+moe+eng_every_cycle": {
+        "engram_layers": (0, 1),
+        "engram_orders": (2, 3),
+        "engram_slots": 32,
+        "engram_sub_dim": 16,
+        "engram_inject_every_cycle": 1,
     },
 }
 
@@ -119,6 +71,11 @@ def tiny_config(**kw):
         vocab_size=256,
         max_position_embeddings=512,
         mtp_depth=0,
+        hrm_H_cycles=2,
+        hrm_L_cycles=2,
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=48,
     )
     base.update(kw)
     return VibyConfig(**base)
@@ -204,13 +161,12 @@ def test_engram_decode_consistency():
             engram_slots=32,
             engram_sub_dim=16,
         ),
-        # r060 同款组合：MoE + MLA + engram + value_res + attn_gate + MTP
-        "moe+eng+mtp+vr+gate": dict(
-            n_routed_experts=8,
-            num_experts_per_tok=2,
-            moe_intermediate_size=48,
-            n_dense_layers=1,
-            engram_layers=(1,),
+        # r073 同款组合：CycleDeltaRouter + CycleFiLM + engram + vr + gate + MTP
+        "cycle+eng+mtp+vr+gate": dict(
+            hrm_cycle_router=1,
+            hrm_cycle_router_rank=4,
+            hrm_cycle_film=1,
+            engram_layers=(0,),
             engram_orders=(2, 3),
             engram_slots=32,
             engram_sub_dim=16,
@@ -218,22 +174,13 @@ def test_engram_decode_consistency():
             use_attn_gate=True,
             mtp_depth=1,
         ),
-        # r070 同款组合：HRM 双栈循环 + 全 MoE + CycleRouter/FiLM + engram
-        # （engram 注入 L 栈、每循环重读；decode 窗口在每层每 cycle 收窄）
-        "hrm2L2+moe+cycle+eng": dict(
-            hrm_H_cycles=2,
-            hrm_L_cycles=2,
-            n_routed_experts=8,
-            num_experts_per_tok=2,
-            moe_intermediate_size=48,
-            n_dense_layers=0,
-            hrm_cycle_router=1,
-            hrm_cycle_film=1,
+        # engram 旧行为消融：每个 L cycle 重读注入
+        "eng_every_cycle": dict(
             engram_layers=(0,),
             engram_orders=(2, 3),
             engram_slots=32,
             engram_sub_dim=16,
-            mtp_depth=1,
+            engram_inject_every_cycle=1,
         ),
     }
     for name, kw in variants.items():
@@ -246,10 +193,7 @@ def test_engram_decode_consistency():
             eng.value_proj.weight = mx.random.normal(eng.value_proj.weight.shape) * 0.02
             eng.taps = mx.random.normal(eng.taps.shape) * 0.02
 
-        orders = tuple(model.config.engram_orders or ())
-        max_order = max(orders) if orders else 0
-        taps = model.model.engrams[0].taps.shape[0]
-        win_len = max_order + (taps - 1) * max_order
+        win_len = model.model.engram_window_len()
         assert win_len > 0, "engram 窗口长度应为正"
 
         ids = rand_ids(40, seed=13)
@@ -334,13 +278,12 @@ def test_mtp_draft_cache_consistency():
     的单位置调用），草稿分布显著偏离（r060 实测 argmax 命中率 45%→34%）。
     """
     variants = {
-        "plain-mtp": dict(mtp_depth=1),
-        # r060 同款组合：MoE + MLA + engram + value_res + attn_gate + MTP
-        "moe+eng+mtp+vr+gate": dict(
-            n_routed_experts=8,
-            num_experts_per_tok=2,
-            moe_intermediate_size=48,
-            n_dense_layers=1,
+        "hrm+moe+mtp": dict(mtp_depth=1),
+        # r073 同款组合：CycleDeltaRouter + FiLM + engram + vr + gate + MTP
+        "cycle+eng+mtp+vr+gate": dict(
+            hrm_cycle_router=1,
+            hrm_cycle_router_rank=4,
+            hrm_cycle_film=1,
             engram_layers=(1,),
             engram_orders=(2, 3),
             engram_slots=32,
@@ -517,129 +460,6 @@ def test_decode_with_pad():
     assert bool(mx.all(mx.isfinite(dec.logits)).item()), "decode 输出包含 NaN/Inf"
 
 
-def test_dw_loop():
-    """ΔW-Loop 专项：参数审计、V=0 初始化等价、delta 通路接线、梯度可达性。"""
-    r, k = 8, 2
-    model = make_model(loop_k=k, dw_rank=r)
-    flat = dict(tree_flatten(model.trainable_parameters()))
-
-    # 1) 参数审计：每个被包装的 Linear 有 dw_u(out×r)+dw_v(r×in)+dw_g(k×r)；
-    #    2 层 ×（6 个注意力投影 + 3 个 FFN 投影），MTP/embedding 不携带。
-    dw_u_keys = [key for key in flat if key.endswith(".dw_u")]
-    n_expected = 2 * (6 + 3)
-    assert len(dw_u_keys) == n_expected, (
-        f"ΔW 包装矩阵数不符: {len(dw_u_keys)} != {n_expected}"
-    )
-    expect = 0
-    for key in dw_u_keys:
-        out_f, in_f = flat[key[: -len("dw_u")] + "base.weight"].shape
-        expect += r * (out_f + in_f) + k * r
-    actual = sum(
-        v.size for key, v in flat.items() if key.endswith((".dw_u", ".dw_v", ".dw_g"))
-    )
-    assert actual == expect, f"ΔW 参数量审计不符: {actual} != {expect}"
-
-    # loop_k=1 时不创建任何 dw 参数（严格向后兼容）
-    model_off = make_model(loop_k=1, dw_rank=r)
-    assert not any(
-        key.endswith((".dw_u", ".dw_v", ".dw_g"))
-        for key in dict(tree_flatten(model_off.trainable_parameters()))
-    ), "loop_k=1 时不应创建 dw 参数"
-
-    # 2) 初始化等价：V=0 时任意 g 都不影响输出
-    ids = rand_ids(32, seed=5)
-    ref = model(ids).logits
-    proj = model.model.layers[0].self_attn.q_proj
-    proj.dw_g = mx.random.normal(proj.dw_g.shape)
-    d = maxdiff(ref, model(ids).logits)
-    assert d == 0.0, f"V=0 初始化下改动 dw_g 不应影响输出，偏差 {d}"
-
-    # 3) 梯度可达性（LoRA 式启动动力学：V=0 时只有 dw_v 收梯度，
-    #    dw_u/dw_g 的梯度恰为 0，待 V 离开原点后才开始学习）
-    def loss_fn(m):
-        return m(ids, labels=ids).loss
-
-    _, grads = mx.value_and_grad(loss_fn)(model)
-    gflat = dict(tree_flatten(grads))
-    dv_max = max(
-        float(mx.abs(v).max().item())
-        for key, v in gflat.items()
-        if key.endswith(".dw_v")
-    )
-    assert dv_max > 0, "dw_v 应收到非零梯度"
-    for suffix in (".dw_u", ".dw_g"):
-        g_max = max(
-            float(mx.abs(v).max().item())
-            for key, v in gflat.items()
-            if key.endswith(suffix)
-        )
-        assert g_max == 0.0, f"V=0 时 {suffix} 梯度应恰为 0，实际 {g_max}"
-
-    # 4) delta 通路接线确认：dw_v 非零后输出必须改变
-    proj.dw_v = mx.random.normal(proj.dw_v.shape) * 0.02
-    d = maxdiff(ref, model(ids).logits)
-    assert d > 1e-4, f"dw_v 非零后输出未变（delta 通路未接线？），偏差 {d}"
-
-
-def test_ws_loop():
-    """W-Scale-Loop 专项：参数审计、s=1 初始化等价、梯度可达、通路接线。"""
-    k = 2
-    model = make_model(loop_k=k, ws_loop=1)
-    flat = dict(tree_flatten(model.trainable_parameters()))
-
-    # 1) 参数审计：2 层 ×（6 个注意力投影 + 3 个 FFN 投影），每个包装
-    #    有 ws_in(k×in) + ws_out(k×out)
-    ws_in_keys = [key for key in flat if key.endswith(".ws_in")]
-    n_expected = 2 * (6 + 3)
-    assert len(ws_in_keys) == n_expected, (
-        f"W-Scale 包装矩阵数不符: {len(ws_in_keys)} != {n_expected}"
-    )
-    expect = 0
-    for key in ws_in_keys:
-        in_f = flat[key].shape[1]
-        out_f = flat[key[: -len("ws_in")] + "ws_out"].shape[1]
-        expect += k * (in_f + out_f)
-    actual = sum(
-        v.size for key, v in flat.items() if key.endswith((".ws_in", ".ws_out"))
-    )
-    assert actual == expect, f"W-Scale 参数量审计不符: {actual} != {expect}"
-
-    # loop_k=1 时不创建 ws 参数（严格向后兼容）
-    model_off = make_model(loop_k=1, ws_loop=1)
-    assert not any(
-        key.endswith((".ws_in", ".ws_out"))
-        for key in dict(tree_flatten(model_off.trainable_parameters()))
-    ), "loop_k=1 时不应创建 ws 参数"
-
-    # 2) 初始化等价：s=1 时输出严格等于 base 路径
-    ids = rand_ids(32, seed=6)
-    ref = model(ids).logits
-    proj = model.model.layers[0].self_attn.q_proj
-    proj.ws_in = mx.ones_like(proj.ws_in)
-    proj.ws_out = mx.ones_like(proj.ws_out)
-    d = maxdiff(ref, model(ids).logits)
-    assert d == 0.0, f"s=1 初始化下输出应严格不变，偏差 {d}"
-
-    # 3) 梯度可达：s 参数在初始化处就应收到梯度（与 V=0 的 ΔW 不同）
-    def loss_fn(m):
-        return m(ids, labels=ids).loss
-
-    _, grads = mx.value_and_grad(loss_fn)(model)
-    gflat = dict(tree_flatten(grads))
-    for suffix in (".ws_in", ".ws_out"):
-        g_max = max(
-            float(mx.abs(v).max().item())
-            for key, v in gflat.items()
-            if key.endswith(suffix)
-        )
-        assert g_max > 0, f"{suffix} 应收到非零梯度"
-
-    # 4) 通路接线确认：扰动 s 后输出必须改变
-    proj.ws_out = mx.ones_like(proj.ws_out) * 1.05
-    d = maxdiff(ref, model(ids).logits)
-    assert d > 1e-4, f"ws_out 扰动后输出未变（通路未接线？），偏差 {d}"
-
-
 def test_engram():
     """Engram n-gram 记忆：参数审计、零初始化启动动力学、因果性、padding、梯度与通路。"""
     kw = dict(
@@ -649,6 +469,26 @@ def test_engram():
         engram_sub_dim=16,
     )
     model = make_model(**kw)
+    # DeepSeek 论文融合口径是固定默认；上一代 sidecar 缺键时 from_dict
+    # 回旧 conv-before-gate（评估旧权重口径不变），不暴露多余开关。
+    assert model.config.engram_paper_fusion is True
+    assert all(eng.paper_fusion for eng in model.model.engrams)
+    legacy_cfg = VibyConfig.from_dict(
+        {
+            "hidden_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "hrm_H_cycles": 1,
+            "hrm_L_cycles": 1,
+            "n_routed_experts": 8,
+            "num_experts_per_tok": 2,
+        }
+    )
+    assert legacy_cfg.engram_paper_fusion is False
+    # 反向经过 MoE 时必须绕开不可微的 decode kernel（路径等价性由 test_moe 覆盖）
+    for m in model.modules():
+        if isinstance(m, MoEFeedForward):
+            m._KERNEL_MAX_PAIRS = 0
     flat = dict(tree_flatten(model.trainable_parameters()))
     table_keys = [k for k in flat if k.endswith(".table")]
     assert len(table_keys) == len(kw["engram_layers"]), (
@@ -713,28 +553,24 @@ def test_engram():
     d = maxdiff(ref, model(ids).logits)
     assert d > 1e-4, f"Engram 表扰动后输出未变（通路未接线？），偏差 {d}"
 
-    # HRM 模式：engram 保留并注入 L-module（每个循环调用重读表）
+    # 第二个位点配置：engram 只挂 L 栈 layer1
     m2 = make_model(
-        hrm_H_cycles=2,
-        hrm_L_cycles=1,
-        ffn_type="hadamard",
-        sandwich_norm=1,
         engram_layers=(1,),
         engram_orders=(1, 2, 3),
         engram_slots=32,
         engram_sub_dim=16,
     )
-    assert len(m2.model.engrams) == 1, "HRM 模式应保留 engram"
+    assert len(m2.model.engrams) == 1, "engram 应按位点保留"
     e2 = m2.model.engrams[0]
     assert float(mx.abs(e2.value_proj.weight).max().item()) == 0.0, (
-        "HRM engram value_proj 应零初始化"
+        "engram value_proj 应零初始化"
     )
     e2.table = mx.random.normal(e2.table.shape) * 0.05
     e2.value_proj.weight = mx.random.normal(e2.value_proj.weight.shape) * 0.02
     ref = m2(ids).logits
     e2.table = e2.table + 0.05
     d = maxdiff(ref, m2(ids).logits)
-    assert d > 1e-4, f"HRM engram 表扰动后输出未变（未接线？），偏差 {d}"
+    assert d > 1e-4, f"engram 表扰动后输出未变（未接线？），偏差 {d}"
 
 
 def test_engram_order_mask():
@@ -773,7 +609,6 @@ def test_engram_order_mask():
 def test_moe():
     """DeepSeekMoE 专项：结构审计、逐专家参考等价、路由权重性质、
     偏置冻结/无辅助损失更新、负载统计、梯度可达性、MTP 同构。"""
-    from model.model import MoEFeedForward
 
     E, K, moe_in = 8, 2, 48
     kw = dict(
@@ -781,31 +616,36 @@ def test_moe():
         num_experts_per_tok=K,
         n_shared_experts=1,
         moe_intermediate_size=moe_in,
-        n_dense_layers=1,
     )
     model = make_model(**kw)
     flat = dict(tree_flatten(model.trainable_parameters()))
 
-    # 1) 结构审计：layer0 dense（SwiGLU），layer1 MoE；专家权重为 (E,out,in) 堆叠
-    l0, l1 = model.model.layers
-    assert not isinstance(l0.mlp, MoEFeedForward), "dense 前缀层应为 SwiGLU"
-    assert isinstance(l1.mlp, MoEFeedForward), "n_dense_layers 之后应为 MoE"
-    gw = flat["model.layers.1.mlp.experts.gate_up_w"]
+    # 1) 结构审计：L/H 双栈所有层均为 MoE；专家权重为 (E,out,in) 堆叠
+    layers = [*model.model.l_module.layers, *model.model.h_module.layers]
+    assert all(isinstance(layer.mlp, MoEFeedForward) for layer in layers), (
+        "所有层的 FFN 应为 MoE"
+    )
+    gw = flat["model.l_module.layers.1.mlp.experts.gate_up_w"]
     assert gw.shape == (E, 2 * moe_in, 128), f"专家堆叠形状错误: {gw.shape}"
     # expert_bias 冻结（不进梯度/优化器），但随 checkpoint 持久化
-    assert "model.layers.1.mlp.router.expert_bias" not in flat, "expert_bias 不应可训练"
+    assert "model.l_module.layers.1.mlp.router.expert_bias" not in flat, (
+        "expert_bias 不应可训练"
+    )
     allp = dict(tree_flatten(model.parameters()))
-    assert "model.layers.1.mlp.router.expert_bias" in allp, "expert_bias 应持久化"
+    assert "model.l_module.layers.1.mlp.router.expert_bias" in allp, (
+        "expert_bias 应持久化"
+    )
 
     # 2) 路由参考等价：逐 (token, expert) 朴素循环 vs 融合 kernel 实现
-    # （G=20 <= _KERNEL_MAX_PAIRS，l1.mlp(x) 走 decode Metal kernel 路径）
+    # （G=20 <= _KERNEL_MAX_PAIRS，mlp(x) 走 decode Metal kernel 路径）
+    mlp = model.model.l_module.layers[1].mlp
     x = mx.random.normal((2, 5, 128))
-    out = l1.mlp(x)
-    idx, w = l1.mlp.router(x)
+    out = mlp(x)
+    idx, w = mlp.router(x)
     B, T, D = x.shape
-    gu_ = np.array(l1.mlp.experts.gate_up_w)  # (E, 2I, D)
+    gu_ = np.array(mlp.experts.gate_up_w)  # (E, 2I, D)
     gw_, uw_ = gu_[:, :moe_in], gu_[:, moe_in:]
-    dw_ = np.array(l1.mlp.experts.down_w)
+    dw_ = np.array(mlp.experts.down_w)
     xn, idxn, wn = np.array(x), np.array(idx), np.array(w)
 
     def silu(v):
@@ -818,23 +658,22 @@ def test_moe():
                 e = idxn[b, t, j]
                 h = silu(xn[b, t] @ gw_[e].T) * (xn[b, t] @ uw_[e].T)
                 ref[b, t] += wn[b, t, j] * (h @ dw_[e].T)
-    ref = mx.array(ref) + l1.mlp.shared(x)
+    ref = mx.array(ref) + mlp.shared(x)
     d = maxdiff(out, ref)
     assert d < 1e-4, f"kernel 融合 MoE 与逐专家参考不符: {d}"
 
     # 2b) 三路径等价：kernel（decode，上面已验）/ 稠密（小 prefill）/ 稀疏（训练）
-    l1.mlp._KERNEL_MAX_PAIRS = 0  # 强制稠密
-    d = maxdiff(ref, l1.mlp(x))
+    mlp._KERNEL_MAX_PAIRS = 0  # 强制稠密
+    d = maxdiff(ref, mlp(x))
     assert d < 1e-4, f"稠密批量 MoE 与逐专家参考不符: {d}"
-    l1.mlp._DENSE_MAX_PAIRS = 0  # 强制稀疏
-    d = maxdiff(ref, l1.mlp(x))
-    l1.mlp._KERNEL_MAX_PAIRS = 512  # 还原默认
-    l1.mlp._DENSE_MAX_PAIRS = 4096
+    mlp._DENSE_MAX_PAIRS = 0  # 强制稀疏
+    d = maxdiff(ref, mlp(x))
+    mlp._KERNEL_MAX_PAIRS = 512  # 还原默认
+    mlp._DENSE_MAX_PAIRS = 4096
     assert d < 1e-4, f"稀疏分段 MoE 与逐专家参考不符: {d}"
 
     # 2c) bf16 下 kernel 路径（含 router kernel）与原生路径整体一致
     # （decode 实际运行 dtype；随机输入 tie 概率 0，选择集合应精确一致）
-    mlp = l1.mlp
     saved = (mlp.experts.gate_up_w, mlp.experts.down_w, mlp.router.weight)
     mlp.experts.gate_up_w = mlp.experts.gate_up_w.astype(mx.bfloat16)
     mlp.experts.down_w = mlp.experts.down_w.astype(mx.bfloat16)
@@ -851,7 +690,8 @@ def test_moe():
     sums = np.array(w.sum(axis=-1))
     assert np.allclose(sums, 2.5, atol=1e-5), f"路由权重和应为 scaling factor: {sums}"
 
-    # 4) 负载统计与无辅助损失偏置更新（V3 规则：超载减、欠载增）
+    # 4) 负载统计与无辅助损失偏置更新（V3 规则：超载减、欠载增）。
+    #    HRM 下 L 栈 gate 每前向调 H*L=4 次（跨循环累加），H 栈调 H=2 次。
     gates = model.moe_gates()
     for g in gates:
         g.collect_stats = True
@@ -861,7 +701,10 @@ def test_moe():
     mx.eval(stats)
     assert stats.shape == (len(gates) * E,), f"负载统计形状错误: {stats.shape}"
     per = stats.reshape(len(gates), E)
-    assert float(per[0].sum()) == 2 * 16 * K, f"计数总量不符: {float(per[0].sum())}"
+    sums = sorted(float(per[i].sum()) for i in range(len(gates)))
+    assert sums == [2 * 2 * 16 * K] * 2 + [4 * 2 * 16 * K] * 2, (
+        f"负载统计总量不符（H 栈 2 次/L 栈 4 次调用）: {sums}"
+    )
     bias0 = np.array(gates[0].expert_bias)
     load = per[0]
     model.update_moe_biases(stats, 0.001)
@@ -878,9 +721,10 @@ def test_moe():
     assert bool(mx.all(mx.any(idx2 == 3, axis=-1)).item()), "大 bias 专家应必中"
 
     # 6) 梯度可达：router 与专家堆叠均收非零梯度
-    # （kernel 路径不可微；训练前向走稠密/稀疏路径，这里强制稠密模拟）
-    for m in (l1.mlp,):
-        m._KERNEL_MAX_PAIRS = 0
+    # （kernel 路径不可微；训练前向走稠密/稀疏路径，这里全部强制稠密模拟）
+    for m in model.modules():
+        if isinstance(m, MoEFeedForward):
+            m._KERNEL_MAX_PAIRS = 0
 
     def loss_fn(p):
         model.update(p)
@@ -888,11 +732,11 @@ def test_moe():
 
     val, grads = mx.value_and_grad(loss_fn)(model.trainable_parameters())
     mx.eval(val, grads)
-    l1.mlp._KERNEL_MAX_PAIRS = 512  # 还原默认
+    MoEFeedForward._KERNEL_MAX_PAIRS = 512  # 还原默认（实例属性随之失效无关）
     gflat = dict(tree_flatten(grads))
     for key in (
-        "model.layers.1.mlp.router.weight",
-        "model.layers.1.mlp.experts.gate_up_w",
+        "model.l_module.layers.1.mlp.router.weight",
+        "model.l_module.layers.1.mlp.experts.gate_up_w",
     ):
         g_max = float(mx.abs(gflat[key]).max().item())
         assert g_max > 0, f"{key} 应收到非零梯度"
@@ -905,16 +749,22 @@ def test_moe():
 
 
 def test_hrm_moe_cycle():
-    """HRM×MoE（CycleRouter/CycleFiLM）：参数审计、零初始化等价、
-    梯度可达、通路接线、跨循环负载统计累加。"""
+    """CycleRouter v1（cycle_emb）已删除：开启 cycle router 必须给 rank；
+    CycleFiLM 的零初始化等价/梯度/通路/负载统计仍按 HRM 循环验证。"""
+    # 旧 cycle_emb 形式不再存在：hrm_cycle_router=1 且 rank=0 应直接拒绝
+    try:
+        make_model(hrm_cycle_router=1, hrm_cycle_router_rank=0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("hrm_cycle_router 开启但 rank=0 应报错")
+
     kw = dict(
         hrm_H_cycles=2,
         hrm_L_cycles=2,
         n_routed_experts=8,
         num_experts_per_tok=2,
         moe_intermediate_size=48,
-        n_dense_layers=0,
-        hrm_cycle_router=1,
         hrm_cycle_film=1,
         mtp_depth=1,
     )
@@ -923,57 +773,35 @@ def test_hrm_moe_cycle():
     model = make_model(**kw)
     flat = dict(tree_flatten(model.trainable_parameters()))
 
-    # 1) 参数审计：每个 MoE gate（l/h 栈各 P=2 层 + MTP 块 = 5 个）携带
-    #    cycle_emb(6×128)；VibyModel 携带 hrm_film_scale/shift(6×128)；
-    #    关闭开关时不创建任何对应参数。
-    cb_keys = [k for k in flat if k.endswith(".cycle_emb")]
-    assert len(cb_keys) == 5, f"cycle_emb 数量不符: {len(cb_keys)} != 5"
-    for k in cb_keys:
-        assert flat[k].shape == (n_cycles, D), f"cycle_emb 形状不符: {flat[k].shape}"
+    # 1) 参数审计：VibyModel 携带 hrm_film_scale/shift(6×128)；
+    #    不再存在任何 cycle_emb 参数。
     for name in ("hrm_film_scale", "hrm_film_shift"):
         key = f"model.{name}"
         assert key in flat and flat[key].shape == (n_cycles, D), f"{key} 缺失或形状不符"
-    model_off = make_model(**{**kw, "hrm_cycle_router": 0, "hrm_cycle_film": 0})
-    assert not any(
-        k.endswith(".cycle_emb") or "hrm_film" in k
-        for k in dict(tree_flatten(model_off.trainable_parameters()))
-    ), "开关关闭时不应创建 cycle 参数"
+    assert not any(k.endswith("cycle_emb") for k in flat), "cycle_emb 已删除"
 
-    # 2) 零初始化等价：cycle 参数全零时输出与关闭开关一致。容差而非严格
-    #    相等：cycle 模型在小批量 decode 会绕开融合 kernel 走稠密路径
-    #    （kernel 不含 cycle_emb 项），与 off 模型的 kernel 路径存在
-    #    ~1e-6 级数值差；训练侧两条路径选择完全一致，故对训练严格等价。
+    # 2) FiLM 零初始化等价：输出与关闭 FiLM 的模型一致。
     ids = rand_ids(32, seed=11)
+    model_off = make_model(**{**kw, "hrm_cycle_film": 0})
     ref = model_off(ids).logits
     d = maxdiff(ref, model(ids).logits)
-    assert d < 1e-5, f"零初始化下 cycle 参数不应影响输出，偏差 {d}"
+    assert d < 1e-5, f"零初始化下 FiLM 不应影响输出，偏差 {d}"
 
-    # 3) 梯度可达：cycle_emb 经 sigmoid 分→w 回传（全 cycle 回传时非零），
-    #    hrm_film 同理（显式参数形式：model 形式的 value_and_grad 会对
-    #    freeze 的 expert_bias 返回 None 叶，tree_flatten 不接受）
+    # 3) 梯度可达：hrm_film 在尾部回传 cycle 内应收到非零梯度。
+    model.train()
+
     def loss_fn(p):
         model.update(p)
         return model(ids, labels=ids).loss
 
     _, grads = mx.value_and_grad(loss_fn)(model.trainable_parameters())
     gflat = dict(tree_flatten(grads))
-    ce_max = max(
-        float(mx.abs(v).max().item())
-        for k, v in gflat.items()
-        if k.endswith(".cycle_emb")
-    )
-    assert ce_max > 0, "cycle_emb 应收到非零梯度"
     film_max = max(
         float(mx.abs(v).max().item()) for k, v in gflat.items() if "hrm_film" in k
     )
     assert film_max > 0, "hrm_film 应收到非零梯度"
 
-    # 4) 通路接线：扰动 cycle_emb / hrm_film 后输出必须改变
-    g0 = model.model.l_module.layers[0].mlp.router
-    g0.cycle_emb = g0.cycle_emb.at[0].add(0.05)
-    d = maxdiff(ref, model(ids).logits)
-    assert d > 1e-4, f"cycle_emb 扰动后输出未变（通路未接线？），偏差 {d}"
-    g0.cycle_emb = mx.zeros_like(g0.cycle_emb)
+    # 4) 通路接线：扰动 hrm_film 后输出必须改变。
     model.model.hrm_film_scale = model.model.hrm_film_scale.at[3].add(0.1)
     d = maxdiff(ref, model(ids).logits)
     assert d > 1e-4, f"hrm_film 扰动后输出未变（通路未接线？），偏差 {d}"
@@ -1002,6 +830,169 @@ def test_hrm_moe_cycle():
     assert float(l_g.last_load.sum()) == 4 * B * T * K, "负载统计未按前向重置"
 
 
+def test_hrm_moe_cycle_delta():
+    """CycleDeltaRouter：per-cycle 低秩路由增量（U·V_c）。"""
+    kw = dict(
+        hrm_H_cycles=2,
+        hrm_L_cycles=2,
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=48,
+        hrm_cycle_router=1,
+        hrm_cycle_router_rank=4,
+        hrm_cycle_film=0,
+        mtp_depth=1,
+    )
+    model = make_model(**kw)
+    flat = dict(tree_flatten(model.trainable_parameters()))
+    # 1) 参数审计：每个 gate 有共享 U 与 per-cycle V_c。
+    for suffix in ("cycle_u", "cycle_v"):
+        keys = [k for k in flat if k.endswith(suffix)]
+        assert len(keys) == 5, f"{suffix} 数量不符: {len(keys)}"
+    g0 = model.model.l_module.layers[0].mlp.router
+    assert g0.cycle_u.shape == (8, 4)
+    assert g0.cycle_v.shape == (6, 4, 128)
+    assert float(mx.abs(g0.cycle_v).max().item()) == 0.0, "V 应零初始化"
+
+    # 2) 零初始化等价：把 off 模型的公共权重拷到 delta 模型，输出应一致。
+    mx.random.seed(0)
+    model_off = make_model(**{**kw, "hrm_cycle_router": 0})
+    off_flat = dict(tree_flatten(model_off.parameters()))
+    on_flat = dict(tree_flatten(model.parameters()))
+    common = {
+        k: v
+        for k, v in off_flat.items()
+        if k in on_flat and v.shape == on_flat[k].shape
+    }
+    model.update(tree_unflatten(list(common.items())))
+    mx.eval(model.parameters())
+    ids = rand_ids(24, seed=17)
+    d = maxdiff(model_off(ids).logits, model(ids).logits)
+    assert d < 1e-5, f"V=0 时 CycleDeltaRouter 应严格等价，偏差 {d}"
+
+    # 3) 梯度可达：V_c 离地后 U/V 都应收到梯度。
+    for g in model.moe_gates():
+        g.cycle_v = mx.random.normal(g.cycle_v.shape).astype(g.cycle_v.dtype) * 0.02
+    model.train()
+
+    def loss_fn(p):
+        model.update(p)
+        return model(ids, labels=ids).loss
+
+    _, grads = mx.value_and_grad(loss_fn)(model.trainable_parameters())
+    mx.eval(grads)
+    gflat = dict(tree_flatten(grads))
+    for suffix in ("cycle_u", "cycle_v"):
+        mxg = max(
+            float(mx.abs(gflat[k]).max().item()) for k in gflat if k.endswith(suffix)
+        )
+        assert mxg > 0, f"{suffix} 应收到非零梯度"
+
+    # 4) 通路接线：扰动 cycle_v 后输出必须改变。
+    model.eval()
+    ref = model(ids).logits
+    g0.cycle_v = g0.cycle_v.at[0].add(0.05)
+    d = maxdiff(ref, model(ids).logits)
+    assert d > 1e-4, f"cycle_v 扰动后输出未变（通路未接线？），偏差 {d}"
+
+    # 5) decode 融合 kernel 的 cycle delta 支持：带 step_idx 时 __call__
+    #    应走 kernel 路径（G ≤ _KERNEL_MAX_PAIRS），且与「MoEGate 原生
+    #    router + 稠密路径」输出一致（选错专家会产生远超阈值的偏差）。
+    mlp = model.model.l_module.layers[0].mlp
+    assert mlp.router.cycle_rank > 0
+    saved = (mlp.experts.gate_up_w, mlp.experts.down_w, mlp.router.weight)
+    mlp.experts.gate_up_w = mlp.experts.gate_up_w.astype(mx.bfloat16)
+    mlp.experts.down_w = mlp.experts.down_w.astype(mx.bfloat16)
+    mlp.router.weight = mlp.router.weight.astype(mx.bfloat16)
+    xb = mx.random.normal((1, 3, 128)).astype(mx.bfloat16)  # G=6 → kernel 路径
+    for sidx in (0, 3, 5):
+        got = mlp(xb, step_idx=sidx)
+        idx_ref, w_ref = mlp.router(xb, step_idx=sidx)
+        ref = mlp._dense_forward(xb, idx_ref, w_ref) + mlp.shared(xb)
+        rel = maxdiff(got, ref) / maxdiff(ref, mx.zeros_like(ref))
+        assert rel < 2e-2, f"cycle delta kernel 与稠密路径不符: step={sidx} rel={rel}"
+    (mlp.experts.gate_up_w, mlp.experts.down_w, mlp.router.weight) = saved
+
+
+def test_hrm_engram_initial_injection():
+    """HRM 下 engram 只注入初始 z_H 一次，并且在 bp 截断下仍可训练。"""
+    kw = dict(
+        hrm_H_cycles=2,
+        hrm_L_cycles=2,
+        hrm_bp_cycles=[1],  # 每个 H cycle 只有最后一个 L cycle 回传
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=48,
+        hrm_cycle_router=0,
+        hrm_cycle_film=0,
+        use_value_res=False,  # 不依赖 value_res 的梯度泄漏通路
+        engram_layers=(0,),
+        engram_orders=(2, 3),
+        engram_slots=32,
+        engram_sub_dim=16,
+        mtp_depth=0,
+    )
+    model = make_model(**kw)
+    eng = model.model.engrams[0]
+    eng.table = mx.random.normal(eng.table.shape) * 0.05
+    eng.value_proj.weight = mx.random.normal(eng.value_proj.weight.shape) * 0.02
+    ids = rand_ids(24, seed=23)
+    model.train()
+    # 小批量默认会走不可微的融合 kernel；强制可微稠密路径。
+    for m in model.modules():
+        if isinstance(m, MoEFeedForward):
+            m._KERNEL_MAX_PAIRS = 0
+
+    def loss_fn(p):
+        model.update(p)
+        return model(ids, labels=ids).loss
+
+    _, grads = mx.value_and_grad(loss_fn)(model.trainable_parameters())
+    mx.eval(grads)
+    gflat = dict(tree_flatten(grads))
+    vp_grad = max(
+        float(mx.abs(gflat[k]).max().item())
+        for k in gflat
+        if k.endswith("value_proj.weight")
+    )
+    assert vp_grad > 0, (
+        "初始 z_H 注入应让 engram value_proj 在 bp 截断下仍有梯度；"
+        "若每 cycle 注入在 cycle0，早期 stop_gradient 会切断梯度"
+    )
+
+
+def test_engram_doc_mask_no_leak():
+    """doc_mask 下 engram 卷积不得跨文档泄漏：替换 doc1 的 token，
+    doc2 位置的 logits 必须完全不变。"""
+    kw = dict(
+        engram_layers=(0,),
+        engram_orders=(2, 3),
+        engram_slots=32,
+        engram_sub_dim=16,
+        hrm_H_cycles=1,
+        hrm_L_cycles=2,
+    )
+    model = make_model(**kw)
+    eng = model.model.engrams[0]
+    # 让 engram value/taps 离地，否则泄漏量为 0 会掩盖 bug
+    eng.value_proj.weight = mx.random.normal(eng.value_proj.weight.shape) * 0.1
+    eng.taps = mx.random.normal(eng.taps.shape) * 0.1
+    model.eval()
+    B, T = 1, 24
+    ids = rand_ids(T, B=B, seed=31)
+    seg = mx.array([[0] * 8 + [1] * 16], dtype=mx.int32)
+    ids2 = mx.array(ids)
+    ids2_np = np.asarray(ids2).copy()
+    ids2_np[0, :8] = np.random.default_rng(0).integers(3, 256, 8)
+    ids2 = mx.array(ids2_np)
+    attn = mx.ones_like(ids)
+    l0 = model(ids, attention_mask=attn, segment_ids=seg, mask_has_pad=False).logits
+    l1 = model(ids2, attention_mask=attn, segment_ids=seg, mask_has_pad=False).logits
+    mx.eval(l0, l1)
+    d = maxdiff(l0[:, 8:, :], l1[:, 8:, :])
+    assert d < 1e-5, f"engram 卷积在 doc_mask 下发生跨文档泄漏，diff={d}"
+
+
 def main():
     tests = [
         test_prefill_causality,
@@ -1009,14 +1000,15 @@ def main():
         test_pad_equivalence,
         test_decode_with_pad,
         test_loss_masks,
-        test_dw_loop,
-        test_ws_loop,
         test_engram,
         test_engram_order_mask,
         test_engram_decode_consistency,
         test_mtp_draft_cache_consistency,
         test_moe,
         test_hrm_moe_cycle,
+        test_hrm_moe_cycle_delta,
+        test_hrm_engram_initial_injection,
+        test_engram_doc_mask_no_leak,
     ]
     failed = 0
     for fn in tests:

@@ -62,13 +62,6 @@ def main():
         type=str,
     )
     parser.add_argument("--n_docs", type=int, default=2000)
-    parser.add_argument(
-        "--loop_k_override",
-        type=int,
-        default=None,
-        help="H4 测试：覆盖 checkpoint 的 loop_k 用不同推理展开次数评估；"
-        "覆盖时 strict=False 加载共享块权重（per-step FiLM 参数不匹配则跳过）。",
-    )
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--tag", type=str, default=None, help="写入 tsv 的轮次名")
@@ -97,29 +90,15 @@ def main():
     with open(sidecar, "r", encoding="utf-8") as f:
         meta = json.load(f)
     config = VibyConfig.from_dict(meta["config"])
-    loop_override = (
-        args.loop_k_override is not None
-        and args.loop_k_override != getattr(config, "loop_k", 1)
-    )
-    if loop_override:
-        orig_loop = getattr(config, "loop_k", 1)
-        config.loop_k = args.loop_k_override
     tokenizer = AutoTokenizer.from_pretrained("./model/")
     model = VibyForCausalLM(config)
-    strict = (not loop_override) and (not args.loose)
     if not load_model_weights(
         model,
         args.ckpt,
-        strict=strict,
+        strict=not args.loose,
         label="checkpoint",
-        allow_dim0_slice=loop_override,
     ):
         raise SystemExit(f"无法加载检查点 {args.ckpt}")
-    if loop_override:
-        print(
-            f"[ppl] loop_k_override: train_k={orig_loop} -> eval_k={config.loop_k} "
-            f"(strict=False)"
-        )
     model.eval()
 
     t0 = time.time()

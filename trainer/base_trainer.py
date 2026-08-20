@@ -162,6 +162,9 @@ class BaseTrainer:
 
         # 训练时长预算（max_train_minutes）的起始时间，train() 开始时设置
         self._train_start_time = None
+        # Ctrl-C 时保存检查点使用的当前 step 位置（train_epoch 内实时更新）
+        self._last_epoch = 0
+        self._last_step = 0
 
     def _time_limit_exceeded(self):
         """是否已达最长训练时长（分钟）。未设置或训练未开始时返回 False。"""
@@ -196,8 +199,8 @@ class BaseTrainer:
             for gate in self._moe_gates:
                 gate.collect_stats = True
 
-        # loss + 梯度函数（mx.compile 默认启用；MoE 稀疏分段前向含数据依赖
-        # 形状，无法 trace，见 _build_loss_and_grad 的自动回退）
+        # loss + 梯度函数（mx.compile 默认启用；MoE 容量表逐微批滚动、
+        # 形状跨步不稳定会反复 retrace，见 _build_loss_and_grad 的自动回退）
         self._loss_and_grad = self._build_loss_and_grad()
 
         # Metal 分配器缓存上限（--cache_limit_gb，默认 24GB，0=不限）：
@@ -219,8 +222,9 @@ class BaseTrainer:
 
         返回 (加权和 loss / accumulation_steps, mtp 分量 loss, moe 负载统计)。
         mtp 分量仅作日志展示、不缩放；无 MTP 时返回 0 常量。
-        moe 负载统计为各 router 每专家 token 计数拼接向量，供无辅助损失
-        偏置均衡更新；无 MoE 时返回零长占位，保持 compile 图结构稳定。
+        总 loss 中已包含 moe_aux_loss_weight 加权的软负载均衡项。
+        moe 负载统计为各 router 每专家 token 计数拼接向量，供偏置均衡
+        更新；无 MoE 时返回零长占位，保持 compile 图结构稳定。
         """
         res = self.model(
             input_ids=X,
@@ -231,10 +235,22 @@ class BaseTrainer:
             segment_ids=seg_ids,
         )
         mtp_loss = res.mtp_loss if res.mtp_loss is not None else mx.array(0.0)
+        lm_loss = res.lm_loss if res.lm_loss is not None else res.loss
+        aux_loss = res.aux_loss if res.aux_loss is not None else mx.array(0.0)
+        div_loss = (
+            res.diversity_loss if res.diversity_loss is not None else mx.array(0.0)
+        )
         moe_stats = self.model.moe_load_stats() if self._moe_gates else None
         if moe_stats is None:
             moe_stats = mx.zeros((0,), dtype=mx.float32)
-        return res.loss / self.args.accumulation_steps, mtp_loss, moe_stats
+        return (
+            res.loss / self.args.accumulation_steps,
+            mtp_loss,
+            moe_stats,
+            lm_loss / self.args.accumulation_steps,
+            aux_loss,
+            div_loss,
+        )
 
     def _loss_and_grad_with_params(
         self, params, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None
@@ -254,8 +270,8 @@ class BaseTrainer:
         use_compile = getattr(self.args, "compile_model", False)
         if use_compile and self._moe_gates:
             Logger(
-                "MoE 稀疏桶前向含数据依赖形状（host sync），mx.compile 不可用，"
-                "自动回退 eager；如要 compile 请关闭 MoE"
+                "MoE 稀疏桶容量表逐微批滚动、形状跨步不稳定，mx.compile 会"
+                "反复 retrace，自动回退 eager；如要 compile 请关闭 MoE"
             )
             use_compile = False
         if use_compile:
@@ -312,8 +328,8 @@ class BaseTrainer:
 
         self.optimizer.update(self.model, grads)
 
-        # 无辅助损失负载均衡：b_i ← b_i − u·sign(load_i − mean_load)。
-        # 梯度累积窗口内用最后一个微批的负载统计更新一次（V3 每步更新的近似）
+        # 无辅助损失负载均衡：比例-截断 + 零均值投影（见 update_moe_biases）。
+        # 负载统计为累积窗口内各微批之和（V3 每步更新的窗口近似）
         if self._moe_bias_rate > 0 and moe_stats is not None and moe_stats.size > 0:
             self.model.update_moe_biases(moe_stats, self._moe_bias_rate)
 
@@ -352,7 +368,8 @@ class BaseTrainer:
         accum_grads = None
         accum_count = 0
         last_grad_norm = 0.0  # Store last calculated gradient norm
-        last_moe_stats = None  # 最近微批的 MoE 负载统计（偏置更新用）
+        last_moe_stats = None  # 窗口内累加的 MoE 负载统计（偏置更新用）
+        win_overflow = 0  # 上次日志点以来的桶容量溢出 pair 累计
 
         self.model.train()
 
@@ -360,6 +377,8 @@ class BaseTrainer:
             # 跳过步骤（恢复训练时）
             if step < skip_steps:
                 continue
+            self._last_epoch = epoch
+            self._last_step = step
             # doc_mask 打包模式下 dataset 多返回一项 segment_ids
             if len(batch) == 4:
                 X, Y, loss_mask, seg_ids = batch
@@ -387,7 +406,17 @@ class BaseTrainer:
             # 参数显式传入：compile 下保证梯度基于当前权重而非初始快照
             # mtp_loss 是辅助输出，仅用于日志展示，不参与梯度
             params = self.model.trainable_parameters()
-            (loss, mtp_loss, moe_stats), grads = self._loss_and_grad(
+            (
+                (
+                    loss,
+                    mtp_loss,
+                    moe_stats,
+                    lm_loss,
+                    aux_loss,
+                    div_loss,
+                ),
+                grads,
+            ) = self._loss_and_grad(
                 params, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids
             )
             if self._compiled:
@@ -399,8 +428,29 @@ class BaseTrainer:
             # 立即物化本微批的 loss/grads 并释放反向图。MLX 是惰性求值，
             # 若不 eval，accumulation_steps 个微批的前向+反向图会全部存活到
             # optimizer step，显存按窗口大小成倍增长。
-            mx.eval(loss, mtp_loss, moe_stats, grads)
-            last_moe_stats = moe_stats
+            # 拆成两次 eval：前向输出与梯度分开物化。一次性 eval(loss+grads)
+            # 时 MLX 的图调度会把前向 tape 滞留与反向临时量同时顶到峰值
+            # （r073 配置实测 46GB/4.0s）；拆开后前向先落定（~14.5GB）再跑
+            # 反向（峰值 ~16GB），显存省 ~3×、单步快 ~2×，数值不变。
+            mx.eval(loss, mtp_loss, moe_stats, lm_loss, aux_loss, div_loss)
+            mx.eval(grads)
+            # 负载统计跨微批累加：偏置均衡看到整个累积窗口的负载，
+            # 比只用最后一个微批噪声更小（V3 每步更新的窗口近似）
+            last_moe_stats = (
+                moe_stats
+                if last_moe_stats is None
+                else mx.add(last_moe_stats, moe_stats)
+            )
+
+            # MoE 稀疏桶容量表滚动更新：本微批实测桶计数 → 下微批容量。
+            # counts 已随上面的 eval 物化，tolist 不再钉住前向图；
+            # 这是稀疏前向无 host sync 的前提（见 _sparse_forward）。
+            # 溢出 pair 累计到日志点统一报告（逐微批打印在路由漂移期
+            # 会刷屏；单微批小溢出会被容量抬升自愈）。
+            for _m in self.model.modules():
+                _f = getattr(_m, "update_capacity_table", None)
+                if _f is not None:
+                    win_overflow += _f()
 
             # 梯度累加
             accum_grads = (
@@ -458,9 +508,16 @@ class BaseTrainer:
                 # 将其乘回去，就得到了当前单个微批次的原始损失，确保日志值量级一致
                 mx.eval(loss)
                 current_loss = float(loss.item()) * self.args.accumulation_steps
-                # MTP 分量（未加权）仅在开启 MTP 时展示
+                # 各 loss 分量（未加权），用于日志与 swanlab
                 has_mtp = getattr(self.lm_config, "mtp_depth", 0) > 0
                 current_mtp_loss = float(mtp_loss.item()) if has_mtp else None
+                current_main_loss = float(lm_loss.item()) * self.args.accumulation_steps
+                current_aux_loss = float(aux_loss.item()) * float(
+                    getattr(self.lm_config, "moe_aux_loss_weight", 0.0) or 0.0
+                )
+                current_div_loss = float(div_loss.item()) * float(
+                    getattr(self.lm_config, "moe_diversity_loss_weight", 0.0) or 0.0
+                )
 
                 # 使用上次计算的梯度范数
                 grad_norm_to_log = last_grad_norm
@@ -493,6 +550,7 @@ class BaseTrainer:
                     }
                     for gi, v in enumerate(gate_max):
                         extra[f"moe/gate{gi}_max_load_k"] = round(v / 2**10, 3)
+                    extra["moe/overflow_pairs"] = win_overflow
                     if debug_mem:
                         Logger(
                             f"[mem] active={act:.2f}G cache={cache:.2f}G "
@@ -513,8 +571,18 @@ class BaseTrainer:
                     grad_norm_to_log,
                     base_step_offset=base_step_offset_for_speed,
                     mtp_loss=current_mtp_loss,
+                    main_loss=current_main_loss,
+                    aux_loss=current_aux_loss,
+                    diversity_loss=current_div_loss,
                     extra=extra,
                 )
+                if win_overflow > 0:
+                    Logger(
+                        f"MoE 桶容量溢出：最近 {self.args.log_interval} 微批累计 "
+                        f"{win_overflow} 对（对应 pair 输出被置零，容量已抬升；"
+                        f"持续增长请排查路由均衡）"
+                    )
+                win_overflow = 0
 
             # 模型保存
             self._save_if_needed(epoch, step)
@@ -541,14 +609,30 @@ class BaseTrainer:
             # 计算需要跳过的步骤
             skip_steps = self.start_step if epoch == self.start_epoch else 0
 
-            time_limit_hit = self.train_epoch(
-                epoch,
-                train_loader,
-                iter_per_epoch,
-                total_training_steps,
-                swanlab,
-                skip_steps,
-            )
+            try:
+                time_limit_hit = self.train_epoch(
+                    epoch,
+                    train_loader,
+                    iter_per_epoch,
+                    total_training_steps,
+                    swanlab,
+                    skip_steps,
+                )
+            except KeyboardInterrupt:
+                Logger(
+                    "检测到 Ctrl-C：在最后完成的微批位置保存检查点后退出"
+                    f"（epoch {self._last_epoch + 1}, step {self._last_step}）"
+                )
+                save_checkpoint(
+                    self.model,
+                    self.optimizer,
+                    self._last_epoch,
+                    self._last_step,
+                    self.args,
+                    self.lm_config,
+                    self.training_type,
+                )
+                time_limit_hit = True
 
             # 重置start_step
             if epoch == self.start_epoch:

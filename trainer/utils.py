@@ -12,7 +12,7 @@ from typing import Tuple
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from transformers import AutoTokenizer
-from model.model import VibyForCausalLM
+from model.model import VibyForCausalLM, migrate_cycle_delta_weights
 
 
 def Logger(content):
@@ -70,38 +70,11 @@ def _is_non_strict_key(key: str) -> bool:
     return any(key == k or key.endswith("." + k) for k in _NON_STRICT_WEIGHT_KEYS)
 
 
-def _remap_split_attn_keys(weights, model_shapes, label, checkpoint_path):
-    """旧 checkpoint 的 MLA 拆分投影（q/kv_down/k_rope、k_up/v_up）合并为
-    当前模型的 qkv_proj / kv_up_proj 单矩阵（nn.Linear 权重 (out,in)，
-    按 out 维拼接，顺序与 Attention 合并路径的 split 一致）。"""
-    _SPLIT_PARTS = {
-        "qkv_proj.weight": (
-            "q_proj.weight",
-            "kv_down_proj.weight",
-            "k_rope_proj.weight",
-        ),
-        "kv_up_proj.weight": ("k_up_proj.weight", "v_up_proj.weight"),
-    }
-    for merged, parts in _SPLIT_PARTS.items():
-        for key in list(model_shapes):
-            if not key.endswith(merged) or key in weights:
-                continue
-            prefix = key[: -len(merged)]
-            part_keys = [prefix + p for p in parts]
-            if all(p in weights for p in part_keys):
-                weights[key] = mx.concatenate(
-                    [weights.pop(p) for p in part_keys], axis=0
-                )
-                Logger(f"{label} 合并旧拆分投影 -> {key}")
-    return weights
-
-
 def load_model_weights(
     model,
     checkpoint_path,
     strict=True,
     label="checkpoint",
-    allow_dim0_slice=False,
 ):
     """安全地加载模型权重。
 
@@ -109,9 +82,6 @@ def load_model_weights(
       的参数都会抛错，避免静默得到随机初始化的部分模型。
     - `freqs_cos/freqs_sin` buffer 即使 shape 不匹配也会被跳过，
       保留当前模型按新 config 计算的版本。
-    - `allow_dim0_slice=True` 仅用于 loop_k_override 推理：形状只在第 0 维
-      （loop 步数）不同的参数，按重叠步数做前缀加载，其余步保留当前模型
-      初始化值（FiLM 为 0、dw_g/ws 为 1，语义正确）。
     """
     if not checkpoint_path or not os.path.exists(checkpoint_path):
         Logger(f"Warning: {label} {checkpoint_path} not found")
@@ -119,12 +89,18 @@ def load_model_weights(
 
     weights = dict(mx.load(checkpoint_path).items())
     model_shapes = {k: v.shape for k, v in tree_flatten(model.parameters())}
-    weights = _remap_split_attn_keys(weights, model_shapes, label, checkpoint_path)
+    # 上一代 CycleDelta checkpoint：cycle_v (rank,D) + cycle_g (n_cycles,rank)
+    # -> 当前 per-cycle V_c (n_cycles,rank,D)，数值等价迁移。
+    weights = migrate_cycle_delta_weights(weights, model_shapes)
 
     loaded = {}
     skipped = []
     for key, value in weights.items():
         if key not in model_shapes:
+            # P=1 的 MTP v_res_lambda 在新结构中已删除，属于已知可丢弃参数。
+            if "mtp_modules" in key and key.endswith(".self_attn.v_res_lambda"):
+                skipped.append(key)
+                continue
             if strict and not _is_non_strict_key(key):
                 raise ValueError(
                     f"{label} {checkpoint_path} 包含模型中没有的参数: {key}"
@@ -135,25 +111,9 @@ def load_model_weights(
             if _is_non_strict_key(key):
                 skipped.append(key)
                 continue
-            if (
-                allow_dim0_slice
-                and value.ndim >= 1
-                and value.shape[1:] == model_shapes[key][1:]
-                and value.shape[0] != model_shapes[key][0]
-            ):
-                # loop_k_override：只切第 0 维（步数），尾部保留当前模型
-                # 初始化值；后续 model.update 统一写入。
-                current = dict(tree_flatten(model.parameters())).get(key)
-                if current is not None:
-                    n = min(value.shape[0], model_shapes[key][0])
-                    value_f = value.astype(current.dtype)
-                    current_f = current.astype(value_f.dtype)
-                    padded = mx.concatenate([value_f[:n], current_f[n:]], axis=0)
-                    loaded[key] = padded.astype(current.dtype)
-                    continue
             if not strict:
-                # 宽松加载（如 eval 侧 loop_k_override）：形状不一致且无法
-                # 按步数切片的张量跳过，保留当前模型对应参数的初始化值。
+                # 宽松加载：形状不一致的张量跳过，保留当前模型对应参数的
+                # 初始化值。
                 skipped.append(key)
                 continue
             raise ValueError(
@@ -241,32 +201,36 @@ _ARCH_ARG_KEYS = (
     "use_attn_gate",
     "mtp_depth",
     "mtp_loss_weight",
-    "loop_k",
-    "dw_rank",
-    "ws_loop",
     "hrm_H_cycles",
     "hrm_L_cycles",
     "hrm_bp_cycles",
     "hrm_emb_scale",
-    "ffn_type",
-    "zero_centered_norm",
-    "use_res_gate",
-    "sandwich_norm",
-    "san_res_init",
-    "emb_scale",
+    "hrm_state_norm",
+    "hrm_input_skip",
+    "hrm_token_gate_scale",
     "engram_layers",
     "engram_orders",
     "engram_heads",
     "engram_slots",
     "engram_sub_dim",
+    "engram_scale",
+    "engram_paper_fusion",
+    "engram_inject_every_cycle",
     "n_routed_experts",
     "num_experts_per_tok",
     "n_shared_experts",
     "moe_intermediate_size",
-    "n_dense_layers",
     "routed_scaling_factor",
+    "moe_router_noise",
+    "moe_aux_loss_weight",
+    "moe_router_logit_norm",
+    "moe_router_logit_temp",
+    "moe_diversity_loss_weight",
+    "cycle_delta_max",
     "moe_bias_update_rate",
+    "scale_logits_by_emb_scale",
     "hrm_cycle_router",
+    "hrm_cycle_router_rank",
     "hrm_cycle_film",
 )
 
@@ -329,11 +293,33 @@ def init_swanlab(args, trainer):
         config["model.params_total_m"] = round(trainer.model.num_parameters() / 1e6, 3)
     except Exception:
         pass
-    swanlab.init(
-        project=args.swanlab_project,
-        experiment_name=args.swanlab_run_name,
-        config=config,
-    )
+
+    # auto-resume 时尽量接回同一个 swanlab run；id 持久化在 out_dir 下。
+    run_id_path = os.path.join(args.save_dir, "swanlab_run_id.txt")
+    run_id = None
+    if os.path.exists(run_id_path):
+        run_id = open(run_id_path, "r", encoding="utf-8").read().strip() or None
+    init_kwargs = {
+        "project": args.swanlab_project,
+        "experiment_name": args.swanlab_run_name,
+        "config": config,
+    }
+    if run_id:
+        init_kwargs["id"] = run_id
+        init_kwargs["resume"] = "allow"
+        Logger(f"SwanLab resume run: {run_id}")
+    else:
+        Logger("SwanLab 新建 run（未找到 swanlab_run_id.txt）")
+    swanlab.init(**init_kwargs)
+
+    # 首次 init 或新 run 后把 id 落盘，下次 --auto_resume 继续接回。
+    try:
+        current_run = swanlab.get_run()
+        if current_run is not None and getattr(current_run, "id", None):
+            with open(run_id_path, "w", encoding="utf-8") as f:
+                f.write(str(current_run.id))
+    except Exception:
+        pass
     return swanlab
 
 
@@ -557,11 +543,15 @@ def log_training_progress(
     grad_norm=0.0,
     base_step_offset: int = 0,
     mtp_loss=None,
+    main_loss=None,
+    aux_loss=None,
+    diversity_loss=None,
     extra=None,
 ):
     """统一的训练进度日志记录
 
-    current_loss 是含 MTP 加权的总 loss；mtp_loss 为未加权分量（可选）。
+    current_loss 是总 loss（CE + MTP + aux + diversity，均已加权）；
+    main_loss 是纯语言建模 CE；mtp/aux/diversity 为已加权分量（可选）。
     展示格式保持 `loss:<总>` 开头以兼容 results.tsv 的解析。
     extra：调用方附加的详细指标 dict（MoE 负载/内存等），一并上报 swanlab。
     """
@@ -573,10 +563,17 @@ def log_training_progress(
     current_lr = get_current_lr(optimizer)
 
     loss_str = f"{current_loss:.3f}"
-    main_loss = None
-    if mtp_loss is not None:
+    if main_loss is None and mtp_loss is not None:
         main_loss = current_loss - args.mtp_loss_weight * mtp_loss
-        loss_str += f"(main:{main_loss:.3f},mtp:{mtp_loss:.3f})"
+    if main_loss is not None:
+        loss_str += f"(main:{main_loss:.3f}"
+        if mtp_loss is not None:
+            loss_str += f",mtp:{mtp_loss:.3f}"
+        if aux_loss not in (None, 0.0):
+            loss_str += f",aux:{aux_loss:.4f}"
+        if diversity_loss not in (None, 0.0):
+            loss_str += f",div:{diversity_loss:.4f}"
+        loss_str += ")"
 
     log_msg = "Epoch:[{}/{}]({}/{}) loss:{} lr:{:.2e} grad_norm:{:.3f} step/s:{:.2f} tokens/s:{:.0f} eta:{}min".format(
         epoch + 1,
@@ -603,9 +600,14 @@ def log_training_progress(
             "grad_norm": grad_norm,
             "epoch": epoch + 1,
         }
+        if main_loss is not None:
+            log_dict["main_loss"] = main_loss
         if mtp_loss is not None:
             log_dict["mtp_loss"] = mtp_loss
-            log_dict["main_loss"] = main_loss
+        if aux_loss is not None:
+            log_dict["aux_loss"] = aux_loss
+        if diversity_loss is not None:
+            log_dict["diversity_loss"] = diversity_loss
         if extra:
             log_dict.update(extra)
 

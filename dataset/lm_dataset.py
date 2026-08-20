@@ -133,6 +133,12 @@ class PretrainDataset:
             self._line_offsets = self._build_line_index()
 
     def _packed_cache_path(self) -> str:
+        # VIBY_PACKED_CACHE：直接指定已构建的打包缓存（.cache/packed_<key>.npy），
+        # 跳过对原始 data_path 的 stat——外接数据盘不在线时仍可用既有缓存
+        # 训练；segs 缓存按 packed_/packedsegs_ 命名规则自动配对。
+        override = os.environ.get("VIBY_PACKED_CACHE")
+        if override:
+            return override
         import hashlib
 
         st = os.stat(self.data_path)

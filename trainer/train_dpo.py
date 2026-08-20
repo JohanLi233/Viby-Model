@@ -219,8 +219,18 @@ class DPOTrainer(BaseTrainer):
                 # 会把占位数组留在 module 上；立即恢复真实参数
                 self.model.update(params)
             # 立即物化本微批的 loss/grads 并释放反向图（与 BaseTrainer 同理，
-            # 避免 accumulation_steps 个惰性图同时存活导致显存倍增）
-            mx.eval(loss, grads)
+            # 避免 accumulation_steps 个惰性图同时存活导致显存倍增）。
+            # 前向 loss 与梯度分两次 eval：合并 eval 会把 tape 滞留与反向
+            # 临时量同时顶到峰值，拆开显存省 ~3×、单步更快（数值不变）。
+            mx.eval(loss)
+            mx.eval(grads)
+
+            # MoE 稀疏桶容量表滚动更新（与 BaseTrainer 同理：counts 已随
+            # eval 物化，此处 tolist 不钉图；稀疏前向无 host sync 的前提）
+            for _m in self.model.modules():
+                _f = getattr(_m, "update_capacity_table", None)
+                if _f is not None:
+                    _f()
 
             # 梯度累加
             accum_grads = (

@@ -1,2 +1,8 @@
 round	date	duration_s	params_m	train_loss	tokens_per_s	last_step	holdout_ce	holdout_ppl	notes
 r070_hrm_moe	2026-08-18 21:24	23925	100.776	2.634	11331	21999	2.1957	8.9865	HRM-Text-MoE(H2L3P1=8evals) + 112x104 top6+1sh 全栈MoE + CycleRouter+CycleFiLM + engram0 + vres + gate + MTP1 + bias0.005/routerlr0.01x @bs6x2048 accum2 packed+docmask full epoch [提前收尾@step21999(77% epoch)，手动kill后补评]
+r073_hrm_moe_cycledelta	2026-08-18 22:39	1	FAILED	0	0	HRM-MoE v2(H2L3P1) CycleDeltaRouter(rank8) + engram initial-zH + 112x104 MoE + FiLM + vres + gate + MTP1 @bs6x2048 accum2 packed+docmask
+r073_hrm_moe_cycledelta	2026-08-18 22:40	2	FAILED	0	0	HRM-MoE v2(H2L3P1) CycleDeltaRouter(rank8) + engram initial-zH + 112x104 MoE + FiLM + vres + gate + MTP1 @bs6x2048 accum2 packed+docmask
+r073_hrm_moe_cycledelta	2026-08-18 22:40	1	FAILED	0	0	HRM-MoE v2(H2L3P1) CycleDeltaRouter(rank8) + engram initial-zH + 112x104 MoE + FiLM + vres + gate + MTP1 @bs6x2048 accum2 packed+docmask
+r073_hrm_moe_cycledelta	2026-08-18 22:41	2	FAILED	0	0	HRM-MoE v2(H2L3P1) CycleDeltaRouter(rank8) + engram initial-zH + 112x104 MoE + FiLM + vres + gate + MTP1 @bs6x2048 accum2 packed+docmask
+r073_hrm_moe_cycledelta	2026-08-18 22:43	142	FAILED	0	0	HRM-MoE v2(H2L3P1) CycleDeltaRouter(rank8) + engram initial-zH + 112x104 MoE + FiLM + vres + gate + MTP1 @bs6x2048 accum2 packed+docmask
+r073_hrm_moe_cycledelta	2026-08-18 23:16	2	FAILED	0	0	HRM-MoE v2(H2L3P1) CycleDeltaRouter(rank8) + engram initial-zH + 112x104 MoE + FiLM + vres + gate + MTP1 @bs6x2048 accum2 packed+docmask
