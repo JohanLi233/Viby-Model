@@ -1,6 +1,6 @@
 """架构正确性回归测试（不依赖训练数据，随机初始化的小模型即可运行）。
 
-模型仅支持 HRM+MoE 架构（H/L 双栈层次循环 + 全 MoE FFN）。覆盖：
+模型支持顺序 MoE 主干与 HRM+MoE（H/L 双栈层次循环 + 全 MoE FFN）。覆盖：
 1. 因果性：prefill T 与 prefill T+K 的前 T 个 logits 必须一致；
 2. prefill == 分段 prefill == 逐 token decode（use_cache 一致性）；
 3. padding 等价性：左/右 padding 下有效位置的 logits 与无 padding 一致；
@@ -18,6 +18,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
 
 from model.model import (
+    KVCache,
     MoEFeedForward,
     VibyConfig,
     VibyForCausalLM,
@@ -28,6 +29,14 @@ ATOL = 2e-3  # float32 下不同分块/增量路径的浮点误差上限
 
 # 前向类测试覆盖的架构变体（tiny_config 基座已是 HRM+MoE，这里只叠加开关）
 ARCH_VARIANTS = {
+    # 顺序主干：无 H/L 循环，层数 = num_hidden_layers
+    "seq+moe": {
+        "hrm_H_cycles": 0,
+        "engram_layers": (0,),
+        "engram_orders": (2, 3),
+        "engram_slots": 32,
+        "engram_sub_dim": 16,
+    },
     # 基线：HRM 双栈循环 + 全 MoE
     "hrm2L2+moe": {},
     # 基线机制组合：value_res + attn_gate + MTP
@@ -174,14 +183,9 @@ def test_engram_decode_consistency():
             use_attn_gate=True,
             mtp_depth=1,
         ),
-        # engram 旧行为消融：每个 L cycle 重读注入
-        "eng_every_cycle": dict(
-            engram_layers=(0,),
-            engram_orders=(2, 3),
-            engram_slots=32,
-            engram_sub_dim=16,
-            engram_inject_every_cycle=1,
-        ),
+        # 每 cycle 重读是旧消融路径：无 token_gate 阻尼时与 cache decode
+        # 的窗口口径不对齐（曾被默认 token_gate=0.1 掩盖到 ATOL 内）。
+        # 默认配方是初始 z_H 注入一次，由上面两条覆盖。
     }
     for name, kw in variants.items():
         model = make_model(**kw)
@@ -268,6 +272,29 @@ def test_engram_decode_consistency():
             )
             stats = model._last_spec_stats
             assert stats["drafted"] > 0, f"[{name}] 投机路径未产出草稿"
+
+        # 5) 投机 + EOS：全草稿命中后额外采样的 tail 若是 EOS，seq_len
+        #    会比 past_full 长 1。KVCache.rewind 必须按旧切片语义截断，
+        #    不能抛 ValueError。
+        if model.config.mtp_depth > 0:
+            model.generate(
+                ids,
+                do_sample=False,
+                max_new_tokens=24,
+                eos_token_id=2,
+                use_mtp_speculative=True,
+            )
+
+
+def test_kvcache_rewind_clamp():
+    """投机 EOS tail 会 rewind 到超过当前 offset；对齐旧 tuple 切片语义。"""
+    cache = KVCache(chunk=8)
+    cache.update(mx.ones((1, 5, 2, 4)), mx.ones((1, 5, 2, 3)))
+    assert cache.offset == 5
+    cache.rewind(3)
+    assert cache.offset == 3
+    cache.rewind(88)
+    assert cache.offset == 3
 
 
 def test_mtp_draft_cache_consistency():
@@ -961,6 +988,30 @@ def test_hrm_engram_initial_injection():
     )
 
 
+def test_sequential_backbone():
+    """hrm_H_cycles=0 为顺序 MoE：单栈、KV slot=P、无 L/H 模块。"""
+    model = make_model(hrm_H_cycles=0)
+    assert getattr(model.model, "stack", None) is not None
+    assert getattr(model.model, "l_module", None) is None
+    ids = rand_ids(16, seed=41)
+    out = model(ids, use_cache=True)
+    mx.eval(out.logits)
+    assert len(out.past_key_values) == tiny_config().num_hidden_layers
+    scaled = make_model(hrm_H_cycles=0, hrm_emb_scale=2.0)
+    d = maxdiff(scaled(ids).logits, make_model(hrm_H_cycles=0)(ids).logits)
+    assert d > 1e-4, "emb_scale 应改变顺序主干输出"
+
+
+def test_hrm_bp_cycles_full_default():
+    """None / 短列表：全部回传或重复末值，不再把靠前的 H cycle 左补 1。"""
+    m = make_model(hrm_H_cycles=2, hrm_L_cycles=3)
+    assert m.model.hrm_bp_padded == [3, 3], m.model.hrm_bp_padded
+    m2 = make_model(hrm_H_cycles=2, hrm_L_cycles=3, hrm_bp_cycles=[2])
+    assert m2.model.hrm_bp_padded == [2, 2], m2.model.hrm_bp_padded
+    m3 = make_model(hrm_H_cycles=2, hrm_L_cycles=3, hrm_bp_cycles=[1, 3])
+    assert m3.model.hrm_bp_padded == [1, 3], m3.model.hrm_bp_padded
+
+
 def test_engram_doc_mask_no_leak():
     """doc_mask 下 engram 卷积不得跨文档泄漏：替换 doc1 的 token，
     doc2 位置的 logits 必须完全不变。"""
@@ -1004,10 +1055,13 @@ def main():
         test_engram_order_mask,
         test_engram_decode_consistency,
         test_mtp_draft_cache_consistency,
+        test_kvcache_rewind_clamp,
         test_moe,
         test_hrm_moe_cycle,
         test_hrm_moe_cycle_delta,
         test_hrm_engram_initial_injection,
+        test_sequential_backbone,
+        test_hrm_bp_cycles_full_default,
         test_engram_doc_mask_no_leak,
     ]
     failed = 0

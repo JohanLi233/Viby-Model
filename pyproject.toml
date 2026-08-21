@@ -9,6 +9,7 @@ dependencies = [
     "mlx>=0.32.0",
     "swanlab>=0.9.4",
     "torch>=2.13.0",
+    "tqdm>=4.67.0",
     "transformers>=4.54.1",
     "zhconv>=1.4.3",
 ]

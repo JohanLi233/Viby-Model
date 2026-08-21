@@ -76,21 +76,47 @@ def check_cache(model, cfg, seq_len=64, cut=None):
     mx.random.seed(3)
     X = mx.random.randint(0, cfg.vocab_size, (B, seq_len)).astype(mx.int32)
     attn = mx.ones_like(X)
-    full = model(X, attention_mask=attn, use_cache=True, mask_has_pad=False).logits
+    # chunk decode 必须与 generate 同口径携带 engram 窗口，否则论文式
+    # 「先门控后卷积」的 engram 会在某一段被跳过，diff 反映的是 engram
+    # 注入本身而不是 cache 一致性。prefill 段只需 engram_decode=True
+    # （用完整 input_ids），第二段额外携带 n-gram 窗口。
+    engram_decode = bool(model.model.engrams and model.model.engram_window_len() > 0)
+    full = model(
+        X,
+        attention_mask=attn,
+        use_cache=True,
+        mask_has_pad=False,
+        engram_decode=engram_decode,
+    ).logits
     first = model(
-        X[:, :cut], attention_mask=attn[:, :cut], use_cache=True, mask_has_pad=False
+        X[:, :cut],
+        attention_mask=attn[:, :cut],
+        use_cache=True,
+        mask_has_pad=False,
+        engram_decode=engram_decode,
     )
+    engram_win = None
+    if engram_decode:
+        win_len = model.model.engram_window_len()
+        engram_win = X[:, max(0, cut - (win_len - 1)) :]
     second = model(
         X[:, cut:],
         attention_mask=attn,
         past_key_values=first.past_key_values,
         use_cache=True,
         mask_has_pad=False,
+        engram_input_ids=engram_win,
+        engram_decode=engram_decode,
     )
     chunk = mx.concatenate([first.logits, second.logits], axis=1)
     mx.eval(full, chunk)
     diff = float(mx.max(mx.abs(full.astype(mx.float32) - chunk.astype(mx.float32))))
-    expected_slots = cfg.hrm_H_cycles * (cfg.hrm_L_cycles + 1) * cfg.num_hidden_layers
+    if cfg.hrm_H_cycles > 0:
+        expected_slots = (
+            cfg.hrm_H_cycles * (cfg.hrm_L_cycles + 1) * cfg.num_hidden_layers
+        )
+    else:
+        expected_slots = cfg.num_hidden_layers
     print(f"  cache slots: {len(first.past_key_values)} (expected {expected_slots})")
     print(f"  prefill vs chunk-decode maxdiff: {diff:.6g} (bf16 模型通常 <1)")
 

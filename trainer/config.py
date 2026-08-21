@@ -170,8 +170,8 @@ def add_common_args(parser):
         "--hrm_H_cycles",
         type=int,
         default=0,
-        help="HRM 高循环次数（必须 >0，唯一支持的架构）；"
-        "num_hidden_layers 表示每个 stack 的真实层数",
+        help="HRM 高循环次数；0=顺序主干（num_hidden_layers 为总层数），"
+        ">0 时 num_hidden_layers 为每个 stack 的层数 P",
     )
     parser.add_argument(
         "--hrm_L_cycles",
@@ -194,8 +194,8 @@ def add_common_args(parser):
     parser.add_argument(
         "--hrm_state_norm",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="HRM 状态混合前对 z_L/z_H 分别 RMS 归一化（默认开启，抗共同分量增长）",
+        default=False,
+        help="HRM 状态混合前对 z_L/z_H 分别 RMS 归一化（默认关闭）",
     )
     parser.add_argument(
         "--hrm_input_skip",
@@ -207,9 +207,9 @@ def add_common_args(parser):
     parser.add_argument(
         "--hrm_token_gate_scale",
         type=float,
-        default=0.1,
+        default=0.0,
         help="stack 输出与 rms(embed(x)) 的门控残差比例："
-        "z <- (1-g)·z + g·x0（默认 0.1）",
+        "z <- (1-g)·z + g·x0（默认关闭）",
     )
     parser.add_argument(
         "--hrm_cycle_router",
@@ -333,7 +333,7 @@ def add_common_args(parser):
     parser.add_argument(
         "--moe_diversity_loss_weight",
         type=float,
-        default=0.01,
+        default=0.0,
         help="router 输入 token 多样性正则权重；0 关闭",
     )
     parser.add_argument(

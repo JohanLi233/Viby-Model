@@ -80,10 +80,9 @@ class VibyConfig:
         self.mtp_depth = kwargs.get("mtp_depth", 0)
         self.mtp_loss_weight = kwargs.get("mtp_loss_weight", 0.3)
         # HRM（Hierarchical Recurrent Model，对齐 HF HrmText 的 H/L
-        # 双状态层次循环）是唯一架构：hrm_H_cycles 必须 >0。
-        # num_hidden_layers 表示每个 stack 的真实层数 P；每个 token 的
-        # 层求值次数 = H_cycles*(L_cycles+1)*P。训练前向与推理前向完全
-        # 一致（不展开推理）。
+        # 双状态层次循环）。hrm_H_cycles=0 为顺序主干（单栈 P 层）；
+        # >0 时 num_hidden_layers 是每个 stack 的层数 P，每 token 层求值
+        # 次数 = H_cycles*(L_cycles+1)*P。训练前向与推理前向完全一致。
         # L stack（快状态 z_L）与 H stack（慢状态 z_H）互相注入：
         #   z_L <- L_stack(z_L + z_H)  重复 L_cycles 次
         #   z_H <- H_stack(z_H + z_L)  每 H cycle 一次
@@ -95,16 +94,15 @@ class VibyConfig:
         # L_bp_cycles 同义。None 表示全部回传（小尺度筛选用）。
         self.hrm_bp_cycles = kwargs.get("hrm_bp_cycles", None)
         self.hrm_emb_scale = kwargs.get("hrm_emb_scale", 1.0)
-        # HRM 状态混合：可选对 z_L/z_H 分别 RMS 归一化后再相加，避免某一
-        # 状态共同分量无限增长（新 run 默认开；旧 sidecar 缺键时 from_dict
-        # 自动设 0 保持旧行为）。
-        self.hrm_state_norm = bool(kwargs.get("hrm_state_norm", True))
+        # HRM 状态混合：可选对 z_L/z_H 分别 RMS 归一化后再相加。
+        # 默认关（会干扰「循环本身」的对照）；旧 sidecar 缺键时 from_dict
+        # 也设 False，显式写入 True 的 checkpoint 保持原行为。
+        self.hrm_state_norm = bool(kwargs.get("hrm_state_norm", False))
         # 加性 input skip：注入状态额外加 skip·rms(embed(x))。
         self.hrm_input_skip = float(kwargs.get("hrm_input_skip", 0.0))
         # 门控 token memory：stack 输出与 rms(embed(x)) 的固定残差混合
-        # z <- (1-g)·z + g·x0。相比加性 skip，它不改变 stack 输入尺度，
-        # 直接给每个 cycle 保留 token 身份（新 run 默认 0.1）。
-        self.hrm_token_gate_scale = float(kwargs.get("hrm_token_gate_scale", 0.1))
+        # z <- (1-g)·z + g·x0。默认关。
+        self.hrm_token_gate_scale = float(kwargs.get("hrm_token_gate_scale", 0.0))
         # CycleRouter（HRM×MoE 创新，research/HRM_MOE.md）：每个 MoE router
         # 让专家按迭代特化——循环第 c 步与第 c' 步的有效权重不再同一，
         # 打破循环引理 F_looped(k,N) ⊆ F_untied(k·N) 的包含上界。
@@ -168,7 +166,7 @@ class VibyConfig:
         # router 输入 token 多样性正则：loss = mean(log1p(common²/residual²))。
         # 直接惩罚后期 cycle 所有 token 收敛到同一方向（res/common 塌缩）。
         self.moe_diversity_loss_weight = float(
-            kwargs.get("moe_diversity_loss_weight", 0.01)
+            kwargs.get("moe_diversity_loss_weight", 0.0)
         )
         # 软负载均衡辅助损失权重。loss = (E/K)·Σ f_i·p_i，f_i 为专家
         # 选择频率（stop_gradient）、p_i 为平均 sigmoid 分；只在
@@ -180,10 +178,14 @@ class VibyConfig:
 
         if self.hidden_size != self.num_attention_heads * self.head_dim:
             raise ValueError("hidden_size must equal num_attention_heads * head_dim")
-        if self.hrm_H_cycles <= 0:
-            raise ValueError("仅支持 HRM 架构：hrm_H_cycles 必须大于 0")
-        if self.hrm_L_cycles <= 0:
-            raise ValueError("hrm_L_cycles 必须大于 0")
+        if self.hrm_H_cycles < 0:
+            raise ValueError("hrm_H_cycles 不能为负数（0=顺序主干）")
+        if self.hrm_H_cycles > 0 and self.hrm_L_cycles <= 0:
+            raise ValueError("HRM 模式下 hrm_L_cycles 必须大于 0")
+        if self.hrm_cycle_router and self.hrm_H_cycles <= 0:
+            raise ValueError("hrm_cycle_router 仅在 HRM 模式（hrm_H_cycles>0）生效")
+        if self.hrm_cycle_film and self.hrm_H_cycles <= 0:
+            raise ValueError("hrm_cycle_film 仅在 HRM 模式（hrm_H_cycles>0）生效")
         if self.n_routed_experts <= 0:
             raise ValueError("仅支持 MoE FFN：n_routed_experts 必须大于 0")
         if self.num_experts_per_tok <= 0:
@@ -272,6 +274,113 @@ class CausalLMOutput:
     diversity_loss: Optional[mx.array] = None
 
 
+class KVCache:
+    """预分配、按块增长的 KV cache。
+
+    内部布局 (B, H, T, D)，decode 可直接送 ``scaled_dot_product_attention``，
+    不必每步把整段历史从 (B, T, H, D) 转置一遍。
+
+    兼容旧 tuple 接口：``cache[0]`` / ``cache[1]`` 返回 (B, T, H, D) 有效
+    切片（与旧 ``concatenate`` 结果同布局），``shape[1]`` 即当前长度。
+    """
+
+    __slots__ = ("keys", "values", "offset", "chunk")
+
+    def __init__(self, chunk: int = 256):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+        self.chunk = int(chunk)
+
+    def update(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
+        """写入当前段 keys/values (B, t, H, D)，返回有效 (B, H, T, D)。"""
+        k = keys.transpose(0, 2, 1, 3)
+        v = values.transpose(0, 2, 1, 3)
+        t = k.shape[2]
+        need = self.offset + t
+        if self.keys is None or need > self.keys.shape[2]:
+            cap = ((need + self.chunk - 1) // self.chunk) * self.chunk
+            if self.keys is None:
+                cap = max(cap, need + self.chunk)
+            nk = mx.zeros((k.shape[0], k.shape[1], cap, k.shape[3]), dtype=k.dtype)
+            nv = mx.zeros((v.shape[0], v.shape[1], cap, v.shape[3]), dtype=v.dtype)
+            if self.keys is not None and self.offset > 0:
+                nk[:, :, : self.offset] = self.keys[:, :, : self.offset]
+                nv[:, :, : self.offset] = self.values[:, :, : self.offset]
+            self.keys, self.values = nk, nv
+        self.keys[:, :, self.offset : need] = k
+        self.values[:, :, self.offset : need] = v
+        self.offset = need
+        return self.keys[:, :, : self.offset], self.values[:, :, : self.offset]
+
+    def rewind(self, offset: int) -> "KVCache":
+        if offset < 0:
+            raise ValueError(f"KVCache.rewind({offset}) 不能为负")
+        # 允许 offset > 当前长度：投机解码在「全草稿命中后额外采样的
+        # tail 恰好是 EOS」时，seq_len 含该 token，但 past_full 还没
+        # 前向过它（EOS 截断故意跳过 tail 前向）。旧 tuple 切片
+        # ``c[:, :seq_len]`` 超出时静默截到实际长度；这里对齐该语义。
+        self.offset = min(int(offset), self.offset)
+        return self
+
+    def __getitem__(self, idx):
+        arr = self.keys if idx == 0 else self.values
+        return arr[:, :, : self.offset].transpose(0, 2, 1, 3)
+
+    def __iter__(self):
+        yield self[0]
+        yield self[1]
+
+    def __len__(self):
+        return 2
+
+
+def _seq_len_of_cache(cache) -> int:
+    if cache is None:
+        return 0
+    if isinstance(cache, KVCache):
+        return cache.offset
+    return cache[0].shape[1]
+
+
+def _rewind_cache(cache, offset: int):
+    if cache is None:
+        return None
+    if isinstance(cache, KVCache):
+        return cache.rewind(offset)
+    return tuple(c[:, :offset] for c in cache)
+
+
+def _rewind_cache_list(caches, offset: int) -> list:
+    return [_rewind_cache(c, offset) for c in caches]
+
+
+def _eval_kv_caches(caches) -> None:
+    if not caches:
+        return
+    bufs = []
+    for c in caches:
+        if isinstance(c, KVCache):
+            if c.keys is not None:
+                bufs.append(c.keys)
+                bufs.append(c.values)
+        elif c is not None:
+            bufs.extend(c)
+    if bufs:
+        mx.eval(*bufs)
+
+
+def _offset_causal_mask(q_len: int, k_len: int, dtype):
+    """query i 可见 key j iff j <= (k_len - q_len) + i。"""
+    q = mx.arange(q_len)[:, None]
+    k = mx.arange(k_len)[None, :]
+    return mx.where(
+        k <= q + (k_len - q_len),
+        mx.array(0.0, dtype=dtype),
+        mx.array(-mx.inf, dtype=dtype),
+    )
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -288,6 +397,7 @@ def precompute_freqs_cis(
     end: int = int(32 * 1024),
     rope_base: float = 1e6,
     rope_scaling: Optional[dict] = None,
+    return_freqs: bool = False,
 ) -> tuple[mx.array, mx.array]:
     freqs = 1.0 / (
         rope_base ** (mx.arange(0, dim, 2)[: (dim // 2)].astype(mx.float32) / dim)
@@ -318,9 +428,14 @@ def precompute_freqs_cis(
             freqs = freqs * (1 - ramp + ramp / factor)
 
     t = mx.arange(end).astype(mx.float32)
+    base_freqs = freqs
     freqs = mx.outer(t, freqs)
     freqs_cos = mx.concatenate([mx.cos(freqs), mx.cos(freqs)], axis=-1) * attn_factor
     freqs_sin = mx.concatenate([mx.sin(freqs), mx.sin(freqs)], axis=-1) * attn_factor
+    if return_freqs:
+        # mx.fast.rope 的 freqs 参数是"周期/分母"口径（angle = pos / freqs），
+        # 因此存 1/freqs；attn_factor 在 kernel 外统一乘回。
+        return freqs_cos, freqs_sin, 1.0 / base_freqs, attn_factor
     return freqs_cos, freqs_sin
 
 
@@ -329,9 +444,40 @@ def apply_rotary_pos_emb(
     k: mx.array,
     cos: mx.array,
     sin: mx.array,
+    rope_freqs: Optional[mx.array] = None,
+    rope_offset: int = 0,
+    rope_attn_factor: float = 1.0,
 ) -> tuple[mx.array, mx.array]:
     # q: (bsz, seq_len, heads, rope_dim)；k: (bsz, seq_len, 1, rope_dim)
     # （MLA 解耦 RoPE 键跨 head 共享）；cos/sin: (seq_len, rope_dim)
+    if rope_freqs is not None:
+        # 融合 RoPE kernel：输入布局为 (B, *, T, D)，把 head 维当 *。
+        q_t = q.transpose(0, 2, 1, 3)
+        k_t = k.transpose(0, 2, 1, 3)
+        dim = q.shape[-1]
+        q_embed = mx.fast.rope(
+            q_t,
+            dim,
+            traditional=False,
+            base=None,
+            scale=1.0,
+            offset=rope_offset,
+            freqs=rope_freqs,
+        ).transpose(0, 2, 1, 3)
+        k_embed = mx.fast.rope(
+            k_t,
+            dim,
+            traditional=False,
+            base=None,
+            scale=1.0,
+            offset=rope_offset,
+            freqs=rope_freqs,
+        ).transpose(0, 2, 1, 3)
+        if rope_attn_factor != 1.0:
+            q_embed = q_embed * rope_attn_factor
+            k_embed = k_embed * rope_attn_factor
+        return q_embed.astype(q.dtype), k_embed.astype(k.dtype)
+
     def rotate_half(x: mx.array) -> mx.array:
         half = x.shape[-1] // 2
         return mx.concatenate([-x[..., half:], x[..., :half]], axis=-1)
@@ -584,16 +730,51 @@ class Attention(nn.Module):
                 xv = (1.0 - lam) * xv + lam * value_residual[0]
         q_nope, xk = self.q_norm(q_nope), self.k_norm(xk)
 
-        cos, sin = position_embeddings
-        q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, cos, sin)
+        cos, sin = position_embeddings[:2]
+        rope_meta = position_embeddings[2] if len(position_embeddings) > 2 else None
+        if rope_meta is None:
+            q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, cos, sin)
+        else:
+            q_rope, k_rope = apply_rotary_pos_emb(
+                q_rope,
+                k_rope,
+                cos,
+                sin,
+                rope_freqs=rope_meta[0],
+                rope_offset=rope_meta[1],
+                rope_attn_factor=rope_meta[2],
+            )
         k_rope = mx.broadcast_to(k_rope, (bsz, seq_len, self.n_heads, self.rope_dim))
         xq = mx.concatenate([q_nope, q_rope], axis=-1)
         xk = mx.concatenate([xk, k_rope], axis=-1)
 
-        if past_key_value is not None:
-            xk = mx.concatenate([past_key_value[0], xk], axis=1)
-            xv = mx.concatenate([past_key_value[1], xv], axis=1)
-        past_kv = (xk, xv) if use_cache else None
+        # KV：训练无 cache；推理写入预分配 KVCache（内部 BHTD）。
+        past_kv = None
+        if use_cache:
+            if isinstance(past_key_value, KVCache):
+                cache = past_key_value
+            else:
+                cache = KVCache()
+                if past_key_value is not None:
+                    cache.update(past_key_value[0], past_key_value[1])
+            k_bhtd, v_bhtd = cache.update(xk, xv)
+            past_kv = cache
+        elif past_key_value is not None:
+            if isinstance(past_key_value, KVCache):
+                pk = past_key_value.keys[:, :, : past_key_value.offset]
+                pv = past_key_value.values[:, :, : past_key_value.offset]
+                k_bhtd = mx.concatenate([pk, xk.transpose(0, 2, 1, 3)], axis=2)
+                v_bhtd = mx.concatenate([pv, xv.transpose(0, 2, 1, 3)], axis=2)
+            else:
+                k_bhtd = mx.concatenate([past_key_value[0], xk], axis=1).transpose(
+                    0, 2, 1, 3
+                )
+                v_bhtd = mx.concatenate([past_key_value[1], xv], axis=1).transpose(
+                    0, 2, 1, 3
+                )
+        else:
+            k_bhtd = xk.transpose(0, 2, 1, 3)
+            v_bhtd = xv.transpose(0, 2, 1, 3)
 
         # (bsz, heads, seq_len, qk_dim)
         xq = xq.transpose(0, 2, 1, 3)
@@ -602,28 +783,59 @@ class Attention(nn.Module):
                 mx.all(attention_mask == 1).item()
             )
         scale = 1.0 / math.sqrt(self.qk_dim)
+        key_len = k_bhtd.shape[2]
+        has_past = key_len > seq_len
         if (
             self.flash
-            and seq_len > 1
-            and past_key_value is None
             and self.dropout == 0.0
-            and (mask_is_full or causal_bias is not None)
+            and (mask_is_full or (causal_bias is not None and not has_past))
+            and (
+                (seq_len > 1 and not has_past)
+                # decode：单 query 对全部历史可见，mask 为 None 即可。
+                or (seq_len == 1 and mask_is_full)
+                # chunk decode / MTP 验证：qlen>1 且已有 cache，构造 offset
+                # causal 后仍走 flash（旧路径只允许无 cache 的 prefill）。
+                or (seq_len > 1 and has_past and mask_is_full)
+            )
         ):
             # MLA 各 head 独立上投影 K/V，等价于 MHA，可直接走 flash。
             # 有 padding/doc_mask 时使用预构造的 causal+pad/seg 融合 mask。
-            mask = "causal" if mask_is_full else causal_bias
+            if seq_len == 1 and mask_is_full:
+                mask = None
+            elif has_past and seq_len > 1 and mask_is_full:
+                mask = _offset_causal_mask(seq_len, key_len, xq.dtype)
+            else:
+                mask = "causal" if mask_is_full else causal_bias
+            # MLA 的逐 head QK 维（head_dim + rope_dim = 128）与 V 维
+            # （head_dim = 96）不等宽。MLX 的 flash kernel 只在两者相等时
+            # 生效，不等宽会整体退化到通用慢路径：bs6×2048×8head 实测
+            # 12.3ms（7.5 TFLOPS）vs 等宽 4.4ms（23.9 TFLOPS）。把 V 零填
+            # 到 QK 维再切回前 head_dim 列即可命中快路径——softmax(·)@[V|0]
+            # = [softmax(·)@V | 0]，数值严格等价，代价只是 AV 段多算
+            # (qk-v)/v 的 FLOPs 和一块 (B,H,T,32) 的零缓冲。
+            v_dim = v_bhtd.shape[-1]
+            qk_dim = xq.shape[-1]
+            if v_dim < qk_dim:
+                v_bhtd = mx.concatenate(
+                    [
+                        v_bhtd,
+                        mx.zeros(
+                            v_bhtd.shape[:-1] + (qk_dim - v_dim,), dtype=v_bhtd.dtype
+                        ),
+                    ],
+                    axis=-1,
+                )
             output = mx.fast.scaled_dot_product_attention(
                 xq,
-                xk.transpose(0, 2, 1, 3),
-                xv.transpose(0, 2, 1, 3),
+                k_bhtd,
+                v_bhtd,
                 scale=scale,
                 mask=mask,
             )
+            if v_dim < qk_dim:
+                output = output[..., :v_dim]
         else:
-            xk = xk.transpose(0, 2, 1, 3)
-            xv = xv.transpose(0, 2, 1, 3)
-
-            scores = (xq @ mx.swapaxes(xk, -1, -2)) * scale
+            scores = (xq @ mx.swapaxes(k_bhtd, -1, -2)) * scale
 
             if self.is_causal:
                 causal_mask = mx.triu(mx.full((seq_len, seq_len), -mx.inf), k=1).astype(
@@ -632,7 +844,6 @@ class Attention(nn.Module):
                 scores = scores.at[..., -seq_len:].add(causal_mask)
 
             if attention_mask is not None:
-                key_len = scores.shape[-1]
                 am = attention_mask
                 if am.shape[1] < key_len:
                     pad = mx.ones((am.shape[0], key_len - am.shape[1]), dtype=am.dtype)
@@ -652,14 +863,14 @@ class Attention(nn.Module):
                 xq.dtype
             )
             attn_weights = self.attn_dropout(attn_weights)
-            output = attn_weights @ xv
+            output = attn_weights @ v_bhtd
 
         output = output.transpose(0, 2, 1, 3).reshape(bsz, seq_len, -1)
         if self.attn_gate is not None:
-            gate = mx.sigmoid(self.attn_gate(x).astype(mx.float32))
-            output = output * mx.repeat(
-                gate.astype(output.dtype), self.head_dim, axis=-1
-            )
+            # bf16 下 sigmoid 误差 ~1e-2（远小于 gate 自身量级与训练
+            # 噪声），无需把 (B,T,H) 小张量抬成 f32 再降回来。
+            gate = mx.sigmoid(self.attn_gate(x)).astype(output.dtype)
+            output = output * mx.repeat(gate, self.head_dim, axis=-1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
@@ -681,7 +892,12 @@ class FeedForward(nn.Module):
         self.act_fn = nn.silu
 
     def __call__(self, x: mx.array, step_idx: Optional[int] = None) -> mx.array:
-        h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        # gate/up 输入相同，合并为单个 (2I, D) GEMM 再 split：放大 GEMM 形状、
+        # 减少 kernel 发射，数学与逐 Linear 严格等价（参数仍分别存储，
+        # checkpoint/优化器路径不变）。
+        gu_w = mx.concatenate([self.gate_proj.weight, self.up_proj.weight], axis=0)
+        g, u = mx.split(x @ gu_w.T, 2, axis=-1)
+        h = self.act_fn(g) * u
         return self.down_proj(h)
 
 
@@ -769,11 +985,11 @@ class MoEGate(nn.Module):
         if self.norm_logits:
             # 逐 token 标准化 logits：均值为 0、std 为 logit_temp。
             # 防止 CycleDelta 把 logits 推到 sigmoid 饱和区，让 bias 与
-            # 噪声始终作用在 sigmoid 敏感段。
+            # 噪声始终作用在 sigmoid 敏感段。融合 RMSNorm kernel 做
+            # centered/rsqrt，数学同原式。
             mean = mx.mean(logits, axis=-1, keepdims=True)
             centered = logits - mean
-            var = mx.mean(mx.square(centered), axis=-1, keepdims=True)
-            logits = centered * mx.rsqrt(var + 1e-6) * self.logit_temp
+            logits = _rms_unit(centered, 1e-6) * self.logit_temp
         scores = mx.sigmoid(logits)
         bias = self.expert_bias
         if bias.ndim == 2:
@@ -1133,11 +1349,22 @@ class MoEFeedForward(nn.Module):
     _KERNEL_MAX_PAIRS = 512  # G 小于该值走融合 kernel 路径（decode/极小批量）
     _SPARSE_GROUP = 8  # 稀疏桶路径的专家分组大小（显存/耗时与全局最大桶解耦；实测集中态下 8 最快：更小的组 padding 省不下多少（慢衰减记住轮换尖峰），GEMM 启动开销反而主导，见 HRM_MOE.md）
     _SPARSE_ALIGN = 128  # 组内桶容量对齐粒度
+    # 组峰值的逐微批衰减因子（半衰期 ≈ 138 微批）：热点尖峰被记住足够久以
+    # 覆盖 ~50-150 微批的复发周期，但稳态下峰值收敛到实测最大值本身。
+    _CAP_DECAY = 0.995
     _KERNEL_VERIFIED: set = set()  # 编译验证通过的 (D,I,K,dtype)
     _KERNEL_DISABLED = False  # 任一 shape 编译失败则整体禁用 kernel 路径
     # 训练稀疏桶的融合 kernel 路径（model/moe_fused.py）：VIBY_MOE_FUSED=0
     # 或编译/验证失败时回退逐组 padded GEMM 旧路径
     _FUSED_DISABLED = os.environ.get("VIBY_MOE_FUSED", "1") != "1"
+    # 训练稀疏桶 custom_function 的前向路径：
+    #   "1"     强制 MLX padded batched GEMM（旧稀疏前向）；
+    #   "0"     强制手写融合 kernel；
+    #   "auto"  按 padding 比选择：桶缓冲 ≤ 2× 真实 pair 时 MLX GEMM 更
+    #           快，高 padding（路由集中/大余量）时融合 kernel 跳过 padding
+    #           tile 更占优。反向始终是同一个手写 VJP。
+    _MLX_FORWARD = os.environ.get("VIBY_MOE_MLX_FWD", "auto")
+    _MLX_FWD_RATIO = 2.0
 
     def __init__(self, config: VibyConfig):
         super().__init__()
@@ -1156,6 +1383,13 @@ class MoEFeedForward(nn.Module):
         # VIBY_DEBUG_MEM 用：本模块训练期见过的最大对齐桶容量 C（python int，
         # 不进图不进参数），由训练循环在日志点读取并清零
         self._c_max_seen = 0
+        # 同上，用于诊断稀疏桶效率：窗口内累计的桶行数 / 真实 pair 数（比值
+        # 即 padding 倍率，直接决定专家 GEMM 的白算比例），以及走 MLX GEMM
+        # 前向的调用数 / 总调用数。全是 python int，不进图、不触发同步。
+        self._rows_seen = 0
+        self._pairs_seen = 0
+        self._mlxfwd_seen = 0
+        self._calls_seen = 0
         # 稀疏桶容量表：{(调用槽位 step_idx): ([每组容量], 对应 G)}。
         # 容量来自上一微批的实测桶计数（update_capacity_table 滚动更新），
         # 使 _sparse_forward 的桶形状与本批数据解耦 → 前向无 host sync。
@@ -1164,17 +1398,28 @@ class MoEFeedForward(nn.Module):
         # 总和（r073 实测 46GB → 48GB 机器 swap，吞吐塌缩）。
         self._cap_table: dict = {}
         self._cap_G: dict = {}
+        # 每个专家的「衰减峰值」：max(本批实测计数, 上批峰值 × _CAP_DECAY)。
+        # 容量由它派生，不再由上一批的容量自我递推（见 update_capacity_table）。
+        self._cap_peak: dict = {}
+        # 专家 → 桶槽位 / 槽位 → 专家：按峰值降序装槽，使同组专家容量需求
+        # 相近（见 update_capacity_table）。缺省恒等排列。
+        self._cap_perm: dict = {}
+        self._cap_order: dict = {}
         self._pending_counts: dict = {}
         # 融合 kernel 在任何 value_and_grad 建图之前预编译+端到端验证
         # （mlx metal_kernel 是 lazy 编译，训练内首次调用才验证会在建图期
-        # 抛出且无法干净回退）
+        # 抛出且无法干净回退）。形状不满足只跳过本实例，不能把类变量
+        # _FUSED_DISABLED 钉死——tiny 测试 I=48 会误伤同进程合法形状。
+        self._fused_ready = False
         if not type(self)._FUSED_DISABLED:
             try:
-                if not _prewarm_fused(self):
-                    type(self)._FUSED_DISABLED = True
-                    print("[moe_fused] 预热验证未通过（形状约束不满足），回退逐组 GEMM")
+                prewarm_mlx_fwd = type(self)._MLX_FORWARD == "1"
+                self._fused_ready = bool(
+                    _prewarm_fused(self, mlx_forward=prewarm_mlx_fwd)
+                )
             except Exception as exc:
                 type(self)._FUSED_DISABLED = True
+                self._fused_ready = False
                 print(
                     f"[moe_fused] 预热失败，回退逐组 GEMM：{type(exc).__name__}: {exc}"
                 )
@@ -1252,6 +1497,18 @@ class MoEFeedForward(nn.Module):
             # 默认容量也落表：update_capacity_table 据此检测首微批溢出
             self._cap_table[key] = caps
             self._cap_G[key] = G
+            # G 变了（batch/seq 改变）旧峰值不再可比，重新开始跟踪；
+            # 排列一并重置为恒等（各组容量相同，装槽顺序无所谓）
+            self._cap_peak.pop(key, None)
+            self._cap_perm.pop(key, None)
+            self._cap_order.pop(key, None)
+        # 专家 → 槽位排列（缺省恒等）。桶按槽位连续布局，第 gi 组占槽位
+        # [gi·EG,(gi+1)·EG)；update_capacity_table 按负载峰值降序装槽，
+        # 使同组专家容量需求相近。
+        perm = self._cap_order.get(key)
+        slot_of = self._cap_perm.get(key)
+        if slot_of is None:
+            perm = slot_of = list(range(E))
         # 组起始行前缀和（全 host int）
         starts = [0] * (n_groups + 1)
         for gi in range(n_groups):
@@ -1260,36 +1517,71 @@ class MoEFeedForward(nn.Module):
         cm = max(caps)
         if cm > self._c_max_seen:
             self._c_max_seen = cm
+        self._rows_seen += total_rows
+        self._pairs_seen += G
+        self._calls_seen += 1
 
         caps_dev = mx.array(caps, dtype=mx.int32)
         start_dev = mx.array(starts[:-1], dtype=mx.int32)
-        grp = exps_s // EG
-        exp_in_grp = exps_s - grp * EG
+        slot_dev = mx.array(slot_of, dtype=mx.int32)
+        slot_s = slot_dev[exps_s]  # 各 pair 所属专家的桶槽位
+        grp = slot_s // EG
+        slot_in_grp = slot_s - grp * EG
         rank = mx.arange(G, dtype=mx.int32) - offsets[exps_s]  # 桶内序号
         cap_g = caps_dev[grp]
-        row = start_dev[grp] + exp_in_grp * cap_g + rank
+        row = start_dev[grp] + slot_in_grp * cap_g + rank
         row = mx.where(rank >= cap_g, total_rows, row)  # 溢出 → trash 行
 
         xb = mx.zeros((total_rows + 1, D), dtype=x.dtype).at[row].add(xf[tok_s])
         cls = type(self)
         y_flat = None
-        if not cls._FUSED_DISABLED and x.dtype in _MOE_METAL_TYPE:
+        if (
+            not cls._FUSED_DISABLED
+            and getattr(self, "_fused_ready", False)
+            and x.dtype in _MOE_METAL_TYPE
+        ):
             try:
                 # 融合 kernel：2 个 Metal kernel 算完全部专家（含 trash 行
                 # 清零），替代下方逐组 padded GEMM；反向经 custom_function
                 # 的手写 vjp（padded batched GEMM，数学与旧路径 autodiff
-                # 同构）。base_e/cap_e 为各专家桶起始行/容量（device）。
-                exp_ids = mx.arange(E, dtype=mx.int32)
-                grp_e = exp_ids // EG
-                base_e = start_dev[grp_e] + (exp_ids - grp_e * EG) * caps_dev[grp_e]
-                cap_e = caps_dev[grp_e]
-                fused = _make_fused_experts(
-                    D, self.moe_in, E, EG, caps, starts, x.dtype
+                # 同构）。base_e/cap_e 为各专家桶起始行/容量（device，按专家
+                # id 索引）；base_e 末尾追加 total_rows，kernel 据此清零
+                # trash 行（专家按负载装槽后不能再由末专家推算）。
+                grp_e = slot_dev // EG
+                base_e = mx.concatenate(
+                    [
+                        start_dev[grp_e] + (slot_dev - grp_e * EG) * caps_dev[grp_e],
+                        mx.array([total_rows], dtype=mx.int32),
+                    ]
                 )
+                cap_e = caps_dev[grp_e]
+                mlx_fwd = cls._MLX_FORWARD == "1"
+                if cls._MLX_FORWARD == "auto":
+                    # 容量表 padding 比：total_rows 是实际分配的桶行数（含
+                    # trash），G 是真实 (token,choice) 对数。低 padding 时
+                    # Metal batched GEMM 前向更快；高 padding 时融合 kernel
+                    # 的“全 padding tile 直接返回”优势更大。
+                    mlx_fwd = total_rows <= G * cls._MLX_FWD_RATIO
+                self._mlxfwd_seen += int(mlx_fwd)
+                fused = _make_fused_experts(
+                    D,
+                    self.moe_in,
+                    E,
+                    EG,
+                    caps,
+                    starts,
+                    x.dtype,
+                    mlx_forward=mlx_fwd,
+                    perm=perm,
+                )
+                gu_w, dw_w = self.experts.gate_up_w, self.experts.down_w
+                if gu_w.dtype != x.dtype:
+                    gu_w = gu_w.astype(x.dtype)
+                    dw_w = dw_w.astype(x.dtype)
                 y_flat = fused(
                     xb,
-                    self.experts.gate_up_w,
-                    self.experts.down_w,
+                    gu_w,
+                    dw_w,
                     base_e,
                     counts,
                     cap_e,
@@ -1301,16 +1593,22 @@ class MoEFeedForward(nn.Module):
                     f"[moe_fused] 融合 kernel 运行失败，回退逐组 GEMM：{type(exc).__name__}: {exc}"
                 )
         if y_flat is None:
-            gu_t = self.experts.gate_up_w.swapaxes(-1, -2)  # (E,D,2I)
-            dw_t = self.experts.down_w.swapaxes(-1, -2)  # (E,I,D)
+            # 桶按槽位布局，权重先整体重排成槽位序（gather 走连续 axis-0），
+            # 组内再取零拷贝切片；对转置视图逐组花式索引会各物化一份副本。
+            gu_w_s, dw_w_s = self.experts.gate_up_w, self.experts.down_w
+            if perm != list(range(E)):
+                perm_arr = mx.array(perm, dtype=mx.int32)
+                gu_w_s, dw_w_s = gu_w_s[perm_arr], dw_w_s[perm_arr]
+            gu_t = gu_w_s.swapaxes(-1, -2)  # (E,D,2I)
+            dw_t = dw_w_s.swapaxes(-1, -2)  # (E,I,D)
             ys_list = []
             for gi in range(n_groups):
-                e0, e1 = gi * EG, min(gi * EG + EG, E)
-                eg = e1 - e0
+                s0, s1 = gi * EG, min(gi * EG + EG, E)
+                eg = s1 - s0
                 Cg = caps[gi]
                 xg = xb[starts[gi] : starts[gi] + eg * Cg].reshape(eg, Cg, D)
-                g_, u_ = mx.split(xg @ gu_t[e0:e1], 2, axis=-1)
-                yg = (nn.silu(g_) * u_) @ dw_t[e0:e1]  # (eg,Cg,D)
+                g_, u_ = mx.split(xg @ gu_t[s0:s1], 2, axis=-1)
+                yg = (nn.silu(g_) * u_) @ dw_t[s0:s1]  # (eg,Cg,D)
                 ys_list.append(yg.reshape(eg * Cg, D))
             ys_list.append(mx.zeros((1, D), dtype=x.dtype))  # trash 行输出恒 0
             y_flat = mx.concatenate(ys_list, axis=0)
@@ -1326,6 +1624,12 @@ class MoEFeedForward(nn.Module):
         counts 此时已随 mx.eval 物化，tolist 是不钉图的廉价同步。
         返回本批溢出 pair 数（>0 说明容量不足、该微批对应 pair 输出被
         置零，已抬升容量；正常余量下恒为 0），供训练日志告警。
+
+        同时产出「专家 → 桶槽位」的排列 perm：按逐专家衰减峰值降序装槽。
+        桶容量是每组 EG 个槽位取组内最大值，若按专家 id 成组，一个热专家
+        会把同组另外 EG-1 个冷专家一起顶到同样容量 —— 40 微批实测负载上，
+        EG=8 按 id 成组的平均 padding 是 2.84×，按负载排序后降到 1.63×
+        （已接近完全不分组的 1.44× 下限），塌缩态下差距达 2.0×。
         """
         if not self._pending_counts:
             return 0
@@ -1338,28 +1642,43 @@ class MoEFeedForward(nn.Module):
             c = counts.tolist()
             G = sum(c)
             old = self._cap_table.get(key)
+            old_perm = self._cap_perm.get(key)
+            peak_old = self._cap_peak.get(key)
+            # 逐专家衰减峰值 = max(本批实测计数, 上批峰值×衰减)；容量由它
+            # 加余量（×1.25+64）派生。旧实现让容量自我递推（新容量取
+            # max(目标, 旧容量×衰减)），慢衰减档 old*999//1000 在 128 对齐
+            # 下无法跨过对齐边界 —— 2304 → 2301 → 对齐回 2304，容量永久卡
+            # 在初始 4×均值默认量附近（实测稳态 3.4× padding，而实际只需
+            # 1.6×），反向 padded GEMM 白算 2 倍多的行。改为衰减「峰值」后
+            # 稳态收敛到实测最大值，尖峰仍被记住 ~138 微批（覆盖热点复发
+            # 周期）。峰值按专家而非按组记，才不受 perm 变动影响。
+            if peak_old is None:
+                peaks = [float(v) for v in c]
+            else:
+                dec = self._CAP_DECAY
+                peaks = [max(float(c[e]), peak_old[e] * dec) for e in range(E)]
+            # 溢出检测：本批计数超出该专家上批实际分到的容量。首微批走默认
+            # 容量、尚无排列，此时各组容量相同，任取一组即可。
+            if old is not None:
+                for e in range(E):
+                    cap_e = old[old_perm[e] // EG] if old_perm is not None else old[0]
+                    if c[e] > cap_e:
+                        overflow_pairs += c[e] - cap_e
+            # 按峰值降序装槽（用峰值而非本批计数排序，perm 随峰值缓变，
+            # 桶形状跨微批更稳定）
+            order = sorted(range(E), key=lambda e: -peaks[e])
+            slot_of = [0] * E
+            for s, e in enumerate(order):
+                slot_of[e] = s
             caps = []
             for gi in range(n_groups):
-                e0, e1 = gi * EG, min(gi * EG + EG, E)
-                m = max(c[e0:e1])
-                if old is not None and m > old[gi]:
-                    overflow_pairs += m - old[gi]
-                # 余量取 max(实测×1.25+64, 上批容量×衰减)，两速衰减：
-                # 容量远超当前所需（>2.5×）时 ×0.9 快速回吐（消化初始默认
-                # 与旧尖峰）；接近工作点时 ×0.999 慢衰减（半衰期 ~693 微批）。
-                # r076 曾用 0.995：热点每 ~50-150 微批复发一次，容量刚衰减
-                # 回去就撞上复发尖峰，出现 1220~2488 pairs 的间歇溢出。
-                base = m * 5 // 4 + 64
-                if old is not None:
-                    aged = (
-                        old[gi] * 9 // 10
-                        if old[gi] > base * 5 // 2
-                        else old[gi] * 999 // 1000
-                    )
-                    base = max(base, aged)
-                cap = ((base) + AL - 1) // AL * AL
-                caps.append(max(cap, AL))
+                m = peaks[order[gi * EG]]  # 组内槽位已按峰值降序，首个即最大
+                base = int(m) * 5 // 4 + 64
+                caps.append(max(((base) + AL - 1) // AL * AL, AL))
             self._cap_table[key] = caps
+            self._cap_peak[key] = peaks
+            self._cap_perm[key] = slot_of
+            self._cap_order[key] = order
             self._cap_G[key] = G
         self._pending_counts.clear()
         return overflow_pairs
@@ -1486,9 +1805,18 @@ class MoEFeedForward(nn.Module):
         return out
 
 
+_rms_unit_weights: dict = {}
+
+
 def _rms_unit(x: mx.array, eps: float = 1e-6) -> mx.array:
-    xf = x.astype(mx.float32)
-    return xf * mx.rsqrt(mx.mean(xf * xf, axis=-1, keepdims=True) + eps)
+    """无权重 RMS 单位化。用融合 RMSNorm kernel（ones 权重）替代手写
+    f32 平方/均值/rsqrt 链：数学等价，Metal 单 kernel 且不必物化
+    (..., D) 级 f32 中间量。"""
+    w = _rms_unit_weights.get((x.shape[-1], x.dtype, eps))
+    if w is None:
+        w = mx.ones((x.shape[-1],), dtype=x.dtype)
+        _rms_unit_weights[(x.shape[-1], x.dtype, eps)] = w
+    return mx.fast.rms_norm(x, w, eps).astype(x.dtype)
 
 
 @dataclass
@@ -1511,6 +1839,11 @@ class _EngramRead:
     scale: float = 1.0
     paper_fusion: bool = True
     window_hidden: Optional[mx.array] = None
+
+    def __post_init__(self):
+        # 同一次前向里窗口路径可能被调用两次（先推进 window_hidden、
+        # 再注入当前 hidden），缓存 Y 避免重复计算整窗卷积。
+        self._window_y: Optional[mx.array] = None
 
     def _tail(self, x, t: int):
         if x is None or x.shape[1] <= t:
@@ -1560,7 +1893,8 @@ class _EngramRead:
         # 因果卷积 → SiLU，最后与 gated value 做模块内残差。
         return self._apply_paper(hidden_states, ek, ev, shift_ok, gate_dim)
 
-    def _apply_paper(self, hidden_states, ek, ev, shift_ok, gate_dim):
+    def _paper_output(self, hidden_states, ek, ev, shift_ok, gate_dim):
+        """DeepSeek Engram 融合输出 Y（不含 h+residual），供等长/窗口路径共用。"""
         alpha = mx.sigmoid(
             mx.sum(_rms_unit(hidden_states) * _rms_unit(ek), axis=-1)
             / math.sqrt(gate_dim)
@@ -1578,15 +1912,21 @@ class _EngramRead:
             valid = shift_ok[..., j].astype(shifted.dtype)[..., None]
             y = y + shifted * valid * taps[j]
         y = nn.silu(y)
-        return hidden_states + (y + gated).astype(hidden_states.dtype)
+        return (y + gated).astype(hidden_states.dtype)
+
+    def _apply_paper(self, hidden_states, ek, ev, shift_ok, gate_dim):
+        return hidden_states + self._paper_output(
+            hidden_states, ek, ev, shift_ok, gate_dim
+        )
 
     def _apply_paper_full_window(self, hidden_states, gate_dim):
-        """缓存解码：在 n-gram 窗口上重算初始注入的 hidden 后做全窗口卷积。"""
-        t = hidden_states.shape[1]
-        fused = self._apply_paper(
-            self.window_hidden, self.ek, self.ev, self.shift_ok, gate_dim
-        )
-        return hidden_states + (fused - self.window_hidden)[:, -t:, :]
+        """缓存解码：在 n-gram 窗口上重算初始注入的 hidden，再取窗口尾部
+        与当前输入对齐的融合输出 Y（不做 fused-minus-hidden 的往返）。"""
+        if self._window_y is None or self._window_y.shape != self.ek.shape:
+            self._window_y = self._paper_output(
+                self.window_hidden, self.ek, self.ev, self.shift_ok, gate_dim
+            )
+        return hidden_states + self._window_y[:, -hidden_states.shape[1] :, :]
 
 
 def _shift_right_tokens(x: mx.array, offset: int) -> mx.array:
@@ -1934,12 +2274,24 @@ class VibyModel(nn.Module):
         self.hrm_token_gate_scale = float(
             getattr(config, "hrm_token_gate_scale", 0.0) or 0.0
         )
-        # num_hidden_layers 表示每个 stack 的真实层数 P；一个 token 的
-        # 层求值次数 = H*(L+1)*P，训练/推理前向完全一致。
-        self.l_module = VibyStack(config, config.num_hidden_layers)
-        self.h_module = VibyStack(config, config.num_hidden_layers)
-        raw_bp = list(config.hrm_bp_cycles or [self.hrm_L])
-        self.hrm_bp_padded = [1] * max(0, self.hrm_H - len(raw_bp)) + raw_bp
+        # num_hidden_layers：顺序主干 = 总层数；HRM = 每个 stack 的层数 P。
+        if self.hrm_H > 0:
+            self.l_module = VibyStack(config, config.num_hidden_layers)
+            self.h_module = VibyStack(config, config.num_hidden_layers)
+            raw_bp = config.hrm_bp_cycles
+            if not raw_bp:
+                self.hrm_bp_padded = [self.hrm_L] * self.hrm_H
+            else:
+                raw_bp = [int(x) for x in raw_bp]
+                if len(raw_bp) >= self.hrm_H:
+                    self.hrm_bp_padded = raw_bp[: self.hrm_H]
+                else:
+                    self.hrm_bp_padded = raw_bp + [raw_bp[-1]] * (
+                        self.hrm_H - len(raw_bp)
+                    )
+        else:
+            self.stack = VibyStack(config, config.num_hidden_layers)
+            self.hrm_bp_padded = []
         # Engram n-gram 记忆位点：注入 L-module（快状态栈）的同名层；
         # engram_inject_every_cycle=1 时每个循环调用都会重读一次表。
         engram_layers = tuple(int(x) for x in (config.engram_layers or ()))
@@ -1968,8 +2320,8 @@ class VibyModel(nn.Module):
         # 注入状态做 per-cycle scale/shift，给每个 cycle 显式时间身份。
         # 零初始化 ⇒ 初始严格等价。编号与 CycleRouter 共享：
         # c = h_idx*(L+1)+l_idx（L 调用）/ h_idx*(L+1)+L（H 调用）。
-        self.hrm_n_cycles = self.hrm_H * (self.hrm_L + 1)
-        if config.hrm_cycle_film:
+        self.hrm_n_cycles = self.hrm_H * (self.hrm_L + 1) if self.hrm_H > 0 else 0
+        if config.hrm_cycle_film and self.hrm_n_cycles > 0:
             self.hrm_film_scale = mx.zeros((self.hrm_n_cycles, config.hidden_size))
             self.hrm_film_shift = mx.zeros((self.hrm_n_cycles, config.hidden_size))
         else:
@@ -1982,15 +2334,21 @@ class VibyModel(nn.Module):
                 "original_max_position_embeddings",
                 config.original_max_position_embeddings,
             )
-        freqs_cos, freqs_sin = precompute_freqs_cis(
+        freqs_cos, freqs_sin, rope_freqs, rope_attn_factor = precompute_freqs_cis(
             dim=config.qk_rope_head_dim,
             end=config.max_position_embeddings,
             rope_base=config.rope_theta,
             rope_scaling=rope_scaling,
+            return_freqs=True,
         )
         self.freqs_cos = freqs_cos
         self.freqs_sin = freqs_sin
-        self.freeze(recurse=False, keys=["freqs_cos", "freqs_sin"])
+        self.rope_freqs = rope_freqs
+        self.rope_attn_factor = rope_attn_factor
+        self.freeze(
+            recurse=False,
+            keys=["freqs_cos", "freqs_sin", "rope_freqs", "rope_attn_factor"],
+        )
 
     def engram_window_len(self) -> int:
         """缓存解码时 Engram 需要携带的 token 窗口长度。
@@ -2029,7 +2387,10 @@ class VibyModel(nn.Module):
     ) -> tuple[mx.array, list]:
         batch_size, seq_length = input_ids.shape
         n_layers_per_stack = self.config.num_hidden_layers
-        n_effective_layers = self.hrm_H * (self.hrm_L + 1) * n_layers_per_stack
+        if self.hrm_H > 0:
+            n_effective_layers = self.hrm_H * (self.hrm_L + 1) * n_layers_per_stack
+        else:
+            n_effective_layers = n_layers_per_stack
         if past_key_values is None:
             past_key_values = [None] * n_effective_layers
         elif len(past_key_values) != n_effective_layers:
@@ -2038,10 +2399,7 @@ class VibyModel(nn.Module):
                 f"{n_effective_layers} 不一致"
             )
         first_cache = past_key_values[0]
-        if first_cache is None:
-            start_pos = 0
-        else:
-            start_pos = first_cache[0].shape[1]
+        start_pos = _seq_len_of_cache(first_cache)
         if start_pos + seq_length > self.config.max_position_embeddings:
             raise ValueError(
                 f"输入长度 {start_pos + seq_length} 超过模型最大上下文长度 "
@@ -2071,7 +2429,11 @@ class VibyModel(nn.Module):
         if freqs_cos.dtype != hidden_states.dtype:
             freqs_cos = freqs_cos.astype(hidden_states.dtype)
             freqs_sin = freqs_sin.astype(hidden_states.dtype)
-        position_embeddings = (freqs_cos, freqs_sin)
+        position_embeddings = (
+            freqs_cos,
+            freqs_sin,
+            (self.rope_freqs, start_pos, self.rope_attn_factor),
+        )
 
         # 每微批只 sync/构造一次 causal+pad 融合 mask，所有层共享：
         # 有 padding 时普通 Attention 也能走 flash，而不是逐层退化到 O(T²)。
@@ -2169,6 +2531,23 @@ class VibyModel(nn.Module):
             engram_evs = {}
 
         presents = []
+        if self.hrm_H <= 0:
+            hidden_states, presents = self.stack(
+                hidden_states,
+                position_embeddings,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+                causal_bias=causal_bias,
+                mask_is_full=mask_is_full,
+                value_residual=value_residual,
+                step_idx=None,
+                cache_offset=0,
+                engram_evs=engram_evs,
+                collect_aux=True,
+            )
+            return hidden_states, presents
+
         # HRM 双状态层次循环。z_H = 慢/高状态，z_L = 快/低状态；
         # 每个 token 的训练前向与推理前向完全一致，没有推理侧额外展开。
         z_h = hidden_states
@@ -2178,10 +2557,12 @@ class VibyModel(nn.Module):
         need_x0 = self.hrm_input_skip != 0.0 or self.hrm_token_gate_scale != 0.0
         x0 = _rms_unit(hidden_states).astype(hidden_states.dtype) if need_x0 else None
 
-        def _mix_states(a, b):
+        def _mix_states(a, b, norm_a: bool = True, norm_b: bool = True):
             if self.hrm_state_norm:
-                a = _rms_unit(a).astype(a.dtype)
-                b = _rms_unit(b).astype(b.dtype)
+                if norm_a:
+                    a = _rms_unit(a).astype(a.dtype)
+                if norm_b:
+                    b = _rms_unit(b).astype(b.dtype)
             y = a + b
             if x0 is not None and self.hrm_input_skip != 0.0:
                 y = y + self.hrm_input_skip * x0
@@ -2203,14 +2584,20 @@ class VibyModel(nn.Module):
 
         for h_idx in range(self.hrm_H):
             num_grad = int(
-                self.hrm_bp_padded[h_idx] if h_idx < len(self.hrm_bp_padded) else 1
+                self.hrm_bp_padded[h_idx]
+                if h_idx < len(self.hrm_bp_padded)
+                else self.hrm_L
             )
+            num_grad = min(self.hrm_L, max(1, num_grad))
             grad_threshold = self.hrm_L - num_grad
+            # H 状态在一个 H cycle 的 L 次循环里保持不变：只归一化一次，
+            # L 循环内复用；H 调用时也复用同一份归一化状态。
+            z_h_for_l = _rms_unit(z_h).astype(z_h.dtype) if self.hrm_state_norm else z_h
             for l_idx in range(self.hrm_L):
                 cyc = h_idx * (self.hrm_L + 1) + l_idx
                 cache_offset = cyc * n_layers_per_stack
                 z_l, p = self.l_module(
-                    _cycle_in(_mix_states(z_l, z_h), cyc),
+                    _cycle_in(_mix_states(z_l, z_h_for_l, norm_b=False), cyc),
                     position_embeddings,
                     past_key_values=past_key_values,
                     use_cache=use_cache,
@@ -2235,7 +2622,7 @@ class VibyModel(nn.Module):
             cyc = h_idx * (self.hrm_L + 1) + self.hrm_L
             cache_offset = cyc * n_layers_per_stack
             z_h, p = self.h_module(
-                _cycle_in(_mix_states(z_h, z_l), cyc),
+                _cycle_in(_mix_states(z_h_for_l, z_l, norm_a=False), cyc),
                 position_embeddings,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -2378,6 +2765,8 @@ class VibyForCausalLM(nn.Module):
             if config.mtp_depth > 0
             else []
         )
+        # module 树建完后缓存 gate 列表；每步前向避免重复 isinstance 遍历。
+        self._moe_gates = [m for m in self.modules() if isinstance(m, MoEGate)]
 
     def _lm_logits(self, hidden_states: mx.array) -> mx.array:
         if self.lm_head is not None:
@@ -2421,6 +2810,7 @@ class VibyForCausalLM(nn.Module):
             position_embeddings = (
                 self.model.freqs_cos[:sub].astype(hidden_states.dtype),
                 self.model.freqs_sin[:sub].astype(hidden_states.dtype),
+                (self.model.rope_freqs, 0, self.model.rope_attn_factor),
             )
             am = attention_mask[:, :sub] if attention_mask is not None else None
             # mask_has_pad 由调用方在 eager 侧算好传入（compile 图内不允许 .item()）
@@ -2486,7 +2876,7 @@ class VibyForCausalLM(nn.Module):
     ) -> CausalLMOutput:
         # MoE 负载统计/辅助 loss 按"次前向"重置：HRM 模式下同一 gate 每
         # 次前向被 H*(L+1) 次调用并跨循环累加（见 MoEGate.__call__）。
-        for g in self.moe_gates():
+        for g in self._moe_gates:
             g.last_aux = None
             g.last_div = None
             g.aux_calls = 0
@@ -2615,8 +3005,11 @@ class VibyForCausalLM(nn.Module):
         engram_win_len = self.model.engram_window_len()
         engram_decode_enabled = engram_win_len > 0
 
-        # 投机解码只支持全 1 的 attention_mask（无 padding）。
+        # 全 1 mask 是生成主路径的常见情形：后续 decode 步直接传
+        # mask_has_pad=False，避免每步在模型内对 attention_mask 做
+        # mx.any(...).item() 同步；也无需每步 concatenate 全 1 mask。
         mask_ok = attention_mask is None or bool(mx.all(attention_mask == 1).item())
+        # 投机解码只支持全 1 的 attention_mask（无 padding）。
         if use_mtp_speculative:
             can_speculate = (
                 len(self.mtp_modules) > 0
@@ -2674,35 +3067,38 @@ class VibyForCausalLM(nn.Module):
                 return {"generated_ids": input_ids, "past_kv": None}
             return input_ids
 
+        # 预分配 token 缓冲，避免每步 concatenate 整段序列（图膨胀 + 拷贝）。
+        total_len = prompt_len + max_new_tokens
+        tokens = mx.zeros((batch, total_len), dtype=input_ids.dtype)
+        tokens[:, :prompt_len] = input_ids
+        n = prompt_len
+
         for _ in range(max_new_tokens):
-            if past_key_values:
-                past_len = past_key_values[0][0].shape[1]
-            else:
-                past_len = 0
+            past_len = _seq_len_of_cache(past_key_values[0]) if past_key_values else 0
             current_input_ids = (
-                input_ids[:, past_len:]
-                if past_len < input_ids.shape[1]
-                else input_ids[:, -1:]
+                tokens[:, past_len:n] if past_len < n else tokens[:, n - 1 : n]
             )
             engram_window = None
             if engram_decode_enabled and past_len > 0:
-                engram_window = input_ids[:, -engram_win_len:]
+                win0 = max(0, n - engram_win_len)
+                engram_window = tokens[:, win0:n]
             outputs = self(
                 current_input_ids,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
+                mask_has_pad=(not mask_ok),
                 engram_input_ids=engram_window,
                 engram_decode=engram_decode_enabled,
             )
             logits_mx = outputs.logits[:, -1, :]
-            if attention_mask is not None:
+            if attention_mask is not None and not mask_ok:
                 attention_mask = mx.concatenate(
                     [attention_mask, mx.ones((batch, 1), dtype=attention_mask.dtype)],
                     axis=-1,
                 )
 
-            seen_ids = input_ids if repetition_penalty != 1.0 else None
+            seen_ids = tokens[:, :n] if repetition_penalty != 1.0 else None
             transformed = _transform_logits_mx(
                 logits_mx,
                 seen_ids,
@@ -2721,10 +3117,14 @@ class VibyForCausalLM(nn.Module):
                     next_token,
                 )
 
-            input_ids = mx.concatenate(
-                [input_ids, next_token[:, None].astype(input_ids.dtype)], axis=-1
-            )
+            tokens[:, n] = next_token.reshape((batch,)).astype(tokens.dtype)
+            n += 1
             past_key_values = outputs.past_key_values if use_cache else None
+            # 每步物化：否则惰性图会把所有 decode 步串在一起，T 增大后
+            # 吞吐塌缩。eval 之后的 EOS .item() 几乎不再额外同步。
+            mx.eval(next_token, tokens)
+            if use_cache:
+                _eval_kv_caches(past_key_values)
 
             if streamer:
                 streamer.put(next_token[:, None])
@@ -2734,26 +3134,25 @@ class VibyForCausalLM(nn.Module):
                 if bool(mx.all(finished).item()):
                     break
 
+        input_ids = tokens[:, :n]
         if streamer:
             streamer.end()
-        if (
-            return_kv
-            and use_cache
-            and past_key_values is not None
-            and past_key_values[0][0].shape[1] < input_ids.shape[1]
-        ):
+        cache_len = _seq_len_of_cache(past_key_values[0]) if past_key_values else 0
+        if return_kv and use_cache and past_key_values is not None and cache_len < n:
             # 标准循环每步先 forward 当前 token、再采样并 append，因此循环
             # 结束时 cache 还差最后一个已生成 token。这里补一次纯前向，让
             # return_kv 的 cache 与 generated_ids 对齐（与投机路径一致）。
-            missing = input_ids[:, past_key_values[0][0].shape[1] :]
+            missing = tokens[:, cache_len:n]
             engram_window = None
             if engram_decode_enabled:
-                engram_window = input_ids[:, -(engram_win_len - 1 + missing.shape[1]) :]
+                win0 = max(0, n - (engram_win_len - 1 + missing.shape[1]))
+                engram_window = tokens[:, win0:n]
             outputs = self(
                 missing,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=True,
+                mask_has_pad=(not mask_ok),
                 engram_input_ids=engram_window,
                 engram_decode=engram_decode_enabled,
             )
@@ -2798,6 +3197,7 @@ class VibyForCausalLM(nn.Module):
         # 因此 RoPE 全程固定为 freqs[pos_idx]，与训练约定一致。
         cos = self.model.freqs_cos[pos_idx : pos_idx + 1]
         sin = self.model.freqs_sin[pos_idx : pos_idx + 1]
+        rope_meta = (self.model.rope_freqs, pos_idx, self.model.rope_attn_factor)
         for i in range(draft_len):
             module_idx = i % n_modules
             module = self.mtp_modules[module_idx]
@@ -2808,7 +3208,7 @@ class VibyForCausalLM(nn.Module):
             h, present = module(
                 h,
                 emb,
-                (cos.astype(h.dtype), sin.astype(h.dtype)),
+                (cos.astype(h.dtype), sin.astype(h.dtype), rope_meta),
                 past_key_value=mtp_past if own_cache else None,
                 use_cache=True,
             )
@@ -2875,6 +3275,7 @@ class VibyForCausalLM(nn.Module):
             input_ids,
             attention_mask=attention_mask,
             use_cache=True,
+            mask_has_pad=False,
             engram_decode=engram_decode_enabled,
         )
         past = out.past_key_values
@@ -2894,6 +3295,7 @@ class VibyForCausalLM(nn.Module):
             rope_pref = (
                 self.model.freqs_cos[: seq_len - 1].astype(h_pref.dtype),
                 self.model.freqs_sin[: seq_len - 1].astype(h_pref.dtype),
+                (self.model.rope_freqs, 0, self.model.rope_attn_factor),
             )
             _, mtp_past = self.mtp_modules[0](h_pref, e_pref, rope_pref, use_cache=True)
 
@@ -2921,7 +3323,7 @@ class VibyForCausalLM(nn.Module):
             # max_position_embeddings（前向里有显式越界检查）。
             remaining = max_new_tokens - len(generated)
             iter_draft_len = min(draft_len, max(0, remaining - 2))
-            mtp_past_len = mtp_past[0].shape[1] if mtp_past is not None else 0
+            mtp_past_len = _seq_len_of_cache(mtp_past)
             drafts, draft_probs = [], []
             if iter_draft_len > 0:
                 drafts, draft_probs, mtp_past = self._mtp_draft(
@@ -2955,6 +3357,7 @@ class VibyForCausalLM(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_before_verify,
                 use_cache=True,
+                mask_has_pad=False,
                 engram_input_ids=engram_window,
                 engram_decode=engram_decode_enabled,
             )
@@ -3055,10 +3458,10 @@ class VibyForCausalLM(nn.Module):
             if streamer:
                 streamer.put(mx.array([new_tokens]))
             if stop:
-                # EOS 截断后无需再前向 tail：直接截取已验证 cache 到最终长度。
-                # 若继续走下面的 tail_win，seen_tail 中已包含 EOS 再拼一次
-                # EOS，会把 engram n-gram 窗口整体前移一格，污染 return_kv。
-                past = [tuple(c[:, :seq_len] for c in pkv) for pkv in past_full]
+                # EOS 截断后不再前向 tail。若 EOS 本身就是未验证的 tail，
+                # seq_len 会比 past_full 长 1；rewind 按旧切片语义截到
+                # 实际 cache 长度（见 KVCache.rewind）。
+                past = _rewind_cache_list(past_full, seq_len)
                 break
 
             # MTP cache：回滚草稿阶段的追加，再教师强制追平本轮新确定的
@@ -3066,7 +3469,7 @@ class VibyForCausalLM(nn.Module):
             # 口径一致：条目 t = 主模型 h[t] + token t+1 的嵌入，RoPE 按
             # 绝对流位置切片）。
             if mtp_past is not None:
-                mtp_past = tuple(c[:, :mtp_past_len] for c in mtp_past)
+                mtp_past = _rewind_cache(mtp_past, mtp_past_len)
                 n_e = len(new_tokens)
                 h_in = mx.concatenate(
                     [h_last, vout.hidden_states[:, : n_e - 1, :]], axis=1
@@ -3079,13 +3482,18 @@ class VibyForCausalLM(nn.Module):
                     self.model.freqs_sin[mtp_past_len : mtp_past_len + n_e].astype(
                         h_in.dtype
                     ),
+                    (
+                        self.model.rope_freqs,
+                        mtp_past_len,
+                        self.model.rope_attn_factor,
+                    ),
                 )
                 _, mtp_past = self.mtp_modules[0](
                     h_in, e_in, rope_c, past_key_value=mtp_past, use_cache=True
                 )
 
             keep = seq_len - 1  # old_seq_len + len(new_tokens[:-1])
-            past = [tuple(c[:, :keep] for c in pkv) for pkv in past_full]
+            past = _rewind_cache_list(past_full, keep)
             # tail token 的 n-gram 窗口：尾部 win_len 个 token（含 tail 自身），
             # 与标准 decode 步口径一致，保证该位置的缓存 K/V 与下一轮 bonus
             # logits 都带 engram 记忆。iter_draft_len==0 时 tail 为 None，
@@ -3127,14 +3535,14 @@ class VibyForCausalLM(nn.Module):
         target_len = input_ids.shape[1] + len(generated)
         if past:
             # 时间维在 axis 1
-            past = [tuple(c[:, :target_len] for c in pkv) for pkv in past]
+            past = _rewind_cache_list(past, target_len)
         object.__setattr__(self, "_last_spec_stats", stats)
         object.__setattr__(self, "_last_spec_past", past)
         return out_ids
 
     def moe_gates(self) -> list:
         """模型内全部 MoE router（含 MTP 块内的），遍历顺序固定。"""
-        return [m for m in self.modules() if isinstance(m, MoEGate)]
+        return list(self._moe_gates)
 
     def moe_aux_loss(self) -> Optional[mx.array]:
         """本次前向的 MoE 软负载均衡辅助 loss（按调用次数平均，未加权）。"""

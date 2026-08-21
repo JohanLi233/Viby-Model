@@ -40,6 +40,9 @@ _METAL_TYPE = {
     mx.float32: "float",
 }
 _kernel_cache: dict = {}
+# (D,I,E,EG,dtype,mlx_fwd) -> (caps_tuple, starts_tuple, fn)
+# 容量表稳定后复用 custom_function，避免每微批每层重新 @mx.custom_function。
+_fused_fn_cache: dict = {}
 
 
 def _ceil_div(a, b):
@@ -106,13 +109,13 @@ def _build_train_kernels(D, I, E, dtype):
         for (uint c = 0; c < {D // CHK}; c++) {{
             for (uint t = 0; t < {nx}; t++) {{
                 uint f = tid + t * 256;
-                xs[f] = xb[(row0 + f / {CHK}) * {D} + c * {CHK} + f % {CHK}];
+                    xs[f] = {mt}(xb[(row0 + f / {CHK}) * {D} + c * {CHK} + f % {CHK}]);
             }}
             for (uint t = 0; t < {nws}; t++) {{
                 uint f = tid + t * 256;
                 if ({ws_guard}) {{
                     uint ii = f / {CHK}; uint kk = f % {CHK};
-                    wst[kk * {I} + ii] = gu_w[((size_t)e * {2 * I} + ii) * {D} + c * {CHK} + kk];
+                    wst[kk * {I} + ii] = {mt}(gu_w[((size_t)e * {2 * I} + ii) * {D} + c * {CHK} + kk]);
                 }}
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -130,7 +133,7 @@ def _build_train_kernels(D, I, E, dtype):
                 uint f = tid + t * 256;
                 if ({ws_guard}) {{
                     uint ii = f / {CHK}; uint kk = f % {CHK};
-                    wst[kk * {I} + ii] = gu_w[((size_t)e * {2 * I} + {I} + ii) * {D} + c * {CHK} + kk];
+                    wst[kk * {I} + ii] = {mt}(gu_w[((size_t)e * {2 * I} + {I} + ii) * {D} + c * {CHK} + kk]);
                 }}
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -156,16 +159,17 @@ def _build_train_kernels(D, I, E, dtype):
             }}
         }}
     """
-    # y 块：64 行 × 64 列。z==E 的 threadgroup 清零 trash 行（R = 末专家
-    # 桶末尾，桶按 EG 均匀分配时 base[E-1]+cap = R）。dw_w 同样转置
-    # staging（ii-major）消除 bank conflict。
+    # y 块：64 行 × 64 列。z==E 的 threadgroup 清零 trash 行，其行号由
+    # base[E] 给出（base 长度 E+1，末元素 = 桶总行数）。不能用
+    # base[E-1]+cap_tab[E-1] 推算：专家按负载排序装槽后，专家 E-1 不一定
+    # 落在最后一个槽位。dw_w 同样转置 staging（ii-major）消除 bank conflict。
     down_src = f"""
         uint tid = thread_position_in_grid.x;
         uint ty = thread_position_in_grid.y;
         uint e = thread_position_in_grid.z;
         if (e == {E}) {{
             if (ty == 0) {{
-                size_t R = (size_t)base[{E} - 1] + (size_t)cap_tab[{E} - 1];
+                size_t R = (size_t)base[{E}];
                 for (uint d = tid; d < {D}; d += 256) y[R * {D} + d] = {mt}(0.0f);
             }}
             return;
@@ -186,13 +190,13 @@ def _build_train_kernels(D, I, E, dtype):
         for (uint c = 0; c < {I // 13}; c++) {{
             for (uint t = 0; t < 4; t++) {{
                 uint f = tid + t * 256;
-                if (f < 832) hs[f] = h[(row0 + f / 13) * {I} + c * 13 + f % 13];
+                if (f < 832) hs[f] = {mt}(h[(row0 + f / 13) * {I} + c * 13 + f % 13]);
             }}
             for (uint t = 0; t < 4; t++) {{
                 uint f = tid + t * 256;
                 if (f < 832) {{
                     uint dd = f / 13; uint ii = f % 13;
-                    wst[ii * 64 + dd] = dw_w[((size_t)e * {D} + tc * 64 + dd) * {I} + c * 13 + ii];
+                    wst[ii * 64 + dd] = {mt}(dw_w[((size_t)e * {D} + tc * 64 + dd) * {I} + c * 13 + ii]);
                 }}
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -227,42 +231,103 @@ def _build_train_kernels(D, I, E, dtype):
     return k_gu, k_down
 
 
-def make_fused_experts(D, I, E, EG, caps, starts, dtype):
-    """为本微批创建一次性 custom_function 实例（fwd=2 个融合 kernel，
-    vjp 闭包捕获本批 host 容量表，用 padded batched GEMM 建反向图）。
+def make_fused_experts(D, I, E, EG, caps, starts, dtype, mlx_forward=False, perm=None):
+    """为本微批创建一次性 custom_function 实例。
+
+    fwd 可选两条路径：
+    - 融合 kernel（默认）：2 个 Metal kernel；
+    - mlx_forward=True：padded batched GEMM（旧稀疏前向）。
+    两条路径共享同一个手写 VJP（闭包捕获本批 host 容量表，用 padded
+    batched GEMM 重建反向图）。
 
     caps/starts：host int 列表（_sparse_forward 的容量表与前缀和）；
-    EG：稀疏分组大小；要求 E % EG == 0 且桶按 EG 均匀布局（trash 行
-    定位依赖 base[E-1]+cap == R）。调用签名：
+    EG：稀疏分组大小；要求 E % EG == 0。
+
+    perm：槽位→专家 id 的映射（长度 E，slot s 装 perm[s]）。桶按槽位
+    连续布局，第 gi 组占槽位 [gi·EG, (gi+1)·EG) ⇒ 组内 batched GEMM 要
+    取的是 perm 切片指定的那 EG 个专家权重，而非连续 id 区间。None 等
+    价于恒等排列（旧行为）。_sparse_forward 按负载降序装槽，使同组专家
+    容量需求相近，消除「组内一个热专家把 7 个冷专家一起顶到同样容量」
+    的放大（实测把平均 padding 从 2.84× 压到 1.63×）。
+
+    调用签名：
         fused(xb, gate_up_w, down_w, base_e, counts, cap_e) -> y_flat
     xb (R+1,D)、y_flat (R+1,D)（末行为 trash，恒 0）；base_e/cap_e (E,)
-    int32 为各专家桶起始行/容量（device）；counts (E,) int32 实测计数。
+    int32 为各专家桶起始行/容量（device，按专家 id 索引）；counts (E,)
+    int32 实测计数；base_e 需长度 E+1、末元素 = R（kernel 定位 trash 行）。
     """
     if E % EG != 0:
         raise ValueError(f"fused MoE kernel 要求 E%EG==0，got E={E} EG={EG}")
-    k_gu, k_down = _build_train_kernels(D, I, E, dtype)
+    if perm is None:
+        perm = list(range(E))
+    caps_t, starts_t, perm_t = tuple(caps), tuple(starts), tuple(perm)
+    meta = (D, I, E, EG, dtype, bool(mlx_forward))
+    hit = _fused_fn_cache.get(meta)
+    if hit is not None and hit[0] == (caps_t, starts_t, perm_t):
+        return hit[1]
     R = int(starts[-1])
     n_groups = len(caps)
-    row_tiles = _ceil_div(max(caps), 64)
-    col_tiles = D // 64
+    # perm_arr：槽位 → 专家 id，用于把权重整体重排成槽位序；
+    # slot_arr：专家 id → 槽位，用于把 VJP 产出的槽位序梯度还原回专家序。
+    identity = all(perm[s] == s for s in range(E))
+    slot_of = [0] * E
+    for s, e in enumerate(perm):
+        slot_of[e] = s
+    perm_arr = None if identity else mx.array(perm, dtype=mx.int32)
+    slot_arr = None if identity else mx.array(slot_of, dtype=mx.int32)
 
-    @mx.custom_function
-    def _fused(xb, gu_w, dw_w, base_e, counts, cap_e):
-        h = k_gu(
-            inputs=[xb, gu_w, base_e, counts, cap_e],
-            output_shapes=[(R, I)],
-            output_dtypes=[dtype],
-            grid=(256, row_tiles, E),
-            threadgroup=(256, 1, 1),
-        )[0]
-        y = k_down(
-            inputs=[h, dw_w, base_e, counts, cap_e],
-            output_shapes=[(R + 1, D)],
-            output_dtypes=[dtype],
-            grid=(256, row_tiles * col_tiles, E + 1),
-            threadgroup=(256, 1, 1),
-        )[0]
-        return y
+    def to_slot(a):
+        """(E,...) 专家序 → 槽位序（恒等排列时零开销直通）"""
+        return a if identity else a[perm_arr]
+
+    def to_expert(a):
+        """(E,...) 槽位序 → 专家序"""
+        return a if identity else a[slot_arr]
+
+    if mlx_forward:
+        k_gu = k_down = None
+        row_tiles = col_tiles = 0
+
+        @mx.custom_function
+        def _fused(xb, gu_w, dw_w, base_e, counts, cap_e):
+            # 权重整体按槽位重排一次（gather 走连续 axis-0，代价 = 一次拷贝），
+            # 之后每组取切片（零拷贝视图）。不能反过来对转置视图做花式索引
+            # ——那会让每组各物化一份转置副本，实测拖慢整步数倍。
+            gu_t = to_slot(gu_w).swapaxes(-1, -2)  # (E,D,2I) 槽位序
+            dw_t = to_slot(dw_w).swapaxes(-1, -2)  # (E,I,D) 槽位序
+            parts = []
+            for gi in range(n_groups):
+                s0, s1 = gi * EG, (gi + 1) * EG
+                eg = s1 - s0
+                Cg = int(caps[gi])
+                xg = xb[starts[gi] : starts[gi] + eg * Cg].reshape(eg, Cg, D)
+                g_, u_ = mx.split(xg @ gu_t[s0:s1], 2, axis=-1)
+                yg = (nn.silu(g_) * u_) @ dw_t[s0:s1]
+                parts.append(yg.reshape(eg * Cg, D))
+            parts.append(mx.zeros((1, D), dtype=xb.dtype))
+            return mx.concatenate(parts, axis=0)
+    else:
+        k_gu, k_down = _build_train_kernels(D, I, E, dtype)
+        row_tiles = _ceil_div(max(caps), 64)
+        col_tiles = D // 64
+
+        @mx.custom_function
+        def _fused(xb, gu_w, dw_w, base_e, counts, cap_e):
+            h = k_gu(
+                inputs=[xb, gu_w, base_e, counts, cap_e],
+                output_shapes=[(R, I)],
+                output_dtypes=[dtype],
+                grid=(256, row_tiles, E),
+                threadgroup=(256, 1, 1),
+            )[0]
+            y = k_down(
+                inputs=[h, dw_w, base_e, counts, cap_e],
+                output_shapes=[(R + 1, D)],
+                output_dtypes=[dtype],
+                grid=(256, row_tiles * col_tiles, E + 1),
+                threadgroup=(256, 1, 1),
+            )[0]
+            return y
 
     def _vjp(primals, cotangents, outputs):
         # Stage A：padded batched GEMM 反向（与原稀疏路径 autodiff 同构）。
@@ -272,47 +337,56 @@ def make_fused_experts(D, I, E, EG, caps, starts, dtype):
         xb, gu_w, dw_w, _base_e, _counts, _cap_e = primals
         dy_full = cotangents[0] if isinstance(cotangents, (list, tuple)) else cotangents
         dy_full = dy_full.astype(xb.dtype)
-        gu_t = gu_w.swapaxes(-1, -2)  # (E,D,2I)
+        # 同前向：整体按槽位重排一次，组内取零拷贝切片
+        gu_p = to_slot(gu_w)  # (E,2I,D) 槽位序
+        dw_p = to_slot(dw_w)  # (E,D,I) 槽位序
+        gu_t = gu_p.swapaxes(-1, -2)  # (E,D,2I)
         dxb_parts, dgu_parts, ddw_parts = [], [], []
         for gi in range(n_groups):
-            e0, e1 = gi * EG, min(gi * EG + EG, E)
-            eg = e1 - e0
+            s0, s1 = gi * EG, (gi + 1) * EG
+            eg = s1 - s0
             Cg = int(caps[gi])
             sl = slice(starts[gi], starts[gi] + eg * Cg)
             xg = xb[sl].reshape(eg, Cg, D)
             dyg = dy_full[sl].reshape(eg, Cg, D)
-            gu = xg @ gu_t[e0:e1]  # (eg,Cg,2I)，重算前向激活
+            gu = xg @ gu_t[s0:s1]  # (eg,Cg,2I)，重算前向激活
             g, u = mx.split(gu, 2, axis=-1)
             h_g = nn.silu(g) * u  # (eg,Cg,I)
-            dh = dyg @ dw_w[e0:e1]  # (eg,Cg,I)
+            dh = dyg @ dw_p[s0:s1]  # (eg,Cg,I)
             ddw_parts.append(mx.matmul(dyg.swapaxes(-1, -2), h_g))  # (eg,D,I)
             sg = mx.sigmoid(g)
             dg = dh * u * (sg * (1.0 + g * (1.0 - sg)))  # dh⊙u⊙silu'(g)
             du = dh * (g * sg)  # dh⊙silu(g)
             dgu = mx.concatenate([dg, du], axis=-1)  # (eg,Cg,2I)
             dgu_parts.append(mx.matmul(dgu.swapaxes(-1, -2), xg))  # (eg,2I,D)
-            dxb_parts.append((dgu @ gu_w[e0:e1]).reshape(eg * Cg, D))
+            dxb_parts.append((dgu @ gu_p[s0:s1]).reshape(eg * Cg, D))
         dxb = mx.concatenate(dxb_parts + [mx.zeros((1, D), dtype=xb.dtype)], axis=0)
-        d_gu = mx.concatenate(dgu_parts, axis=0)  # (E,2I,D)
-        d_dw = mx.concatenate(ddw_parts, axis=0)  # (E,D,I)
+        # 分组梯度按槽位顺序拼接，再还原回专家 id 顺序
+        d_gu = to_expert(mx.concatenate(dgu_parts, axis=0))  # (E,2I,D)
+        d_dw = to_expert(mx.concatenate(ddw_parts, axis=0))  # (E,D,I)
         return dxb, d_gu, d_dw, None, None, None
 
     _fused.vjp(_vjp)
+    _fused_fn_cache[meta] = ((caps_t, starts_t, perm_t), _fused)
     return _fused
 
 
-def prewarm_fused(moe) -> bool:
+def prewarm_fused(moe, mlx_forward=False) -> bool:
     """在模块 __init__（任何 value_and_grad 建图之外）编译并端到端验证
-    kernel（含 vjp 建图）。返回 False 表示不可用，调用方应永久回退。
+    custom_function（含 vjp 建图）。返回 False 表示不可用，调用方应永久
+    回退逐组 GEMM autodiff。
 
     mlx metal_kernel 是 lazy 编译（首次 mx.eval 才触发），若把验证推迟到
     训练首个微批，编译失败/建图错误会在 value_and_grad 内部抛出且无法
-    干净回退，故在此用微型 dummy 输入预编译。"""
+    干净回退，故在此用微型 dummy 输入预编译。mlx_forward=True 时前向
+    只有 MLX batched GEMM，无需 kernel 形状约束。"""
     D = moe.experts.gate_up_w.shape[-1]
     I = moe.moe_in
     E = moe.n_routed
     EG = min(moe._SPARSE_GROUP, E)
-    if D % 64 != 0 or I % 13 != 0 or E % EG != 0:
+    if E % EG != 0:
+        return False
+    if not mlx_forward and (D % 64 != 0 or I % 13 != 0):
         return False
     n_groups = E // EG
     caps = [128] * n_groups
@@ -324,14 +398,22 @@ def prewarm_fused(moe) -> bool:
     grp = exp_ids // EG
     caps_dev = mx.array(caps, dtype=mx.int32)
     start_dev = mx.array(starts[:-1], dtype=mx.int32)
-    base_e = start_dev[grp] + (exp_ids - grp * EG) * caps_dev[grp]
+    # base_e 末尾追加 R：kernel 据此定位并清零 trash 行
+    base_e = mx.concatenate(
+        [
+            start_dev[grp] + (exp_ids - grp * EG) * caps_dev[grp],
+            mx.array([R], dtype=mx.int32),
+        ]
+    )
     cap_e = caps_dev[grp]
     counts = mx.zeros((E,), dtype=mx.int32)
     dtypes = {mx.bfloat16, moe.experts.gate_up_w.dtype}
     for dt in dtypes:
         if dt not in _METAL_TYPE:
             continue
-        fused = make_fused_experts(D, I, E, EG, caps, starts, dt)
+        fused = make_fused_experts(
+            D, I, E, EG, caps, starts, dt, mlx_forward=mlx_forward
+        )
         xb = mx.zeros((R + 1, D), dtype=dt)
         gu = moe.experts.gate_up_w.astype(dt)
         dw = moe.experts.down_w.astype(dt)

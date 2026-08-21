@@ -536,17 +536,30 @@ class BaseTrainer:
                         if g.last_load is not None
                     ]
                     # 各 MoE 模块本窗口见过的最大单次桶容量（决定 (E,C,D) 峰值）
+                    # 及桶 padding 倍率、MLX GEMM 前向占比（稀疏桶效率诊断）
                     cmax = 0
+                    rows = pairs = mlxfwd = calls = 0
                     for m in self.model.modules():
                         v = getattr(m, "_c_max_seen", None)
                         if v:
                             cmax = max(cmax, v)
                             m._c_max_seen = 0
+                        if getattr(m, "_calls_seen", 0):
+                            rows += m._rows_seen
+                            pairs += m._pairs_seen
+                            mlxfwd += m._mlxfwd_seen
+                            calls += m._calls_seen
+                            m._rows_seen = m._pairs_seen = 0
+                            m._mlxfwd_seen = m._calls_seen = 0
+                    pad_ratio = rows / pairs if pairs else 0.0
+                    mlx_frac = mlxfwd / calls if calls else 0.0
                     extra = {
                         "mem/active_gb": round(act, 3),
                         "mem/cache_gb": round(cache, 3),
                         "mem/peak_gb": round(peak, 3),
                         "moe/call_c_max": cmax,
+                        "moe/pad_ratio": round(pad_ratio, 3),
+                        "moe/mlx_fwd_frac": round(mlx_frac, 3),
                     }
                     for gi, v in enumerate(gate_max):
                         extra[f"moe/gate{gi}_max_load_k"] = round(v / 2**10, 3)
@@ -556,7 +569,8 @@ class BaseTrainer:
                             f"[mem] active={act:.2f}G cache={cache:.2f}G "
                             f"peak={peak:.2f}G "
                             f"gate_maxK={'/'.join(f'{v / 2**10:.1f}' for v in gate_max)} "
-                            f"callC={cmax}"
+                            f"callC={cmax} pad={pad_ratio:.2f}x "
+                            f"mlxfwd={mlx_frac:.0%}"
                         )
 
                 log_training_progress(

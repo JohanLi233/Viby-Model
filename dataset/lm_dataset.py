@@ -1,10 +1,15 @@
 import json
 import os
 import random
+import sys
 import threading
-from typing import Optional, List, Dict, Any
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, List, Dict, Any, Iterable, Tuple
 
 import numpy as np
+from numpy.lib.format import open_memmap
+from tqdm import tqdm
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -91,6 +96,236 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.2):
     return prompt_content
 
 
+_PACK_SENTINEL = object()
+_DEFAULT_PACK_BATCH = 4096
+
+
+def _pack_batch_size(override: Optional[int] = None) -> int:
+    if override is not None:
+        return max(1, int(override))
+    raw = os.environ.get("VIBY_PACK_BATCH")
+    if raw:
+        return max(1, int(raw))
+    return _DEFAULT_PACK_BATCH
+
+
+def _pack_tqdm(**kwargs):
+    """终端显示进度条；管道/测试（TQDM_DISABLE）下关闭，避免刷屏。"""
+    env_off = os.environ.get("TQDM_DISABLE", "").lower() in {"1", "true", "yes"}
+    kwargs.setdefault("file", sys.stderr)
+    kwargs.setdefault("dynamic_ncols", True)
+    kwargs.setdefault("mininterval", 0.2)
+    kwargs.setdefault("disable", env_off or not sys.stderr.isatty())
+    return tqdm(**kwargs)
+
+
+def _iter_text_batches(
+    data_path: str, batch_size: int
+) -> Iterable[Tuple[List[str], int]]:
+    batch: List[str] = []
+    nbytes = 0
+    with open(data_path, "rb") as f:
+        for line in f:
+            nbytes += len(line)
+            s = line.decode("utf-8", errors="ignore").strip()
+            if not s:
+                continue
+            batch.append(json.loads(s)["text"])
+            if len(batch) >= batch_size:
+                yield batch, nbytes
+                batch = []
+                nbytes = 0
+        if batch:
+            yield batch, nbytes
+
+
+def _prefetch(iterator: Iterable) -> Iterable:
+    """读 JSON 与分词重叠：后台线程预取下一批。"""
+    it = iter(iterator)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="pack-jsonl") as pool:
+        fut = pool.submit(next, it, _PACK_SENTINEL)
+        while True:
+            item = fut.result()
+            if item is _PACK_SENTINEL:
+                return
+            fut = pool.submit(next, it, _PACK_SENTINEL)
+            yield item
+
+
+def _encode_text_batch(tokenizer, texts: List[str]) -> List[List[int]]:
+    """分批分词。有 Rust backend 时开并行，避免 TOKENIZERS_PARALLELISM=false。"""
+    prev = os.environ.get("TOKENIZERS_PARALLELISM")
+    os.environ["TOKENIZERS_PARALLELISM"] = "true"
+    try:
+        backend = getattr(tokenizer, "backend", None)
+        encode_batch = getattr(backend, "encode_batch", None) if backend else None
+        if encode_batch is not None:
+            return [
+                enc.ids for enc in encode_batch(texts, add_special_tokens=False)
+            ]
+        return tokenizer(texts, add_special_tokens=False)["input_ids"]
+    finally:
+        if prev is None:
+            os.environ.pop("TOKENIZERS_PARALLELISM", None)
+        else:
+            os.environ["TOKENIZERS_PARALLELISM"] = prev
+
+
+def _raw_int32_to_npy(raw_path: str, out_path: str, width: int) -> int:
+    """把流式写出的 int32 裸文件切成 (n_blocks, width) 的 .npy，分块拷贝避免峰值内存。"""
+    n_tokens = os.path.getsize(raw_path) // 4
+    n_blocks = n_tokens // width
+    if n_blocks == 0:
+        np.save(out_path, np.zeros((0, width), dtype=np.int32))
+        return 0
+    tmp_out = out_path + ".writing"
+    src = np.memmap(raw_path, dtype=np.int32, mode="r", shape=(n_tokens,))
+    dst = open_memmap(tmp_out, mode="w+", dtype=np.int32, shape=(n_blocks, width))
+    chunk = max(1, (8 * 1024 * 1024) // (width * 4))
+    pbar = _pack_tqdm(
+        total=n_blocks,
+        desc="[pack] write npy",
+        unit="blk",
+        leave=False,
+    )
+    try:
+        for start in range(0, n_blocks, chunk):
+            end = min(n_blocks, start + chunk)
+            dst[start:end] = np.asarray(src[start * width : end * width]).reshape(
+                end - start, width
+            )
+            pbar.update(end - start)
+        dst.flush()
+    finally:
+        pbar.close()
+        del dst
+        del src
+    os.replace(tmp_out, out_path)
+    return n_blocks
+
+
+def _unlink(*paths: Optional[str]) -> None:
+    for p in paths:
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def pack_pretrain_jsonl(
+    data_path: str,
+    tokenizer,
+    max_length: int,
+    packed_path: str,
+    segs_path: Optional[str] = None,
+    batch_size: Optional[int] = None,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """流式打包预训练 jsonl：ids（及可选文档 id）直写磁盘，峰值内存 ≈ 一个 batch。
+
+    口径与旧实现相同：文档用 eos 拼接，切成 max_length+1 的定长块，余数丢弃。
+    """
+    packed_ok = os.path.exists(packed_path)
+    segs_ok = segs_path is None or os.path.exists(segs_path)
+    if packed_ok and segs_ok:
+        packed = np.load(packed_path, mmap_mode="r")
+        segs = np.load(segs_path, mmap_mode="r") if segs_path else None
+        return packed, segs
+
+    need_ids = not packed_ok
+    need_segs = segs_path is not None and not segs_ok
+    batch_size = _pack_batch_size(batch_size)
+    parent = os.path.dirname(os.path.abspath(packed_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    width = max_length + 1
+    eos_id = tokenizer.eos_token_id
+    raw_ids = packed_path + ".raw" if need_ids else None
+    raw_segs = segs_path + ".raw" if need_segs else None
+    _unlink(raw_ids, raw_segs, packed_path + ".writing")
+    if segs_path:
+        _unlink(segs_path + ".writing")
+
+    n_docs = 0
+    n_tokens = 0
+    t0 = time.time()
+    print(
+        f"[pack] 构建 {os.path.basename(data_path)} → {os.path.basename(packed_path)} "
+        f"(seq={max_length}, segs={'on' if need_segs else 'off'}, batch={batch_size})",
+        flush=True,
+    )
+
+    f_ids = open(raw_ids, "wb") if raw_ids else None
+    f_segs = open(raw_segs, "wb") if raw_segs else None
+    pbar = _pack_tqdm(
+        total=os.path.getsize(data_path),
+        desc="[pack] tokenize",
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+    )
+    try:
+        for texts, n_bytes in _prefetch(_iter_text_batches(data_path, batch_size)):
+            encoded = _encode_text_batch(tokenizer, texts)
+            total = 0
+            for ids in encoded:
+                total += len(ids) + 1
+            id_buf = np.empty(total, dtype=np.int32) if need_ids else None
+            seg_buf = np.empty(total, dtype=np.int32) if need_segs else None
+            pos = 0
+            for i, ids in enumerate(encoded):
+                n = len(ids) + 1
+                if id_buf is not None:
+                    id_buf[pos : pos + n - 1] = ids
+                    id_buf[pos + n - 1] = eos_id
+                if seg_buf is not None:
+                    seg_buf[pos : pos + n] = n_docs + i
+                pos += n
+            if f_ids is not None and id_buf is not None:
+                id_buf.tofile(f_ids)
+            if f_segs is not None and seg_buf is not None:
+                seg_buf.tofile(f_segs)
+            n_docs += len(texts)
+            n_tokens += total
+            pbar.update(n_bytes)
+            pbar.set_postfix(docs=f"{n_docs:,}", tok=f"{n_tokens:,}", refresh=False)
+        if f_ids is not None:
+            f_ids.flush()
+        if f_segs is not None:
+            f_segs.flush()
+    finally:
+        pbar.close()
+        if f_ids is not None:
+            f_ids.close()
+        if f_segs is not None:
+            f_segs.close()
+
+    n_blocks = 0
+    try:
+        if need_ids and raw_ids:
+            n_blocks = _raw_int32_to_npy(raw_ids, packed_path, width)
+        if need_segs and raw_segs and segs_path:
+            _raw_int32_to_npy(raw_segs, segs_path, width)
+            if not need_ids:
+                n_blocks = len(np.load(packed_path, mmap_mode="r"))
+    finally:
+        _unlink(
+            raw_ids,
+            raw_segs,
+            packed_path + ".writing",
+            (segs_path + ".writing") if segs_path else None,
+        )
+
+    print(
+        f"[pack] 完成: {n_blocks} blocks, {n_docs} docs, {n_tokens} tokens, "
+        f"{time.time() - t0:.1f}s",
+        flush=True,
+    )
+    packed = np.load(packed_path, mmap_mode="r")
+    segs = np.load(segs_path, mmap_mode="r") if segs_path else None
+    return packed, segs
+
+
 def _read_line_at_offset(data_path: str, offset: int) -> str:
     """Read a specific line using its byte offset (binary-safe, thread-local handle)."""
     f = getattr(_thread_files, "f", None)
@@ -120,14 +355,19 @@ class PretrainDataset:
         self.doc_mask = doc_mask
         self._cache: Dict[int, Dict[str, Any]] = {}
         if pack_sequences:
-            # 打包模式：全部文档 tokenize 后用 eos 拼接，切成 max_length+1 的
-            # 定长块（无 padding 浪费；允许跨文档注意力，与主流预训练一致）。
-            # 文档中位 338 token 时 seq640 的 padding 浪费约 47%，打包后
-            # 每步真实 token 数接近翻倍。
-            self._packed = self._build_packed()
-            # doc_mask：为每个 token 记录所属文档 id，供注意力做文档边界掩码
-            # （训练/逐篇 PPL 评估口径对齐），并在 loss 中屏蔽跨文档边界位置。
-            self._packed_segs = self._build_segs() if doc_mask else None
+            # 打包模式：文档 tokenize 后用 eos 拼接，切成 max_length+1 的定长块。
+            # 流式写入磁盘，峰值内存约一个 batch；已有 .npy 则 mmap 只读。
+            packed_path = self._packed_cache_path()
+            segs_path = (
+                packed_path.replace("packed_", "packedsegs_") if doc_mask else None
+            )
+            self._packed, self._packed_segs = pack_pretrain_jsonl(
+                self.data_path,
+                self.tokenizer,
+                self.max_length,
+                packed_path,
+                segs_path,
+            )
             self._line_offsets = None
         else:
             self._line_offsets = self._build_line_index()
@@ -138,6 +378,11 @@ class PretrainDataset:
         # 训练；segs 缓存按 packed_/packedsegs_ 命名规则自动配对。
         override = os.environ.get("VIBY_PACKED_CACHE")
         if override:
+            print(
+                f"[pack] VIBY_PACKED_CACHE={override} "
+                f"（忽略 data_path={self.data_path}）",
+                flush=True,
+            )
             return override
         import hashlib
 
@@ -152,62 +397,9 @@ class PretrainDataset:
         os.makedirs(cache_dir, exist_ok=True)
         return os.path.join(cache_dir, f"packed_{key}.npy")
 
-    def _build_packed(self) -> np.ndarray:
-        cache_path = self._packed_cache_path()
-        if os.path.exists(cache_path):
-            # mmap 只读映射：2.7G 级别的打包语料由文件页缓存承载，不占
-            # 匿名内存（内存压力下可直接驱逐，不会转化为 swap 写入压力）
-            return np.load(cache_path, mmap_mode="r")
-
-        eos_id = self.tokenizer.eos_token_id
-        texts = []
-        with open(self.data_path, "rb") as f:
-            for line in f:
-                texts.append(
-                    json.loads(line.decode("utf-8", errors="ignore").strip())["text"]
-                )
-        all_ids: List[int] = []
-        # 批量 tokenize（不加特殊 token，由我们显式加 eos 分隔）
-        for enc in self.tokenizer(texts, add_special_tokens=False)["input_ids"]:
-            all_ids.extend(enc)
-            all_ids.append(eos_id)
-        arr = np.asarray(all_ids, dtype=np.int32)
-        n_blocks = len(arr) // (self.max_length + 1)
-        packed = arr[: n_blocks * (self.max_length + 1)].reshape(
-            n_blocks, self.max_length + 1
-        )
-        np.save(cache_path, packed)
-        return packed
-
     def _segs_cache_path(self) -> str:
         p = self._packed_cache_path()
         return p.replace("packed_", "packedsegs_")
-
-    def _build_segs(self) -> np.ndarray:
-        """与 _build_packed 相同的 tokenize/切分逻辑，但记录每个 token 的
-        文档 id（eos 归属于其文档）。块内只需相等性，全局 id 即可。"""
-        cache_path = self._segs_cache_path()
-        if os.path.exists(cache_path):
-            return np.load(cache_path, mmap_mode="r")  # 同 _build_packed
-
-        texts = []
-        with open(self.data_path, "rb") as f:
-            for line in f:
-                texts.append(
-                    json.loads(line.decode("utf-8", errors="ignore").strip())["text"]
-                )
-        all_segs: List[int] = []
-        for doc_id, enc in enumerate(
-            self.tokenizer(texts, add_special_tokens=False)["input_ids"]
-        ):
-            all_segs.extend([doc_id] * (len(enc) + 1))  # tokens + eos
-        arr = np.asarray(all_segs, dtype=np.int32)
-        n_blocks = len(arr) // (self.max_length + 1)
-        segs = arr[: n_blocks * (self.max_length + 1)].reshape(
-            n_blocks, self.max_length + 1
-        )
-        np.save(cache_path, segs)
-        return segs
 
     def _build_line_index(self) -> List[int]:
         """Build an index of line offsets for fast random access.

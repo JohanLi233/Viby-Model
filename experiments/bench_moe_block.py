@@ -58,10 +58,13 @@ def run_regime(name, caps_mode, iters):
     vg = mx.value_and_grad(loss_fn, argnums=(0, 1, 2))
     for label, dis in [("旧逐组GEMM", True), ("融合kernel", False)]:
         MoEFeedForward._FUSED_DISABLED = dis
+
         def fwd():
             return (loss_fn(x0, gu0, dw0),)
+
         def fb():
             return vg(x0, gu0, dw0)
+
         fmin, favg = timed(fwd, iters)
         bmin, bavg = timed(fb, iters)
         print(
