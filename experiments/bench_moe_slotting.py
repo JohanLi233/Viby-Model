@@ -22,9 +22,10 @@ import mlx.core as mx
 import numpy as np
 from mlx.utils import tree_map
 
-from model.model import MoEFeedForward, VibyConfig
+from model.config import VibyConfig
+from model.moe import MoEFeedForward
 
-B, T, D, E, I, K = 6, 2048, 768, 112, 104, 6
+B, T, D, E, I, K = 6, 2048, 768, 112, 104, 6  # noqa: E741
 
 
 def build():
@@ -32,18 +33,12 @@ def build():
         hidden_size=D,
         num_hidden_layers=1,
         num_attention_heads=8,
-        kv_lora_rank=192,
-        qk_rope_head_dim=32,
         vocab_size=6400,
         max_position_embeddings=T,
         n_routed_experts=E,
         num_experts_per_tok=K,
         n_shared_experts=1,
         moe_intermediate_size=I,
-        hrm_H_cycles=2,
-        hrm_L_cycles=3,
-        hrm_cycle_router=1,
-        hrm_cycle_router_rank=8,
         moe_router_noise=0.0,
     )
     mx.random.seed(0)
@@ -69,7 +64,7 @@ def set_routing(moe, counts, seed=0):
     idx_a = mx.array(idx.reshape(B, T, K).astype(np.int32))
     w_a = mx.array(rng.random((B, T, K)).astype(np.float32)).astype(mx.bfloat16)
 
-    def stub(x, step_idx=None, collect_aux=False):
+    def stub(x):
         return idx_a, w_a
 
     moe.router = stub  # type: ignore[assignment]
@@ -112,7 +107,7 @@ def measure(moe, identity, iters=7):
 
     def loss(p_):
         moe.update(p_)
-        return (moe(x, step_idx=0).astype(mx.float32) * C).sum()
+        return (moe(x).astype(mx.float32) * C).sum()
 
     vg = mx.value_and_grad(loss)
     ts = []

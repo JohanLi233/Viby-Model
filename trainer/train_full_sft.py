@@ -5,11 +5,16 @@ __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import warnings
-from model.model import VibyConfig
+from model.config import VibyConfig
 from dataset.lm_dataset import SFTDataset
 from .base_trainer import BaseTrainer
-from .config import build_sft_rope_scaling, get_sft_parser, setup_training_args
-from .utils import build_config_from_sidecar, build_model_and_tokenizer, init_swanlab
+from .config import get_sft_parser, setup_training_args
+from .utils import (
+    build_config_from_sidecar,
+    build_model_and_tokenizer,
+    finish_training,
+    init_swanlab,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -44,14 +49,8 @@ if __name__ == "__main__":
         else f"pretrain_{args.hidden_size}.safetensors"
     )
     cfg, has_sidecar = build_config_from_sidecar(args, checkpoint_name)
-    # SFT 的上下文长度由 max_seq_len 决定；YaRN 的"原始长度"取 pretrain
-    # 的实际训练上下文（sidecar），而不是硬编码 1024
-    pretrain_ctx = cfg.get("max_position_embeddings")
+    # SFT 的上下文长度由 max_seq_len 决定
     cfg["max_position_embeddings"] = args.max_seq_len
-    if args.original_max_seq_len is None:
-        args.original_max_seq_len = pretrain_ctx or 1024
-    cfg["original_max_position_embeddings"] = args.original_max_seq_len
-    cfg["rope_scaling"] = build_sft_rope_scaling(args)
     lm_config = VibyConfig.from_dict(cfg) if has_sidecar else VibyConfig(**cfg)
 
     # 初始化模型
@@ -66,10 +65,12 @@ if __name__ == "__main__":
 
     swanlab = init_swanlab(args, trainer)
 
-    # 开始训练
-    trainer.train(train_loader, swanlab)
-    if swanlab is not None:
-        swanlab.finish()
+    try:
+        trainer.train(train_loader, swanlab)
+    except KeyboardInterrupt:
+        trainer.interrupted = True
+    finally:
+        finish_training(swanlab, interrupted=trainer.interrupted)
 
 # 执行命令示例:
 #
@@ -81,5 +82,4 @@ if __name__ == "__main__":
 # python train_full_sft.py --data_path /Volumes/pan/sft_1024.jsonl --max_seq_len 1024 --batch_size 8 --accumulation_steps 4
 # python train_full_sft.py --data_path /Volumes/pan/sft_2048.jsonl --max_seq_len 2048 --batch_size 4 --accumulation_steps 4
 #
-# 使用YaRN进行2048长度训练 (会自动启用):
 # python train_full_sft.py --data_path /Volumes/pan/sft_2048.jsonl --max_seq_len 2048 --batch_size 4 --accumulation_steps 4

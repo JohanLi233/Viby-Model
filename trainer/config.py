@@ -11,7 +11,16 @@ def add_common_args(parser):
     parser.add_argument("--out_dir", type=str, default="../out")
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--learning_rate", type=float, default=0.001)
+    # default None 作为"用户未显式传入"的哨兵：pretrain 下由
+    # resolve_compute_scaled_hparams 决定最终 lr（手动 > 公式 > 0.01 兜底），
+    # SFT/DPO 由各自 parser 的 set_defaults 给出固定默认值。
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=None,
+        help="基础学习率。pretrain 且 --lr_scale_auto 开启时，显式传入会覆盖"
+        "公式推出的 adam_lr（muon_lr 仍按 13/3× 派生）；不传则全自动",
+    )
     parser.add_argument(
         "--device",
         type=str,
@@ -22,18 +31,6 @@ def add_common_args(parser):
     parser.add_argument("--hidden_size", type=int, default=768)
     parser.add_argument("--num_hidden_layers", type=int, default=8)
     parser.add_argument("--num_attention_heads", type=int, default=8)
-    parser.add_argument(
-        "--kv_lora_rank",
-        type=int,
-        default=192,
-        help="MLA 的 KV 低秩潜在维度",
-    )
-    parser.add_argument(
-        "--qk_rope_head_dim",
-        type=int,
-        default=32,
-        help="MLA 解耦 RoPE 键的维度（跨 head 共享）",
-    )
     parser.add_argument(
         "--head_dim",
         type=int,
@@ -46,6 +43,14 @@ def add_common_args(parser):
         type=int,
         default=None,
         help="默认按 hidden_size 自动计算",
+    )
+    parser.add_argument(
+        "--tie_word_embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="绑定输入/输出 embedding（True 时 lm_head 复用 embed_tokens，"
+        "无额外参数）；默认 False：单独创建 nn.Linear，muonh 下走 AdamH 组。"
+        "解绑增加约 vocab_size × hidden_size 参数，但给 unembedding 独立梯度",
     )
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument(
@@ -60,8 +65,18 @@ def add_common_args(parser):
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--accumulation_steps", type=int, default=1)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--warmup_iters", type=int, default=100)
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=0.0,
+        help="梯度范数裁剪阈值；0=不裁剪（默认，对齐 Hyperball 配方）",
+    )
+    parser.add_argument(
+        "--warmup_iters",
+        type=int,
+        default=None,
+        help="线性 warmup 步数；默认按总步数的 1%（Marin / K3）",
+    )
     parser.add_argument(
         "--profile", action="store_true", help="Enable performance profiling"
     )
@@ -97,14 +112,14 @@ def add_common_args(parser):
         "--lr_decay_steps",
         type=int,
         default=None,
-        help="LR cosine 衰减的总步数覆盖（短时限时训练时对齐到实际步数，"
-        "让 lr 在结束时衰减到 0；默认用 epochs×每轮步数）",
+        help="LR 线性衰减的总步数覆盖（短时限时训练时对齐到实际步数，"
+        "让 lr 在结束时落到 min_lr_ratio；默认用 epochs×每轮步数）",
     )
     parser.add_argument(
         "--min_lr_ratio",
         type=float,
-        default=0.1,
-        help="cosine 衰减的下限比例（相对峰值），默认 0.1；0 表示衰减到 0",
+        default=0.05,
+        help="线性衰减的下限比例（相对峰值），默认 0.05（Marin）；0 表示衰减到 0",
     )
     parser.add_argument(
         "--pack_sequences",
@@ -137,21 +152,21 @@ def add_common_args(parser):
     parser.add_argument("--seed", type=int, default=1337, help="全局随机种子")
     parser.add_argument("--max_seq_len", default=1024, type=int)
     parser.add_argument(
-        "--use_value_res",
-        action="store_true",
-        default=False,
-        help="Value Residual Learning：后续层以可学习比例混入第一层 V",
-    )
-    parser.add_argument("--no_value_res", action="store_false", dest="use_value_res")
-    parser.add_argument(
         "--use_attn_gate",
-        action="store_true",
-        default=False,
-        help="注意力输出门：输入条件逐 head sigmoid 门（零初始化）",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="注意力输出门：2·σ(W_g x)，零初始化门=1（Marin，默认开）",
     )
     parser.add_argument("--no_attn_gate", action="store_false", dest="use_attn_gate")
     parser.add_argument("--mtp_depth", type=int, default=1)
     parser.add_argument("--mtp_loss_weight", type=float, default=0.3)
+    parser.add_argument(
+        "--z_loss_weight",
+        type=float,
+        default=1e-4,
+        help="logit z-loss 权重：loss += z_loss_weight * mean(lse²)（Marin），"
+        "主 LM 与 MTP 各 head 同权重；0 关闭",
+    )
     parser.add_argument(
         "--optimizer",
         type=str,
@@ -165,114 +180,6 @@ def add_common_args(parser):
         default=5,
         help="Muon Newton-Schulz 迭代步数（默认 5 对齐原版；减到 3 整步快 ~5%%，"
         "但正交化精度下降、训练动力学改变）",
-    )
-    parser.add_argument(
-        "--hrm_H_cycles",
-        type=int,
-        default=0,
-        help="HRM 高循环次数；0=顺序主干（num_hidden_layers 为总层数），"
-        ">0 时 num_hidden_layers 为每个 stack 的层数 P",
-    )
-    parser.add_argument(
-        "--hrm_L_cycles",
-        type=int,
-        default=3,
-        help="HRM 每个高循环内的低循环次数",
-    )
-    parser.add_argument(
-        "--hrm_bp_cycles",
-        type=str,
-        default=None,
-        help="HRM 训练梯度路由：逗号分隔的每 H cycle 尾部回传 L cycle 数；默认全部回传",
-    )
-    parser.add_argument(
-        "--hrm_emb_scale",
-        type=float,
-        default=1.0,
-        help="HRM 输入 embedding 缩放；默认 1.0（MLX 初始化与 HF 不同）",
-    )
-    parser.add_argument(
-        "--hrm_state_norm",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="HRM 状态混合前对 z_L/z_H 分别 RMS 归一化（默认关闭）",
-    )
-    parser.add_argument(
-        "--hrm_input_skip",
-        type=float,
-        default=0.0,
-        help="每个 HRM cycle 向注入状态额外加 skip·rms(embed(x))；默认关闭，"
-        "由 hrm_token_gate_scale 承担 token 记忆",
-    )
-    parser.add_argument(
-        "--hrm_token_gate_scale",
-        type=float,
-        default=0.0,
-        help="stack 输出与 rms(embed(x)) 的门控残差比例："
-        "z <- (1-g)·z + g·x0（默认关闭）",
-    )
-    parser.add_argument(
-        "--hrm_cycle_router",
-        type=int,
-        default=0,
-        help="HRM×MoE CycleRouter：让专家按迭代特化；仅 HRM 模式生效",
-    )
-    parser.add_argument(
-        "--hrm_cycle_router_rank",
-        type=int,
-        default=0,
-        help="CycleDeltaRouter 的低秩维度（推荐 8~16）；"
-        "--hrm_cycle_router 开启时必须 >0",
-    )
-    parser.add_argument(
-        "--cycle_router_lr_mult",
-        type=float,
-        default=0.1,
-        help="CycleDeltaRouter U/V_c 相对 base lr 的倍数（仅优化器分组，非模型配置）",
-    )
-    parser.add_argument(
-        "--hrm_cycle_film",
-        type=int,
-        default=0,
-        help="HRM CycleFiLM：每次 stack 调用前做 per-cycle scale/shift（零初始化）",
-    )
-    parser.add_argument(
-        "--engram_layers",
-        type=str,
-        default="",
-        help="Engram n-gram 记忆注入的层下标，逗号分隔（如 1,4）；空串关闭",
-    )
-    parser.add_argument(
-        "--engram_orders",
-        type=str,
-        default="2,3",
-        help="Engram 的 n-gram 阶数，逗号分隔",
-    )
-    parser.add_argument("--engram_slots", type=int, default=8192)
-    parser.add_argument(
-        "--engram_heads",
-        type=int,
-        default=0,
-        help="Engram 每 order 的表头数；0=按 hidden_size 自动",
-    )
-    parser.add_argument("--engram_sub_dim", type=int, default=128)
-    parser.add_argument(
-        "--engram_scale",
-        type=float,
-        default=1.0,
-        help="Engram 注入幅度的显式缩放（value_proj 之外的调节旋钮）",
-    )
-    parser.add_argument(
-        "--engram_lr_mult",
-        type=float,
-        default=1.0,
-        help="Engram 参数组相对 base lr 的倍数（独立 AdamW 组，ENGRAM_LR_MULT 可覆盖）",
-    )
-    parser.add_argument(
-        "--engram_inject_every_cycle",
-        action="store_true",
-        default=False,
-        help="HRM 下 engram 每个 L cycle 都注入（旧行为）；默认只在初始状态注入一次",
     )
     parser.add_argument(
         "--n_routed_experts",
@@ -290,7 +197,7 @@ def add_common_args(parser):
         "--n_shared_experts",
         type=int,
         default=1,
-        help="MoE 共享专家数（中间维 = moe_intermediate_size × n_shared_experts）",
+        help="独立共享专家个数；每个中间维 = moe_intermediate_size，输出相加",
     )
     parser.add_argument(
         "--moe_intermediate_size",
@@ -303,20 +210,6 @@ def add_common_args(parser):
         type=float,
         default=2.5,
         help="MoE 路由权重缩放因子（sigmoid 归一化后乘该系数）",
-    )
-    parser.add_argument(
-        "--moe_router_noise",
-        type=float,
-        default=0.05,
-        help="训练期 router 选择分高斯抖动（只影响 top-k 选择，不进入权重），"
-        "默认 0.05；0.1 更稳但早期 loss 下降更慢，0 关闭",
-    )
-    parser.add_argument(
-        "--moe_aux_loss_weight",
-        type=float,
-        default=0.001,
-        help="MoE 软负载均衡辅助损失权重（router-only，只回传 router/CycleDelta）；"
-        "0 关闭",
     )
     parser.add_argument(
         "--moe_router_logit_norm",
@@ -337,24 +230,44 @@ def add_common_args(parser):
         help="router 输入 token 多样性正则权重；0 关闭",
     )
     parser.add_argument(
-        "--cycle_delta_max",
-        type=float,
-        default=0.0,
-        help="CycleDeltaRouter 的 delta logits 逐 token RMS 上限（实验性）；"
-        "默认 0 不限制——r073 探针中 clamp 反而加重 MTP 槽位集中",
+        "--moe_latent_dim",
+        type=int,
+        default=None,
+        help="Latent MoE：路由专家在压缩后的 latent 空间计算——共享 "
+        "lat_down(hidden→d)/lat_up(d→hidden) 投影包住路由专家，lat_down 后"
+        "接 learnable latent_norm；router 仍在全维打分，共享专家仍走全宽。"
+        "默认 None → hidden_size//2（开启）；显式 0 关闭（消融）",
     )
     parser.add_argument(
-        "--scale_logits_by_emb_scale",
+        "--lr_scale_auto",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="实验开关：tied embedding 时对 logits 乘 1/hrm_emb_scale，把初始 "
-        "CE 拉回 ln V 附近，但会显著放慢早期 loss 下降；默认关闭",
+        default=True,
+        help="compute 缩放超参（Hyperball 口径，仅 pretrain 生效）：adam_lr = "
+        "0.087571·tokens^-0.3461·hidden^-0.3448·sqrt(tpb)，muon_lr = 13/3×adam_lr，"
+        "beta2 = clip(0.999^(tpb/131072), 0.95, 0.9999)，"
+        "eps = 9.676e-18·sqrt(tokens/tpb)（Adam/AdamH 组）。默认开启；"
+        "--no-lr_scale_auto 回到旧常数（单一 lr 默认 0.01、betas (0.9,0.95)、eps 1e-8）。"
+        "优先级：显式 --learning_rate > 公式 > 0.01 兜底",
     )
     parser.add_argument(
-        "--moe_bias_update_rate",
+        "--token_budget",
         type=float,
-        default=0.001,
-        help="无辅助损失负载均衡的偏置更新步长 u（每优化器步按负载统计更新）；<=0 关闭",
+        default=None,
+        help="总训练 token 预算（供 lr_scale_auto 公式）；不传则按"
+        "epochs × 每轮步数 × batch_size × max_seq_len 推导",
+    )
+    parser.add_argument(
+        "--muonh",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="MuonH/AdamH/Adam 体系（Marin 口径）：Muon 组更新加 Frobenius "
+        "范数球投影（方向/范数解耦）；3D 堆叠专家逐专家 NS 进 MuonH（默认 "
+        "AdamW）；lm_head（非 tied）走 AdamH（Adam 方向+范数球投影，lr=muon "
+        "基础 lr）。默认开启，--no-muonh 回退旧分组。注意：开关改变优化器分组，"
+        "不能用于续跑旧 checkpoint（optimizer state 分组对不上），只用于新 run。"
+        "VIBY_MUONH_EXPERTS=0 只开范数球投影、专家保持 AdamW（消融/省逐专家 "
+        "NS 开销）。Temporal 默认开：VIBY_MUONH_CACHE_Q=1 + EVERY=8，命中 Q@U；"
+        "VIBY_MUONH_CACHE_Q_RES 残差超限则本步重跑 NS5（0 关闭）",
     )
 
 
@@ -364,10 +277,11 @@ def get_pretrain_parser():
     add_common_args(parser)
 
     # 预训练特定参数
+    # learning_rate 保持 None 哨兵：由 resolve_compute_scaled_hparams 在
+    # train_pretrain.py 中按 手动 > 公式 > 0.01 兜底 的优先级解析
     parser.set_defaults(
         epochs=1,
         batch_size=32,
-        learning_rate=0.01,
         accumulation_steps=8,
         max_seq_len=2048,
     )
@@ -396,45 +310,23 @@ def get_sft_parser():
     parser.set_defaults(
         num_hidden_layers=None,
         num_attention_heads=None,
-        kv_lora_rank=None,
-        qk_rope_head_dim=None,
         vocab_size=None,
         mtp_depth=None,
         mtp_loss_weight=None,
     )
     parser.set_defaults(
-        use_value_res=None,
         use_attn_gate=None,
-        hrm_H_cycles=None,
-        hrm_L_cycles=None,
-        hrm_bp_cycles=None,
-        hrm_emb_scale=None,
-        hrm_state_norm=None,
-        hrm_input_skip=None,
-        hrm_token_gate_scale=None,
-        hrm_cycle_router=None,
-        hrm_cycle_router_rank=None,
-        hrm_cycle_film=None,
-        engram_layers=None,
-        engram_orders=None,
-        engram_heads=None,
-        engram_slots=None,
-        engram_sub_dim=None,
-        engram_scale=None,
-        engram_inject_every_cycle=None,
-        scale_logits_by_emb_scale=None,
-        moe_router_noise=None,
-        moe_aux_loss_weight=None,
+        tie_word_embeddings=None,
         moe_router_logit_norm=None,
         moe_router_logit_temp=None,
         moe_diversity_loss_weight=None,
-        cycle_delta_max=None,
+        z_loss_weight=None,
         n_routed_experts=None,
         num_experts_per_tok=None,
         n_shared_experts=None,
         moe_intermediate_size=None,
         routed_scaling_factor=None,
-        moe_bias_update_rate=None,
+        moe_latent_dim=None,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-Full-SFT")
@@ -446,31 +338,61 @@ def get_sft_parser():
         help="预训练检查点文件名（默认按 hidden_size 自动推导）",
     )
 
-    # YaRN scaling parameters
-    parser.add_argument(
-        "--enable_yarn", action="store_true", help="Enable YaRN scaling"
+    return parser
+
+
+def get_draft_parser():
+    """获取 EAGLE-3 草稿微调参数解析器"""
+    parser = argparse.ArgumentParser(description="Viby Draft (EAGLE-3) Finetune")
+    add_common_args(parser)
+
+    # 草稿微调特定参数
+    parser.set_defaults(
+        epochs=1,
+        batch_size=16,
+        learning_rate=0.001,
+        accumulation_steps=1,
+        max_seq_len=2048,
     )
-    parser.add_argument(
-        "--yarn_scaling_factor", default=2.0, type=float, help="YaRN scaling factor"
+    # 结构参数默认 None：优先从基座 checkpoint 的 sidecar config 继承，
+    # 仅在用户显式传入时覆盖（sidecar 缺失时回退 VibyConfig 默认值）。
+    parser.set_defaults(
+        num_hidden_layers=None,
+        num_attention_heads=None,
+        vocab_size=None,
+        mtp_depth=None,
+        mtp_loss_weight=None,
     )
+    parser.set_defaults(
+        use_attn_gate=None,
+        tie_word_embeddings=None,
+        moe_router_logit_norm=None,
+        moe_router_logit_temp=None,
+        moe_diversity_loss_weight=None,
+        z_loss_weight=None,
+        n_routed_experts=None,
+        num_experts_per_tok=None,
+        n_shared_experts=None,
+        moe_intermediate_size=None,
+        routed_scaling_factor=None,
+        moe_latent_dim=None,
+    )
+
+    parser.add_argument("--swanlab_project", type=str, default="Viby-Draft")
+    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl")
     parser.add_argument(
-        "--original_max_seq_len",
+        "--pretrain_checkpoint",
+        type=str,
         default=None,
+        help="基座检查点文件名（默认按 hidden_size 自动推导）",
+    )
+    parser.add_argument(
+        "--draft_ttt_steps",
         type=int,
-        help="Original context length before scaling（默认取 pretrain checkpoint "
-        "sidecar 中的实际上下文长度，无 sidecar 时为 1024）",
-    )
-    parser.add_argument(
-        "--yarn_beta_fast", default=32.0, type=float, help="YaRN beta_fast parameter"
-    )
-    parser.add_argument(
-        "--yarn_beta_slow", default=1.0, type=float, help="YaRN beta_slow parameter"
-    )
-    parser.add_argument(
-        "--yarn_attention_factor",
-        default=1.0,
-        type=float,
-        help="YaRN attention factor（mscale）",
+        default=4,
+        help="EAGLE-3 training-time test (TTT) rollout 步数：step 1 消费目标"
+        "多层特征 + 真实下一 token 嵌入；step≥2 消费草稿自身上一步 hidden + "
+        "自预测 token 嵌入；各步 CE 平均",
     )
 
     return parser
@@ -489,50 +411,28 @@ def get_dpo_parser():
         accumulation_steps=1,
         max_seq_len=1024,
     )
-    # 结构参数默认 None：优先从 SFT checkpoint 的 sidecar config 继承
-    # （含 rope_scaling/YaRN 配置），仅在用户显式传入时覆盖。
+    # 结构参数默认 None：优先从 SFT checkpoint 的 sidecar config 继承，
+    # 仅在用户显式传入时覆盖。
     parser.set_defaults(
         num_hidden_layers=None,
         num_attention_heads=None,
-        kv_lora_rank=None,
-        qk_rope_head_dim=None,
         vocab_size=None,
         mtp_depth=None,
         mtp_loss_weight=None,
     )
     parser.set_defaults(
-        use_value_res=None,
         use_attn_gate=None,
-        hrm_H_cycles=None,
-        hrm_L_cycles=None,
-        hrm_bp_cycles=None,
-        hrm_emb_scale=None,
-        hrm_state_norm=None,
-        hrm_input_skip=None,
-        hrm_token_gate_scale=None,
-        hrm_cycle_router=None,
-        hrm_cycle_router_rank=None,
-        hrm_cycle_film=None,
-        engram_layers=None,
-        engram_orders=None,
-        engram_heads=None,
-        engram_slots=None,
-        engram_sub_dim=None,
-        engram_scale=None,
-        engram_inject_every_cycle=None,
-        scale_logits_by_emb_scale=None,
-        moe_router_noise=None,
-        moe_aux_loss_weight=None,
+        tie_word_embeddings=None,
         moe_router_logit_norm=None,
         moe_router_logit_temp=None,
         moe_diversity_loss_weight=None,
-        cycle_delta_max=None,
+        z_loss_weight=None,
         n_routed_experts=None,
         num_experts_per_tok=None,
         n_shared_experts=None,
         moe_intermediate_size=None,
         routed_scaling_factor=None,
-        moe_bias_update_rate=None,
+        moe_latent_dim=None,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-DPO")
@@ -548,28 +448,6 @@ def get_dpo_parser():
     )
 
     return parser
-
-
-def build_sft_rope_scaling(args):
-    """Build YaRN config for SFT and update args.max_seq_len when enabled."""
-    if not (args.max_seq_len >= 2048 or args.enable_yarn):
-        return None
-
-    if not hasattr(args, "yarn_scaling_factor") or args.yarn_scaling_factor == 2.0:
-        args.yarn_scaling_factor = args.max_seq_len / args.original_max_seq_len
-
-    rope_scaling = {
-        "type": "yarn",
-        "factor": args.yarn_scaling_factor,
-        "original_max_position_embeddings": args.original_max_seq_len,
-        "beta_fast": getattr(args, "yarn_beta_fast", 32.0),
-        "beta_slow": getattr(args, "yarn_beta_slow", 1.0),
-        "attention_factor": getattr(args, "yarn_attention_factor", 1.0),
-    }
-    Logger(
-        f"[YaRN] 启用上下文扩展: {args.original_max_seq_len} → {args.max_seq_len} (scaling factor: {args.yarn_scaling_factor})"
-    )
-    return rope_scaling
 
 
 def setup_training_args(args, training_type="pretrain"):
@@ -614,10 +492,10 @@ def setup_training_args(args, training_type="pretrain"):
     os.makedirs(args.out_dir, exist_ok=True)
 
     # 设置 swanlab 运行名称：out_dir 基名（通常即实验轮次名）+ 关键配置
+    # learning_rate 为 None 时（pretrain 哨兵，稍后由 lr_scale_auto 解析）标 auto
     run_tag = os.path.basename(os.path.normpath(args.out_dir))
-    args.swanlab_run_name = (
-        f"{run_tag}-E{args.epochs}-BS{args.batch_size}-LR{args.learning_rate}"
-    )
+    lr_tag = args.learning_rate if args.learning_rate is not None else "auto"
+    args.swanlab_run_name = f"{run_tag}-E{args.epochs}-BS{args.batch_size}-LR{lr_tag}"
 
     # 设置随机种子（MLX 单设备）
     base_seed = getattr(args, "seed", 1337)

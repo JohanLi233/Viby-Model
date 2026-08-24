@@ -1,10 +1,11 @@
 """端到端训练单步分解基准（合成数据，不依赖外部语料）。
 
-按 r073 真实配置构建模型，跑若干微批并把整步墙钟拆成：
-  数据准备 / 前向 / 反向 / 梯度累加 / optimizer（含 Muon NS）/ 容量表滚动。
+默认保留历史单微批口径；``--preset 1080m`` 使用当前真实配置和两个微批的
+梯度累积窗口。墙钟拆成前向 / 反向 / 梯度累加 / optimizer（含 Muon NS）。
 
 用法:
     .venv/bin/python experiments/bench_train_step.py [iters] [--bs N] [--seq N]
+    .venv/bin/python experiments/bench_train_step.py 8 --preset 1080m
 """
 
 import argparse
@@ -18,53 +19,75 @@ import mlx.core as mx
 import numpy as np
 from mlx.utils import tree_map
 
-from model.model import VibyConfig, VibyForCausalLM
+from model.config import VibyConfig
+from model.model import VibyForCausalLM
 from trainer.muon import create_mixed_optimizer
+
+
+def optimizer_due(microbatch_index: int, accumulation_steps: int) -> bool:
+    """返回当前微批是否结束一个梯度累积窗口。"""
+    if accumulation_steps < 1:
+        raise ValueError("accumulation_steps 必须 >= 1")
+    return (microbatch_index + 1) % accumulation_steps == 0
+
+
+def benchmark_accounting(
+    batch_size: int,
+    seq_len: int,
+    accumulation_steps: int,
+    elapsed_seconds: float,
+) -> dict[str, float]:
+    """统一窗口 token 数、吞吐和归一化单微批耗时的计算口径。"""
+    if accumulation_steps < 1:
+        raise ValueError("accumulation_steps 必须 >= 1")
+    if elapsed_seconds <= 0:
+        raise ValueError("elapsed_seconds 必须 > 0")
+    tokens = batch_size * seq_len * accumulation_steps
+    return {
+        "tokens": tokens,
+        "tokens_per_second": tokens / elapsed_seconds,
+        "seconds_per_microbatch": elapsed_seconds / accumulation_steps,
+    }
+
+
+def kda_layer_counts(num_hidden_layers: int, mtp_depth: int) -> tuple[int, int]:
+    """按 VibyBlock 的 3:1 local/global 规则推导 KDA 层数。"""
+    main = sum(
+        not (((i + 1) % 4 == 0) or i == num_hidden_layers - 1)
+        for i in range(num_hidden_layers)
+    )
+    # 每个 MTP block 使用 layer_idx=0；主干多于一层时它是 local KDA。
+    mtp = mtp_depth if num_hidden_layers > 1 else 0
+    return int(main), int(mtp)
+
+
+def summarize_samples(samples) -> tuple[float, float, float]:
+    """返回历史上中位/min 口径，并保留周期性刷新所需的算术均值。"""
+    values = sorted(samples)
+    if not values:
+        raise ValueError("samples 不能为空")
+    return values[len(values) // 2], values[0], sum(values) / len(values)
 
 
 def build_config(args):
     return VibyConfig(
         hidden_size=768,
-        num_hidden_layers=1,
+        num_hidden_layers=args.layers,
         num_attention_heads=8,
-        kv_lora_rank=192,
-        qk_rope_head_dim=32,
         vocab_size=6400,
         max_position_embeddings=args.seq,
         mtp_depth=args.mtp,
         mtp_loss_weight=0.3,
-        use_value_res=True,
         use_attn_gate=True,
-        hrm_H_cycles=2,
-        hrm_L_cycles=3,
-        hrm_bp_cycles=[2],
-        hrm_emb_scale=27.7128,
-        hrm_state_norm=False,
-        hrm_input_skip=0.0,
-        hrm_token_gate_scale=0.0,
-        hrm_cycle_router=1,
-        hrm_cycle_router_rank=8,
-        hrm_cycle_film=1,
-        engram_layers=(0,) if args.engram else (),
-        engram_orders=(2, 3),
-        engram_heads=0,
-        engram_slots=8192,
-        engram_sub_dim=128,
-        engram_scale=1.0,
-        engram_inject_every_cycle=0,
-        n_routed_experts=112,
-        num_experts_per_tok=6,
-        n_shared_experts=1,
-        moe_intermediate_size=104,
+        n_routed_experts=args.experts,
+        num_experts_per_tok=args.topk,
+        n_shared_experts=args.shared,
+        moe_intermediate_size=args.moe_in,
         routed_scaling_factor=2.5,
         moe_router_noise=0.05,
-        moe_aux_loss_weight=0.001,
         moe_router_logit_norm=True,
         moe_router_logit_temp=1.0,
         moe_diversity_loss_weight=0.0,
-        cycle_delta_max=0.0,
-        moe_bias_update_rate=0.02,
-        scale_logits_by_emb_scale=False,
     )
 
 
@@ -72,13 +95,18 @@ class _Args:
     learning_rate = 0.01
     muon_ns_steps = 5
     router_lr_mult = 0.01
-    cycle_router_lr_mult = 0.1
-    engram_lr_mult = 1.0
+    # 与 train_pretrain 默认口径一致（--muonh 默认开启）；置 0 可对照旧分组
+    muonh = os.environ.get("VIBY_BENCH_MUONH", "1") == "1"
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("iters", nargs="?", type=int, default=8)
+    p.add_argument(
+        "--preset",
+        choices=("1080m",),
+        help="应用当前 1080M 训练口径（会覆盖模型形状、compile/no-clip 与 accum）",
+    )
     p.add_argument(
         "--ab",
         action="store_true",
@@ -89,8 +117,30 @@ def main():
     p.add_argument("--bs", type=int, default=6)
     p.add_argument("--seq", type=int, default=2048)
     p.add_argument("--mtp", type=int, default=1)
-    p.add_argument("--engram", type=int, default=1)
     p.add_argument("--warmup", type=int, default=3)
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="用 mx.compile 编译 loss（与真实训练 --compile_model 同口径，"
+        "含融合 kernel 预热）。不加则是 eager 口径。",
+    )
+    p.add_argument("--layers", type=int, default=1)
+    p.add_argument("--experts", type=int, default=112)
+    p.add_argument("--topk", type=int, default=6)
+    p.add_argument("--moe_in", type=int, default=104)
+    p.add_argument("--shared", type=int, default=2)
+    p.add_argument(
+        "--accumulation_steps",
+        type=int,
+        default=1,
+        help="每个 optimizer 窗口包含的微批数；默认 1 保留历史基准口径",
+    )
+    p.add_argument(
+        "--no_clip",
+        action="store_true",
+        help="与真实训练默认 grad_clip=0 同口径：不算 clip_grad_norm，"
+        "只做优化器更新（bench 默认仍 clip=1，便于和 1380ms 基线对照）。",
+    )
     p.add_argument(
         "--skew",
         type=float,
@@ -101,6 +151,22 @@ def main():
         "复现该量级（跑完看输出的 max/mean 标定）。",
     )
     args = p.parse_args()
+    if args.preset == "1080m":
+        args.bs = 12
+        args.seq = 1024
+        args.layers = 8
+        args.experts = 256
+        args.topk = 8
+        args.moe_in = 384
+        args.shared = 2
+        args.mtp = 1
+        args.compile = True
+        args.no_clip = True
+        args.accumulation_steps = 2
+    if args.accumulation_steps < 1:
+        p.error("--accumulation_steps 必须 >= 1")
+    if args.ab:
+        print("提示: 当前训练使用 gather_mm，旧 capacity-table --ab 已停用并忽略")
 
     cfg = build_config(args)
     model = VibyForCausalLM(cfg)
@@ -137,29 +203,6 @@ def main():
     apply_skew()
     mx.eval(model.parameters())
 
-    moe_mods = [m for m in model.modules() if hasattr(m, "_cap_peak")]
-
-    def force_id_grouping():
-        """把容量表改回按专家 id 成组（容量推导规则不变），作为 A/B 的对照臂"""
-        for mod in moe_mods:
-            E = mod.n_routed
-            EG = min(mod._SPARSE_GROUP, E)
-            AL = mod._SPARSE_ALIGN
-            ng = (E + EG - 1) // EG
-            for k in list(mod._cap_peak):
-                pk = mod._cap_peak[k]
-                mod._cap_order[k] = list(range(E))
-                mod._cap_perm[k] = list(range(E))
-                mod._cap_table[k] = [
-                    max(
-                        (int(max(pk[gi * EG : (gi + 1) * EG])) * 5 // 4 + 64 + AL - 1)
-                        // AL
-                        * AL,
-                        AL,
-                    )
-                    for gi in range(ng)
-                ]
-
     opt = create_mixed_optimizer(model, _Args(), "pretrain")
 
     B, T = args.bs, args.seq
@@ -179,10 +222,26 @@ def main():
             mask_has_pad=False,
             segment_ids=seg,
         )
-        stats = model.moe_load_stats()
+        stats = model.qb_margin_stats()
         return res.loss, stats
 
     vg = mx.value_and_grad(loss_fn, argnums=0)
+    if args.compile:
+        # 与 base_trainer 同口径：compile 前必须预热融合 kernel，否则首次
+        # 校验的 host sync 落在 trace 内、被吞掉后整轮回退 eager
+        # （整步 fwd+bwd 807→1189ms、峰值内存 17.4→31.0GB）。
+        from mlx.utils import tree_flatten
+
+        from model.kernels import prewarm_all
+
+        prewarm_all(
+            model,
+            cfg,
+            tree_flatten(model.parameters())[0][1].dtype,
+            args.seq,
+            log=print,
+        )
+        vg = mx.compile(vg)
 
     X = mx.array(Xn)
     Y = mx.array(Yn)
@@ -195,111 +254,113 @@ def main():
             model.trainable_parameters()
         )
     )
+    main_kda, mtp_kda = kda_layer_counts(args.layers, args.mtp)
     print(
-        f"配置: bs{B}×seq{T} mtp={args.mtp} engram={args.engram} 可训练参数 {n_params / 1e6:.2f}M"
+        f"配置: bs{B}×seq{T} accum={args.accumulation_steps} mtp={args.mtp} "
+        f"可训练参数 {n_params / 1e6:.2f}M"
     )
+    print(f"KDA 层: 主干 {main_kda} + MTP {mtp_kda} = {main_kda + mtp_kda}")
 
-    acc = {"fwd": [], "bwd": [], "accum": [], "opt": [], "cap": [], "total": []}
-    ab = {False: [], True: []}  # 按 id 成组 / 按负载装槽 的整步耗时
-    ab_pad = {False: [0, 0], True: [0, 0]}
-    arm = True  # 本次迭代使用的分组方式（--ab 时逐次翻转）
-
+    acc = {"fwd": [], "bwd": [], "accum": [], "opt": [], "total": []}
     for it in range(args.warmup + args.iters):
         rec = it >= args.warmup
-        rows0 = sum(m._rows_seen for m in moe_mods)
-        pairs0 = sum(m._pairs_seen for m in moe_mods)
         t0 = time.perf_counter()
+        fwd_s = bwd_s = accum_s = opt_s = 0.0
+        accum_grads = None
+        window_stats = None
+        for microbatch in range(args.accumulation_steps):
+            params = model.trainable_parameters()
+            (loss, stats), grads = vg(params, X, Y, mask, seg)
+            if args.compile:
+                # compiled fn 内 model.update 只在 trace 时执行，恢复真实参数引用。
+                model.update(params)
 
-        params = model.trainable_parameters()
-        (loss, stats), grads = vg(params, X, Y, mask, seg)
-        mx.eval(loss, stats)
-        t1 = time.perf_counter()
-        mx.eval(grads)
-        t2 = time.perf_counter()
+            ts = time.perf_counter()
+            mx.eval(loss, stats)
+            fwd_s += time.perf_counter() - ts
+            ts = time.perf_counter()
+            mx.eval(grads)
+            bwd_s += time.perf_counter() - ts
 
-        accum = tree_map(mx.add, grads, grads)
-        mx.eval(accum)
-        t3 = time.perf_counter()
+            ts = time.perf_counter()
+            if args.accumulation_steps == 1:
+                # 历史基准用 grads+grads 单独测一次累加，保留可比性。
+                accum_grads = tree_map(mx.add, grads, grads)
+                mx.eval(accum_grads)
+            elif accum_grads is None:
+                accum_grads = grads
+            else:
+                accum_grads = tree_map(mx.add, accum_grads, grads)
+                mx.eval(accum_grads)
+            accum_s += time.perf_counter() - ts
+            if window_stats is None or window_stats.size == 0:
+                window_stats = stats
+            elif stats is not None and stats.size > 0:
+                window_stats = mx.concatenate([window_stats, stats], axis=1)
 
-        ov = 0
-        for m in model.modules():
-            f = getattr(m, "update_capacity_table", None)
-            if f is not None:
-                ov += f()
-        if args.ab:
-            arm = not arm  # 下一次迭代换另一条臂
-            if not arm:
-                force_id_grouping()
-        t4 = time.perf_counter()
+            if optimizer_due(microbatch, args.accumulation_steps):
+                import mlx.optimizers as optim
 
-        import mlx.optimizers as optim
-
-        g2, gn = optim.clip_grad_norm(accum, 1.0)
-        opt.update(model, g2)
-        model.update_moe_biases(stats, 0.02)
-        apply_skew()  # 维持目标倾斜，抵消 bias 均衡更新
-        mx.eval(model.parameters(), opt.state)
+                ts = time.perf_counter()
+                g2 = accum_grads
+                if not args.no_clip:
+                    g2, _gn = optim.clip_grad_norm(accum_grads, 1.0)
+                opt.update(model, g2)
+                if window_stats is not None and window_stats.size > 0:
+                    model.update_moe_biases(window_stats)
+                apply_skew()
+                mx.eval(model.parameters(), opt.state)
+                opt_s += time.perf_counter() - ts
         t5 = time.perf_counter()
 
-        if rec and args.ab:
-            # 本次迭代跑的是切换「之前」的那条臂
-            used = not arm if args.ab else True
-            ab[used].append(t5 - t0)
-            ab_pad[used][0] += sum(m._rows_seen for m in moe_mods) - rows0
-            ab_pad[used][1] += sum(m._pairs_seen for m in moe_mods) - pairs0
         if rec:
-            acc["fwd"].append(t1 - t0)
-            acc["bwd"].append(t2 - t1)
-            acc["accum"].append(t3 - t2)
-            acc["cap"].append(t4 - t3)
-            acc["opt"].append(t5 - t4)
+            acc["fwd"].append(fwd_s)
+            acc["bwd"].append(bwd_s)
+            acc["accum"].append(accum_s)
+            acc["opt"].append(opt_s)
             acc["total"].append(t5 - t0)
+        per_mb = (t5 - t0) / args.accumulation_steps
         print(
-            f"  iter {it:>2}{'(warm)' if not rec else '      '} "
-            f"total {(t5 - t0) * 1e3:7.1f}ms  fwd {(t1 - t0) * 1e3:6.1f}  "
-            f"bwd {(t2 - t1) * 1e3:6.1f}  opt {(t5 - t4) * 1e3:5.1f}"
+            f"  window {it:>2}{'(warm)' if not rec else '      '} "
+            f"total {(t5 - t0) * 1e3:7.1f}ms  /micro {per_mb * 1e3:6.1f}  "
+            f"fwd {fwd_s * 1e3:6.1f}  bwd {bwd_s * 1e3:6.1f}  "
+            f"opt {opt_s * 1e3:5.1f}"
         )
 
     def stat(key):
-        v = sorted(acc[key])
-        n = len(v)
-        return v[n // 2], v[0]
+        return summarize_samples(acc[key])
 
-    tot_avg = stat("total")[0]
-    print(f"\n{'段':<12}{'中位(ms)':>10}{'min(ms)':>10}{'占比':>8}")
+    tot_med, tot_min, tot_mean = stat("total")
+    print(f"\n{'段':<12}{'中位(ms)':>10}{'min(ms)':>10}{'周期均值':>10}{'均值占比':>9}")
     for key, label in [
         ("fwd", "前向"),
         ("bwd", "反向"),
         ("accum", "梯度累加"),
-        ("cap", "容量表"),
         ("opt", "optimizer"),
     ]:
-        a, m = stat(key)
-        print(f"{label:<12}{a * 1e3:>10.1f}{m * 1e3:>10.1f}{a / tot_avg * 100:>7.1f}%")
-    a, m = stat("total")
-    print(f"{'整步':<12}{a * 1e3:>10.1f}{m * 1e3:>10.1f}{100.0:>7.1f}%")
-    print(f"吞吐: {B * T / a:.0f} tokens/s（中位口径） / {B * T / m:.0f}（min）")
-    print(f"峰值内存: {mx.get_peak_memory() / 2**30:.2f} GB")
-    rows = pairs = 0
-    for mod in model.modules():
-        if getattr(mod, "_calls_seen", 0):
-            rows += mod._rows_seen
-            pairs += mod._pairs_seen
-    if pairs:
-        print(f"MoE 桶 padding: {rows / pairs:.2f}x（桶行数 / 真实 pair 数）")
-    if args.ab and ab[True] and ab[False]:
-        import statistics
-
-        a = statistics.median(ab[False])
-        b = statistics.median(ab[True])
-        pa = ab_pad[False][0] / max(ab_pad[False][1], 1)
-        pb = ab_pad[True][0] / max(ab_pad[True][1], 1)
+        med_v, min_v, mean_v = stat(key)
         print(
-            f"\n同进程交替 A/B（各 {len(ab[False])}/{len(ab[True])} 次，中位）:\n"
-            f"  桶按专家 id 成组   {a * 1e3:7.1f}ms  padding {pa:.2f}x\n"
-            f"  桶按负载排序装槽   {b * 1e3:7.1f}ms  padding {pb:.2f}x\n"
-            f"  整步提速           {a / b:.2f}x"
+            f"{label:<12}{med_v * 1e3:>10.1f}{min_v * 1e3:>10.1f}"
+            f"{mean_v * 1e3:>10.1f}{mean_v / tot_mean * 100:>8.1f}%"
         )
+    print(
+        f"{'累积窗口':<12}{tot_med * 1e3:>10.1f}{tot_min * 1e3:>10.1f}"
+        f"{tot_mean * 1e3:>10.1f}{100.0:>8.1f}%"
+    )
+    med = benchmark_accounting(B, T, args.accumulation_steps, tot_med)
+    cycle = benchmark_accounting(B, T, args.accumulation_steps, tot_mean)
+    best = benchmark_accounting(B, T, args.accumulation_steps, tot_min)
+    print(
+        f"归一化单微批: {med['seconds_per_microbatch'] * 1e3:.1f}ms（中位） / "
+        f"{cycle['seconds_per_microbatch'] * 1e3:.1f}ms（周期均值） / "
+        f"{best['seconds_per_microbatch'] * 1e3:.1f}ms（min）"
+    )
+    print(
+        f"吞吐: {med['tokens_per_second']:.0f} tokens/s（中位口径） / "
+        f"{cycle['tokens_per_second']:.0f}（周期均值） / "
+        f"{best['tokens_per_second']:.0f}（min）"
+    )
+    print(f"峰值内存: {mx.get_peak_memory() / 2**30:.2f} GB")
 
 
 if __name__ == "__main__":

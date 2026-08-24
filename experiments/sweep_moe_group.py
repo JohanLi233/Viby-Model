@@ -16,9 +16,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import mlx.core as mx
 from mlx.utils import tree_map
 
-from model.model import MoEFeedForward, VibyConfig
+from model.config import VibyConfig
+from model.moe import MoEFeedForward
 
-B, T, D, E, I, K = 6, 2048, 768, 112, 104, 6
+
+def _env(name, default):
+    return int(os.environ.get(name, default))
+
+
+B = _env("VIBY_BENCH_B", 6)
+T = _env("VIBY_BENCH_T", 2048)
+D = _env("VIBY_BENCH_D", 768)
+E = _env("VIBY_BENCH_E", 112)
+I = _env("VIBY_BENCH_I", 104)  # noqa: E741
+K = _env("VIBY_BENCH_K", 6)
 G = B * T * K
 
 
@@ -33,26 +44,22 @@ def timed(fn, it=6, w=2):
     return min(ts)
 
 
-def run(eg, fwd_mode, iters):
+def run(eg, fwd_mode, iters, align=None):
     MoEFeedForward._SPARSE_GROUP = eg
     MoEFeedForward._MLX_FORWARD = fwd_mode
     MoEFeedForward._FUSED_DISABLED = False
+    if align is not None:
+        MoEFeedForward._SPARSE_ALIGN = align
     cfg = VibyConfig(
         hidden_size=D,
         num_hidden_layers=1,
         num_attention_heads=8,
-        kv_lora_rank=192,
-        qk_rope_head_dim=32,
         vocab_size=6400,
         max_position_embeddings=T,
         n_routed_experts=E,
         num_experts_per_tok=K,
         n_shared_experts=1,
         moe_intermediate_size=I,
-        hrm_H_cycles=2,
-        hrm_L_cycles=3,
-        hrm_cycle_router=1,
-        hrm_cycle_router_rank=8,
     )
     mx.random.seed(0)
     moe = MoEFeedForward(cfg)
@@ -71,7 +78,7 @@ def run(eg, fwd_mode, iters):
 
     def loss(x_, p):
         moe.update(p)
-        return (moe(x_, step_idx=0).astype(mx.float32) * C).sum()
+        return (moe(x_).astype(mx.float32) * C).sum()
 
     p = moe.trainable_parameters()
     for _ in range(4):
@@ -86,20 +93,29 @@ def run(eg, fwd_mode, iters):
 
 def main():
     iters = int(sys.argv[1]) if len(sys.argv) > 1 else 6
-    print(f"形状 bs{B}×{T} E={E} I={I} K={K}，真实 pair={G}")
+    egs = [int(v) for v in os.environ.get("VIBY_SWEEP_EG", "").split(",") if v]
+    als = [int(v) for v in os.environ.get("VIBY_SWEEP_AL", "128").split(",") if v]
+    if not egs:
+        egs = [e for e in (4, 8, 16, 32, 64, 144, E) if e <= E]
+    print(f"形状 bs{B}×{T} D={D} E={E} I={I} K={K}，真实 pair={G}")
     print(
-        f"{'EG':>5}{'前向路径':>10}{'桶行数':>10}{'pad':>7}{'fwd':>9}{'fwd+bwd':>10}{'bwd':>9}"
+        f"{'EG':>5}{'AL':>5}{'前向路径':>10}{'桶行数':>10}{'pad':>7}"
+        f"{'fwd':>9}{'fwd+bwd':>10}{'bwd':>9}"
     )
-    for eg in (4, 8, 14, 16, 28, 56, 112):
-        for mode, label in (("0", "kernel"), ("1", "mlxgemm")):
-            try:
-                f, fb, rows = run(eg, mode, iters)
-                print(
-                    f"{eg:>5}{label:>10}{rows:>10}{rows / G:>7.2f}"
-                    f"{f * 1e3:>9.1f}{fb * 1e3:>10.1f}{(fb - f) * 1e3:>9.1f}"
-                )
-            except Exception as exc:
-                print(f"{eg:>5}{label:>10}  ERR {type(exc).__name__}: {str(exc)[:50]}")
+    for al in als:
+        for eg in egs:
+            for mode, label in (("0", "kernel"), ("1", "mlxgemm")):
+                try:
+                    f, fb, rows = run(eg, mode, iters, align=al)
+                    print(
+                        f"{eg:>5}{al:>5}{label:>10}{rows:>10}{rows / G:>7.2f}"
+                        f"{f * 1e3:>9.1f}{fb * 1e3:>10.1f}{(fb - f) * 1e3:>9.1f}"
+                    )
+                except Exception as exc:
+                    print(
+                        f"{eg:>5}{al:>5}{label:>10}  ERR "
+                        f"{type(exc).__name__}: {str(exc)[:50]}"
+                    )
 
 
 if __name__ == "__main__":

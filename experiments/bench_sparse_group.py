@@ -18,7 +18,9 @@ from mlx.utils import tree_flatten
 from transformers import AutoTokenizer
 
 from dataset.lm_dataset import PretrainDataset
-from model.model import VibyConfig, VibyForCausalLM, MoEFeedForward
+from model.config import VibyConfig
+from model.model import VibyForCausalLM
+from model.moe import MoEFeedForward
 from trainer.base_trainer import MLXDataLoader
 
 CKPT_DIR = "research_runs/r073_hrm_moe_cycledelta_bad1"

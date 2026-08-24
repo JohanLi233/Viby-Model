@@ -175,9 +175,7 @@ class PackPretrainTests(unittest.TestCase):
         )
         self.assertIsNone(segs)
         self.assertTrue(os.path.exists(packed_path))
-        self.assertFalse(
-            os.path.exists(os.path.join(self.td, "packedsegs_t.npy"))
-        )
+        self.assertFalse(os.path.exists(os.path.join(self.td, "packedsegs_t.npy")))
         self.assertEqual(packed.shape[1], 9)
 
 

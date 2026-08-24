@@ -9,7 +9,8 @@ import warnings
 import mlx.core as mx
 import numpy as np
 from transformers import AutoTokenizer
-from model.model import VibyConfig, VibyForCausalLM
+from model.config import VibyConfig
+from model.model import VibyForCausalLM
 from trainer.utils import load_model_weights
 
 warnings.filterwarnings("ignore")
@@ -131,56 +132,16 @@ def init_model(args):
             f"(epoch={meta.get('epoch')}, step={meta.get('step')})"
         )
     else:
-        # Fallback: build config from args (including YaRN handling)
-        rope_scaling = None
-        original_max_seq_len = args.max_seq_len  # 保存原始值
-
-        if hasattr(args, "enable_yarn") and args.enable_yarn:
-            # 自动将 max_seq_len 乘以 scaling factor
-            args.max_seq_len = int(args.max_seq_len * args.yarn_scaling_factor)
-
-            rope_scaling = {
-                "type": "yarn",
-                "factor": args.yarn_scaling_factor,
-                "original_max_position_embeddings": original_max_seq_len,
-                "beta_fast": getattr(args, "yarn_beta_fast", 32.0),
-                "beta_slow": getattr(args, "yarn_beta_slow", 1.0),
-                "attention_factor": getattr(args, "yarn_attention_factor", 1.0),
-            }
-            print(
-                f"[YaRN] 启用上下文扩展: {original_max_seq_len} → {args.max_seq_len} (scaling factor: {args.yarn_scaling_factor})"
-            )
-
+        # Fallback: build config from args
         config = VibyConfig(
             hidden_size=args.hidden_size,
             num_hidden_layers=args.num_hidden_layers,
             num_attention_heads=getattr(args, "num_attention_heads", 8),
-            kv_lora_rank=getattr(args, "kv_lora_rank", 192),
-            qk_rope_head_dim=getattr(args, "qk_rope_head_dim", 32),
             vocab_size=getattr(args, "vocab_size", 6400),
             max_position_embeddings=args.max_seq_len,
-            original_max_position_embeddings=(
-                original_max_seq_len
-                if hasattr(args, "enable_yarn") and args.enable_yarn
-                else getattr(args, "original_max_seq_len", 1024)
-            ),
-            rope_scaling=rope_scaling,
-            use_value_res=getattr(args, "use_value_res", False),
             use_attn_gate=getattr(args, "use_attn_gate", False),
             mtp_depth=getattr(args, "mtp_depth", 0),
             mtp_loss_weight=getattr(args, "mtp_loss_weight", 0.3),
-            engram_layers=(
-                tuple(int(x) for x in args.engram_layers.split(","))
-                if args.engram_layers
-                else ()
-            ),
-            engram_orders=(
-                tuple(int(x) for x in args.engram_orders.split(","))
-                if args.engram_orders
-                else ()
-            ),
-            engram_slots=getattr(args, "engram_slots", 8192),
-            engram_sub_dim=getattr(args, "engram_sub_dim", 128),
             **(
                 {"head_dim": args.head_dim}
                 if getattr(args, "head_dim", None) is not None
@@ -250,15 +211,16 @@ def main():
     parser.add_argument("--hidden_size", default=768, type=int)
     parser.add_argument("--num_hidden_layers", default=8, type=int)
     parser.add_argument("--num_attention_heads", default=8, type=int)
-    parser.add_argument("--kv_lora_rank", default=192, type=int)
-    parser.add_argument("--qk_rope_head_dim", default=32, type=int)
     parser.add_argument("--head_dim", type=int, default=None)
     parser.add_argument("--vocab_size", default=6400, type=int)
     parser.add_argument("--max_seq_len", default=1024, type=int)
     parser.add_argument("--mtp_depth", type=int, default=1)
     parser.add_argument("--mtp_loss_weight", type=float, default=0.3)
-    parser.add_argument("--use_value_res", action="store_true", default=False)
-    parser.add_argument("--use_attn_gate", action="store_true", default=False)
+    parser.add_argument(
+        "--use_attn_gate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument(
         "--history_cnt",
         default=0,
@@ -277,43 +239,12 @@ def main():
         help="MTP 投机解码每轮草稿的 token 数（默认 3，对齐 DeepSeek V4 等主流配置；"
         "需配合 --use_mtp_speculative，模型只有 1 个 MTP 模块时会循环复用）",
     )
-    # fallback 配置（无 sidecar 时）需要的 engram 参数
-    parser.add_argument("--engram_layers", default="", type=str)
-    parser.add_argument("--engram_orders", default="", type=str)
-    parser.add_argument("--engram_slots", default=8192, type=int)
-    parser.add_argument("--engram_sub_dim", default=128, type=int)
     parser.add_argument(
         "--model_mode",
         default=0,
         type=int,
         help="0: 预训练模型，1: SFT-Chat模型",
     )
-    # YaRN parameters
-    parser.add_argument(
-        "--enable_yarn", action="store_true", help="Enable YaRN scaling"
-    )
-    parser.add_argument(
-        "--yarn_scaling_factor", default=2.0, type=float, help="YaRN scaling factor"
-    )
-    parser.add_argument(
-        "--original_max_seq_len",
-        default=1024,
-        type=int,
-        help="Original context length before scaling",
-    )
-    parser.add_argument(
-        "--yarn_beta_fast", default=32.0, type=float, help="YaRN beta_fast parameter"
-    )
-    parser.add_argument(
-        "--yarn_beta_slow", default=1.0, type=float, help="YaRN beta_slow parameter"
-    )
-    parser.add_argument(
-        "--yarn_attention_factor",
-        default=1.0,
-        type=float,
-        help="YaRN attention factor（mscale）",
-    )
-
     args = parser.parse_args()
 
     # Basic input validation
@@ -341,17 +272,6 @@ def main():
     print(f"[device] 默认计算设备: {mx.default_device()}")
 
     model, tokenizer = init_model(args)
-
-    if model.model.engrams:
-        eng = model.model.engrams[0]
-        print(
-            f"[engram] layers={model.config.engram_layers} "
-            f"orders={model.config.engram_orders} slots={eng.slots} "
-            f"sub_dim={eng.sub_dim}; 缓存解码注入=开（prefill 全位置 + "
-            f"decode/投机验证 n-gram 窗口）"
-        )
-    else:
-        print("[engram] 模型无 engram 模块")
 
     prompts = get_prompt_datas(args)
     test_mode = int(input("[0] 自动测试\n[1] 手动输入\n"))

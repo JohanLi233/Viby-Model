@@ -1,0 +1,431 @@
+import math
+from typing import Optional
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from .acts import situ_glu, situ_glu_gu
+from .config import VibyConfig
+from .kernels.moe_decode import _MOE_METAL_TYPE, _build_moe_decode_kernels
+from .kernels.swiglu_decode import silu_mul_down_decode
+from .norms import RMSNorm, _rms_unit
+
+__all__ = ["FeedForward", "MoEGate", "MoEFeedForward", "situ_glu", "_col_quantile"]
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        config: VibyConfig,
+        intermediate_size: Optional[int] = None,
+    ):
+        super().__init__()
+        intermediate_size = intermediate_size or config.intermediate_size
+        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # gate/up 输入相同，合并为单个 (2I, D) GEMM 再 split：放大 GEMM 形状、
+        # 减少 kernel 发射，数学与逐 Linear 严格等价（参数仍分别存储，
+        # checkpoint/优化器路径不变）。eval 下按身份缓存拼接结果。
+        srcs = (self.gate_proj.weight, self.up_proj.weight)
+        gu_w = None
+        if not self.training:
+            c = self.__dict__.get("_gu_w_cache")
+            if c is not None and c[1] is srcs[0] and c[2] is srcs[1]:
+                gu_w = c[0]
+        if gu_w is None:
+            gu_w = mx.concatenate(srcs, axis=0)
+            if not self.training:
+                object.__setattr__(self, "_gu_w_cache", (gu_w, srcs[0], srcs[1]))
+        gu = x @ gu_w.T
+        # 推理小批量：silu·mul + down 投影融合 kernel（无梯度）
+        if not self.training:
+            M = x.size // x.shape[-1]
+            if M <= 512:
+                r = silu_mul_down_decode(
+                    gu.reshape(M, gu.shape[-1]), self.down_proj.weight
+                )
+                if r is not None:
+                    return r.reshape(x.shape)
+        return self.down_proj(situ_glu_gu(gu))
+
+
+def _col_quantile(x: mx.array, q: float) -> mx.array:
+    """x (N, E) 沿 axis 0 的 q 分位数（线性插值，同 numpy 默认）→ (E,)。
+
+    MLX 0.32 无 mx.quantile，用 sort + 双点插值；lo/hi 是 shape 派生的
+    python int，不触发数据 sync。"""
+    s = mx.sort(x, axis=0)
+    n = s.shape[0]
+    pos = q * (n - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return s[lo] * (1.0 - frac) + s[hi] * frac
+
+
+class MoEGate(nn.Module):
+    """QB（Quantile Balancing）路由的 MoE router：sigmoid 打分 + 分位数
+    快照偏置。
+
+    选择分 = sigmoid(x·W) + expert_bias；对选择分取 top-(K+1)，第 K+1 个
+    即 per-token 阈值 alpha，前 K 个入选。合并权重取原始 sigmoid 分
+    （不含 bias）在命中集上归一化并乘 routed_scaling_factor。
+    expert_bias 是 frozen 非梯度 buffer：训练期 forward 记录全部专家的
+    margin = 选择分 − alpha，训练循环每优化器步取各专家 margin 的
+    (1−K/E) 上分位数 beta，以 −beta（零均值化、stop-gradient）覆写
+    bias（见 VibyForCausalLM.update_moe_biases）。
+
+    collect_stats（python 属性，compile 期常量）开启时，训练 forward
+    额外记录每专家 token 计数到 self.last_load、margin 样本到
+    self.last_margins（均为图节点，随 loss 一同输出）；eval/生成侧
+    保持关闭，零开销。
+    """
+
+    def __init__(self, config: VibyConfig):
+        super().__init__()
+        self.n_routed = int(config.n_routed_experts)
+        self.top_k = int(config.num_experts_per_tok)
+        self.norm_topk_prob = bool(config.norm_topk_prob)
+        self.scaling = float(config.routed_scaling_factor)
+        self.norm_logits = bool(getattr(config, "moe_router_logit_norm", False))
+        self.logit_temp = float(getattr(config, "moe_router_logit_temp", 1.0) or 1.0)
+        self.div_weight = float(
+            getattr(config, "moe_diversity_loss_weight", 0.0) or 0.0
+        )
+        std = config.hidden_size**-0.5
+        self.weight = mx.random.uniform(-std, std, (self.n_routed, config.hidden_size))
+        # 负载均衡偏置（frozen 非梯度 buffer，由训练循环按 QB 分位数快照覆写）。
+        self.expert_bias = mx.zeros((self.n_routed,), dtype=mx.float32)
+        self.freeze(recurse=False, keys=["expert_bias"])
+        # QB：扩展选择宽度 K+1（第 K+1 个选择分即 per-token 阈值 alpha）。
+        # K == E 时退化为 E（阈值 = 全体最小选择分）。
+        self._k1 = min(self.top_k + 1, self.n_routed)
+        self.collect_stats = False
+        self.last_load = None
+        self.last_margins = None
+        self.last_div = None
+        self.div_calls = 0
+
+    def __call__(
+        self,
+        x: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        # 路由分数在 bf16 下计算（bf16 模型下保证 top-k 选择稳定）
+        logits = (x @ self.weight.T).astype(mx.float32)
+        if self.norm_logits:
+            # 逐 token 标准化 logits：均值为 0、std 为 logit_temp。
+            # 让 sigmoid 始终工作在敏感区，bias 不被饱和区吞掉。
+            # 融合 RMSNorm kernel 做 centered/rsqrt，数学同原式。
+            mean = mx.mean(logits, axis=-1, keepdims=True)
+            centered = logits - mean
+            logits = _rms_unit(centered, 1e-6) * self.logit_temp
+        scores = mx.sigmoid(logits)
+        sel = scores + self.expert_bias.astype(mx.float32)
+        idx_ext = mx.argpartition(-sel, self._k1 - 1, axis=-1)[..., : self._k1]
+        # 路由选择是离散操作、不可微；不断开的话 idx 会经 argpartition 链回
+        # router 权重，使 autodiff 向使用 idx 的 gather/scatter 算子请求
+        # indices 的 VJP（不支持）
+        idx_ext = mx.stop_gradient(idx_ext)
+        idx = idx_ext[..., : self.top_k]
+        # per-token 阈值 alpha = 第 K+1 个选择分（扩展集中最小的那个；
+        # argpartition 不保证有序，但第 _k1 个位置的元素即第 _k1 大）。
+        alpha = mx.take_along_axis(sel, idx_ext[..., self._k1 - 1 : self._k1], axis=-1)
+        # 合并权重来自 unbiased sigmoid 分（选择用 biased 分）。
+        w = mx.take_along_axis(scores, idx, axis=-1)
+        if self.norm_topk_prob and self.top_k > 1:
+            w = w / mx.maximum(w.sum(axis=-1, keepdims=True), mx.array(1e-9))
+        w = w * self.scaling
+        if self.collect_stats and self.training:
+            # QB 统计原料：全部 E 个专家的 margin = 选择分 − alpha，
+            # (M, E) 图节点，跨调用沿 token 轴拼接（本 forward 内多次
+            # 调用时），跨微批由训练循环拼接。
+            margins = (sel - alpha).reshape(-1, self.n_routed)
+            if self.last_margins is None:
+                object.__setattr__(self, "last_margins", margins)
+            else:
+                object.__setattr__(
+                    self,
+                    "last_margins",
+                    mx.concatenate([self.last_margins, margins], axis=0),
+                )
+        if self.collect_stats:
+            counts = (
+                mx.zeros((self.n_routed,), dtype=mx.float32)
+                .at[idx.reshape(-1)]
+                .add(1.0)
+            )
+            if self.last_load is not None:
+                counts = counts + self.last_load
+            object.__setattr__(self, "last_load", counts)
+        if self.training and self.div_weight > 0.0:
+            # router 输入 token 多样性正则：直接惩罚“所有位置收敛到同一
+            # 方向”。loss = mean_b log1p(common² / residual²)，健康时接近 0，
+            # res/common≈0.01 时约 9.2。
+            xf = x.astype(mx.float32)
+            mu = mx.mean(xf, axis=1, keepdims=True)
+            centered = xf - mu
+            common2 = mx.mean(mx.square(mu), axis=-1).reshape(-1)
+            residual2 = mx.mean(mx.square(centered), axis=(1, 2))
+            div = mx.mean(mx.log1p(common2 / mx.maximum(residual2, mx.array(1e-6))))
+            if self.last_div is None:
+                object.__setattr__(self, "last_div", div)
+            else:
+                object.__setattr__(self, "last_div", self.last_div + div)
+            self.div_calls += 1
+        return idx.astype(mx.int32), w.astype(x.dtype)
+
+
+class _StackedExperts(nn.Module):
+    """堆叠路由专家权重：(E, out, in) 张量，前向用广播 matmul 批量计算。
+
+    gate/up 投影合并存为单张量 gate_up_w (E, 2*I, D)：前向一次 GEMM 出
+    (E, C, 2I) 再 split，比两次独立 GEMM 的 kernel 数少、单 GEMM 更大
+    （GPU 利用率高），数学严格等价（同分布独立初始化）。
+
+    独立模块以便优化器按路径名（"*.experts.*"）把 3D 专家权重分进
+    AdamW 组——Muon 对 ndim>2 参数会 reshape 成 (E, out*in) 整体正交化，
+    跨专家耦合尺度，不是逐专家语义。
+    """
+
+    def __init__(self, n_routed: int, moe_in: int, dim: int):
+        super().__init__()
+        std_in = dim**-0.5
+        std_moe = moe_in**-0.5
+        self.gate_up_w = mx.random.uniform(-std_in, std_in, (n_routed, 2 * moe_in, dim))
+        self.down_w = mx.random.uniform(-std_moe, std_moe, (n_routed, dim, moe_in))
+
+
+class MoEFeedForward(nn.Module):
+    """DeepSeekMoE FFN：共享专家（每 token 必走）+ top-k 路由专家。
+
+    三路径实现（按 (token,choice) 对数 G = B*T*K 静态选择）：
+    - G <= _KERNEL_MAX_PAIRS（decode / 极小批量）：融合 Metal kernel 路径——
+      3 个手写 kernel 完成 router（打分+top-k）、SiTU-GLU 前半、加权合并，
+      只读 top-k 命中专家权重，kernel 数与权重读取量都远小于稠密路径
+      （见上方注释）。不可微，仅推理前向：model.train() 或
+      router.collect_stats 开启（训练负载统计）时不走本路径。
+      JIT 编译失败自动永久回退。
+    - G <= _DENSE_MAX_PAIRS（小 prefill）：稠密批量路径——堆叠
+      权重广播 matmul 一次算完全部专家，按路由权重（非命中为 0）加权
+      合并。无 host sync、可微、可与 mx.compile 共存。
+    - G 更大（训练 / 大 prefill）：sorted gather_mm 路径——按专家 argsort
+      后用 mx.gather_mm(sorted_indices=True) 做免 padding 的分组 GEMM，
+      每个 (token,choice) 对只算真实行（无桶容量、无 padding 白算、
+      无 host sync、形状只随 (B,T,E,K) 变 ⇒ 可被 mx.compile）。
+      实测（M=12288/K=8/E=256/DE=384/I=320，mlx 0.32）fwd 8.8ms、
+      fwd+bwd 25.5ms，负载倾斜下耗时不变；反向峰值内存有界（~0.5GB/层）。
+    """
+
+    _DENSE_MAX_PAIRS = 4096  # G 小于该值走稠密批量路径
+    _KERNEL_MAX_PAIRS = 512  # G 小于该值走融合 kernel 路径（decode/极小批量）
+    _KERNEL_VERIFIED: set = set()  # 编译验证通过的 (D,I,K,dtype)
+    _KERNEL_DISABLED = False  # 任一 shape 编译失败则整体禁用 kernel 路径
+
+    def __init__(self, config: VibyConfig):
+        super().__init__()
+        self.n_routed = int(config.n_routed_experts)
+        self.top_k = int(config.num_experts_per_tok)
+        moe_in = int(config.moe_intermediate_size or config.intermediate_size)
+        self.moe_in = moe_in
+        self.router = MoEGate(config)
+        # Latent MoE（moe_latent_dim>0）：路由专家的输入/输出维从 hidden
+        # 压缩到 d，lat_down/lat_up 两个共享投影包住专家计算；lat_down 后
+        # 接 learnable-gain RMSNorm（latent_norm）再 dispatch。router 与
+        # 共享专家仍在全维 hidden 上。gather_mm / kernel 形状参数化，
+        # 传 d 维输入即可复用，dispatch 流量同步减半。
+        self.latent_dim = int(getattr(config, "moe_latent_dim", 0) or 0)
+        expert_dim = self.latent_dim if self.latent_dim > 0 else config.hidden_size
+        self.experts = _StackedExperts(self.n_routed, moe_in, expert_dim)
+        if self.latent_dim > 0:
+            D, d = config.hidden_size, self.latent_dim
+            self.lat_down = nn.Linear(D, d, bias=False)
+            self.lat_up = nn.Linear(d, D, bias=False)
+            # 与 _StackedExperts 同口径的均匀初始化（默认 Linear 初始化
+            # 含 glorot 因子，方差口径不同）
+            self.lat_down.weight = mx.random.uniform(-(D**-0.5), D**-0.5, (d, D))
+            self.lat_up.weight = mx.random.uniform(-(d**-0.5), d**-0.5, (D, d))
+            # latent RMSNorm（learnable gain，1-D 自动落 AdamW 标量组）
+            self.latent_norm = RMSNorm(d, eps=config.rms_norm_eps)
+        else:
+            self.lat_down = None
+            self.lat_up = None
+            self.latent_norm = None
+        n_shared = int(config.n_shared_experts)
+        # N_s 个独立共享专家，各宽 moe_in，输出相加。
+        self.shared = [
+            FeedForward(config, intermediate_size=moe_in) for _ in range(n_shared)
+        ]
+
+    def _dense_forward(self, x, idx, w):
+        """稠密批量路径：全专家广播 matmul + 路由权重加权合并。"""
+        B, T, D = x.shape
+        M = B * T
+        # 路由权重稠密化：S (M, E)，每行 top-k 个非零（top-k 内专家不重复）
+        S = (
+            mx.zeros((M, self.n_routed), dtype=x.dtype)
+            .at[mx.arange(M)[:, None], idx.reshape(M, self.top_k)]
+            .add(w.reshape(M, self.top_k).astype(x.dtype))
+        )
+        xf = x.reshape(M, D)
+        # 广播 matmul：(M,D) @ (E,D,2I) -> (E,M,2I)，末维即 [gate|up]
+        h = situ_glu_gu(xf @ self.experts.gate_up_w.swapaxes(-1, -2))
+        y = h @ self.experts.down_w.swapaxes(-1, -2)  # (E,M,D)
+        return (y * S.T[..., None].astype(y.dtype)).sum(axis=0).reshape(B, T, D)
+
+    def _sparse_forward(self, x, idx, w):
+        """sorted gather_mm 路径：按专家 argsort → 免 padding 分段 GEMM →
+        加权 scatter-add 回 token。
+
+        mx.gather_mm(sorted_indices=True) 在 rhs_indices 有序时走分段
+        GEMM（同专家行连续成段），只计算真实 (token,choice) 行——无桶
+        容量、无 padding 白算、无 host sync，形状只随 (B,T,E,K) 静态
+        确定 ⇒ 可进 mx.compile。反向经 autodiff（gather_mm 的 VJP 同为
+        分段 GEMM），峰值内存有界（实测 ~0.5GB/层 @G=98304）。
+        实测（M=12288/K=8/E=256/D=384/I=320，mlx 0.32）：fwd 8.8ms、
+        fwd+bwd 25.5ms，负载倾斜下耗时不变（旧桶路径倾斜下 padding
+        1.7~3× 且反向慢 3~4×）。
+        K 个专家输出按 token 用 f32 累加器合并（与旧桶路径口径一致）。
+        """
+        B, T, D = x.shape
+        K = self.top_k
+        M = B * T
+        G = M * K
+        flat = idx.reshape(G)  # (G,) pair g ↔ token g//K
+        order = mx.argsort(flat)  # 同专家的 pair 连续（sorted_indices 前提）
+        exps_s = flat[order].astype(mx.int32)
+        tok_s = (order // K).astype(mx.int32)  # 排序后各 pair 的源 token
+        w_s = w.reshape(G)[order].astype(x.dtype)
+        xf = x.reshape(M, D)
+        xs = xf[tok_s]  # (G, D) 按专家连续
+        gu_t = self.experts.gate_up_w.swapaxes(-1, -2)  # (E,D,2I)
+        dw_t = self.experts.down_w.swapaxes(-1, -2)  # (E,I,D)
+        if gu_t.dtype != x.dtype:
+            gu_t = gu_t.astype(x.dtype)
+            dw_t = dw_t.astype(x.dtype)
+        h = mx.gather_mm(
+            xs[:, None, :],
+            gu_t,
+            lhs_indices=None,
+            rhs_indices=exps_s,
+            sorted_indices=True,
+        )  # (G,1,2I)：逐 pair 的 gate/up 投影
+        act = situ_glu_gu(h)
+        y = mx.gather_mm(
+            act, dw_t, lhs_indices=None, rhs_indices=exps_s, sorted_indices=True
+        )[:, 0, :]  # (G, D)
+        yw = y * w_s[:, None]
+        out = mx.zeros((M, D), dtype=mx.float32).at[tok_s].add(yw.astype(mx.float32))
+        return out.astype(x.dtype).reshape(B, T, D)
+
+    def _kernel_forward(self, x):
+        """融合 Metal kernel 路径：3 个 kernel 完成 router 打分+top-k 选择、
+        SiTU-GLU 前半、加权合并（无梯度）。router kernel 输出 idx 按分数降序，
+        与 MoEGate 的 argpartition 无序输出在加权求和下数学等价。
+        Latent MoE 时 router 仍在全维 x 上打分，up/down kernel 在 latent
+        维（DE=latent_dim）上跑，前后各多一次共享投影小 GEMM。"""
+        B, T, D = x.shape
+        M = B * T
+        K, inter, E = self.top_k, self.moe_in, self.n_routed
+        lat = self.lat_up is not None
+        DE = self.latent_dim if lat else D
+        g = self.router
+        router, up, down = _build_moe_decode_kernels(
+            D,
+            inter,
+            K,
+            E,
+            x.dtype,
+            g.norm_topk_prob,
+            g.scaling,
+            logit_norm=g.norm_logits,
+            logit_temp=g.logit_temp,
+            latent_dim=self.latent_dim,
+        )
+        xf = x.reshape(M, D)
+        idx, w = router(
+            inputs=[xf, g.weight, g.expert_bias.astype(mx.float32)],
+            output_shapes=[(M, K), (M, K)],
+            output_dtypes=[mx.int32, x.dtype],
+            grid=(32, M, 1),
+            threadgroup=(32, 1, 1),
+        )
+        xf_e = self.latent_norm(self.lat_down(x)).reshape(M, DE) if lat else xf
+        h = up(
+            inputs=[xf_e, self.experts.gate_up_w, idx],
+            output_shapes=[(M * K * inter,)],
+            output_dtypes=[x.dtype],
+            grid=(32, K * inter, M),
+            threadgroup=(32, 1, 1),
+        )[0]
+        out = down(
+            inputs=[h, self.experts.down_w, w, idx],
+            output_shapes=[(M, DE)],
+            output_dtypes=[x.dtype],
+            grid=(32, DE, M),
+            threadgroup=(32, 1, 1),
+        )[0]
+        if lat:
+            out = self.lat_up(out)
+        return out.reshape(B, T, D)
+
+    def __call__(
+        self,
+        x: mx.array,
+    ) -> mx.array:
+        B, T, D = x.shape
+        G = B * T * self.top_k
+        lat = self.lat_up is not None
+        # 融合 kernel 仅推理路径：不可微（无 CustomKernel vjp），训练
+        # （model.train()）一律旁路；collect_stats（训练负载统计）同理。
+        if (
+            G <= self._KERNEL_MAX_PAIRS
+            and not self.training
+            and not self.router.collect_stats
+        ):
+            cls = type(self)
+            if cls._KERNEL_DISABLED or x.dtype not in _MOE_METAL_TYPE:
+                idx, w = self.router(x)
+                out = self._dense_forward(
+                    self.latent_norm(self.lat_down(x)) if lat else x, idx, w
+                )
+                if lat:
+                    out = self.lat_up(out)
+            else:
+                kk = (
+                    D,
+                    self.latent_dim,
+                    self.moe_in,
+                    self.top_k,
+                    self.n_routed,
+                    x.dtype,
+                    self.router.norm_logits,
+                    self.router.logit_temp,
+                )
+                try:
+                    out = self._kernel_forward(x)
+                    if kk not in cls._KERNEL_VERIFIED:
+                        mx.eval(out)  # 触发 JIT 编译，编译失败走 except 回退
+                        cls._KERNEL_VERIFIED.add(kk)
+                except Exception:
+                    cls._KERNEL_DISABLED = True
+                    idx, w = self.router(x)
+                    out = self._dense_forward(
+                        self.latent_norm(self.lat_down(x)) if lat else x, idx, w
+                    )
+                    if lat:
+                        out = self.lat_up(out)
+        else:
+            idx, w = self.router(x)  # (B,T,K) int32 / (B,T,K)
+            xe = self.latent_norm(self.lat_down(x)) if lat else x
+            if G <= self._DENSE_MAX_PAIRS:
+                out = self._dense_forward(xe, idx, w)
+            else:
+                out = self._sparse_forward(xe, idx, w)
+            if lat:
+                out = self.lat_up(out)
+        for ff in self.shared:
+            out = out + ff(x)
+        return out

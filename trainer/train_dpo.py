@@ -7,7 +7,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import warnings
 import mlx.core as mx
 import mlx.nn as nn
-from model.model import VibyConfig, VibyForCausalLM
+from model.config import VibyConfig
+from model.model import VibyForCausalLM
 from dataset.lm_dataset import DPODataset
 from .base_trainer import BaseTrainer
 from .config import get_dpo_parser, setup_training_args
@@ -16,6 +17,7 @@ from .utils import (
     build_config_from_sidecar,
     build_model_and_tokenizer,
     convert_model_dtype,
+    finish_training,
     init_swanlab,
     load_model_weights,
     log_training_progress,
@@ -137,16 +139,30 @@ class DPOTrainer(BaseTrainer):
     def _build_loss_and_grad(self):
         fn = mx.value_and_grad(self._dpo_loss_fn)
         use_compile = getattr(self.args, "compile_model", False)
-        if use_compile and getattr(self, "_moe_gates", []):
-            Logger(
-                "MoE 稀疏桶前向含数据依赖形状（host sync），mx.compile 不可用，"
-                "自动回退 eager；如要 compile 请关闭 MoE"
-            )
-            use_compile = False
-        self._compiled = bool(use_compile)
         if use_compile:
+            dropout = float(getattr(self.lm_config, "dropout", 0.0) or 0.0)
+            if dropout > 0.0:
+                Logger(f"dropout={dropout} 在 mx.compile 下 RNG 被冻结，自动回退 eager")
+                use_compile = False
+        if use_compile:
+            try:
+                from mlx.utils import tree_flatten
+
+                from model.kernels import prewarm_all
+
+                dtype = tree_flatten(self.model.parameters())[0][1].dtype
+                prewarm_all(
+                    self.model,
+                    self.lm_config,
+                    dtype,
+                    int(getattr(self.args, "max_seq_len", 0) or 0),
+                    log=Logger,
+                )
+            except Exception as e:
+                Logger(f"融合 kernel 预热跳过（{e}），运行时按需回退 eager")
             Logger("使用 mx.compile 编译 loss 函数")
             fn = mx.compile(fn)
+        self._compiled = bool(use_compile)
         return fn
 
     def train_epoch(
@@ -193,6 +209,7 @@ class DPOTrainer(BaseTrainer):
                 global_step,
                 total_training_steps,
                 self.args.warmup_iters,
+                min_lr_ratio=getattr(self.args, "min_lr_ratio", 0.05),
             )
 
             # 参考模型前向传播（不走 value_and_grad，不会计算梯度）
@@ -224,13 +241,6 @@ class DPOTrainer(BaseTrainer):
             # 临时量同时顶到峰值，拆开显存省 ~3×、单步更快（数值不变）。
             mx.eval(loss)
             mx.eval(grads)
-
-            # MoE 稀疏桶容量表滚动更新（与 BaseTrainer 同理：counts 已随
-            # eval 物化，此处 tolist 不钉图；稀疏前向无 host sync 的前提）
-            for _m in self.model.modules():
-                _f = getattr(_m, "update_capacity_table", None)
-                if _f is not None:
-                    _f()
 
             # 梯度累加
             accum_grads = (
@@ -273,15 +283,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args = setup_training_args(args, "dpo")
 
-    # 优先从 SFT checkpoint 的 sidecar config 继承模型结构（含 YaRN/
-    # rope_scaling），CLI 显式传入的参数优先；无 sidecar 时回退库默认值。
+    # 优先从 SFT checkpoint 的 sidecar config 继承模型结构，
+    # CLI 显式传入的参数优先；无 sidecar 时回退库默认值。
     checkpoint_name = (
         args.sft_checkpoint
         if getattr(args, "sft_checkpoint", None)
         else f"full_sft_{args.hidden_size}.safetensors"
     )
     cfg, has_sidecar = build_config_from_sidecar(args, checkpoint_name)
-    # DPO 上下文不低于 SFT 的实际上下文，保证继承 YaRN/rope 配置时行为一致
+    # DPO 上下文不低于 SFT 的实际上下文
     cfg["max_position_embeddings"] = max(
         args.max_seq_len, cfg.get("max_position_embeddings", 0)
     )
@@ -299,10 +309,12 @@ if __name__ == "__main__":
 
     swanlab = init_swanlab(args, trainer)
 
-    # 开始训练
-    trainer.train(train_loader, swanlab)
-    if swanlab is not None:
-        swanlab.finish()
+    try:
+        trainer.train(train_loader, swanlab)
+    except KeyboardInterrupt:
+        trainer.interrupted = True
+    finally:
+        finish_training(swanlab, interrupted=trainer.interrupted)
 
 # 执行命令示例:
 #

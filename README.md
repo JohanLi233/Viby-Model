@@ -2,89 +2,102 @@
 
 基于 Apple MLX 的单设备中文大语言模型训练与推理项目。
 
-架构为 decoder-only Transformer：HRM 双栈循环（L/H 两个 stack 交替迭代，
-唯一架构）+ MLA（Multi-head Latent Attention，
-DeepSeek V2/V3 风格）+ RoPE（解耦位置键）+ RMSNorm + SwiGLU + QK-norm，
-FFN 全部为 MoE（DeepSeekMoE，V3/V4 风格）；可选 value residual、
-注意力输出门（attn gate）、cycle 条件路由 / CycleFiLM、engram n-gram 记忆，
-以及 MTP（multi-token prediction，默认开启 depth=1，推理侧可用于投机解码加速）。
+架构为 decoder-only Transformer：顺序主干 + Kimi Linear 3:1 混合注意力
+（每 4 层与最后一层为 global：full-causal NoPE GQA，`n_kv_heads=h/4`；
+其余 local 为 KDA——逐通道门控 delta 规则线性注意力，衰减
+`g = −5·σ(e^{A_h} z)`，满秩输出门 `y = W_o[σ(W_g x) ⊙ RMSNorm(ō)]`；
+全模型无 RoPE / 滑窗；GQA 侧逐 head 无参 RMS qk-norm、XSA、默认开的
+注意力输出门 `2·σ`）+ GQA K-path ShortConv 与 KDA q/k/v 短卷积 +
+AttnRes（score 用 `w·RMSNorm(v_j)`，混合仍用原始 `v_j`）+ RMSNorm
+（GatedNorm 包裹，`2·sigmoid` 门）+ SiTU-GLU（`β1=4, β2=25`）。
+FFN 全部为 LatentMoE：路由专家在 `hidden/2` latent 空间计算；
+`n_shared_experts` 个独立共享专家各宽 `moe_intermediate_size`、输出相加；
+QB 分位数快照偏置做负载均衡。logit z-loss 为 `mean(lse²)`（默认 1e-4），
+融合进 CE kernel。MTP（Kimi-K3 / EAGLE-3，预训练默认 depth=1：与主干
+同构，输入为低/中/高三层 AttnRes 特征融合 + 下一 token 嵌入；后训练用
+`trainer/train_draft.py` 冻结主干做 EAGLE-3 TTT 草稿微调）。
+2D 矩阵按 `TruncNormal(0, (0.5/√hidden)²)`、|z|≤2 初始化。
+`lm_head` 默认与 embedding 解绑。
 
 ## 组件
 
 - `model/`：模型定义（VibyConfig / VibyForCausalLM）、tokenizer
 - `dataset/`：预训练 / SFT / DPO 数据集
-- `trainer/`：Muon + AdamW 混合优化器、训练循环、检查点管理
+- `trainer/`：MuonH/AdamH + AdamW 混合优化器（compute 自动缩放超参）、
+  训练循环、检查点管理
+- `model/kernels/`：手写融合 Metal kernel（flash 注意力反向、KDA
+  chunk/scan、conv、SiTU、CE、decode 路径）与训练前预热
+- `experiments/`：性能 probe / bench / sweep / verify / A-B 脚本
 - `eval_model.py`：交互式 / 自动评估脚本
-- `test_consistency.py`：架构正确性回归测试（因果性、prefill/分段/decode
-  一致性、padding 等价性、loss mask），`python test_consistency.py` 运行
+- `test_consistency.py`：架构正确性回归（因果性、prefill/decode、padding、
+  MoE）；`test_align.py`：Marin / K3 公式对齐；`test_kda.py`：KDA 数值
+- `research/MLX_PERF.md`：**MLX / Apple Silicon 性能优化手册**——硬件
+  roofline 基线、测量口径纪律、mx.compile 与 prewarm 的坑、算子选择
+  清单、手写 Metal kernel 范式、失败方案清单。做性能优化前先读它
 
 ## 架构开关
 
 ```bash
---kv_lora_rank 192     # MLA 的 KV 低秩潜在维度
---qk_rope_head_dim 32  # MLA 解耦 RoPE 键维度（跨 head 共享）
---use_value_res        # value residual：第一层 V 作为跨层值残差混入后续层
---use_attn_gate        # 注意力输出门（逐 head 输入条件 sigmoid 门，零初始化）
---mtp_depth 1          # MTP 模块深度（默认 1，0 关闭）
+--use_attn_gate / --no-use_attn_gate   # 默认开：2·σ，零初始化门=1，进 Adam
+--mtp_depth 1          # MTP 深度（K3/EAGLE-3，默认 1，0 关闭）
 --mtp_loss_weight 0.3
+# EAGLE-3 草稿微调（冻结主干，只训练 MTP 层，TTT rollout）：
+# python trainer/train_draft.py --draft_ttt_steps 4 --data_path ...
+--z_loss_weight 1e-4   # logit z-loss：loss += w · mean(lse²)，0 关闭
+--tie_word_embeddings  # 绑定输入/输出 embedding（默认 False：独立 lm_head）
 --pack_sequences       # 预训练序列打包（消除 padding 浪费）
 --doc_mask             # 打包时屏蔽跨文档注意力与边界 loss（需配合 --pack_sequences）
-# HRM（唯一架构，必选）：
---hrm_H_cycles 2       # 高层（H 栈）循环次数，必须 >0
---hrm_L_cycles 2       # 每个 H cycle 内低层（L 栈）循环次数，必须 >0
---hrm_cycle_router 1   # cycle 条件化 MoE 路由（可选，0 关闭）
---hrm_cycle_film 1     # cycle 对隐状态做 FiLM 调制（可选，0 关闭）
-# DeepSeekMoE（V3/V4 风格，所有层 FFN 均为 MoE）：
+# MoE（LatentMoE + QB 路由，所有层 FFN 均为 MoE）：
 --n_routed_experts 32      # 路由专家数（必须 >0）
---num_experts_per_tok 6    # 每 token 激活专家数（V4 为 6）
---n_shared_experts 1       # 共享专家数（中间维 = moe_intermediate_size × 该值）
---moe_intermediate_size 104  # 单个路由专家中间维（默认取 intermediate_size）
+--num_experts_per_tok 6    # 每 token 激活专家数
+--n_shared_experts 2       # 独立共享专家数（每个中间维 = moe_intermediate_size）
+--moe_intermediate_size 384  # 单个路由/共享专家中间维
 --routed_scaling_factor 2.5  # sigmoid 归一化后的路由权重缩放
---moe_bias_update_rate 0.001 # 无辅助损失负载均衡的偏置更新步长（<=0 关闭）
+--moe_latent_dim           # 路由专家 latent 维度（默认 hidden//2；0 关闭）
+--moe_aux_loss_weight 0.001  # 软负载均衡辅助损失（轻正则，0 关闭）
+# 学习率：线性 warmup（默认总步数 1%）+ 线性衰减到 --min_lr_ratio（默认 0.05）
+# 训练超参（Hyperball 口径 compute 缩放，默认开启 --lr_scale_auto）：
+# adam_lr = 0.0876·tokens^-0.3461·hidden^-0.3448·√tpb，muon_lr = 13/3×adam_lr，
+# beta2/eps 同样按 tokens/tpb 推导；--token_budget 显式给预算，
+# 显式 --learning_rate 覆盖 adam_lr。--muonh（默认开）：Muon 组加
+# Frobenius 范数球投影；Q/K/V 按 head 切开 NS；堆叠专家逐专家 NS；
+# lm_head 走 AdamH；短卷积（含 KDA q/k/v_conv）与 attn_gate 走 Adam。
 ```
 
-注：MoE 的路由专家前向是分组稀疏桶 GEMM（每 token 只算 top-k 个专家），
-桶容量取自上一微批实测的滚动容量表（×1.25+64 余量、128 对齐），前向
-**无 host sync**——这是硬要求：sync 会迫使前向在 value_and_grad 建图期
-（vjp 尚未构建）分段执行，全部中间张量被未完成惰性图钉住（r073 实测
-46GB/步、48GB 机器 swap 塌缩；改后峰值 17.6GB、单步 3.3s→1.3s）。
-容量表逐微批变化 ⇒ 形状跨步不稳定，训练时 `mx.compile` 仍自动回退
-eager。推理（generate/eval）本来就是 eager，无差异。
+1080M 常用配方：
 
-训练侧优化（默认启用）：
-- BatchedMuon：同形状权重堆叠批量跑 Newton-Schulz（kernel 数从
-  ~16×张量数 降到 ~16×形状组数），数学上与逐张量 NS 等价（bf16 舍入
-  级差异）；`--muon_ns_steps` 可调迭代步数（默认 5，对齐原版）。
-- `--cache_limit_gb`（默认 24，0=不限）：Metal 分配器空闲块缓存上限。
-  上限内的释放块常驻复用、不归还 OS，避免每步"释放-重分配"抖动
-  （bs16x640 实测 10G→24G 提速 4.5%，峰值 14.8G + 缓存 ≈ 39G）。
-  大 batch 配置注意峰值+缓存上限不要超物理内存。
-- MoE 专家 gate/up 投影合并为单次 GEMM（数学严格等价）；稀疏桶路径按
-  8 专家分组（峰值/耗时与全局最大桶解耦，路由塌缩从 swap 悬崖退化为
-  热点组变慢的可恢复劣化），argsort 排名 + 全 device 散布/收回，
-  输出端 f32 scatter-add 直接累加回 token（省 padded 加权缓冲与
-  gather+sumK 往返）；桶容量由滚动容量表给出，前向无 host sync。
-- MLA 投影合并：q/kv_down/k_rope 单 GEMM（768→1248）、k_up/v_up 单
-  GEMM（192→1536），数学严格等价；Muon 侧按行段分段 NS 保持逐矩阵
-  语义（分段 vs 逐矩阵基类单步 diff ~2e-7）。
-- engram 注入门/掩码链降回残差 dtype 再乘加：修复残差流从注入层起
-  被抬成 f32 的泄漏（曾使整步慢 18%、峰值内存 +3G）。
-100M MoE 配置（bs8×512, bf16, M4 Max）实测：fwd+bwd 243→199ms/步
-（16.8K→20.6K tok/s）；含 optimizer + 真实数据管线完整步
-11.5K→15.3K tok/s（本轮累计 +87%），已反超 dense-73M 的 13.8K
-（MoE 激活参数仅其 46%）。
+```bash
+python trainer/train_pretrain.py --hidden_size 768 --num_hidden_layers 8 \
+  --num_attention_heads 8 --n_routed_experts 256 --num_experts_per_tok 8 \
+  --n_shared_experts 2 --moe_intermediate_size 384 --batch_size 12 \
+  --accumulation_steps 2 --max_seq_len 1024 --pack_sequences --doc_mask \
+  --compile_model --muonh
+```
 
-MoE 推理前向按 (token,choice) 对数 G = B×T×top_k 分三条路径：
-- `G <= 512`（decode/极小批量）：手写融合 Metal kernel（router 打分+top-k、
-  SwiGLU、加权合并共 3 个 kernel，只读 top-k 命中专家权重；simdgroup
-  合并访存 + simd_sum 归约）。不可微，仅推理（`model.train()` 或
-  `router.collect_stats` 开启时不走本路径）；支持 CycleDeltaRouter
-  低秩增量（host 预算 cz=(x·V^T⊙g_c)，kernel 内加 cu·cz；CycleDelta
-  形式仍旁路稠密路径）；JIT 编译失败自动回退。
-  实测 100M 配置 decode 503→622 tok/s（+24%）。
-- `G <= 4096`（小 prefill）：稠密全专家广播 matmul。
-- 更大（训练/大 prefill）：分组 (Eg,Cg,D) padded 桶稀疏 batched GEMM
-  （无 host sync；桶容量滚动自上一微批实测，见上文训练侧说明）。
+注：MoE 负载均衡走 QB（Quantile Balancing）：训练期 forward 记录各专家
+margin（选择分 − per-token 阈值 alpha），每优化器步取 margin 的
+(1−K/E) 上分位数、零均值化后覆写 frozen 的 expert_bias（无梯度、
+无 EMA rate 超参）。
+
+MoE 按 (token,choice) 对数 `G = B×T×top_k` 分三条路径（形状只随
+`(B,T,E,K)` 变，训练可 `mx.compile`）：
+
+- `G <= 512`（decode / 极小批量）：融合 Metal kernel（router + SiTU-GLU
+  前半 + 加权合并）。不可微，仅推理；`model.train()` 或
+  `router.collect_stats` 时不走。
+- `G <= 4096`（小 prefill）：稠密全专家广播 matmul，按路由权重加权。
+- 更大（训练 / 大 prefill）：`mx.gather_mm(sorted_indices=True)` 免 padding
+  分组 GEMM，每个 (token,choice) 只算真实行，无桶容量、无 host sync。
+
+训练侧：
+
+- BatchedMuon：同形状权重堆叠批量 Newton-Schulz；Q/K/V 再按 head 切开。
+  2D 矩阵与堆叠专家都是每 8 步重算一次 NS（命中复用极因子）。
+  `--muon_ns_steps` 默认 5。
+- `--cache_limit_gb`（默认 0=不限）：Metal 空闲块缓存上限（GB）。上限内
+  释放块常驻复用；大 batch 时峰值+缓存不要超物理内存。
+- `--compile_model`：compile 前 `prewarm_all()` 跑完融合 kernel 校验
+  （图内不能 `.item()`）。dropout>0 时自动回退 eager。
 
 ## 训练
 
@@ -104,9 +117,9 @@ python trainer/train_dpo.py --data_path ../dataset/dpo.jsonl
 
 注意：
 
-- SFT / DPO 会自动从基座 checkpoint 的 sidecar JSON 继承模型结构配置
-  （含 YaRN/rope_scaling），CLI 显式传入的结构参数优先；`save_interval`
-  会自动对齐到 `accumulation_steps` 的整数倍，避免 resume 丢失梯度。
+- SFT / DPO 会自动从基座 checkpoint 的 sidecar JSON 继承模型结构配置，
+  CLI 显式传入的结构参数优先；`save_interval` 会自动对齐到
+  `accumulation_steps` 的整数倍，避免 resume 丢失梯度。
 
 ## 数据格式（与 MiniMind 对齐）
 

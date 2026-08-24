@@ -21,7 +21,6 @@ uv run trainer/train_pretrain.py \
     --epochs 1 \
     --pack_sequences \
     --doc_mask \
-    --use_value_res \
     --use_attn_gate \
     --batch_size 48 \
     --accumulation_steps 1 \

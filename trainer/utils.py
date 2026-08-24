@@ -12,7 +12,7 @@ from typing import Tuple
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from transformers import AutoTokenizer
-from model.model import VibyForCausalLM, migrate_cycle_delta_weights
+from model.model import VibyForCausalLM
 
 
 def Logger(content):
@@ -26,11 +26,7 @@ def set_ddp_flag(is_ddp: bool):
 
 
 def convert_model_dtype(model, dtype_name):
-    """按 args.dtype 将模型参数整体转换为 bfloat16/float16（MLX 无 autocast）。
-
-    非持久 buffer（freqs_cos/freqs_sin）也在 parameters() 里，
-    一并转换无妨；加载权重时结构匹配即可。
-    """
+    """按 args.dtype 将模型参数整体转换为 bfloat16/float16（MLX 无 autocast）。"""
     if dtype_name == "bfloat16":
         target = mx.bfloat16
     elif dtype_name == "float16":
@@ -58,11 +54,29 @@ def log_parameter_count(model):
     )
 
 
-# 这些 key 是按当前 config 重新计算的非持久状态，跨 checkpoint
-# 加载时不应因 shape 不一致而报错，也不应覆盖当前模型中的版本。
+# 旧 checkpoint 里的非持久 buffer（当前架构已无 RoPE，这些 buffer 不复存在；
+# 保留跳过逻辑仅为加载旧权重时不报错）。
 _NON_STRICT_WEIGHT_KEYS = (
     "freqs_cos",
     "freqs_sin",
+)
+
+# 已从架构中删除的子系统（MLA / HRM / Engram / value-res / CycleDelta /
+# RoPE）遗留在旧 checkpoint 里的参数标记：加载时直接跳过，不进 strict 报错。
+_LEGACY_WEIGHT_MARKERS = (
+    "kv_down",
+    "kv_up",
+    "k_rope",
+    "qkv_proj",
+    "rope_freqs",
+    ".engrams.",
+    "hrm_",
+    "v_res_lambda",
+    "cycle_v",
+    "cycle_g",
+    "cycle_u",
+    "l_module.",
+    "h_module.",
 )
 
 
@@ -80,8 +94,6 @@ def load_model_weights(
 
     - `strict=True` 时，除 `_NON_STRICT_WEIGHT_KEYS` 之外缺少/多余/形状不一致
       的参数都会抛错，避免静默得到随机初始化的部分模型。
-    - `freqs_cos/freqs_sin` buffer 即使 shape 不匹配也会被跳过，
-      保留当前模型按新 config 计算的版本。
     """
     if not checkpoint_path or not os.path.exists(checkpoint_path):
         Logger(f"Warning: {label} {checkpoint_path} not found")
@@ -89,16 +101,14 @@ def load_model_weights(
 
     weights = dict(mx.load(checkpoint_path).items())
     model_shapes = {k: v.shape for k, v in tree_flatten(model.parameters())}
-    # 上一代 CycleDelta checkpoint：cycle_v (rank,D) + cycle_g (n_cycles,rank)
-    # -> 当前 per-cycle V_c (n_cycles,rank,D)，数值等价迁移。
-    weights = migrate_cycle_delta_weights(weights, model_shapes)
 
     loaded = {}
     skipped = []
     for key, value in weights.items():
         if key not in model_shapes:
-            # P=1 的 MTP v_res_lambda 在新结构中已删除，属于已知可丢弃参数。
-            if "mtp_modules" in key and key.endswith(".self_attn.v_res_lambda"):
+            # 已删除子系统（MLA/HRM/Engram/value-res/CycleDelta）的旧参数
+            # 属于已知可丢弃参数。
+            if any(m in key for m in _LEGACY_WEIGHT_MARKERS):
                 skipped.append(key)
                 continue
             if strict and not _is_non_strict_key(key):
@@ -192,46 +202,23 @@ _ARCH_ARG_KEYS = (
     "hidden_size",
     "num_hidden_layers",
     "num_attention_heads",
-    "kv_lora_rank",
-    "qk_rope_head_dim",
     "head_dim",
     "vocab_size",
     "intermediate_size",
-    "use_value_res",
     "use_attn_gate",
     "mtp_depth",
     "mtp_loss_weight",
-    "hrm_H_cycles",
-    "hrm_L_cycles",
-    "hrm_bp_cycles",
-    "hrm_emb_scale",
-    "hrm_state_norm",
-    "hrm_input_skip",
-    "hrm_token_gate_scale",
-    "engram_layers",
-    "engram_orders",
-    "engram_heads",
-    "engram_slots",
-    "engram_sub_dim",
-    "engram_scale",
-    "engram_paper_fusion",
-    "engram_inject_every_cycle",
     "n_routed_experts",
     "num_experts_per_tok",
     "n_shared_experts",
     "moe_intermediate_size",
     "routed_scaling_factor",
-    "moe_router_noise",
-    "moe_aux_loss_weight",
     "moe_router_logit_norm",
     "moe_router_logit_temp",
     "moe_diversity_loss_weight",
-    "cycle_delta_max",
-    "moe_bias_update_rate",
-    "scale_logits_by_emb_scale",
-    "hrm_cycle_router",
-    "hrm_cycle_router_rank",
-    "hrm_cycle_film",
+    "z_loss_weight",
+    "moe_latent_dim",
+    "tie_word_embeddings",
 )
 
 
@@ -323,6 +310,91 @@ def init_swanlab(args, trainer):
     return swanlab
 
 
+def finish_training(swanlab=None, interrupted=False):
+    """收掉 swanlab；Ctrl-C 路径用 os._exit 跳过解释器 teardown。
+
+    MLX / SwanLab / 任何漏网的 daemon 线程在 Py_Finalize 阶段再碰 Python
+    会 Fatal `PyThreadState_Get`（GIL 已释放）。正常跑完仍走常规退出。
+    """
+    if swanlab is not None:
+        try:
+            swanlab.finish()
+        except Exception:
+            pass
+    if interrupted:
+        os._exit(0)
+
+
+def compute_scaled_hparams(tokens: float, tpb: float, hidden: int):
+    """Hyperball 口径的 compute 缩放公式，返回 (adam_lr, muon_lr, beta2, eps)。
+
+    tokens = 总训练 token 预算；tpb = 每个优化器步的 token 数
+    （batch_size × accumulation_steps × max_seq_len）；hidden = hidden_size。
+    eps 只用于 Adam/AdamH 组，Muon 的 eps 保持 1e-8。
+    """
+    adam_lr = 0.087571 * tokens**-0.3461 * hidden**-0.3448 * math.sqrt(tpb)
+    muon_lr = (13.0 / 3.0) * adam_lr
+    beta2 = min(max(0.999 ** (tpb / 131072.0), 0.95), 0.9999)
+    eps = 9.676e-18 * math.sqrt(tokens / tpb)
+    return adam_lr, muon_lr, beta2, eps
+
+
+def resolve_compute_scaled_hparams(args, iter_per_epoch: int):
+    """解析 pretrain 的 lr/beta2/eps 并写回 args（仅 train_pretrain 调用）。
+
+    优先级：显式 --learning_rate > lr_scale_auto 公式 > 旧常数 0.01。
+    - auto 开 + 无手动 lr：adam_lr/muon_lr/beta2/eps 全部按公式；
+    - auto 开 + 手动 lr：adam_lr 取手动值，muon_lr 仍 13/3× 派生，
+      beta2/eps 按公式；
+    - auto 关：单一 lr（手动值或 0.01），betas (0.9, 0.95)，eps 1e-8（旧行为）。
+
+    写回字段：learning_rate（= adam 基础 lr）、muon_lr、adam_beta2、adam_eps、
+    token_budget_resolved、tokens_per_batch。SFT/DPO 不调用本函数，
+    create_mixed_optimizer 内以 getattr 兜底回退单一 lr 旧行为。
+    """
+    tpb = args.batch_size * args.accumulation_steps * args.max_seq_len
+    tokens = getattr(args, "token_budget", None)
+    if tokens is None:
+        opt_steps = (args.epochs * iter_per_epoch) // args.accumulation_steps
+        tokens = float(opt_steps) * tpb
+    tokens = float(tokens)
+
+    manual_lr = args.learning_rate  # None = 用户未显式传入
+    if getattr(args, "lr_scale_auto", False):
+        adam_lr, muon_lr, beta2, eps = compute_scaled_hparams(
+            tokens, tpb, args.hidden_size
+        )
+        if manual_lr is not None:
+            adam_lr = float(manual_lr)
+            muon_lr = (13.0 / 3.0) * adam_lr
+            src = "手动 --learning_rate 覆盖 adam_lr（beta2/eps 仍按公式）"
+        else:
+            src = "公式自动推导"
+    else:
+        adam_lr = muon_lr = float(manual_lr) if manual_lr is not None else 0.01
+        beta2, eps = 0.95, 1e-8
+        src = "旧常数（--no-lr_scale_auto）"
+
+    args.learning_rate = adam_lr
+    args.muon_lr = muon_lr
+    args.adam_beta2 = beta2
+    args.adam_eps = eps
+    args.token_budget_resolved = tokens
+    args.tokens_per_batch = tpb
+    Logger(
+        f"[lr_scale] {src}: tokens={tokens:.3e} tpb={tpb} "
+        f"adam_lr={adam_lr:.4e} muon_lr={muon_lr:.4e} beta2={beta2:.5f} eps={eps:.3e}"
+    )
+    return args
+
+
+def resolve_warmup_iters(args, total_steps: int):
+    """warmup_iters 为 None 时按总步数的 1%（Marin / K3）。显式值不覆盖。"""
+    if getattr(args, "warmup_iters", None) is None:
+        args.warmup_iters = max(1, int(round(0.01 * float(max(1, total_steps)))))
+    return args
+
+
 def get_lr_and_momentum(
     step: int,
     total_steps: int,
@@ -330,28 +402,23 @@ def get_lr_and_momentum(
     initial_momentum: float = 0.85,
     final_momentum: float = 0.95,
     momentum_warmup_steps: int = 300,
-    min_lr_ratio: float = 0.1,
+    min_lr_ratio: float = 0.05,
 ) -> Tuple[float, float]:
     """
     计算当前步骤的学习率乘子和动量。
-    - 学习率: Warmup + Cosine Decay（下限 min_lr_ratio × 峰值，0 为衰减到 0）
+    - 学习率: 线性 warmup + 线性衰减到 min_lr_ratio（Marin Hero 口径）
     - 动量: Linear Warmup
     """
     # --- 学习率调度 ---
     if step < warmup_steps:
-        # 线性预热阶段
         lr_multiplier = float(step) / float(max(1, warmup_steps))
     elif step >= total_steps:
-        # 训练结束，使用最小学习率
         lr_multiplier = min_lr_ratio
     else:
-        # 余弦衰减阶段
         progress = float(step - warmup_steps) / float(
             max(1, total_steps - warmup_steps)
         )
-        lr_multiplier = min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (
-            1.0 + math.cos(math.pi * progress)
-        )
+        lr_multiplier = 1.0 - (1.0 - min_lr_ratio) * progress
 
     # --- 动量调度 (仅用于Muon) ---
     momentum = final_momentum
@@ -509,7 +576,7 @@ def find_latest_checkpoint(save_dir):
 
 
 def apply_lr_schedule(
-    optimizer, global_step, total_training_steps, warmup_iters, min_lr_ratio=0.1
+    optimizer, global_step, total_training_steps, warmup_iters, min_lr_ratio=0.05
 ):
     """应用学习率调度（每微批 step 调用一次）"""
     lr_multiplier, current_momentum = get_lr_and_momentum(
@@ -544,14 +611,15 @@ def log_training_progress(
     base_step_offset: int = 0,
     mtp_loss=None,
     main_loss=None,
-    aux_loss=None,
     diversity_loss=None,
+    z_loss=None,
+    unemb_lar=None,
     extra=None,
 ):
     """统一的训练进度日志记录
 
-    current_loss 是总 loss（CE + MTP + aux + diversity，均已加权）；
-    main_loss 是纯语言建模 CE；mtp/aux/diversity 为已加权分量（可选）。
+    current_loss 是总 loss（CE + MTP + diversity + z-loss，均已加权）；
+    main_loss 是纯语言建模 CE；mtp/diversity/z 为已加权分量（可选）。
     展示格式保持 `loss:<总>` 开头以兼容 results.tsv 的解析。
     extra：调用方附加的详细指标 dict（MoE 负载/内存等），一并上报 swanlab。
     """
@@ -569,18 +637,22 @@ def log_training_progress(
         loss_str += f"(main:{main_loss:.3f}"
         if mtp_loss is not None:
             loss_str += f",mtp:{mtp_loss:.3f}"
-        if aux_loss not in (None, 0.0):
-            loss_str += f",aux:{aux_loss:.4f}"
         if diversity_loss not in (None, 0.0):
             loss_str += f",div:{diversity_loss:.4f}"
+        if z_loss not in (None, 0.0):
+            loss_str += f",z:{z_loss:.5f}"
         loss_str += ")"
+    lar_str = ""
+    if unemb_lar is not None:
+        lar_str = f" unemb_lar:{unemb_lar:.4f}"
 
-    log_msg = "Epoch:[{}/{}]({}/{}) loss:{} lr:{:.2e} grad_norm:{:.3f} step/s:{:.2f} tokens/s:{:.0f} eta:{}min".format(
+    log_msg = "Epoch:[{}/{}]({}/{}) loss:{}{} lr:{:.2e} grad_norm:{:.3f} step/s:{:.2f} tokens/s:{:.0f} eta:{}min".format(
         epoch + 1,
         args.epochs,
         step,
         iter_per_epoch,
         loss_str,
+        lar_str,
         current_lr,
         grad_norm,
         steps_per_sec,
@@ -604,10 +676,12 @@ def log_training_progress(
             log_dict["main_loss"] = main_loss
         if mtp_loss is not None:
             log_dict["mtp_loss"] = mtp_loss
-        if aux_loss is not None:
-            log_dict["aux_loss"] = aux_loss
         if diversity_loss is not None:
             log_dict["diversity_loss"] = diversity_loss
+        if z_loss is not None:
+            log_dict["z_loss"] = z_loss
+        if unemb_lar is not None:
+            log_dict["unembedding_lar"] = unemb_lar
         if extra:
             log_dict.update(extra)
 

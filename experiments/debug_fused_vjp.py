@@ -12,7 +12,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 DT = mx.float32
-B, T, D, I, E, K, EG = 1, 8, 64, 13, 2, 1, 2
+B, T, D, I, E, K, EG = 1, 8, 64, 13, 2, 1, 2  # noqa: E741
 M = B * T
 G = M * K
 

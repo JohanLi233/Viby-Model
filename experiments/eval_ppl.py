@@ -6,8 +6,6 @@
 - 仅用主模型 logits 计算 next-token CE（不含 MTP 辅助 loss），因此 mtp0/mtp1
   的 checkpoint 可以公平对比，而训练日志的报告 loss 口径不同不可直接比。
 - 主指标为全体 token 加权平均 CE 的指数（overall PPL），辅以逐篇均值 PPL。
-- 模型带 engram 时按训练口径注入；生成（缓存解码）路径同样注入（n-gram
-  窗口携带），因此 PPL 与生成测的是同一函数。
 
 用法：
   uv run experiments/eval_ppl.py --ckpt out_exp/round28_packed_seq1024/pretrain_768.safetensors \
@@ -29,12 +27,15 @@ import mlx.core as mx
 import numpy as np
 from transformers import AutoTokenizer
 
-from model.model import VibyConfig, VibyForCausalLM
+from model.config import VibyConfig
+from model.model import VibyForCausalLM
 from trainer.utils import load_model_weights
 
 warnings.filterwarnings("ignore")
 
 RESULTS_TSV = os.path.join(os.path.dirname(__file__), "ppl_results.tsv")
+
+LAR_TSV_COLUMNS = ("unemb_lar", "unemb_lar_eff_dim")
 
 
 def load_eval_docs(data_path: str, n_docs: int):
@@ -46,6 +47,102 @@ def load_eval_docs(data_path: str, n_docs: int):
             if line:
                 buf.append(json.loads(line.decode("utf-8", errors="ignore"))["text"])
     return list(buf)
+
+
+def unembedding_lar(
+    model: VibyForCausalLM,
+    logits: mx.array,
+    hidden: mx.array,
+    valid_mask: mx.array,
+):
+    """计算 unembedding 的 log-alignment ratio（LAR）。
+
+    论文定义：LAR = log_n(||WX||_RMS / (||W||_RMS * ||X||_RMS))。
+    logits 已是 X @ W.T，因此这里只聚合现有前向输出，不重复做 GEMM。
+    返回 LAR 和论文中的等效函数维度 k = n^(2*(1-LAR))。
+    """
+    lm_head = getattr(model, "lm_head", None)
+    weight = lm_head.weight if lm_head is not None else model.model.embed_tokens.weight
+    weight_f32 = weight.astype(mx.float32)
+    logits_f32 = logits.astype(mx.float32)
+    hidden_f32 = hidden.astype(mx.float32)
+
+    valid = valid_mask.astype(mx.float32)
+    token_count = mx.maximum(mx.sum(valid), 1.0)
+    output_dim, input_dim = weight.shape
+    wx_ms = mx.sum(logits_f32 * logits_f32 * valid[:, :, None]) / (
+        token_count * output_dim
+    )
+    w_ms = mx.sum(weight_f32 * weight_f32) / (output_dim * input_dim)
+    x_ms = mx.sum(hidden_f32 * hidden_f32 * valid[:, :, None]) / (
+        token_count * input_dim
+    )
+    lar = (
+        0.5
+        * (mx.log(wx_ms) - mx.log(w_ms) - mx.log(x_ms))
+        / mx.log(mx.array(input_dim, dtype=mx.float32))
+    )
+    eff_dim = mx.exp(2.0 * (1.0 - lar) * mx.log(mx.array(input_dim)))
+    return float(lar.item()), float(eff_dim.item())
+
+
+def append_ppl_result(row: dict):
+    """追加结果并兼容旧版 10 列 TSV：缺列时补齐表头和历史行。"""
+    base_columns = [
+        "round",
+        "date",
+        "n_docs",
+        "tokens",
+        "mean_ce",
+        "overall_ppl",
+        "doc_ppl",
+        "eval_s",
+        "ckpt",
+        "notes",
+    ]
+    rewrite_needed = False
+    lines = []
+    if os.path.exists(RESULTS_TSV):
+        with open(RESULTS_TSV, "r", encoding="utf-8") as f:
+            lines = [line.rstrip("\n") for line in f]
+        if lines:
+            old_columns = lines[0].split("\t")
+            rewrite_needed = any(col not in old_columns for col in LAR_TSV_COLUMNS)
+            if rewrite_needed:
+                columns = old_columns + [
+                    col for col in LAR_TSV_COLUMNS if col not in old_columns
+                ]
+                lines[1:] = [
+                    line + "\t" * (len(columns) - len(line.split("\t")))
+                    for line in lines[1:]
+                ]
+                lines[0] = "\t".join(columns)
+            else:
+                columns = old_columns
+        else:
+            columns = base_columns + list(LAR_TSV_COLUMNS)
+            rewrite_needed = True
+    else:
+        columns = base_columns + list(LAR_TSV_COLUMNS)
+
+    missing = [col for col in columns if col not in row]
+    if missing:
+        raise ValueError(f"缺少结果字段: {missing}")
+    line = "\t".join(str(row[col]) for col in columns)
+    if lines:
+        lines.append(line)
+        content = "\n".join(lines) + "\n"
+    else:
+        content = "\t".join(columns) + "\n" + line + "\n"
+
+    if rewrite_needed or not os.path.exists(RESULTS_TSV):
+        temp_path = RESULTS_TSV + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(temp_path, RESULTS_TSV)
+    else:
+        with open(RESULTS_TSV, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
 
 def main():
@@ -116,13 +213,14 @@ def main():
     print(
         f"[ppl] {os.path.basename(os.path.dirname(args.ckpt))}: "
         f"{len(doc_ids)} docs, mtp_depth={config.mtp_depth}, "
-        f"engram={'on' if model.model.engrams else 'off'}, "
         f"加载+tokenize {time.time() - t0:.1f}s"
     )
 
     total_ce = 0.0
     total_tok = 0
     doc_ce_sum = 0.0  # 逐篇平均 CE 的和（每篇等权）
+    lar_sum = 0.0
+    lar_weight_sum = 0
     t1 = time.time()
     for i in range(0, len(doc_ids), args.batch_size):
         batch = doc_ids[i : i + args.batch_size]
@@ -135,6 +233,16 @@ def main():
 
         out = model(mx.array(ids), attention_mask=mx.array(mask))
         logits = out.logits.astype(mx.float32)[:, :-1, :]  # (B, T-1, V)
+        hidden = out.hidden_states[:, :-1, :]
+        batch_lar, _ = unembedding_lar(
+            model,
+            logits,
+            hidden,
+            mx.array(mask[:, :-1]),
+        )
+        batch_valid = int(mask[:, :-1].sum().item())
+        lar_sum += batch_lar * batch_valid
+        lar_weight_sum += batch_valid
         tgt = mx.array(ids[:, 1:])  # (B, T-1)
         valid = mx.array(mask[:, 1:])
         log_z = mx.logsumexp(logits, axis=-1)
@@ -154,39 +262,43 @@ def main():
     mean_ce = total_ce / max(total_tok, 1)
     ppl = math.exp(mean_ce)
     doc_ppl = math.exp(doc_ce_sum / max(len(doc_ids), 1))
+    mean_lar = lar_sum / max(lar_weight_sum, 1)
+    # 论文等效维度公式以矩阵输入维 n 为底；tied unembedding 的 n=hidden_size。
+    unembedding_input_dim = (
+        model.lm_head.weight.shape[1]
+        if model.lm_head is not None
+        else model.model.embed_tokens.weight.shape[1]
+    )
+    mean_lar_eff_dim = unembedding_input_dim ** (2.0 * (1.0 - mean_lar))
     elapsed = time.time() - t1
 
     tag = args.tag or os.path.basename(os.path.dirname(args.ckpt))
     line = (
         f"[ppl] {tag}: overall_ppl={ppl:.4f} doc_ppl={doc_ppl:.4f} "
         f"mean_ce={mean_ce:.4f} tokens={total_tok} docs={len(doc_ids)} "
+        f"unemb_lar={mean_lar:.6f} "
+        f"unemb_lar_eff_dim={mean_lar_eff_dim:.3f} "
         f"eval_time={elapsed:.1f}s"
     )
     print(line)
 
     if not args.no_save:
-        header = "round\tdate\tn_docs\ttokens\tmean_ce\toverall_ppl\tdoc_ppl\teval_s\tckpt\tnotes\n"
-        if not os.path.exists(RESULTS_TSV):
-            with open(RESULTS_TSV, "w", encoding="utf-8") as f:
-                f.write(header)
-        with open(RESULTS_TSV, "a", encoding="utf-8") as f:
-            f.write(
-                "\t".join(
-                    [
-                        tag,
-                        time.strftime("%Y-%m-%d %H:%M"),
-                        str(len(doc_ids)),
-                        str(total_tok),
-                        f"{mean_ce:.4f}",
-                        f"{ppl:.4f}",
-                        f"{doc_ppl:.4f}",
-                        f"{elapsed:.1f}",
-                        args.ckpt,
-                        args.notes,
-                    ]
-                )
-                + "\n"
-            )
+        append_ppl_result(
+            {
+                "round": tag,
+                "date": time.strftime("%Y-%m-%d %H:%M"),
+                "n_docs": len(doc_ids),
+                "tokens": total_tok,
+                "mean_ce": f"{mean_ce:.4f}",
+                "overall_ppl": f"{ppl:.4f}",
+                "doc_ppl": f"{doc_ppl:.4f}",
+                "eval_s": f"{elapsed:.1f}",
+                "ckpt": args.ckpt,
+                "notes": args.notes,
+                "unemb_lar": f"{mean_lar:.6f}",
+                "unemb_lar_eff_dim": f"{mean_lar_eff_dim:.4f}",
+            }
+        )
 
 
 if __name__ == "__main__":

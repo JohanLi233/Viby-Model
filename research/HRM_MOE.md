@@ -1,5 +1,11 @@
 # HRM-Text-MoE 设计（r070，2026-08-17）
 
+> **已归档**：本文记录的 HRM 双栈循环、MLA、CycleRouter/CycleFiLM、
+> Engram、value-residual 与 V3 rate 控制器已从代码库删除。当前架构见
+> README.md（KDA 3:1 + NoPE GQA、SiTU-GLU、独立共享专家、LatentMoE+QB、
+> AttnRes key RMSNorm、z-loss = mean(lse²)）。下文是历史研究记录，
+> 不要当现行实现读。
+
 ## 动机
 
 r042 已在 28M/0.1B 尺度关闭纯 dense HRM 路线（同 D 追平 dense 但 3× per-token
@@ -308,3 +314,109 @@ max/mean 从 ~15× 降到 ~1.5-4×，bias rate0.02 下 60 微批累计溢出从
 3. **Token 多样性正则**：`moe_diversity_loss_weight=0.01`，
    `mean_b log1p(common²/residual²)`，只在 hrm_bp_cycles 可回传 cycle
    收集。健康 res/common≈1 时 loss≈0，塌缩到 0.01 时≈9.2。
+
+## 外部借鉴：Marin hero run scaling ladder（marin#8435，2026-08-23 读）
+
+Marin 535B-A23B MoE 英雄 run 前的方法论。对本项目有用的部分：
+
+**流程（制度化我们已踩过的坑）**：
+- Scaling ladder 花 ~1% 算力，作用是抓 bug 而非只外推：他们曾在放大
+  token horizon 时抓到 grad norm 涨到 4+，定位到缺 logit z-loss（不加
+  会在高 batch 下中途爆掉）。对应我们 r070→r073 三次事故全是"换了
+  一个结构维度（E=32→112）后旧超参失效、正式 run 才暴露"——教训同构：
+  **改 E / seq / horizon / cycle 数任一维度，先跑百步级 ladder 点验证
+  动力学再上全量**。
+- 固化"健康曲线形状"作为不干预/干预判据：他们的参照是 grad norm 前
+  40% 涨后随 LR 衰减回落；我们的等价信号是 `moe/overflow_pairs`、
+  max/mean 负载比（健康 2~4×）、容量表水位。新 run 偏离形状立即停，
+  不跑到 step3000 复盘。（r080 中检修正：细粒度 E=288/均值负载 256
+  下溢出是"低水平慢性 + 缓慢下降"而不收敛到 0——近泊松尾必然偶发
+  超余量，判据改为"不增长、无 loss 尖刺关联、占比 <0.1% pair"。）
+- Early cooldown 分支做零污染实验：主 run 中途切短 cooldown 分支出
+  可对比评估点（r070 提前 kill @77% 导致口径不干净的规范替代）。
+- seq len 与均衡负相关：他们为此从 8k 退回 4k 预训练（每 batch 序列
+  数翻倍）。我们 bs6×2048 仅 6 条序列，扩 seq 前需预期溢出恶化，
+  ladder 需含 seq 维度。
+
+**架构（见下文候选改动）**：
+- 共享专家做抗 dropping 主干：他们 2 个半宽共享 ≈ 1/3 神经元来自
+  shared，在 40% dropping 下仍无 loss 尖刺。我们 n_shared=1 全宽，
+  共享占比仅 ~1/7。
+- Latent MoE：active 专家前 2× 压缩，等效同 FLOPs 下 routed 神经元
+  翻倍。
+- Logit z-loss 压 grad norm 随 horizon 增长。
+- 长上下文扩程：qk_mult 按 mscale=X·ln(new/old)+1（X≈0.1）调整；
+  扩程是 dropping 的主要诱因（4k→65k：7%→40%），届时再启用。
+
+## Latent MoE 落地（2026-08-23，`--moe_latent_dim`）
+
+实现：`MoEFeedForward` 加共享 `lat_down (D→d)` / `lat_up (d→D)` 投影
+包住路由专家（`moe_latent_dim=d`），router 仍在全维打分、共享专家保持
+全宽。三路径全部复用：稀疏桶/kernel 均形状参数化，传 d 维输入即可，
+bucket gather/scatter 流量减半；decode kernel 加 `latent_dim` 参数
+（router kernel 全维、up/down kernel latent 维）。lat_down/lat_up 为
+2D 矩阵自动进 Muon 组。无零初始化等价（函数类从 step 0 改变），只用于
+新 run；`moe_latent_dim=0` 默认关，旧 checkpoint/sidecar 零影响。
+回归 18/18（新增 test_moe_latent：结构审计/三路径逐专家参考等价/
+梯度可达/sidecar 往返）。
+
+吞吐 A/B（experiments/bench_latent_moe.py，r080 口径 bs12×1024
+E=288 K=6 D=768 bf16，r080 在跑有背景竞争，三臂轮转计时取相对值）：
+- baseline I=128：fwd+bwd 29.7ms（1.00×）
+- latent d384/I=128：18.7ms（**0.63×**）——账面 FLOPs 仅 −16%，实测
+  收益远大于此：bucket/权重读取减半，该路径是访存受限
+- latent d384/I=256（等专家参数、神经元翻倍）：26.8ms（**0.90×**）——
+  账面 +33% FLOPs 但比 baseline 还快
+
+结论：d=hidden/2 时 latent MoE 在 Metal 上是"白拿容量"——I 翻倍
+（routed 神经元 ×2）MoE 成本反而降 10%。A/B 臂：r081 = r080 配置
++ `--moe_latent_dim 384 --moe_intermediate_size 256`。
+
+## 优化器借鉴：Marin 的 MuonH / AdamH / Adam 三分（同 issue 模型 spec，2026-08-23）
+
+三组是三种更新规则：MuonH = NS 正交化方向 + **Frobenius 范数球投影**
+（scale-invariant：方向由优化器学、范数冻结，fp32 算范数；专家 4D 栈
+逐专家 NS 不 gather 矩阵维）；AdamH = Adam 方向 + 同样范数球投影
+（只用于 lm_head，lr 用 MuonH 的）；Adam = embed/router/bias/gate/
+1-D norm/小 conv kernel 的普通 Adam。
+
+与现状差异：我们 Muon 无范数球投影（只有 Moonlight √max(1,r/c) 缩放）；
+专家堆叠整体排除 Muon（reshape (E,out·in) 跨专家耦合）走 AdamW。
+
+**已落地（2026-08-23，`--muonh`，默认关）**：
+- `BatchedMuon(hyperball=True)`：groups/seg_groups/stack_groups 三分支
+  更新后逐矩阵 rescale 回更新前 Frobenius 范数（fp32 范数）。
+- 堆叠专家（ndim>2）以 axis0 为 batch 进 `_ns5` 逐专家 NS（批量维
+  无耦合），从 AdamW 移入 MuonH；`VIBY_MUONH_EXPERTS=0` 可只开投影
+  不移专家（消融/省 NS 开销）。
+- `AdamH(FusedAdamW)`：lm_head（非 tied 才存在）Adam 方向 + 同一
+  范数球投影，lr=基础 lr，wd=0（径向分量投影后无操作）。
+- 注意：开关改变优化器分组，**不能续跑旧 checkpoint**（optimizer
+  state 分组对不上），只用于新 run；r081 latent A/B 不开，避免混淆。
+- 验证：experiments/test_muonh.py 11 项全过（范数冻结/对照组确实
+  变化/堆叠逐专家==2D 逐片（含动量两步）/AdamH 与 Adam 共线且范数
+  保持/端到端分组+一步更新范数审计）；muonh=False 分组与旧行为一致；
+  真实数据 6 步冒烟通过。
+- 成本提示：E=288 逐专家 NS 约 18 个 (288,r,c) 批量 NS/步，估计
+  整步开销 +10~30%，正式 run 前用 queue 探针实测；太贵就
+  VIBY_MUONH_EXPERTS=0 只留范数球投影。
+- **实测（experiments/bench_muonh.py，r081 口径，r080 背景竞争下相对
+  值有效）**：2D Muon base 36ms → +范数球投影 38ms（≈免费）；+专家
+  逐专家 NS5 1221ms（+34×，~12 TFLOP/步）；NS bf16 无效（训练本
+  就是 bf16，NS 一直在 bf16 跑）；NS 3 步 855ms；NS3+每 4 步重算
+  摊薄 331ms（缓存命中步仍有 ~115ms 堆叠/动量/norm 固定流量）。
+  ## Temporal MuonH / Cache Q（2026-08-23 研究原型）
+
+专家必须留在 MuonH、又要压单机 NS 墙钟时，走 CacheMuon 口径：
+
+- 刷新步：`_ns5_gram`（与标准 NS5 cos≈0.999）并缓存左变换 `Q`
+- 命中步：`D = Q @ normalize(U)`，新动量仍进更新（对比复用旧极因子 D）
+- 开关：`VIBY_MUONH_CACHE_Q=1` + `VIBY_MUONH_STACK_NS_EVERY=4|8`
+- 验证：`experiments/test_muonh_cache.py`；墙钟：`bench_muonh.py` 的
+  `exp_cache_q_e*`
+
+**实测（r081，M4 Max）**：每步 NS5 ≈1277ms；Cache Q every=8 摊薄
+先约 468ms。后续优化：刷新改为标准 NS5 顺带累积 Q（不再走更贵的
+Gram 刷新）、动量/投影 mx.compile、命中残差触发
+（`VIBY_MUONH_CACHE_Q_RES`，默认 0.15）。`--muonh` 默认
+CACHE_Q=1 + EVERY=8。

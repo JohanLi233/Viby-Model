@@ -160,9 +160,7 @@ def _encode_text_batch(tokenizer, texts: List[str]) -> List[List[int]]:
         backend = getattr(tokenizer, "backend", None)
         encode_batch = getattr(backend, "encode_batch", None) if backend else None
         if encode_batch is not None:
-            return [
-                enc.ids for enc in encode_batch(texts, add_special_tokens=False)
-            ]
+            return [enc.ids for enc in encode_batch(texts, add_special_tokens=False)]
         return tokenizer(texts, add_special_tokens=False)["input_ids"]
     finally:
         if prev is None:

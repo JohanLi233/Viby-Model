@@ -1,4 +1,4 @@
-"""按 token 预算切取 train 文件前缀，供短预算实验独立训练（cosine 终点对齐）。
+"""按 token 预算切取 train 文件前缀，供短预算实验独立训练（线性衰减终点对齐）。
 用法: uv run scripts/make_token_slice.py <src> <dst> <max_tokens>
 token 计数口径 = len(enc)+2（<bos>+text+<eos>，与训练一致）。
 """

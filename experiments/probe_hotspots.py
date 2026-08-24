@@ -55,26 +55,21 @@ def probe_sdpa():
 
 
 def probe_moe_padding():
-    from model.model import MoEFeedForward, VibyConfig
+    from model.config import VibyConfig
+    from model.moe import MoEFeedForward
 
     print("\n=== MoE 桶 padding 收敛与耗时（bs6×2048, E=112 I=104 K=6）===")
-    D, E, I, K = 768, 112, 104, 6
+    D, E, I, K = 768, 112, 104, 6  # noqa: E741
     cfg = VibyConfig(
         hidden_size=D,
         num_hidden_layers=1,
         num_attention_heads=8,
-        kv_lora_rank=192,
-        qk_rope_head_dim=32,
         vocab_size=6400,
         max_position_embeddings=T,
         n_routed_experts=E,
         num_experts_per_tok=K,
         n_shared_experts=1,
         moe_intermediate_size=I,
-        hrm_H_cycles=2,
-        hrm_L_cycles=3,
-        hrm_cycle_router=1,
-        hrm_cycle_router_rank=8,
     )
     from mlx.utils import tree_map
 
@@ -95,7 +90,7 @@ def probe_moe_padding():
 
     def loss(x_, p):
         moe.update(p)
-        return (moe(x_, step_idx=0).astype(mx.float32) * C).sum()
+        return (moe(x_).astype(mx.float32) * C).sum()
 
     p = moe.trainable_parameters()
     # 迭代到容量表稳态
@@ -107,7 +102,7 @@ def probe_moe_padding():
             print(f"  iter {i + 1:>3}: rows={rows} padding={rows / G:.2f}×")
 
     moe._pending_counts.get(0)
-    idx, w = moe.router(x, step_idx=0)
+    idx, w = moe.router(x)
     cnt = mx.zeros((E,), dtype=mx.int32).at[idx.reshape(-1)].add(1)
     mx.eval(cnt)
     c = sorted(cnt.tolist(), reverse=True)
