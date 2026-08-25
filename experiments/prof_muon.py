@@ -1,11 +1,10 @@
 """MuonH 优化器分项剖析：r081 真实口径（L8+MTP, E256/K8/I320, bf16）。
 
 构建真实模型跑一次 fwd/bwd 拿真实梯度，然后连续跑 N 步 optimizer，
-用计时 wrapper 包住 BatchedMuon 的 _ns5 / _apply_cached_Q / mom/apply
+用计时 wrapper 包住 BatchedMuon 的 _ns5 / _ns5_gram / mom/apply
 kernel，拆出：
-  - 2D 矩阵组 NS5（每步都跑）
-  - 专家堆叠组 refresh 步 NS5(+Q)
-  - 专家堆叠组 cache-hit 步 Q@U
+  - 2D 矩阵组 NS5
+  - 专家堆叠组 Gram-NS
   - 逐元素 mom/apply 融合 kernel
 
 用法: .venv/bin/python experiments/prof_muon.py [steps]
@@ -105,7 +104,6 @@ SHAPES = set()
 
 orig_ns5 = BatchedMuon._ns5
 orig_ns5_gram = BatchedMuon._ns5_gram
-orig_cached = BatchedMuon._apply_cached_Q
 
 
 def _tag(args):
@@ -114,7 +112,7 @@ def _tag(args):
 
 
 def timed_ns5(self, X, *a, **kw):
-    key = ("ns5(+Q)" if kw.get("return_Q") else "ns5", _tag((self, X)))
+    key = ("ns5", _tag((self, X)))
     SHAPES.add(key)
     t0 = time.perf_counter()
     r = orig_ns5(self, X, *a, **kw)
@@ -124,7 +122,7 @@ def timed_ns5(self, X, *a, **kw):
 
 
 def timed_ns5g(self, X, *a, **kw):
-    key = ("ns5_gram(+Q)" if kw.get("return_Q") else "ns5_gram", _tag((self, X)))
+    key = ("ns5_gram", _tag((self, X)))
     SHAPES.add(key)
     t0 = time.perf_counter()
     r = orig_ns5_gram(self, X, *a, **kw)
@@ -133,19 +131,8 @@ def timed_ns5g(self, X, *a, **kw):
     return r
 
 
-def timed_cached(self, Q, X, tr):
-    key = ("cache_Q@U", tuple(X.shape))
-    SHAPES.add(key)
-    t0 = time.perf_counter()
-    r = orig_cached(self, Q, X, tr)
-    mx.eval(r)
-    TIMES[key[0]].append((time.perf_counter() - t0, key[1]))
-    return r
-
-
 BatchedMuon._ns5 = timed_ns5
 BatchedMuon._ns5_gram = timed_ns5g
-BatchedMuon._apply_cached_Q = timed_cached
 
 # 找到 MuonH 子优化器
 muon_opt = None
@@ -155,7 +142,6 @@ for o in opt.optimizers:
 assert muon_opt is not None, "未找到 BatchedMuon"
 print(
     f"BatchedMuon: ns_steps={muon_opt.ns_steps} ns_bf16={muon_opt.ns_bf16} "
-    f"stack_ns_every={muon_opt.stack_ns_every} cache_q={muon_opt.stack_cache_q} "
     f"stack_ns_steps={muon_opt.stack_ns_steps}"
 )
 

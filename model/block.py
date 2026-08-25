@@ -85,10 +85,14 @@ class VibyBlock(nn.Module):
         residuals.append(v_attn)
         hidden_states = _attn_res_merge(self.attn_res_q_attn, residuals)
         mlp_output = self.mlp(self.post_attention_layernorm(hidden_states))
-        # site 3 卷积：解码状态与 site 2 同挂本层 KVCache.extras
+        # site 3 卷积：解码状态与 site 2 同挂本层 KVCache.extras；投机解码
+        # 挂了 mlp_out_trace 时逐步记录尾部快照，rewind 可精确恢复。
         if isinstance(present_key_value, KVCache):
             mlp_output, st = self.mlp_out_conv.cached_call(
-                mlp_output, present_key_value.extras.get("mlp_out")
+                mlp_output,
+                present_key_value.extras.get("mlp_out"),
+                trace=present_key_value.extras.get("mlp_out_trace"),
+                trace_base=present_key_value.offset - mlp_output.shape[1],
             )
             present_key_value.extras["mlp_out"] = st
         else:

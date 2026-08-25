@@ -39,10 +39,18 @@ class ShortConv(nn.Module):
         w = self.weight.astype(x.dtype)
         return causal_conv(x, w, seg=segment_ids, silu=False)
 
-    def cached_call(self, x: mx.array, state: Optional[mx.array]):
+    def cached_call(
+        self,
+        x: mx.array,
+        state: Optional[mx.array],
+        trace: Optional[list] = None,
+        trace_base: int = 0,
+    ):
         """缓存解码：state 为 (B, K-1, C) 的历史输入尾部（None 视为全零），
         返回 (y, 新 state)。segment 掩码只在完整前向（训练）出现，解码侧
-        不打包文档，无需传入。"""
+        不打包文档，无需传入。trace 非 None 时把每步处理后的输入尾部按
+        (trace_base + t + 1, tail) 逐步追加（与 KDA kda_trace 同口径），
+        供投机解码 rewind 精确恢复任意截断点的 conv 历史。"""
         B, T, C = x.shape
         K = self.kernel_size
         if state is None:
@@ -50,6 +58,10 @@ class ShortConv(nn.Module):
         hist = mx.concatenate([state, x], axis=1)  # (B, K-1+T, C)
         w = self.weight.astype(x.dtype)
         y = causal_conv(hist, w, seg=None, silu=False)[:, K - 1 :, :]
+        if trace is not None:
+            # 步 t 后的尾部 = 截至该步的最后 K-1 个 conv 输入
+            for t in range(T):
+                trace.append((trace_base + t + 1, hist[:, t + 1 : t + K, :]))
         return y, hist[:, T:, :]
 
 
@@ -271,10 +283,14 @@ class GQAAttention(nn.Module):
             output = output * mx.repeat(gate, self.head_dim, axis=-1)
         output = self.resid_dropout(self.o_proj(output))
         # site 2：attn 分支输出（o_proj 之后、residual 之前）的 ShortConv；
-        # 解码状态挂在本层 KVCache.extras，随 cache 流转/rewind。
+        # 解码状态挂在本层 KVCache.extras，随 cache 流转/rewind；投机解码
+        # 挂了 attn_out_trace 时逐步记录尾部快照，rewind 可精确恢复。
         if isinstance(past_kv, KVCache):
             output, st = self.out_conv.cached_call(
-                output, past_kv.extras.get("attn_out")
+                output,
+                past_kv.extras.get("attn_out"),
+                trace=past_kv.extras.get("attn_out_trace"),
+                trace_base=past_kv.offset - seq_len,
             )
             past_kv.extras["attn_out"] = st
         else:

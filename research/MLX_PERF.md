@@ -119,7 +119,7 @@ def timed(fn, iters=10, warm=3):
 |------|------|------|
 | 短 kernel、微组件 | **min** | 乐观但方差最小，本项目默认 |
 | 跨分钟的 A/B | **median，丢弃前 2 轮** | 抗热漂移 |
-| 整步训练步 | **中位 + min + 周期均值三个都报** | Muon 每 8 步 NS 刷新有尖峰，只看中位会漏掉摊平成本 |
+| 整步训练步 | **中位 + min + 周期均值三个都报** | 历史上 NS 降频刷新步有尖峰，只看中位会漏掉摊平成本（机制已删，口径保留） |
 
 **热漂移是本机最大的测量陷阱**：跨进程比对可以差 **±30%**，连续跑之后
 GPU 降频能让同一段代码慢 **~20%**。所以：
@@ -151,7 +151,17 @@ print(f"bwd 下界 {el * 14 / BW * 1e3:.2f}ms")       # x+dy+dx+dz 往返
 | KDA scan f+b | 15.01 ms | 带宽下界 3.24 ms | **4.6×** | 发射几何/occupancy 问题，值得做 |
 | flash bwd（早期） | 3.2 TFLOPS | MMA 12 | **3.8×** | MMA 操作数形态不对，值得做 |
 | MoE 整层 | 7.9 TFLOPS | 12.9 | 1.6× | 差距在索引和碎片 GEMM，收益有限 |
+| MoE gather_mm 单独 | 12.7~13.1 TF/s（均匀/倾斜/真实路由三者基本同速） | 同 FLOPs 稠密均匀 batched GEMM 13.4 TF/s | **1.05×** | 手写分段 GEMM 不值得做，见下行注 |
 | kda_prep fwd | 2.05 ms | 0.63 ms | 3.3× | 融合后到 1.63 ms，接近到顶 |
+
+**gather_mm 判定注**（2026-08-25，`probe_gather_mm_uniform.py`，受控同进程、
+compile 对 compile）：sorted gather_mm 在均匀索引、合成倾斜（段长 std≈19）、
+真实路由（std≈32）下 fwd 全部 ≈12.7~13.1 TF/s，与同 FLOPs 稠密均匀 batched
+GEMM（13.4）差 ≤5%，且差值里还含段尾 tile 量化的内在损耗（任何分段 kernel
+都付）。此前「gather_mm 比等价稠密慢 ~4.2ms/层」的印象来自
+`probe_moe_parts.py` 的 eager 稠密对照 vs compile gather_mm 的混合口径 +
+跨段热漂移；同口径复测不成立。**结论：手写分段 GEMM 的恢复上限 <1% 整步，
+不做。**
 
 **经验阈值**：倍数 < 1.5× 就不要动了，改一天赚不回来。
 
@@ -687,8 +697,15 @@ optimizer 在 M4 Max 上能占整步墙钟 **~48%**，值得单独优化。
 `(N,r,c)` 一次做 NS。100M 模型的 103 个 Muon 张量从 **~1700 kernel/步**
 降到 **~16 kernel/形状组**。
 
-**② 每 N 步复用 NS 极因子。** 默认每 8 步做一次完整 Gram-NS5，中间步
-复用（动量 EMA 0.95 半衰期 ~14 步，8 步内 drift 可控）。
+**② ~~每 N 步复用 NS 极因子~~（已删除，勿重引入）。** 曾默认每 8 步做
+一次完整 Gram-NS5、中间步复用旧极因子，省 ~30% 优化器墙钟。r082 归因
+（7 条单变量 probe，同 seed/数据、微步对同步）实测这是 r081→r082 回退
+的**最大单项元凶：早期损失 0.4-0.5 nat**——方向仍精确正交但相对当前
+动量是 stale 的，warmup 期动量旋转最快，恰好最不能复用。叠加 per-head
+NS（单独 −0.14 nat）后总回退 ~0.9 nat @500 步；动量 warmup 经隔离
+probe（p9）洗清，单独无害。整套机制（含 Temporal Q 缓存）已删除，
+正交化每步全量重算；详见 §7.1 与 BatchedMuon 类 docstring 的负面
+结果记录。
 
 **③ Gram-NS 只对 r ≪ c 有利。** `_ns_auto` 实测：
 
@@ -699,9 +716,11 @@ optimizer 在 M4 Max 上能占整步墙钟 **~48%**，值得单独优化。
 | (2,6400,768) | 12.9 ms | **5.2 ms**（更快） |
 | (2304,768,384) r<c | 527 ms | **414 ms**（更快，~25% FLOPs） |
 
-**④ 大张量的命中步不要 stack。** 专家栈单份 G/P/V 约 **1.27 GB**，
-三次 stack + scatter 光搬运就 **30 ms/组/步**。改成逐张量处理后
-gate_up 组 **64 → 39 ms**。**stack 的收益有 size 上限。**
+**④ 大张量不要随便 stack。** 专家栈单份 G/P/V 约 **1.27 GB**，三次
+stack + scatter 光搬运就 **30 ms/组/步**。**stack 的收益有 size 上限。**
+NS 降频删除后刷新路径也改成了逐张量（`probe_stack_free_opt.py`：
+mom/NS/apply 全逐矩阵语义，跨层 stack 是纯搬运；逐张量版与堆叠版
+**逐位一致**，两组 −41ms/步，`bench_muonh` 专家 NS 751→712ms）。
 
 **⑤ FusedAdamW**：10 个逐元素算子融合成 1 个
 `@partial(mx.compile, shapeless=True)`。MoE 细粒度化后 AdamW 覆盖
@@ -713,6 +732,23 @@ gate_up 组 **64 → 39 ms**。**stack 的收益有 size 上限。**
 
 **⑦ 含 `_fro_norm` 的投影必须 shapeful compile**（grid 绑形状）；
 纯逐元素链才能用 `shapeless=True`。
+
+**⑧ cubic5 低次 NS 系数 + 膝盖扫描（默认 cubic5b05）。** quintic 的
+`X←aX+bX³+cX⁵` 换成 NVIDIA relaxed cubic（arXiv 2606.00371，u=1.3、
+l₀=7e-3，Chen–Chow 闭式逐迭代系数，复现见
+`experiments/probe_cubic5.py`）：每步省掉 Gram 平方项，3→2 个主
+GEMM。P13 probe（14 分钟、同 seed 微步对同步）实测：500 步 loss
+**5.245 vs classic 5.328（−0.08 nat 不差反略好）**，步速
+0.70→0.73 step/s，`apply_gradients` 基准 **−19.5%**
+（`bench_muonh.py` exp_bf16_ns5 行）。同批对照证伪了两个方向：
+PE5 正交化残差减半却 +0.14 nat、无 NS 只归一化 +0.34 nat——
+**训练质量不由 polar 精度单调决定**（与 2606.00371 的核心结论
+一致），classic 的 [0.65,1.2] 带宽本身就是好口径。
+膝盖位置 l₀ 作为一等超参的扫描（同 probe 协议，loss@500）：
+l₀=0.007（cubic5）5.245 → l₀=0.05（b05）**5.223** → l₀=0.10（b10）
+5.314。峰值在 l₀=0.05，b05 与 cubic5 之差在 probe 噪声（±0.05）
+内、成本相同，按预注册规则翻默认为 **cubic5b05**。切换复现：
+`VIBY_MUONH_NS_COEFF=classic|pe|cubic5|cubic5b05|cubic5b10`。
 
 ---
 
@@ -736,9 +772,14 @@ gate_up 组 **64 → 39 ms**。**stack 的收益有 size 上限。**
 | MoE router 走 Muon | 负载失衡：top-1 桶 C 从 ~6K 涨到 13K+，吞吐 -30% |
 | router 用 base lr | C → 14K，吞吐 -45%（须 0.05× 或更小） |
 | 关掉 `bias_correction` | 前百余窗口有效步长放大 7~15×，beta2=0.9998 下 KDA 衰减参数溢出 NaN |
-| Muon Temporal Q 缓存（命中步 `D=Q@normalize(U)`） | 正交残差 4~13（完整 NS5 只有 0.02~0.03），残差门几乎每步 fallback，整步 **1585 → 3098 ms**。默认关闭 |
+| Muon NS 降频复用（每 8 步重算正交化、命中步复用旧极因子） | **质量灾难**：方向精确正交但相对当前动量 stale，r082 归因实测早期 −0.4~0.5 nat（r081→r082 总回退 ~0.9 nat 里的最大单项），墙钟只省 ~30%。机制已删除，勿重引入 |
+| Muon Temporal Q 缓存（命中步 `D=Q@normalize(U)`） | 正交残差 4~13（完整 NS5 只有 0.02~0.03），残差门几乎每步 fallback，整步 **1585 → 3098 ms**。机制已删除 |
 | 命中步 stack 专家栈 G/P/V | 30 ms/组纯搬运（1.27 GB/份） |
 | Gram-NS 用在方阵组 | 61→73 ms、320→371 ms |
+| Polar Express 5 步系数替换 NS5（同 GEMM 数、正交化残差减半 σ[0.80,1.13]） | 训练反而变差：P12 probe 500 步 **+0.14 nat**（5.465 vs 5.328）。polar 精度高 ≠ 训练好，勿以残差口径选型 |
+| Gram 逆平方根 Newton 细化 warm-start（跨步复用 Y≈G^{-1/2} 逐步细化） | **永不收敛**：warm 残差被 κ(G)=κ(X)² 放大（动量每步旋转 ~1.8e-2 × κ² ⇒ 残差 ~15，Newton 盆地要求 ≲1），合成轨迹 100% 回退（`experiments/probe_ns_refine.py`）。逆因子复用与 stale-D 同源，勿重引入 |
+| 去掉 NS 只归一化 + hyperball（`VIBY_MUONH_NO_NS` 测量开关） | **+0.34 nat** @500 步（5.669 vs 5.328）：NS 谱均衡本身值 0.34 nat，其墙钟占整步 ~27% |
+| 谱指数 NS：幂律谱变换 σ→σ·(σ²+s)^((p−1)/2) 的 Chebyshev-on-Gram 单发实现（frac50/frac25，8/10 GEMM vs cubic5 10） | **家族否定**：bf16 保真合格（max\|Δσ\|≤3.4e-2、单调）但 P14b/P15b probe @500 frac50 **5.523（+0.28）**、frac25 **5.441（+0.20）** vs cubic5 5.245——「幂律主体保大 σ 序信息」在此尺度有害，bulk 必须压平。教训：frac 输出必须把 \|\|D\|\|_F 钉回 √min(r,c)，未钉回（P14）+0.78 nat 主要是范数亏空非形状。勿以换 p/换正则重试同族（设计与验证见 `experiments/probe_frac_design.py`） |
 
 ### 7.2 Metal kernel 层
 
@@ -807,8 +848,13 @@ gate_up 组 **64 → 39 ms**。**stack 的收益有 size 上限。**
 | `VIBY_FLASH_NOPAD=1` | 关掉 flash 行距填充 |
 | `VIBY_FLASH_NT` / `VIBY_FLASH_STR` | 覆盖 flash tile |
 | `VIBY_FLASH_FWD=0` | 前向走 mlx SDPA，反向重算 LSE |
-| `VIBY_MUONH_STACK_NS_EVERY` | NS 刷新周期（默认 8） |
-| `VIBY_MUONH_CACHE_Q` | Temporal Q 缓存（默认 0，见 §7.1） |
+| `VIBY_MUONH_PER_HEAD` | Q/K/V per-head NS（默认 0；隔离实测单独 −0.14 nat @500 步，NS 降频下放大到 −0.26） |
+| `VIBY_MUONH_MOM_WARMUP` | 0.85→0.95 动量 warmup（默认 0；隔离实测单独无害也无益，r081 基线无此机制） |
+| `VIBY_SITU=0` | SiTU-GLU 回退无界 SwiGLU（A/B 用；实测早期无差异） |
+| `VIBY_KDA_SCAN_ZSC=0` | 关掉 kda_scan 反向的「状态 cotangent 恒零」特化（A/B 用） |
+
+（`VIBY_MUONH_STACK_NS_EVERY` / `VIBY_MUONH_CACHE_Q` / `VIBY_MUONH_CACHE_Q_RES`
+已随 NS 降频复用机制一并删除——r082 归因质量灾难，见 §7.1。）
 | `VIBY_DEBUG_MEM=1` | 打印 active/cache/peak + 分 gate 负载 + 桶容量 |
 | `VIBY_BENCH_B/T/D/E/I/K` | benchmark 脚本的形状口径 |
 
@@ -830,7 +876,7 @@ fwd+bwd（f+b）。
 | 未 prewarm 的 compile | 807 → 1189 ms；峰值 17.4 → 31.0 GB |
 | 一次 eval vs 两次 eval | 46 GB / 4.0 s → ~16 GB / 快 2× |
 | cache_limit 10G → 24G（bs16×640） | 提速 4.5%（峰值 14.8G，峰值+缓存 ≈39G） |
-| optimizer 占整步 | ~48% |
+| optimizer 占整步 | 历史上 ~48%（含每 8 步 NS 刷新摊平）；cubic5b05 + 每步全量 NS 口径（2026-08-25 实测）：**窗口 2620ms，fwd 590 / bwd 1175 / opt 833（31.8%），9380 tok/s，峰值 22.8GB**；专家组去 stack 逐张量化后 opt 段 833→789ms 中位（同进程 probe 口径 −41ms，逐位一致）。opt 中专家 NS GEMM ~660ms @ ~11.8 TF/s，已贴近 bf16 GEMM 峰值——优化器侧再无 kernel 级余量，只剩质量门控的算法杠杆（如 ns_steps 5→3，bench_muonh 示 −220ms/步） |
 
 ### 组件（每层）
 
@@ -861,6 +907,7 @@ fwd+bwd（f+b）。
 | `_fro_norm` kernel（专家栈） | 12 → ~2.5 ms |
 | BatchedMuon | ~1700 → ~16 kernel/形状组 |
 | decode kernel 融合 | KDA ~28→1、GatedNorm ~7→1、MoE ~18→3 |
+| kda_scan ZSC（训练时 cot_Sall 恒零特化，逐位等价） | scan bwd 9.66→8.16 ms、`_chunk_kda` f+b 17.26→16.21 ms/层（同进程 compile 口径）；整步 bwd min 1173.0→1163.7 ms、峰值 22.83→22.67 GB（背靠背 bench，min 口径） |
 
 ### 硬件上限
 

@@ -57,6 +57,13 @@ class VibyConfig:
                     f"mtp_feature_layers 各项必须在 [1, {num_hidden_layers}] 内: "
                     f"{self.mtp_feature_layers}"
                 )
+        if len(self.mtp_feature_layers) != 3:
+            # MTPModule 硬编码低/中/高三路融合（norm_low/mid/high + fc_l(3d)），
+            # 提前在配置期报错，避免运行时 shape mismatch
+            raise ValueError(
+                f"mtp_feature_layers 必须恰好 3 项（低/中/高）: "
+                f"{self.mtp_feature_layers}"
+            )
         # logit z-loss（Marin）：loss += z_loss_weight * mean(lse²)，
         # 主 LM 与 MTP 各 head 同权重，融合进 CE kernel。
         self.z_loss_weight = float(kwargs.get("z_loss_weight", 1e-4))

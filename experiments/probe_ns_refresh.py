@@ -32,7 +32,7 @@ GROUPS = [
     ("down    (E,DE,I)", (E, DE, I)),
 ]
 
-opt = BatchedMuon(learning_rate=1e-3, hyperball=True, ns_bf16=True, stack_ns_every=8)
+opt = BatchedMuon(learning_rate=1e-3, hyperball=True, ns_bf16=True)
 mom_fn = _stack_mom_kernel(opt.momentum, opt.nesterov, opt.weight_decay)
 apply_fn = _stack_apply_kernel(opt.hyperball)
 lr = mx.array(1e-3, dtype=mx.bfloat16)

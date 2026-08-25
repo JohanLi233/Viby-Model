@@ -266,8 +266,8 @@ def add_common_args(parser):
         "基础 lr）。默认开启，--no-muonh 回退旧分组。注意：开关改变优化器分组，"
         "不能用于续跑旧 checkpoint（optimizer state 分组对不上），只用于新 run。"
         "VIBY_MUONH_EXPERTS=0 只开范数球投影、专家保持 AdamW（消融/省逐专家 "
-        "NS 开销）。Temporal 默认开：VIBY_MUONH_CACHE_Q=1 + EVERY=8，命中 Q@U；"
-        "VIBY_MUONH_CACHE_Q_RES 残差超限则本步重跑 NS5（0 关闭）",
+        "NS 开销）。正交化固定每步全量重算：NS 降频复用/Temporal Q 缓存是 "
+        "r082 回退的最大元凶（早期 −0.4~0.5 nat），机制已删除，勿重引入。",
     )
 
 

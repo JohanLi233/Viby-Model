@@ -2,7 +2,7 @@
 
 覆盖：z-loss lse²、KDA 下界门 + 满秩输出门、SiTU-GLU、独立共享专家、
 attn_gate 默认 2·sigmoid 进 Adam、AttnRes key RMSNorm、0.5/√hidden
-截断正态、warmup 1% + 线性衰减、Per-Head Muon。
+截断正态、warmup 1% + 线性衰减、Per-Head Muon（opt-in，默认关）。
 """
 
 import math
@@ -228,9 +228,17 @@ def test_optimizer_groups_and_per_head():
     cfg = tiny(use_attn_gate=True, tie_word_embeddings=False, mtp_depth=0)
     model = VibyForCausalLM(cfg)
     args = types.SimpleNamespace(learning_rate=0.01, muon_ns_steps=5, muonh=True)
-    opt = create_mixed_optimizer(model, args)
+    # per-head NS 默认关（r082 归因），这里显式打开验证该机制本身
+    os.environ["VIBY_MUONH_PER_HEAD"] = "1"
+    try:
+        opt = create_mixed_optimizer(model, args)
+    finally:
+        del os.environ["VIBY_MUONH_PER_HEAD"]
     muon = opt.optimizers[0]
     check("Muon 拿到 head_dim", getattr(muon, "head_dim", None) == cfg.head_dim)
+    # 默认（无 env）不开 per-head NS（r082 归因后的默认口径）
+    opt_d = create_mixed_optimizer(model, args)
+    check("默认 per-head 关闭", getattr(opt_d.optimizers[0], "head_dim", -1) == 0)
 
     # attn_gate / 短卷积不得进 Muon（KDA q/k/v_conv 形状 (4, proj)）
     trainable = tree_flatten(model.trainable_parameters())

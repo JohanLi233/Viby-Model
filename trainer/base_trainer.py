@@ -589,6 +589,15 @@ class BaseTrainer:
                 load_stats,
             )
             mx.eval(grads)
+            # P-0/P-1 快照（env 门控，默认零开销）：捕获本微批梯度，
+            # 供跨 microbatch 方向相关分析（research/OPTIMIZER_RESEARCH §0.5）
+            from . import snapshot
+
+            if snapshot.active():
+                acc = self.args.accumulation_steps
+                snapshot.maybe_dump_grads(
+                    step // acc + 1, step % acc, dict(tree_flatten(grads)), acc
+                )
             # margin 样本跨微批沿 token 轴拼接：QB 偏置快照看到整个累积
             # 窗口的 margin 分布，比只用最后一个微批噪声更小
             if last_moe_stats is None or last_moe_stats.size == 0:

@@ -53,12 +53,27 @@ class KVCache:
         # ``c[:, :seq_len]`` 超出时静默截到实际长度；这里对齐该语义。
         trace = self.extras.get("kda_trace")
         if offset < self.offset:
-            # block 级 conv（attn_out/mlp_out）尾部对应被截掉的位置，无法
-            # 重建，丢弃；随后 ≤kernel-1 个位置按零历史卷积（近似口径）。
-            # KDA 的 q/k/v conv 尾部与 SSM state 由快照精确恢复（快照条目
-            # 为 (offset, S, q尾, k尾, v尾)），无轨迹时才丢弃。
-            self.extras.pop("attn_out", None)
-            self.extras.pop("mlp_out", None)
+            # block 级 conv（attn_out/mlp_out）尾部：有逐步快照轨迹（投机
+            # 解码在 prefill 后挂载）时按不超过 offset 的最近快照精确恢复；
+            # 无轨迹时对应被截掉位置的尾部无法重建，丢弃，随后 ≤kernel-1
+            # 个位置按零历史卷积（近似口径）。KDA 的 q/k/v conv 尾部与
+            # SSM state 同理由 kda_trace 快照精确恢复（快照条目为
+            # (offset, S, q尾, k尾, v尾)），无轨迹时才丢弃。
+            for key in ("attn_out", "mlp_out"):
+                ctr = self.extras.get(key + "_trace")
+                if ctr:
+                    base = None
+                    for entry in ctr:
+                        if entry[0] <= offset:
+                            base = entry
+                    if base is not None:
+                        self.extras[key] = base[1]
+                        self.extras[key + "_trace"] = [base]
+                    else:
+                        self.extras.pop(key, None)
+                        self.extras[key + "_trace"] = []
+                else:
+                    self.extras.pop(key, None)
             if not trace:
                 for key in ("q_conv", "k_conv", "v_conv", "kda_state"):
                     self.extras.pop(key, None)

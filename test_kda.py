@@ -129,7 +129,9 @@ def test_decay_clamp_no_overflow():
     attn = KDAAttention(cfg, layer_idx=0)
     mx.eval(attn.parameters())
     attn.A_log = mx.full(attn.A_log.shape, 4.0)  # e^4 ≈ 55
-    attn.dt_bias = mx.full(attn.dt_bias.shape, 8.0)  # softplus(8)≈8 → 440 nats/步
+    attn.dt_bias = mx.full(
+        attn.dt_bias.shape, 8.0
+    )  # e^4·8≈435 → σ≈1 → g 饱和至 g_min=−5/步
     x = mx.random.normal((2, 64, 192)).astype(mx.bfloat16)
 
     def loss_fn(a, d):

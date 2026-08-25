@@ -100,7 +100,7 @@ def _build(D: int, Dv: int, H: int, dtype, scale: float, eps: float):
             sh_qh[tid] = float(qh);
             sh_kh[tid] = float(kh);
             float av = float(a[row + tid]) + float(dt_bias[h * D + tid]);
-            // K3: g = g_min * sigmoid(exp(A_log) * a * dt_bias); exp(A_log) stored dtype
+            // K3: g = g_min * sigmoid(exp(A_log) * (a + dt_bias)); exp(A_log) stored dtype
             float eg = float(({mt})(metal::exp(float(A_log[h]))));
             float lg = G_MIN / (1.0f + metal::exp(-eg * av));
             sh_egl[tid] = metal::exp(lg);

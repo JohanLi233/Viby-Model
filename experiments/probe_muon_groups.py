@@ -152,7 +152,7 @@ def main():
         groups.items(), key=lambda kv: -sum(flat_g[p].size for p in kv[1])
     ):
         measure(f"{shp[0]}x{shp[1]}", paths, shp[0], shp[1], False)
-    print(f"\n=== 堆叠专家组（stack_ns_every=8，此处显示刷新步成本）===\n{hdr}")
+    print(f"\n=== 堆叠专家组（每步全量 Gram-NS，不降频）===\n{hdr}")
     for (b, r, c), paths in sorted(
         stack_groups.items(), key=lambda kv: -sum(flat_g[p].size for p in kv[1])
     ):

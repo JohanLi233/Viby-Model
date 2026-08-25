@@ -405,18 +405,25 @@ E=288 K=6 D=768 bf16，r080 在跑有背景竞争，三臂轮转计时取相对�
   逐专家 NS5 1221ms（+34×，~12 TFLOP/步）；NS bf16 无效（训练本
   就是 bf16，NS 一直在 bf16 跑）；NS 3 步 855ms；NS3+每 4 步重算
   摊薄 331ms（缓存命中步仍有 ~115ms 堆叠/动量/norm 固定流量）。
-  ## Temporal MuonH / Cache Q（2026-08-23 研究原型）
+  ## Temporal MuonH / Cache Q（2026-08-23 研究原型 → r082 归因后删除）
+
+**结论先行：整套 NS 降频复用机制（含本节 Cache Q）已于 r082 归因后
+删除，勿重引入。** r082 相对 r081 回退 ~0.9 nat @500 步，单变量 probe
+证明 EVERY=8 复用旧极因子是最大单项元凶（早期 −0.4~0.5 nat）；Cache Q
+的正交残差 4~13（完整 NS5 仅 0.02~0.03）同样不可用。下面保留当时的
+研究记录供参考，开关均已不存在。
 
 专家必须留在 MuonH、又要压单机 NS 墙钟时，走 CacheMuon 口径：
 
 - 刷新步：`_ns5_gram`（与标准 NS5 cos≈0.999）并缓存左变换 `Q`
 - 命中步：`D = Q @ normalize(U)`，新动量仍进更新（对比复用旧极因子 D）
-- 开关：`VIBY_MUONH_CACHE_Q=1` + `VIBY_MUONH_STACK_NS_EVERY=4|8`
-- 验证：`experiments/test_muonh_cache.py`；墙钟：`bench_muonh.py` 的
-  `exp_cache_q_e*`
+- ~~开关：`VIBY_MUONH_CACHE_Q=1` + `VIBY_MUONH_STACK_NS_EVERY=4|8`~~（已删除）
+- ~~验证：`experiments/test_muonh_cache.py`~~（已删除）
 
 **实测（r081，M4 Max）**：每步 NS5 ≈1277ms；Cache Q every=8 摊薄
 先约 468ms。后续优化：刷新改为标准 NS5 顺带累积 Q（不再走更贵的
 Gram 刷新）、动量/投影 mx.compile、命中残差触发
 （`VIBY_MUONH_CACHE_Q_RES`，默认 0.15）。`--muonh` 默认
 CACHE_Q=1 + EVERY=8。
+**（事后注：上述墙钟节省以早期 −0.4~0.5 nat 为代价，r082 归因后
+全部回退并删除实现。）**

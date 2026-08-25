@@ -48,14 +48,16 @@ def _build(
     dv_split: int = _DV_SPLIT,
     nt_fwd: int = _NT_FWD,
     nt_bwd: int = _NT_BWD,
+    zsc: bool = False,
 ):
-    """按 (NC,C,D,DV,dv_split,nt_fwd,nt_bwd) 构建 fwd/bwd kernel。
+    """按 (NC,C,D,DV,dv_split,nt_fwd,nt_bwd,zsc) 构建 fwd/bwd kernel。
 
     要求：DV % dv_split == 0；DVH % (nt_fwd//C) == 0、D % (nt_bwd//C) == 0、
     DV % (nt_bwd//C) == 0（寄存器分块对齐，由调度器守卫）。dv_split 越大
     并行组数越多、每核驻留组数越多（TG 占用随分片减小），代价是
-    w/qe/kd/Aqk 等输入被多分片重复读取。"""
-    key = (NC, C, D, DV, dv_split, nt_fwd, nt_bwd)
+    w/qe/kd/Aqk 等输入被多分片重复读取。zsc=True 构建「状态 cotangent 恒零」
+    的 bwd 变体（不读 cot_Sall；与通用版在 cot_Sall=0 时逐位等价）。"""
+    key = (NC, C, D, DV, dv_split, nt_fwd, nt_bwd, zsc)
     if key in _KERNELS:
         return _KERNELS[key]
     DVH = DV // dv_split
@@ -64,6 +66,38 @@ def _build(
     JBB = DV // (nt_bwd // C)  # bwd 寄存器分块宽
     NBB = DV // JBB  # bwd j 块数
     DBB = D // (nt_bwd // C)  # bwd d 分块宽
+
+    # ZSC（zero state-cotangent）bwd 变体：训练图里 Sall 的 cotangent 恒为零
+    # （_chunk_kda 只经 Sall[:, :, NC] 暴露末态，训练时末态不被下游消费），
+    # 省掉 cot_Sall 零张量的物化与逐 chunk 切片读。通用版此处做 dSw += ct，
+    # ct=0 时首轮等价于零初始化、其余迭代为 +0.0f 恒等（x+0.0f 逐位等于 x），
+    # 故两变体在 cot_Sall=0 下逐位等价。
+    if zsc:
+        p0_src = f"""
+            // P0: cot_Sall 恒零（ZSC）：首轮零初始化 dSw，其余迭代跳过
+            if (c == {NC} - 1) {{
+                for (uint idx = tid; idx < D * DV; idx += NT)
+                    dSw[sb + idx] = 0.0f;
+            }}
+        """
+        ds0_src = """
+        // dS0 = dS（cot_Sall[0] 恒零）
+        for (uint idx = tid; idx < D * DV; idx += NT)
+            dS0[sb + idx] = dSw[sb + idx];
+        """
+    else:
+        p0_src = f"""
+            // P0: dS += cot_Sall[c+1]（首轮直接载入，免零初始化）
+            for (uint idx = tid; idx < D * DV; idx += NT) {{
+                float ct = cot_Sall[sab + ((size_t)c + 1) * D * DV + idx];
+                dSw[sb + idx] = (c == {NC} - 1) ? ct : dSw[sb + idx] + ct;
+            }}
+        """
+        ds0_src = """
+        // dS0 = dS + cot_Sall[0]
+        for (uint idx = tid; idx < D * DV; idx += NT)
+            dS0[sb + idx] = dSw[sb + idx] + cot_Sall[sab + idx];
+        """
 
     fwd_src = f"""
         uint tid = thread_position_in_grid.x;
@@ -159,11 +193,7 @@ def _build(
 
         for (int c = {NC} - 1; c >= 0; c--) {{
             size_t cbh = cb + c;
-            // P0: dS += cot_Sall[c+1]（首轮直接载入，免零初始化）
-            for (uint idx = tid; idx < D * DV; idx += NT) {{
-                float ct = cot_Sall[sab + ((size_t)c + 1) * D * DV + idx];
-                dSw[sb + idx] = (c == {NC} - 1) ? ct : dSw[sb + idx] + ct;
-            }}
+{p0_src}
             threadgroup_barrier(mem_flags::mem_threadgroup);
             // P1: vt = u − w@Sc（重算；Sc = Sall[c]，(i, j块) 分块）
             for (uint u_ = tid; u_ < C * NB; u_ += NT) {{
@@ -266,9 +296,7 @@ def _build(
                 du[cbh * C * DV + idx] = dvt[idx];
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
-        // dS0 = dS + cot_Sall[0]
-        for (uint idx = tid; idx < D * DV; idx += NT)
-            dS0[sb + idx] = dSw[sb + idx] + cot_Sall[sab + idx];
+{ds0_src}
     """
 
     k_fwd = mx.fast.metal_kernel(
@@ -277,19 +305,12 @@ def _build(
         output_names=["o", "Sall"],
         source=fwd_src,
     )
+    bwd_inputs = ["qe", "w", "u", "Aqk", "kd", "egl", "Sall", "cot_o"]
+    if not zsc:
+        bwd_inputs.append("cot_Sall")
     k_bwd = mx.fast.metal_kernel(
-        name=f"kda_scan_bwd_{NC}_{C}_{D}_{DV}_{nt_bwd}",
-        input_names=[
-            "qe",
-            "w",
-            "u",
-            "Aqk",
-            "kd",
-            "egl",
-            "Sall",
-            "cot_o",
-            "cot_Sall",
-        ],
+        name=f"kda_scan_bwd_{NC}_{C}_{D}_{DV}_{nt_bwd}{'_zsc' if zsc else ''}",
+        input_names=bwd_inputs,
         output_names=["dqe", "dw", "du", "dAqk", "dkd", "degl", "dS0", "dSw"],
         source=bwd_src,
     )
@@ -305,8 +326,9 @@ def _scan_op_factory(
     dv_split: int = _DV_SPLIT,
     nt_fwd: int = _NT_FWD,
     nt_bwd: int = _NT_BWD,
+    zsc: bool = False,
 ):
-    k_fwd, k_bwd = _build(NC, C, D, DV, dv_split, nt_fwd, nt_bwd)
+    k_fwd, k_bwd = _build(NC, C, D, DV, dv_split, nt_fwd, nt_bwd, zsc)
 
     @mx.custom_function
     def _op(qe, w, u, Aqk, kd, egl, S0):
@@ -326,10 +348,15 @@ def _scan_op_factory(
     @_op.vjp
     def _op_vjp(primals, cotangent, output):
         qe, w, u, Aqk, kd, egl, _S0 = primals
-        cot_o, cot_Sall = cotangent
+        cot_o = cotangent[0]
         B, H = qe.shape[0], qe.shape[1]
+        # zsc：cotangent[1]（Sall 的协梯度）按约定恒零，不进 kernel 输入表；
+        # compile 下该 lazy zeros 被 DCE 掉，连同其物化一起消除。
+        ins = [qe, w, u, Aqk, kd, egl, output[1], cot_o]
+        if not zsc:
+            ins.append(cotangent[1])
         dqe, dw, du, dAqk, dkd, degl, dS0, _dSw = k_bwd(
-            inputs=[qe, w, u, Aqk, kd, egl, output[1], cot_o, cot_Sall],
+            inputs=ins,
             output_shapes=[
                 (B, H, NC, C, D),
                 (B, H, NC, C, D),
@@ -385,9 +412,11 @@ def kda_scan_metal(
     dv_split: int = None,
     nt_fwd: int = None,
     nt_bwd: int = None,
+    zsc: bool = False,
 ):
     """融合扫描入口。仅接受 f32 且满足 _supported；由 _chunk_kda 侧的
-    调度器（含在线校验与 eager 回退）调用。
+    调度器（含在线校验与 eager 回退）调用。zsc=True 走「状态 cotangent
+    恒零」bwd 变体（调用方须保证该条件，训练路径由 _chunk_kda 断言）。
 
     发射几何默认取模块级 _DV_SPLIT/_NT_FWD/_NT_BWD（sweep 脚本改这三个
     模块变量即可切换，无需改调用点）。"""
@@ -396,9 +425,9 @@ def kda_scan_metal(
     nt_bwd = _NT_BWD if nt_bwd is None else nt_bwd
     NC, C, D = qe.shape[2], qe.shape[3], qe.shape[4]
     DV = u.shape[-1]
-    key = (NC, C, D, DV, dv_split, nt_fwd, nt_bwd)
+    key = (NC, C, D, DV, dv_split, nt_fwd, nt_bwd, zsc)
     op = _OPS.get(key)
     if op is None:
-        op = _scan_op_factory(NC, C, D, DV, dv_split, nt_fwd, nt_bwd)
+        op = _scan_op_factory(NC, C, D, DV, dv_split, nt_fwd, nt_bwd, zsc)
         _OPS[key] = op
     return op(qe, w, u, Aqk, kd, egl, S0)

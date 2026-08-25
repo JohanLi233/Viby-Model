@@ -54,12 +54,16 @@ _SCAN_KERNEL_DISABLED = (
     os.environ.get("VIBY_KDA_SCAN", "1") != "1"
     or os.environ.get("VIBY_FUSED_KERNELS", "1") == "0"
 )
+# VIBY_KDA_SCAN_ZSC=0：关闭 scan 反向的「状态 cotangent 恒零」特化
+# （仅训练路径使用；评估/prefill 消费末态 S，cot_Sall 非零，自动走通用版）
+_ZSC_ENABLED = os.environ.get("VIBY_KDA_SCAN_ZSC", "1") == "1"
 
 
-def _scan_dispatch(qe, w, u, Aqk, kd, egl, S):
+def _scan_dispatch(qe, w, u, Aqk, kd, egl, S, zsc: bool = False):
     """chunk 扫描调度：优先融合 Metal kernel（fwd+bwd 各 1 次发射），
     首调用按形状键对照 eager 参考（_kda_scan 含 VJP）做在线校验，
-    失败/不支持形状永久回退 eager。"""
+    失败/不支持形状永久回退 eager。zsc=True 使用「状态 cotangent 恒零」
+    的 bwd 变体（仅当调用方保证 Sall/末态的 cotangent 为零时合法）。"""
     global _SCAN_KERNEL_DISABLED
     NC, C, D = qe.shape[2], qe.shape[3], qe.shape[4]
     Dv = u.shape[-1]
@@ -69,9 +73,9 @@ def _scan_dispatch(qe, w, u, Aqk, kd, egl, S):
         or not _scan_supported(NC, C, D, Dv)
     ):
         return _kda_scan(qe, w, u, Aqk, kd, egl, S)
-    key = (NC, C, D, Dv)
+    key = (NC, C, D, Dv, zsc)
     try:
-        o, Sall = kda_scan_metal(qe, w, u, Aqk, kd, egl, S)
+        o, Sall = kda_scan_metal(qe, w, u, Aqk, kd, egl, S, zsc=zsc)
         if key not in _SCAN_KERNEL_VERIFIED:
             o_ref, Sall_ref = _kda_scan(qe, w, u, Aqk, kd, egl, S)
             mx.eval(o, Sall, o_ref, Sall_ref)  # 触发 JIT 编译
@@ -94,7 +98,7 @@ def _scan_prewarm(NC: int, C: int, D: int, Dv: int, B: int = 1, H: int = 1) -> b
     global _SCAN_KERNEL_DISABLED
     if _SCAN_KERNEL_DISABLED:
         return False
-    key = (NC, C, D, Dv)
+    key = (NC, C, D, Dv, False)
     if key in _SCAN_KERNEL_VERIFIED:
         return True
     try:
@@ -130,6 +134,34 @@ def _scan_prewarm(NC: int, C: int, D: int, Dv: int, B: int = 1, H: int = 1) -> b
             if rel > 1e-3:
                 raise RuntimeError(f"kda_scan prewarm 梯度不一致 rel={rel:.2e}")
         _SCAN_KERNEL_VERIFIED.add(key)
+        # ZSC 变体（训练路径实际使用）也必须在 compile 前完成校验，否则首个
+        # 训练调用落在 compile trace 内，在线校验被迫放弃 → 静默永久回退
+        # eager。loss 只依赖 o，使 cot_Sall 恒零——正是 ZSC 变体的合法条件。
+        if _ZSC_ENABLED:
+            key_z = (NC, C, D, Dv, True)
+            if key_z not in _SCAN_KERNEL_VERIFIED:
+
+                def fk_z(*a):
+                    return (kda_scan_metal(*a, zsc=True)[0] ** 2).sum()
+
+                def fe_z(*a):
+                    return (_kda_scan(*a)[0] ** 2).sum()
+
+                lz, gz = mx.value_and_grad(fk_z, argnums=list(range(7)))(*ins)
+                lz_r, gz_r = mx.value_and_grad(fe_z, argnums=list(range(7)))(*ins)
+                mx.eval(lz, lz_r, *gz, *gz_r)
+                if abs(lz.item() - lz_r.item()) > 1e-3 * max(1.0, abs(lz_r.item())):
+                    raise RuntimeError(
+                        f"kda_scan zsc prewarm loss 不一致 {lz.item()} vs {lz_r.item()}"
+                    )
+                for a, b in zip(gz, gz_r):
+                    d = (a - b).abs().max().item()
+                    rel = d / (b.abs().max().item() + 1e-12)
+                    if rel > 1e-3:
+                        raise RuntimeError(
+                            f"kda_scan zsc prewarm 梯度不一致 rel={rel:.2e}"
+                        )
+                _SCAN_KERNEL_VERIFIED.add(key_z)
         return True
     except Exception:
         _SCAN_KERNEL_DISABLED = True
@@ -300,9 +332,12 @@ def _chunk_kda(
     beta: mx.array,
     S0: Optional[mx.array] = None,
     chunk_size: int = KDA_CHUNK,
+    zero_state_cot: bool = False,
 ) -> tuple[mx.array, mx.array]:
     """chunk 并行训练前向（f32）。形状同 _recurrent_kda；T 非 C 整数倍时
-    右侧零填充（k=0 不写状态、log_g=0 不衰减，对输出与最终状态无影响）。"""
+    右侧零填充（k=0 不写状态、log_g=0 不衰减，对输出与最终状态无影响）。
+    zero_state_cot=True 向调度器声明：返回的末态 S（即 Sall 全体）的
+    cotangent 恒为零，允许 scan 反向走零协梯度特化（仅训练路径满足）。"""
     B, H, T, D = q.shape
     Dv = v.shape[-1]
     C = chunk_size
@@ -338,7 +373,7 @@ def _chunk_kda(
         if S0 is None
         else S0.astype(mx.float32)
     )
-    o, Sall = _scan_dispatch(qe, w, u, Aqk, kd, egl, S)
+    o, Sall = _scan_dispatch(qe, w, u, Aqk, kd, egl, S, zsc=zero_state_cot)
     o = o.reshape(B, H, T + pad, Dv)
     if pad:
         o = o[:, :, :T]
@@ -374,10 +409,14 @@ class KDAAttention(nn.Module):
         H = self.n_heads
         # A_h 初始化为 0（K3）；仍叫 A_log 以免改 decode kernel 签名
         self.A_log = mx.zeros((H,))
-        # 逐通道 z 偏置：softplus 反函数把 U(0.001,0.1) 映到略负区间，
-        # A_h=0 时 g≈g_min·σ(z) 起步约 −2.5 nats，避免饱和在 0 或 g_min
-        dt = mx.random.uniform(0.001, 0.1, (proj,))
-        self.dt_bias = mx.log(mx.expm1(dt))
+        # 逐通道 z 偏置：直接按目标初始衰减率校准——r ~ U(0.001, 0.1)
+        # nats/step（e-folding 记忆 10~1000 token，与 softplus 时代的
+        # 初始分布一致），存 logit(r/|g_min|) 使 K3 门在 A_h=0 时
+        # σ(z)=r/|g_min| ⇒ g = g_min·σ(z) = −r。z ∈ (−8.5, −3.9)；
+        # 慢端 σ′≈r/5 很小（该侧衰减学得慢），快速整体调节靠
+        # per-head 的 A_h（e^{A_h} 直接缩放 z）。
+        r = mx.random.uniform(0.001, 0.1, (proj,))
+        self.dt_bias = mx.log(r / (-KDA_G_MIN - r))
         self.o_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = nn.Linear(proj, d, bias=False)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -577,7 +616,17 @@ class KDAAttention(nn.Module):
                         )
                     )
         else:
-            out, S = _chunk_kda(q, k, v, log_g, beta, S0)
+            # 训练且不使用 cache 时末态 S 不被下游消费，Sall 全体的
+            # cotangent 恒零 → scan 反向走零协梯度特化（逐位等价）。
+            out, S = _chunk_kda(
+                q,
+                k,
+                v,
+                log_g,
+                beta,
+                S0,
+                zero_state_cot=self.training and cache is None and _ZSC_ENABLED,
+            )
         if cache is not None:
             extras["kda_state"] = S
             cache.offset += T

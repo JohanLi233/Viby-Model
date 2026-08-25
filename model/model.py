@@ -652,8 +652,10 @@ class VibyForCausalLM(nn.Module):
             module_idx = i % n_modules
             module = self.mtp_modules[module_idx]
             emb = self.model.embed_tokens(token)
-            # KV cache 只接首个模块（depth-1 流，唯一被训练的深度）；
-            # 更深的复用步保持无 cache 旧语义（其输入本就 OOD）。
+            # KV cache 只接首个模块（depth-1 流，唯一被训练的深度）：
+            # mtp_depth=1 时循环复用的每步都是 module 0，草稿全程带上下文；
+            # depth>1 时更深的复用步保持无 cache（其链式输入本就 OOD）。
+            # 复用步追加的中间条目随返回一并带出，由调用方截断。
             own_cache = mtp_past is not None and module_idx == 0
             # step 0：EAGLE-3 多层特征输入；step≥1：草稿自身 hidden 链式输入
             h_in = feat_last if i == 0 else h
@@ -737,15 +739,21 @@ class VibyForCausalLM(nn.Module):
         # 追加、再按被接受位置追平。仅维护首个模块（depth-1 流）；有
         # padding 时不启用（speculative 本就限 batch=1，eval 恒无 pad）。
         mtp_past = None
-        if attention_mask is None and seq_len > 1:
+        if seq_len > 1:
+            # 调用方（generate）已保证 attention_mask 全 1 或无 mask
+            # （mask_ok），显式全 1 mask 同样构建草稿上下文，不再静默
+            # 退化到无 cache 口径。
             feats_pref = [f[:, : seq_len - 1, :] for f in out.features]
             e_pref = self.model.embed_tokens(input_ids[:, 1:])
             _, mtp_past = self.mtp_modules[0](feats_pref, e_pref, use_cache=True)
 
-        # 激活 KDA 状态轨迹（rewind 精确回滚用）：以各 cache 当前位置
-        # （prefill 结束）的 state + conv 尾部为种子快照。
+        # 激活 KDA 状态轨迹与 block 级 conv 尾部轨迹（rewind 精确回滚
+        # 用）：以各 cache 当前位置（prefill 结束）的 state + conv 尾部
+        # 为种子快照。
         for c in list(past) + [mtp_past]:
-            if isinstance(c, KVCache) and "kda_state" in c.extras:
+            if not isinstance(c, KVCache):
+                continue
+            if "kda_state" in c.extras:
                 c.extras["kda_trace"] = [
                     (
                         c.offset,
@@ -755,6 +763,9 @@ class VibyForCausalLM(nn.Module):
                         c.extras.get("v_conv"),
                     )
                 ]
+            for key in ("attn_out", "mlp_out"):
+                if key in c.extras:
+                    c.extras[key + "_trace"] = [(c.offset, c.extras[key])]
 
         if streamer:
             streamer.put(input_ids)
@@ -846,8 +857,10 @@ class VibyForCausalLM(nn.Module):
             seen_tail = mx.concatenate(
                 [seen, mx.array(accepted_prefix, dtype=mx.int32)]
             )
-            if n_acc == iter_draft_len and iter_draft_len > 0:
+            if n_acc == iter_draft_len and remaining > n_acc + 1:
                 # All drafts accepted: sample an extra token from the tail.
+                # iter_draft_len==0（剩余额度收紧到不草稿）且额度 ≥2 时，
+                # vlogits[0] 同样给出 bonus 之后的下一 token，不再白跑一轮。
                 tail_logits = _transform_logits_mx(
                     vlogits[iter_draft_len],
                     seen_tail,
@@ -859,7 +872,7 @@ class VibyForCausalLM(nn.Module):
                 )
                 tail = int(_sample_from_logits_mx(tail_logits, do_sample).item())
             elif iter_draft_len == 0:
-                # 上下文/剩余额度边界：只产出 bonus，不补 tail
+                # 剩余额度只够 1 个 token：只产出 bonus，不补 tail
                 tail = None
             elif do_sample:
                 # Reject: resample from the positive residual (p - q)+.

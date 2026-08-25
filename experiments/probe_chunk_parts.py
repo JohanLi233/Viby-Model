@@ -105,6 +105,15 @@ bench(
     (qe, w, u, Aqk, kd, egl, S0),
     MB * (4 + 1) + SALL_MB + MB * (4 + 1 + 1 + 5) + 2 * SALL_MB,
 )
+# scan ZSC 变体（训练真实形态：loss 只依赖 o，cot_Sall 恒零并被特化消除，
+# 少一份 Sall 大小的零张量物化+读）
+bench(
+    "scan_zsc",
+    lambda *a: (kda_scan_metal(*a, zsc=True)[0] ** 2).sum(),
+    tuple(range(7)),
+    (qe, w, u, Aqk, kd, egl, S0),
+    MB * (4 + 1) + SALL_MB + MB * (4 + 1 + 1 + 5) + SALL_MB,
+)
 # 整段
 bench(
     "_chunk_kda",
@@ -121,6 +130,22 @@ bench(
     ),
     0.001,
 )
+# 整段 ZSC（训练真实路径：KDAAttention 训练时传 zero_state_cot=True）
+bench(
+    "_chunk_kda_zsc",
+    lambda a, b_, c_, d_, e_: (
+        _chunk_kda(a, b_, c_, d_, e_, None, zero_state_cot=True)[0] ** 2
+    ).sum(),
+    (0, 1, 2, 3, 4),
+    (
+        q.reshape(B, H, T, Dh),
+        k.reshape(B, H, T, Dh),
+        v.reshape(B, H, T, Dh),
+        log_g.reshape(B, H, T, Dh),
+        beta.reshape(B, H, T),
+    ),
+    0.001,
+)
 
-print(f"\nscan 里 cot_Sall（训练恒零）单独占 {SALL_MB:.0f}MB 分配+读")
+print(f"\nscan 里 cot_Sall（训练恒零）单独占 {SALL_MB:.0f}MB 分配+读（ZSC 行已消除）")
 print(f"峰值内存 {mx.get_peak_memory() / 2**30:.2f} GB")

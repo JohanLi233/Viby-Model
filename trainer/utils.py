@@ -421,6 +421,12 @@ def get_lr_and_momentum(
         lr_multiplier = 1.0 - (1.0 - min_lr_ratio) * progress
 
     # --- 动量调度 (仅用于Muon) ---
+    # 动量 warmup（0.85→0.95 前 300 步）默认关闭：隔离 probe 实测单独
+    # 无害也无益（probe_p9 与基线逐点重合），而 r081 健康基线本就没有
+    # 它——"早期无害"≠"长程无害"，保持与已验证基线一致。
+    # VIBY_MUONH_MOM_WARMUP=1 可打开（消融用）。
+    if os.environ.get("VIBY_MUONH_MOM_WARMUP", "0") != "1":
+        momentum_warmup_steps = 0
     momentum = final_momentum
     if step < momentum_warmup_steps:
         frac = float(step) / float(max(1, momentum_warmup_steps))

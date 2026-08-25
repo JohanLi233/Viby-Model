@@ -32,7 +32,9 @@ from .utils import (
 warnings.filterwarnings("ignore")
 
 
-def draft_ttt_loss(model, X, Y, loss_mask, attn_mask, mask_has_pad, ttt_steps=4):
+def draft_ttt_loss(
+    model, X, Y, loss_mask, attn_mask, mask_has_pad, ttt_steps=4, segment_ids=None
+):
     """EAGLE-3 TTT 多步 rollout 草稿 loss（目标模型冻结，只反传草稿参数）。
 
     X: (B, T) 输入 token；Y: next-token 移位的 labels；ttt_steps: rollout
@@ -40,8 +42,10 @@ def draft_ttt_loss(model, X, Y, loss_mask, attn_mask, mask_has_pad, ttt_steps=4)
     - step 1：输入目标模型多层特征 feats[:, j] 与 Emb(X[j+1])；
     - step s≥2：输入草稿上一步 block 输出 h[j]（梯度回传）与上一步
       argmax 预测 token 的嵌入（约等于 Emb(X[j+s]) 的自预测版）。
-    返回各步 CE 的平均（掩码口径与 _mtp_loss 一致）。目标前向只跑一次，
-    特征全程复用；主干参数已冻结、不在梯度树内，等价于 stop-gradient。
+    返回各步 CE 的平均（掩码口径与 _mtp_loss 一致；segment_ids 非 None
+    时按源位置的文档边界掩码自注意力，与 _mtp_loss 的 doc_mask 口径
+    一致）。目标前向只跑一次，特征全程复用；主干参数已冻结、不在梯度
+    树内，等价于 stop-gradient。
     """
     core = model.model  # VibyModel
     mtp = model.mtp_modules[0]
@@ -72,6 +76,17 @@ def draft_ttt_loss(model, X, Y, loss_mask, attn_mask, mask_has_pad, ttt_steps=4)
             causal_bias = (
                 causal[None, None, :, :] + pad_bias[:, None, None, :]
             ).astype(emb_all.dtype)
+        seg = None
+        if segment_ids is not None:
+            # 与 _mtp_loss 的 doc_mask 口径一致：按源位置 j 的文档边界
+            # 掩码，避免打包序列内 MTP 自注意力跨文档泄漏
+            seg = segment_ids[:, :sub]
+            same_doc = seg[:, :, None] == seg[:, None, :]
+            causal_tril = mx.tril(mx.ones((sub, sub), dtype=mx.bool_))
+            allowed = same_doc & causal_tril[None, :, :]
+            seg_bias = mx.where(allowed[:, None, :, :], 0.0, -1e9).astype(emb_all.dtype)
+            causal_bias = seg_bias if causal_bias is None else causal_bias + seg_bias
+            mask_is_full = False
         if s == 1:
             h_in = [f[:, :sub, :] for f in feats]
             e_in = emb_all[:, 1 : sub + 1, :]
@@ -85,6 +100,7 @@ def draft_ttt_loss(model, X, Y, loss_mask, attn_mask, mask_has_pad, ttt_steps=4)
             attention_mask=am,
             causal_bias=causal_bias,
             mask_is_full=mask_is_full,
+            segment_ids=seg,
         )
         logits = model._lm_logits(h)
         ce = cross_entropy(
@@ -116,6 +132,7 @@ class DraftTrainer(BaseTrainer):
             attn_mask,
             mask_has_pad,
             ttt_steps=self.args.draft_ttt_steps,
+            segment_ids=seg_ids,
         )
         zero = mx.array(0.0)
         # 返回结构与 BaseTrainer._loss_fn 一致：
