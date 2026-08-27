@@ -1,8 +1,8 @@
 """Marin / K3 对齐回归：此前漏掉的机制按论文公式钉死。
 
-覆盖：z-loss lse²、KDA 下界门 + 满秩输出门、SiTU-GLU、独立共享专家、
-attn_gate 默认 2·sigmoid 进 Adam、AttnRes key RMSNorm、0.5/√hidden
-截断正态、warmup 1% + 线性衰减、Per-Head Muon（opt-in，默认关）。
+覆盖：z-loss lse²、KDA 下界门 + 满秩输出门（2σ 零初始化）、SiTU-GLU、
+独立共享专家、attn_gate 默认 2·sigmoid 进 Adam、AttnRes key RMSNorm、
+0.5/√fan_in 截断正态、warmup 1% + 线性/WSD、Per-Head Muon（opt-in，默认关）。
 """
 
 import math
@@ -22,7 +22,13 @@ from model.model import VibyForCausalLM
 from model.moe import FeedForward, situ_glu
 from model.norms import _rms_unit
 from trainer.muon import BatchedMuon, create_mixed_optimizer
-from trainer.utils import get_lr_and_momentum, resolve_warmup_iters
+from trainer.utils import (
+    compute_scaled_hparams,
+    get_lr_and_momentum,
+    resolve_compute_scaled_hparams,
+    resolve_lr_horizon,
+    resolve_warmup_iters,
+)
 
 FAIL = 0
 
@@ -102,7 +108,10 @@ def test_kda_decay_and_gate():
     check(
         "满秩 W_g",
         attn.g_proj.weight.shape
-        == (cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size),
+        == (
+            cfg.num_attention_heads * cfg.kda_v_head_ratio * cfg.head_dim,
+            cfg.hidden_size,
+        ),
     )
     check("无低秩 g_a", not hasattr(attn, "g_a_proj"))
     check("无低秩 g_b", not hasattr(attn, "g_b_proj"))
@@ -137,15 +146,36 @@ def test_shared_experts_independent():
     check("不是一条宽 SwiGLU", mlp.shared[0].gate_proj.weight.shape[0] != 96)
 
 
+def test_active_parameter_count():
+    cfg = tiny()
+    model = VibyForCausalLM(cfg)
+    total = model.num_parameters()
+    active = model.num_active_parameters()
+    e, k = cfg.n_routed_experts, cfg.num_experts_per_tok
+    routed = 0
+    for p, v in tree_flatten(model.parameters()):
+        if ".experts." in p and v.ndim >= 3:
+            routed += v.size
+    expect = total - routed + routed // e * k
+    check("激活 < 总量", active < total)
+    check("激活 = 总量 − 未选中路由专家", active == expect, f"{active} vs {expect}")
+    cfg_full = tiny(num_experts_per_tok=cfg.n_routed_experts)
+    m2 = VibyForCausalLM(cfg_full)
+    check(
+        "K=E 激活等于总量",
+        m2.num_active_parameters() == m2.num_parameters(),
+    )
+
+
 def test_attn_gate_default():
     cfg = tiny()
     check("use_attn_gate 默认开", cfg.use_attn_gate is True)
     model = VibyForCausalLM(cfg)
-    # 最后一层是 global GQA
-    gqa = model.model.stack.layers[-1].self_attn
-    check("GQA 有 attn_gate", gqa.attn_gate is not None)
+    # 默认 MLA 同样有 attn_gate
+    attn = model.model.stack.layers[-1].self_attn
+    check("attn 有 attn_gate", attn.attn_gate is not None)
     x = mx.zeros((1, 3, cfg.hidden_size))
-    g = 2.0 * mx.sigmoid(gqa.attn_gate(x))
+    g = 2.0 * mx.sigmoid(attn.attn_gate(x))
     mx.eval(g)
     check("零初始化门 = 1", abs(float(g.mean().item()) - 1.0) < 1e-5)
 
@@ -180,13 +210,13 @@ def test_attn_res_key_rmsnorm():
 
 def test_init_scale():
     mx.random.seed(5)
-    cfg = tiny(hidden_size=128)
+    cfg = tiny(hidden_size=128, use_linear_attn=True)
     model = VibyForCausalLM(cfg)
     std = 0.5 / math.sqrt(cfg.hidden_size)
     w = model.model.stack.layers[0].mlp.router.weight.astype(mx.float32)
     emp = float(mx.sqrt(mx.mean(w * w)).item())
     check(
-        "矩阵 init ≈ 0.5/√hidden",
+        "router init ≈ 0.5/√fan_in（fan_in=hidden）",
         abs(emp - std) / std < 0.35,
         f"emp={emp:.4f} target={std:.4f}",
     )
@@ -199,6 +229,37 @@ def test_init_scale():
     sc = model.model.stack.layers[-1].self_attn.k_conv.weight
     check("ShortConv 仍 identity", abs(float(sc[0].mean().item()) - 1.0) < 1e-5)
     check("ShortConv tap1 仍 0", abs(float(sc[1].mean().item())) < 1e-5)
+
+    kda = model.model.stack.layers[0].self_attn
+    check(
+        "KDA g_proj 零初始化",
+        float(mx.abs(kda.g_proj.weight).max().item()) < 1e-8,
+    )
+    down = model.model.stack.layers[0].mlp.shared[0].down_proj.weight.astype(mx.float32)
+    fan = int(down.shape[-1])
+    std_fan = 0.5 / math.sqrt(fan)
+    emp_down = float(mx.sqrt(mx.mean(down * down)).item())
+    check(
+        "down_proj init ≈ 0.5/√fan_in",
+        abs(emp_down - std_fan) / std_fan < 0.35,
+        f"emp={emp_down:.4f} target={std_fan:.4f} fan={fan}",
+    )
+
+
+def test_kda_output_gate_identity():
+    """KDA 输出门与 GQA attn_gate 同哲学：零初始化 + 2σ，起步恒等。"""
+    cfg = tiny()
+    attn = KDAAttention(cfg, layer_idx=0)
+    mx.eval(attn.parameters())
+    check("g_proj 全零", float(mx.abs(attn.g_proj.weight).max().item()) < 1e-8)
+    x = mx.random.normal((2, 5, cfg.hidden_size))
+    g_in = x @ attn.g_proj.weight.T
+    gate = 2.0 * mx.sigmoid(g_in)
+    mx.eval(gate)
+    check("2σ(0)=1", abs(float(gate.mean().item()) - 1.0) < 1e-5)
+    y, _ = attn(x)
+    mx.eval(y)
+    check("KDA 前向有限", bool(mx.all(mx.isfinite(y.astype(mx.float32))).item()))
 
 
 def test_lr_schedule():
@@ -223,9 +284,110 @@ def test_lr_schedule():
     )
     check("线性终点 = min_lr", abs(end - 0.05) < 1e-6, f"{end}")
 
+    stable, _ = get_lr_and_momentum(
+        step=500,
+        total_steps=1000,
+        warmup_steps=100,
+        min_lr_ratio=0.05,
+        schedule="wsd",
+        wsd_decay_frac=0.2,
+    )
+    check("WSD 平台期 = 1", abs(stable - 1.0) < 1e-6, f"{stable}")
+    half_decay, _ = get_lr_and_momentum(
+        step=900,
+        total_steps=1000,
+        warmup_steps=100,
+        min_lr_ratio=0.05,
+        schedule="wsd",
+        wsd_decay_frac=0.2,
+    )
+    check("WSD 衰减中点", abs(half_decay - 0.525) < 1e-6, f"{half_decay}")
+    wsd_end, _ = get_lr_and_momentum(
+        step=1000,
+        total_steps=1000,
+        warmup_steps=100,
+        min_lr_ratio=0.05,
+        schedule="wsd",
+        wsd_decay_frac=0.2,
+    )
+    check("WSD 终点 = min_lr", abs(wsd_end - 0.05) < 1e-6, f"{wsd_end}")
+
+    args = types.SimpleNamespace(epochs=2, lr_decay_steps=None, max_steps=None)
+    check("日程默认 epochs×每轮", resolve_lr_horizon(args, 100) == 200)
+    args.max_steps = 40
+    check("max_steps 压缩日程", resolve_lr_horizon(args, 100) == 40)
+    args.max_steps = 500
+    check("max_steps 不超过数据总长", resolve_lr_horizon(args, 100) == 200)
+    args.max_steps = 40
+    args.lr_decay_steps = 80
+    check("lr_decay_steps 优先于 max_steps", resolve_lr_horizon(args, 100) == 80)
+    args.lr_decay_steps = 500
+    check("lr_decay_steps 可长于数据（长 run 前缀）", resolve_lr_horizon(args, 100) == 500)
+
+    # Marin #8435：峰值 LR 与日程共用实际 horizon；显式 token_budget 则保留原预算
+    adam, muon, beta2, eps = compute_scaled_hparams(18.0e12, 11264 * 4096, 6144)
+    check("Hero 18T adam_lr", abs(adam - 0.0007594143751653773) < 1e-12, f"{adam}")
+    check("Hero 18T muon_lr", abs(muon - 0.0032907956257166348) < 1e-12, f"{muon}")
+    check("Hero 18T beta2", abs(beta2 - 0.95) < 1e-12, f"{beta2}")
+    check("Hero 18T eps", abs(eps - 6.043740619502598e-15) < 1e-20, f"{eps}")
+    tiny_adam, tiny_muon, _, _ = compute_scaled_hparams(1e6, 1024 * 4096, 768)
+    check("公式 adam 上限 0.05", tiny_adam == 0.05, f"{tiny_adam}")
+    check("公式 muon 上限 0.05", tiny_muon == 0.05, f"{tiny_muon}")
+
+    scale_args = types.SimpleNamespace(
+        batch_size=12,
+        accumulation_steps=2,
+        max_seq_len=1024,
+        hidden_size=768,
+        epochs=1,
+        max_steps=2000,
+        lr_decay_steps=None,
+        token_budget=None,
+        learning_rate=None,
+        lr_scale_auto=True,
+    )
+    resolve_compute_scaled_hparams(scale_args, iter_per_epoch=27863)
+    tpb = 12 * 2 * 1024
+    expect_tokens = 1000 * tpb
+    expect_adam, expect_muon, _, _ = compute_scaled_hparams(expect_tokens, tpb, 768)
+    check(
+        "max_steps 缩短峰值 token 预算",
+        scale_args.token_budget_resolved == expect_tokens,
+        f"{scale_args.token_budget_resolved} != {expect_tokens}",
+    )
+    check("max_steps 峰值 adam_lr", abs(scale_args.learning_rate - expect_adam) < 1e-15)
+    check("max_steps 峰值 muon_lr", abs(scale_args.muon_lr - expect_muon) < 1e-15)
+
+    scale_args.learning_rate = None
+    scale_args.token_budget = 13931 * tpb
+    resolve_compute_scaled_hparams(scale_args, iter_per_epoch=27863)
+    full_adam, _, _, _ = compute_scaled_hparams(13931 * tpb, tpb, 768)
+    check(
+        "显式 token_budget 保留原峰值",
+        abs(scale_args.learning_rate - full_adam) < 1e-15,
+        f"{scale_args.learning_rate} vs {full_adam}",
+    )
+    check(
+        "协议全量预算 adam_lr",
+        abs(full_adam - 0.0015450949123618698) < 1e-15,
+        f"{full_adam}",
+    )
+
+
+def _optimizer_for(opt, path, arr):
+    for filt, sub in zip(opt.filters, opt.optimizers[:-1]):
+        if filt(path, arr):
+            return sub
+    return opt.optimizers[-1]
+
 
 def test_optimizer_groups_and_per_head():
-    cfg = tiny(use_attn_gate=True, tie_word_embeddings=False, mtp_depth=0)
+    cfg = tiny(
+        use_attn_gate=True,
+        tie_word_embeddings=False,
+        mtp_depth=0,
+        use_linear_attn=True,
+    )
     model = VibyForCausalLM(cfg)
     args = types.SimpleNamespace(learning_rate=0.01, muon_ns_steps=5, muonh=True)
     # per-head NS 默认关（r082 归因），这里显式打开验证该机制本身
@@ -263,6 +425,29 @@ def test_optimizer_groups_and_per_head():
             conv_n += 1
             check(f"短卷积不进 Muon [{p}]", not is_muon(p, a))
     check("存在短卷积参数", conv_n > 0)
+    for p, a in trainable:
+        if ".g_proj." in p:
+            check(f"KDA g_proj 不进 Muon [{p}]", not is_muon(p, a))
+
+    # 标量组（norm / conv / 门 / KDA 衰减）wd=0；embed 仍 0.1
+    dt_path = next(p for p, a in trainable if p.endswith("dt_bias"))
+    dt_arr = next(a for p, a in trainable if p == dt_path)
+    sc_path = next(p for p, a in trainable if ".k_conv.weight" in p)
+    sc_arr = next(a for p, a in trainable if p == sc_path)
+    emb_path = next(p for p, a in trainable if "embed_tokens" in p)
+    emb_arr = next(a for p, a in trainable if p == emb_path)
+    check(
+        "dt_bias wd=0",
+        abs(float(_optimizer_for(opt_d, dt_path, dt_arr).weight_decay) - 0.0) < 1e-12,
+    )
+    check(
+        "ShortConv wd=0",
+        abs(float(_optimizer_for(opt_d, sc_path, sc_arr).weight_decay) - 0.0) < 1e-12,
+    )
+    check(
+        "embed wd=0.1",
+        abs(float(_optimizer_for(opt_d, emb_path, emb_arr).weight_decay) - 0.1) < 1e-12,
+    )
     # filter：Muon 的 _is_muon 应拒绝
     # 用 filter 函数（create 闭包不可见），改：一步后 attn_gate 范数可变（Adam 无超球）
     ids = mx.array([[1, 2, 3, 4]])
@@ -376,10 +561,12 @@ if __name__ == "__main__":
     test_z_loss_lse_sq()
     test_kda_decay_and_gate()
     test_shared_experts_independent()
+    test_active_parameter_count()
     test_attn_gate_default()
     test_attn_res_key_rmsnorm()
     test_attn_res_prewarm_not_global_kill()
     test_init_scale()
+    test_kda_output_gate_identity()
     test_lr_schedule()
     test_optimizer_groups_and_per_head()
     test_feedforward_uses_situ()

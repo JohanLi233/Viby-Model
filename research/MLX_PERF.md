@@ -848,7 +848,7 @@ l₀=0.007（cubic5）5.245 → l₀=0.05（b05）**5.223** → l₀=0.10（b10�
 | `VIBY_FLASH_NOPAD=1` | 关掉 flash 行距填充 |
 | `VIBY_FLASH_NT` / `VIBY_FLASH_STR` | 覆盖 flash tile |
 | `VIBY_FLASH_FWD=0` | 前向走 mlx SDPA，反向重算 LSE |
-| `VIBY_MUONH_PER_HEAD` | Q/K/V per-head NS（默认 0；隔离实测单独 −0.14 nat @500 步，NS 降频下放大到 −0.26） |
+| `VIBY_MUONH_PER_HEAD` | Q/K/V per-head NS（默认 0。r082 栈单独 −0.14 nat @500；post-fix P29a 2000 步中性，仍默认关） |
 | `VIBY_MUONH_MOM_WARMUP` | 0.85→0.95 动量 warmup（默认 0；隔离实测单独无害也无益，r081 基线无此机制） |
 | `VIBY_SITU=0` | SiTU-GLU 回退无界 SwiGLU（A/B 用；实测早期无差异） |
 | `VIBY_KDA_SCAN_ZSC=0` | 关掉 kda_scan 反向的「状态 cotangent 恒零」特化（A/B 用） |

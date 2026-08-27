@@ -44,7 +44,6 @@ def build():
         num_experts_per_tok=K,
         n_shared_experts=1,
         moe_intermediate_size=I,
-        moe_router_noise=0.0,
     )
     mx.random.seed(0)
     moe = MoEFeedForward(cfg)

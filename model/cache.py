@@ -74,6 +74,20 @@ class KVCache:
                         self.extras[key + "_trace"] = []
                 else:
                     self.extras.pop(key, None)
+            ntr = self.extras.get("ngram_tail_trace")
+            if ntr:
+                base = None
+                for entry in ntr:
+                    if entry[0] <= offset:
+                        base = entry
+                if base is not None:
+                    self.extras["ngram_tail"] = base[1]
+                    self.extras["ngram_tail_trace"] = [base]
+                else:
+                    self.extras.pop("ngram_tail", None)
+                    self.extras["ngram_tail_trace"] = []
+            else:
+                self.extras.pop("ngram_tail", None)
             if not trace:
                 for key in ("q_conv", "k_conv", "v_conv", "kda_state"):
                     self.extras.pop(key, None)

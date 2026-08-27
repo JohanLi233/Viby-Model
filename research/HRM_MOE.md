@@ -5,6 +5,12 @@
 > README.md（KDA 3:1 + NoPE GQA、SiTU-GLU、独立共享专家、LatentMoE+QB、
 > AttnRes key RMSNorm、z-loss = mean(lse²)）。下文是历史研究记录，
 > 不要当现行实现读。
+>
+> HEAD 与文中「当时默认」的主要差异：无 HRM/MLA/Engram；负载均衡是 QB
+> 不是 rate 控制器；`moe_router_noise` / `moe_aux_loss_weight` 已删除；
+> `--muonh` 默认开（专家进 MuonH）；`moe_latent_dim` 默认 `hidden//2`；
+> 学习率默认 WSD；KDA 输出门 `2·σ` 零初始化；TruncNormal 按 fan-in；
+> Adam 标量组 wd=0。
 
 ## 动机
 
@@ -272,10 +278,11 @@ max/mean 从 ~15× 降到 ~1.5-4×，bias rate0.02 下 60 微批累计溢出从
 
 ## 代码清理与默认值（r073 后续）
 
-- `moe_router_noise` 默认 **0.05**；`moe_aux_loss_weight` 默认 **0.001**
-  （soft balance loss，只在可回传 cycle 收集）。`cycle_delta_max` 保留为
-  实验开关但默认 **0**：r073 检查点探针中 RMS clamp 反而让 MTP 槽位退化
-  为 base-router winner-take-most，噪声+aux 已能压到 2~4× 且零溢出。
+- 当时 `moe_router_noise` 默认 **0.05**；`moe_aux_loss_weight` 默认 **0.001**
+  （soft balance loss，只在可回传 cycle 收集）。**此后两者均已从代码删除**，
+  负载均衡改走 QB。`cycle_delta_max` 保留为实验开关但默认 **0**：r073
+  检查点探针中 RMS clamp 反而让 MTP 槽位退化为 base-router winner-take-most，
+  噪声+aux 已能压到 2~4× 且零溢出。
 - `scale_logits_by_emb_scale` 默认 **关闭**：开启虽把初始 CE 拉回 ln V，
   但等比例缩小 CE 对 hidden/embedding 的梯度，toy probe 中早期下降明显
   变慢（40 步 4.87→3.97 vs 关闭 11.06→1.11），保留为诊断开关。
@@ -356,7 +363,8 @@ Marin 535B-A23B MoE 英雄 run 前的方法论。对本项目有用的部分：
 bucket gather/scatter 流量减半；decode kernel 加 `latent_dim` 参数
 （router kernel 全维、up/down kernel latent 维）。lat_down/lat_up 为
 2D 矩阵自动进 Muon 组。无零初始化等价（函数类从 step 0 改变），只用于
-新 run；`moe_latent_dim=0` 默认关，旧 checkpoint/sidecar 零影响。
+新 run；当时 `moe_latent_dim=0` 默认关，旧 checkpoint/sidecar 零影响。
+此后 HEAD 改为默认 `hidden//2`（显式 0 关闭）。
 回归 18/18（新增 test_moe_latent：结构审计/三路径逐专家参考等价/
 梯度可达/sidecar 往返）。
 
@@ -380,10 +388,10 @@ E=288 K=6 D=768 bf16，r080 在跑有背景竞争，三臂轮转计时取相对�
 （只用于 lm_head，lr 用 MuonH 的）；Adam = embed/router/bias/gate/
 1-D norm/小 conv kernel 的普通 Adam。
 
-与现状差异：我们 Muon 无范数球投影（只有 Moonlight √max(1,r/c) 缩放）；
+落地前差异：当时 Muon 无范数球投影（只有 Moonlight √max(1,r/c) 缩放）；
 专家堆叠整体排除 Muon（reshape (E,out·in) 跨专家耦合）走 AdamW。
 
-**已落地（2026-08-23，`--muonh`，默认关）**：
+**已落地（2026-08-23，`--muonh`，当时默认关；此后改为默认开）**：
 - `BatchedMuon(hyperball=True)`：groups/seg_groups/stack_groups 三分支
   更新后逐矩阵 rescale 回更新前 Frobenius 范数（fp32 范数）。
 - 堆叠专家（ndim>2）以 axis0 为 batch 进 `_ns5` 逐专家 NS（批量维

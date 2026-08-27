@@ -5,7 +5,8 @@
 架构为 decoder-only Transformer：顺序主干 + Kimi Linear 3:1 混合注意力
 （每 4 层与最后一层为 global：full-causal NoPE GQA，`n_kv_heads=h/4`；
 其余 local 为 KDA——逐通道门控 delta 规则线性注意力，衰减
-`g = −5·σ(e^{A_h} z)`，满秩输出门 `y = W_o[σ(W_g x) ⊙ RMSNorm(ō)]`；
+`g = −5·σ(e^{A_h} z)`，满秩输出门 `y = W_o[2·σ(W_g x) ⊙ RMSNorm(ō)]`
+（`W_g` 零初始化，初始门 1）；
 全模型无 RoPE / 滑窗；GQA 侧逐 head 无参 RMS qk-norm、XSA、默认开的
 注意力输出门 `2·σ`）+ GQA K-path ShortConv 与 KDA q/k/v 短卷积 +
 AttnRes（score 用 `w·RMSNorm(v_j)`，混合仍用原始 `v_j`）+ RMSNorm
@@ -13,10 +14,11 @@ AttnRes（score 用 `w·RMSNorm(v_j)`，混合仍用原始 `v_j`）+ RMSNorm
 FFN 全部为 LatentMoE：路由专家在 `hidden/2` latent 空间计算；
 `n_shared_experts` 个独立共享专家各宽 `moe_intermediate_size`、输出相加；
 QB 分位数快照偏置做负载均衡。logit z-loss 为 `mean(lse²)`（默认 1e-4），
-融合进 CE kernel。MTP（Kimi-K3 / EAGLE-3，预训练默认 depth=1：与主干
-同构，输入为低/中/高三层 AttnRes 特征融合 + 下一 token 嵌入；后训练用
-`trainer/train_draft.py` 冻结主干做 EAGLE-3 TTT 草稿微调）。
-2D 矩阵按 `TruncNormal(0, (0.5/√hidden)²)`、|z|≤2 初始化。
+融合进 CE kernel。MTP（Qwen3.8-Next 口径，预训练默认 depth=1：单层
+full-attn MoE，输入为主干末层 hidden + 下一 token 嵌入，`eh_proj
+(enorm(e)∥hnorm(h))`，teacher-forced 展开 `--mtp_steps` 次默认 2；后训练
+用 `trainer/train_draft.py` 冻结主干做 TTT 草稿微调）。
+2D 矩阵按 `TruncNormal(0, (0.5/√fan_in)²)`、|z|≤2 初始化。
 `lm_head` 默认与 embedding 解绑。
 
 ## 组件
@@ -39,29 +41,38 @@ QB 分位数快照偏置做负载均衡。logit z-loss 为 `mean(lse²)`（默�
 
 ```bash
 --use_attn_gate / --no-use_attn_gate   # 默认开：2·σ，零初始化门=1，进 Adam
---mtp_depth 1          # MTP 深度（K3/EAGLE-3，默认 1，0 关闭）
+--mtp_depth 1          # MTP 开关（>0 挂 1 层 full-attn，0 关闭）
+--mtp_steps 2          # 预训练 teacher-forced 展开步数（Qwen3.8-Next）
 --mtp_loss_weight 0.3
-# EAGLE-3 草稿微调（冻结主干，只训练 MTP 层，TTT rollout）：
+# 草稿微调（冻结主干，只训练 MTP 层，TTT rollout）：
 # python trainer/train_draft.py --draft_ttt_steps 4 --data_path ...
 --z_loss_weight 1e-4   # logit z-loss：loss += w · mean(lse²)，0 关闭
 --tie_word_embeddings  # 绑定输入/输出 embedding（默认 False：独立 lm_head）
 --pack_sequences       # 预训练序列打包（消除 padding 浪费）
 --doc_mask             # 打包时屏蔽跨文档注意力与边界 loss（需配合 --pack_sequences）
 # MoE（LatentMoE + QB 路由，所有层 FFN 均为 MoE）：
---n_routed_experts 32      # 路由专家数（必须 >0）
---num_experts_per_tok 6    # 每 token 激活专家数
---n_shared_experts 2       # 独立共享专家数（每个中间维 = moe_intermediate_size）
+--n_routed_experts 256     # 路由专家数（必须 >0；parser 默认 0 会直接报错）
+--num_experts_per_tok 8    # 每 token 激活专家数（1080M 配方；CLI 默认 6）
+--n_shared_experts 2       # 独立共享专家数（1080M 配方；CLI 默认 1）
 --moe_intermediate_size 384  # 单个路由/共享专家中间维
 --routed_scaling_factor 2.5  # sigmoid 归一化后的路由权重缩放
 --moe_latent_dim           # 路由专家 latent 维度（默认 hidden//2；0 关闭）
---moe_aux_loss_weight 0.001  # 软负载均衡辅助损失（轻正则，0 关闭）
-# 学习率：线性 warmup（默认总步数 1%）+ 线性衰减到 --min_lr_ratio（默认 0.05）
-# 训练超参（Hyperball 口径 compute 缩放，默认开启 --lr_scale_auto）：
-# adam_lr = 0.0876·tokens^-0.3461·hidden^-0.3448·√tpb，muon_lr = 13/3×adam_lr，
-# beta2/eps 同样按 tokens/tpb 推导；--token_budget 显式给预算，
+--moe_diversity_loss_weight 0  # router 输入多样性正则（默认关）
+# 学习率（Marin Hero #8435）：线性 warmup（默认本轮 horizon 1%）后立刻
+# 线性收到 --min_lr_ratio（默认 0.05），无 WSD 平台。短跑 --max_steps
+# 会重算衰减斜率，结束时仍落到 0.05×peak；峰值 LR 未传 --token_budget
+# 时也按该 horizon 的 token 数缩放。`--lr_schedule wsd` 才有平台。
+# 预训练 parser 默认 bs=32 / accum=8 / seq=2048，会把 muon_lr 推到 ~0.03，
+# 不要当 1080M 配方。1080M 用下面这条（bs=12, accum=2, seq=1024）。
+# 训练超参（Hyperball / Marin 口径 compute 缩放，默认开启 --lr_scale_auto）：
+# adam_lr = min(0.05, 0.087571·tokens^-0.3461·hidden^-0.3448·√tpb)，
+# muon_lr = min(0.05, 13/3×adam_lr)，beta2/eps 同样按 tokens/tpb 推导；
+# --token_budget 显式给原计划预算（缩短 run 时只改斜率），
 # 显式 --learning_rate 覆盖 adam_lr。--muonh（默认开）：Muon 组加
-# Frobenius 范数球投影；Q/K/V 按 head 切开 NS；堆叠专家逐专家 NS；
-# lm_head 走 AdamH；短卷积（含 KDA q/k/v_conv）与 attn_gate 走 Adam。
+# Frobenius 范数球投影；堆叠专家逐专家 NS（每步全量，无降频复用）；
+# Q/K/V per-head NS 默认关（VIBY_MUONH_PER_HEAD=1 打开）；lm_head 走 AdamH；
+# 短卷积、attn_gate、KDA g_proj、GatedNorm.gate_up 走 Adam 标量组（wd=0）；
+# embed / router 仍 wd=0.1。
 ```
 
 1080M 常用配方：
@@ -75,7 +86,8 @@ python trainer/train_pretrain.py --hidden_size 768 --num_hidden_layers 8 \
 ```
 
 注：MoE 负载均衡走 QB（Quantile Balancing）：训练期 forward 记录各专家
-margin（选择分 − per-token 阈值 alpha），每优化器步取 margin 的
+margin（原始 sigmoid 分 − per-token 阈值 alpha；K3 Eq.14，旧 bias 只经
+alpha 进入更新），每优化器步取 margin 的
 (1−K/E) 上分位数、零均值化后覆写 frozen 的 expert_bias（无梯度、
 无 EMA rate 超参）。
 
@@ -91,8 +103,8 @@ MoE 按 (token,choice) 对数 `G = B×T×top_k` 分三条路径（形状只随
 
 训练侧：
 
-- BatchedMuon：同形状权重堆叠批量 Newton-Schulz；Q/K/V 再按 head 切开。
-  2D 矩阵与堆叠专家都是每 8 步重算一次 NS（命中复用极因子）。
+- BatchedMuon：同形状权重堆叠批量 Newton-Schulz；正交化每步全量重算
+  （NS 降频复用 / Temporal Q 已删，勿重引入）。Q/K/V per-head 切分默认关。
   `--muon_ns_steps` 默认 5。
 - `--cache_limit_gb`（默认 0=不限）：Metal 空闲块缓存上限（GB）。上限内
   释放块常驻复用；大 batch 时峰值+缓存不要超物理内存。
@@ -102,8 +114,12 @@ MoE 按 (token,choice) 对数 `G = B×T×top_k` 分三条路径（形状只随
 ## 训练
 
 ```bash
-# 预训练
-python trainer/train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl --hidden_size 768 --num_hidden_layers 8
+# 预训练：用上面 1080M 配方（须 --n_routed_experts >0；不要依赖 parser 默认 bs/accum/seq）
+python trainer/train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl \
+  --hidden_size 768 --num_hidden_layers 8 --num_attention_heads 8 \
+  --n_routed_experts 256 --num_experts_per_tok 8 --n_shared_experts 2 \
+  --moe_intermediate_size 384 --batch_size 12 --accumulation_steps 2 \
+  --max_seq_len 1024 --pack_sequences --doc_mask
 
 # 全量 SFT（需要 pretrain 检查点）
 python trainer/train_full_sft.py --data_path ../dataset/sft_512.jsonl
@@ -120,6 +136,9 @@ python trainer/train_dpo.py --data_path ../dataset/dpo.jsonl
 - SFT / DPO 会自动从基座 checkpoint 的 sidecar JSON 继承模型结构配置，
   CLI 显式传入的结构参数优先；`save_interval` 会自动对齐到
   `accumulation_steps` 的整数倍，避免 resume 丢失梯度。
+- 优化器分组变更（MuonH 开关、专家/门控进哪一组）后，旧
+  `.optimizer.safetensors` 不能直接续；加 `--reset_optimizer` 或新开 run。
+  权重仍可加载。
 
 ## 数据格式（与 MiniMind 对齐）
 

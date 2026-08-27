@@ -21,6 +21,7 @@ from .utils import (
     apply_lr_schedule,
     log_training_progress,
     resolve_warmup_iters,
+    resolve_lr_horizon,
     set_ddp_flag,
 )
 
@@ -324,17 +325,52 @@ class BaseTrainer:
         )
 
     def _loss_and_grad_with_params(
-        self, params, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None
+        self,
+        params,
+        moe_biases,
+        X,
+        Y,
+        loss_mask,
+        attn_mask,
+        mask_has_pad,
+        seg_ids=None,
     ):
-        """参数显式作为入参的 loss 函数（value_and_grad 的目标）。
+        """参数与 MoE bias 显式作为入参的 loss 函数（value_and_grad 的目标）。
 
         不能用 nn.value_and_grad + mx.compile：那样 params 通过闭包
         （model.trainable_parameters()）被 compile 捕获为常量，梯度永远
         基于初始权重、优化器更新完全无效。显式传参后参数成为运行时输入。
+        expert_bias 是 freeze buffer，同样必须当入参：只传 params 时
+        compile 会把 bias 收成 trace 时的全 0，QB 覆写进不了图。
         mask_has_pad 是 python bool，作为编译期常量（最多两个图变体）。
+        value_and_grad 只对 params（argnums=0）求梯度。
         """
         self.model.update(params)
+        if hasattr(self.model, "apply_moe_biases"):
+            self.model.apply_moe_biases(moe_biases)
         return self._loss_fn(X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids)
+
+    def _compute_loss_and_grad(
+        self, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None
+    ):
+        """一次微批的 value_and_grad；compile 后立刻恢复 params 与 bias。"""
+        params = self.model.trainable_parameters()
+        biases = (
+            self.model.moe_bias_stack()
+            if hasattr(self.model, "moe_bias_stack")
+            else mx.zeros((0,), dtype=mx.float32)
+        )
+        outputs, grads = self._loss_and_grad(
+            params, biases, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids
+        )
+        if self._compiled:
+            # compiled fn 内部的 model.update / apply_moe_biases 只在 trace
+            # 时执行，会把无 primitive 的占位数组留在 module 上；立即用
+            # 真实参数和本步传入的 bias 恢复，避免污染后续 optimizer step。
+            self.model.update(params)
+            if hasattr(self.model, "apply_moe_biases"):
+                self.model.apply_moe_biases(biases)
+        return outputs, grads
 
     def _build_loss_and_grad(self):
         fn = mx.value_and_grad(self._loss_and_grad_with_params)
@@ -538,6 +574,8 @@ class BaseTrainer:
                 total_training_steps,
                 self.args.warmup_iters,
                 min_lr_ratio=getattr(self.args, "min_lr_ratio", 0.05),
+                schedule=getattr(self.args, "lr_schedule", "linear"),
+                wsd_decay_frac=getattr(self.args, "wsd_decay_frac", 0.2),
             )
 
             # 构造 attention_mask，屏蔽 PAD 位置
@@ -547,9 +585,9 @@ class BaseTrainer:
             mask_has_pad = bool(mx.any(attn_mask != 1).item())
 
             # 前向 + 反向（loss 内部已除以 accumulation_steps）
-            # 参数显式传入：compile 下保证梯度基于当前权重而非初始快照
+            # params 与 expert_bias 都显式传入：compile 下保证梯度基于当前
+            # 权重、QB 偏置基于当前快照，而不是 trace 时的常量。
             # mtp_loss 是辅助输出，仅用于日志展示，不参与梯度
-            params = self.model.trainable_parameters()
             (
                 (
                     loss,
@@ -562,14 +600,9 @@ class BaseTrainer:
                     load_stats,
                 ),
                 grads,
-            ) = self._loss_and_grad(
-                params, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids
+            ) = self._compute_loss_and_grad(
+                X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids
             )
-            if self._compiled:
-                # compiled fn 内部的 model.update(params) 只在 trace 时执行，
-                # 会把无 primitive 的占位数组留在 module 上；立即用真实参数
-                # 恢复，避免污染后续 optimizer step 的 eval
-                self.model.update(params)
 
             # 立即物化本微批的 loss/grads 并释放反向图。MLX 是惰性求值，
             # 若不 eval，accumulation_steps 个微批的前向+反向图会全部存活到
@@ -732,16 +765,13 @@ class BaseTrainer:
     def train(self, train_loader, swanlab=None):
         """主训练循环"""
         iter_per_epoch = len(train_loader)
-        total_training_steps = self.args.epochs * iter_per_epoch
-        # 短时训练（如 --max_train_minutes 限时跑）时，用 --lr_decay_steps 把
-        # 线性衰减的终点对齐到实际会跑的步数，否则 lr 几乎不衰减
-        lr_decay_steps = getattr(self.args, "lr_decay_steps", None)
-        if lr_decay_steps:
-            total_training_steps = lr_decay_steps
+        total_training_steps = resolve_lr_horizon(self.args, iter_per_epoch)
         resolve_warmup_iters(self.args, total_training_steps)
         Logger(
             f"训练总步数: {total_training_steps}, 每轮步数: {iter_per_epoch}, "
-            f"warmup: {self.args.warmup_iters}"
+            f"warmup: {self.args.warmup_iters}, "
+            f"lr_schedule: {getattr(self.args, 'lr_schedule', 'linear')}, "
+            f"min_lr_ratio: {getattr(self.args, 'min_lr_ratio', 0.05)}"
         )
         if getattr(self.args, "max_train_minutes", None):
             Logger(f"最长训练时长: {self.args.max_train_minutes} 分钟")
@@ -764,10 +794,16 @@ class BaseTrainer:
                 )
             except KeyboardInterrupt:
                 self.interrupted = True
-                Logger(
-                    "检测到 Ctrl-C：在最后完成的微批位置保存检查点后退出"
-                    f"（epoch {self._last_epoch + 1}, step {self._last_step}）"
-                )
+                if getattr(self.args, "no_save", False):
+                    Logger(
+                        "检测到 Ctrl-C：--no_save，直接退出"
+                        f"（epoch {self._last_epoch + 1}, step {self._last_step}）"
+                    )
+                else:
+                    Logger(
+                        "检测到 Ctrl-C：在最后完成的微批位置保存检查点后退出"
+                        f"（epoch {self._last_epoch + 1}, step {self._last_step}）"
+                    )
                 try:
                     save_checkpoint(
                         self.model,

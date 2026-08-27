@@ -15,8 +15,10 @@ from .cache import (
     _seq_len_of_cache,
 )
 from .config import VibyConfig
+from .attention import precompute_freqs_cis
 from .kernels.ce import cross_entropy
 from .moe import MoEGate, _col_quantile
+from .ngram import NgramEmbedding
 from .norms import GatedNorm
 
 
@@ -34,9 +36,9 @@ class CausalLMOutput:
     diversity_loss: Optional[mx.array] = None
     # logit z-loss 实际加进总 loss 的加权贡献（仅日志；未启用/无 labels 为 None）
     z_loss: Optional[mx.array] = None
-    # EAGLE-3 多层特征：mtp_feature_layers 指定的低/中/高层在 AttnRes 合并后、
-    # final_norm 前的 hidden，各 (B, T, d)，按层序排列；仅在
-    # output_features=True 或训练（带 labels 且 mtp_depth>0）时返回。
+    # Qwen MTP：mtp_feature_layers 指定层在 AttnRes 合并后、final_norm 前
+    # 的 hidden。现行只抽末层，list 长度 1；训练（带 labels 且 mtp_depth>0）
+    # 或 output_features=True 时返回。
     features: Optional[list] = None
 
 
@@ -52,13 +54,58 @@ class VibyModel(nn.Module):
         # 先归一化压住逐 token 的嵌入尺度差异。
         self.embed_norm = GatedNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.dropout = nn.Dropout(config.dropout)
+        self.ngram = (
+            NgramEmbedding(config) if config.ngram_table_size > 0 else None
+        )
+        self._ngram_inject = (
+            int(config.ngram_layer) - 1 if self.ngram is not None else None
+        )
         # 顺序主干：num_hidden_layers 层单栈，残差流为 AttnRes（栈内维护）
         self.stack = VibyStack(config, config.num_hidden_layers)
-        # EAGLE-3 多层特征抽取层（1-indexed 配置 → 0-indexed 层下标）
-        self._mtp_feature_idx = (
-            tuple(i - 1 for i in config.mtp_feature_layers)
-            if config.mtp_feature_layers
-            else None
+        # Qwen MTP 只抽主干末层（final_norm 前）。
+        self._mtp_feature_idx = (config.num_hidden_layers - 1,)
+        if not config.use_linear_attn:
+            rope_scaling = config.rope_scaling
+            if rope_scaling is not None:
+                rope_scaling = dict(rope_scaling)
+                rope_scaling.setdefault(
+                    "original_max_position_embeddings",
+                    config.original_max_position_embeddings,
+                )
+            freqs_cos, freqs_sin, rope_freqs, rope_attn_factor = precompute_freqs_cis(
+                dim=config.qk_rope_head_dim,
+                end=config.max_position_embeddings,
+                rope_base=config.rope_theta,
+                rope_scaling=rope_scaling,
+                return_freqs=True,
+            )
+            self.freqs_cos = freqs_cos
+            self.freqs_sin = freqs_sin
+            self.rope_freqs = rope_freqs
+            self.rope_attn_factor = float(rope_attn_factor)
+            self.freeze(
+                recurse=False,
+                keys=["freqs_cos", "freqs_sin", "rope_freqs"],
+            )
+        else:
+            self.freqs_cos = None
+            self.freqs_sin = None
+            self.rope_freqs = None
+            self.rope_attn_factor = 1.0
+
+    def position_embeddings(self, start_pos: int, seq_length: int, dtype):
+        """MLA 用的 (cos, sin, (freqs, offset, attn_factor))；linear 模式返回 None。"""
+        if self.freqs_cos is None:
+            return None
+        freqs_cos = self.freqs_cos[start_pos : start_pos + seq_length]
+        freqs_sin = self.freqs_sin[start_pos : start_pos + seq_length]
+        if freqs_cos.dtype != dtype:
+            freqs_cos = freqs_cos.astype(dtype)
+            freqs_sin = freqs_sin.astype(dtype)
+        return (
+            freqs_cos,
+            freqs_sin,
+            (self.rope_freqs, start_pos, self.rope_attn_factor),
         )
 
     def __call__(
@@ -89,6 +136,7 @@ class VibyModel(nn.Module):
             )
 
         hidden_states = self.dropout(self.embed_norm(self.embed_tokens(input_ids)))
+        pos_emb = self.position_embeddings(start_pos, seq_length, hidden_states.dtype)
 
         # 每微批只 sync/构造一次 causal+pad 融合 mask，所有层共享：
         # 有 padding 时普通 Attention 也能走 flash，而不是逐层退化到 O(T²)。
@@ -124,7 +172,18 @@ class VibyModel(nn.Module):
             causal_bias = seg_bias if causal_bias is None else causal_bias + seg_bias
             mask_is_full = False
 
-        return self.stack(
+        ngram_delta = None
+        ngram_tail = None
+        if self.ngram is not None:
+            if isinstance(first_cache, KVCache):
+                ngram_tail = first_cache.extras.get("ngram_tail")
+            ngram_delta = self.ngram(
+                input_ids,
+                tail=ngram_tail,
+                segment_ids=segment_ids if ngram_tail is None else None,
+            )
+
+        hidden_states, presents, features = self.stack(
             hidden_states,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -133,7 +192,35 @@ class VibyModel(nn.Module):
             mask_is_full=mask_is_full,
             segment_ids=seg_for_conv,
             feature_layers=(self._mtp_feature_idx if output_features else None),
+            ngram_delta=ngram_delta,
+            ngram_inject=self._ngram_inject,
+            position_embeddings=pos_emb,
         )
+        if self.ngram is not None and use_cache and presents:
+            c0 = presents[0]
+            if isinstance(c0, KVCache):
+                k = self.ngram.context_len
+                ids_i = input_ids.astype(mx.int32)
+                if ngram_tail is not None:
+                    hist = mx.concatenate([ngram_tail.astype(mx.int32), ids_i], axis=1)
+                else:
+                    hist = ids_i
+                if hist.shape[1] < k:
+                    hist = mx.concatenate(
+                        [
+                            mx.zeros(
+                                (hist.shape[0], k - hist.shape[1]), dtype=hist.dtype
+                            ),
+                            hist,
+                        ],
+                        axis=1,
+                    )
+                tail = hist[:, -k:]
+                c0.extras["ngram_tail"] = tail
+                tr = c0.extras.get("ngram_tail_trace")
+                if tr is not None:
+                    tr.append((c0.offset, tail))
+        return hidden_states, presents, features
 
 
 def _transform_logits_mx(
@@ -224,11 +311,7 @@ class VibyForCausalLM(nn.Module):
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.mtp_modules = (
-            [MTPModule(config) for _ in range(config.mtp_depth)]
-            if config.mtp_depth > 0
-            else []
-        )
+        self.mtp_modules = [MTPModule(config)] if config.mtp_depth > 0 else []
         # module 树建完后缓存 gate 列表；每步前向避免重复 isinstance 遍历。
         self._moe_gates = [m for m in self.modules() if isinstance(m, MoEGate)]
         apply_trunc_normal_init(self, config.hidden_size)
@@ -247,33 +330,31 @@ class VibyForCausalLM(nn.Module):
         attention_mask: Optional[mx.array],
         mask_has_pad: Optional[bool] = None,
         segment_ids: Optional[mx.array] = None,
+        steps: Optional[int] = None,
     ) -> tuple:
-        """EAGLE-3/K3 MTP loss：depth 1 消费主干多层特征，depth>1 链式。
+        """Qwen3.8-Next MTP loss：同一层 teacher-forced 多步展开。
 
-        Depth 1 在流位置 j 消费 features 各层在位置 j 的 hidden（EAGLE-3
-        多层特征）与 Emb(token j+1)，预测 labels[:, 1:]（即 token j+2，
-        labels 已是 next-token 移位）；depth k>1 保持 V3 式链式：消费
-        上一深度输出 h_{k-1}[j] 与 Emb(token j+k)，预测 labels[:, k:]。
-
-        返回 (CE 均值, lse 均值)；lse 均值供 logit z-loss（各 head 与主 LM
-        同 z_loss_weight）使用。
-
-        --doc_mask 时 MTP 的自注意力同样按目标 token 的文档边界掩码：
-        否则 MTP 块会在 packed sequence 内跨文档互相 attend，辅助 loss
-        把跨文档泄漏的梯度传回主干（主 loss 已屏蔽，辅助路径却泄漏）。
+        step k 在流位置 j 消费上一深度 hidden[j] 与 Emb(token j+k)，预测
+        labels[:, k:]（即 token j+k+1；labels 已是 next-token 移位）。
+        step 1 的 hidden 是主干末层（final_norm 前）；之后复用本模块输出。
+        各步 CE / lse 取平均。--doc_mask 时 MTP 自注意力按源位置文档边界
+        掩码，避免 packed 序列把跨文档泄漏回传到主干。
         """
+        n_steps = int(self.config.mtp_steps if steps is None else steps)
+        if n_steps < 1 or not self.mtp_modules:
+            return mx.array(0.0), mx.array(0.0)
         seq_len = input_ids.shape[1]
         token_emb = self.model.embed_tokens(input_ids)
-        h_prev = None
+        h = features[-1] if isinstance(features, (list, tuple)) else features
+        module = self.mtp_modules[0]
         terms = []
         z_terms = []
-        for k, module in enumerate(self.mtp_modules, start=1):
+        dtype = token_emb.dtype
+        for k in range(1, n_steps + 1):
             if seq_len <= k:
                 break
             sub = seq_len - k
-            dtype = token_emb.dtype
             am = attention_mask[:, :sub] if attention_mask is not None else None
-            # mask_has_pad 由调用方在 eager 侧算好传入（compile 图内不允许 .item()）
             if mask_has_pad is None:
                 mask_is_full = am is None or bool(mx.all(am == 1).item())
             else:
@@ -287,9 +368,6 @@ class VibyForCausalLM(nn.Module):
                 ).astype(dtype)
             seg = None
             if segment_ids is not None:
-                # MTP 序列位置 j 消费位置 j 的特征/h_prev 与
-                # token_emb[:, j+k]；按源位置 j 的文档边界掩码，避免
-                # MTP 自注意力跨文档。目标侧边界由 loss_mask 屏蔽。
                 seg = segment_ids[:, :sub]
                 same_doc = seg[:, :, None] == seg[:, None, :]
                 causal_tril = mx.tril(mx.ones((sub, sub), dtype=mx.bool_))
@@ -299,28 +377,25 @@ class VibyForCausalLM(nn.Module):
                     seg_bias if causal_bias is None else causal_bias + seg_bias
                 )
                 mask_is_full = False
-            if k == 1:
-                h_in = [f[:, :sub, :] for f in features]
-            else:
-                h_in = h_prev[:, :sub, :]
-            h_k, _ = module(
-                h_in,
+            h, _ = module(
+                h[:, :sub, :],
                 token_emb[:, k:, :],
                 attention_mask=am,
                 causal_bias=causal_bias,
                 mask_is_full=mask_is_full,
                 segment_ids=seg,
+                position_embeddings=self.model.position_embeddings(
+                    0, sub, token_emb.dtype
+                ),
             )
-            logits_k = self._lm_logits(h_k)
             ce_k, z_k = cross_entropy(
-                logits_k,
+                self._lm_logits(h),
                 labels[:, k:],
                 mask=loss_mask[:, k:] if loss_mask is not None else None,
                 return_z=True,
             )
             terms.append(ce_k)
             z_terms.append(z_k)
-            h_prev = h_k
         if not terms:
             return mx.array(0.0), mx.array(0.0)
         return sum(terms) / len(terms), sum(z_terms) / len(z_terms)
@@ -346,7 +421,7 @@ class VibyForCausalLM(nn.Module):
             if g.collect_stats:
                 g.last_load = None
                 g.last_margins = None
-        # EAGLE-3 多层特征：训练（MTP loss）与投机解码验证路径需要；
+        # Qwen MTP：训练（MTP loss）与投机解码验证路径需要末层 hidden；
         # 捕获只是记录引用，代价可忽略。
         want_feats = output_features or (
             labels is not None and len(self.mtp_modules) > 0
@@ -613,7 +688,7 @@ class VibyForCausalLM(nn.Module):
 
     def _mtp_draft(
         self,
-        feat_last: list,
+        feat_last: mx.array,
         first_token: int,
         pos_idx: int,
         draft_len: int,
@@ -625,48 +700,33 @@ class VibyForCausalLM(nn.Module):
         repetition_penalty: float,
         mtp_past: Optional[tuple] = None,
     ) -> tuple[list[int], list[mx.array], Optional[tuple]]:
-        """Draft tokens with the chained MTP modules (EAGLE 式自回归).
+        """Draft tokens by recursively applying the single Qwen MTP layer.
 
-        feat_last: 目标模型在位置 pos_idx 处的多层特征（3 × (1,1,hidden)），
-        只用于第一个草稿步；step≥1 消费草稿自身上一步的 block 输出
-        （V3 式链式）与自草稿 token 嵌入（EAGLE 自回归）。
-        first_token: the bonus token at position pos_idx + 1.
-        draft_len: 每轮草稿的 token 数。超过模块数时循环复用 MTP 模块
-        （与 vLLM 的 MTP self-speculation 一致，业界 depth=1 但草稿 3~7 个）。
-        mtp_past: 首个 MTP 模块的注意力 KV cache（训练口径的上下文，
-        由 _generate_speculative 在 prefill 时教师强制构建、每轮验证后
-        回滚追平）；循环复用产生的中间条目随返回一并带出，由调用方截断。
-        Returns (draft_token_ids, draft_probs, mtp_past)，len(drafts) ==
-        draft_len，全程 MLX，logits 不离开 GPU。
+        feat_last: 主干在位置 pos_idx 的末层 hidden，(1, 1, hidden)，只用于
+        第一个草稿步；step≥1 消费草稿自身上一步输出与自草稿 token 嵌入。
+        first_token: bonus token at pos_idx + 1.
+        draft_len: 每轮草稿 token 数（默认 mtp_steps，循环复用同一层）。
+        mtp_past: MTP 层 KV cache（prefill 教师强制、验证后回滚追平）。
         """
         token = mx.array([[first_token]])
         h = None
         drafts: list[int] = []
         draft_probs: list[mx.array] = []
-        n_modules = len(self.mtp_modules)
-        # 自复用链中每个草稿都等价于训练时“同一输出位置、更深一层”的 MTP：
-        # 始终消费同一流位置 (pos_idx) 出发的表示，只把 token 逐层后移。
-        # 模型已无 RoPE，pos_idx 仅作审计参数保留。
+        module = self.mtp_modules[0]
         del pos_idx
         for i in range(draft_len):
-            module_idx = i % n_modules
-            module = self.mtp_modules[module_idx]
             emb = self.model.embed_tokens(token)
-            # KV cache 只接首个模块（depth-1 流，唯一被训练的深度）：
-            # mtp_depth=1 时循环复用的每步都是 module 0，草稿全程带上下文；
-            # depth>1 时更深的复用步保持无 cache（其链式输入本就 OOD）。
-            # 复用步追加的中间条目随返回一并带出，由调用方截断。
-            own_cache = mtp_past is not None and module_idx == 0
-            # step 0：EAGLE-3 多层特征输入；step≥1：草稿自身 hidden 链式输入
             h_in = feat_last if i == 0 else h
             h, present = module(
                 h_in,
                 emb,
-                past_key_value=mtp_past if own_cache else None,
+                past_key_value=mtp_past,
                 use_cache=True,
+                position_embeddings=self.model.position_embeddings(
+                    _seq_len_of_cache(mtp_past), 1, emb.dtype
+                ),
             )
-            if own_cache:
-                mtp_past = present
+            mtp_past = present
             logits = self._lm_logits(h)[0, 0]
             # repetition penalty 的上下文应包含 bonus token 与已生成的草稿
             seen_cur = mx.concatenate(
@@ -702,8 +762,8 @@ class VibyForCausalLM(nn.Module):
         repetition_penalty: float,
         num_speculative_tokens: Optional[int] = None,
     ) -> mx.array:
-        """MTP speculative decoding: draft with MTP modules, verify with the
-        main model in parallel, accept the longest matching prefix.
+        """MTP speculative decoding: draft with the single Qwen MTP layer,
+        verify with the main model in parallel, accept the longest prefix.
 
         Greedy mode reproduces the main model's greedy output exactly;
         sampling mode uses standard rejection sampling against draft probs.
@@ -713,14 +773,11 @@ class VibyForCausalLM(nn.Module):
         导致投机路径比标准路径差一个 token。这是 bf16 精度问题，非逻辑错误；
         采样模式不受影响（拒绝采样保证分布等价）。
         """
-        # 每轮草稿长度：默认等于 MTP 模块数，也可通过 num_speculative_tokens
-        # 循环复用模块草稿更多 token（对齐 DeepSeek V4 等主流配置）。
-        draft_len = num_speculative_tokens or len(self.mtp_modules)
+        draft_len = num_speculative_tokens or max(1, int(self.config.mtp_steps))
         seq_len = input_ids.shape[1]
         prompt_ids = input_ids[0].astype(mx.int32)
 
-        # Prefill the main model（同时取出 EAGLE-3 多层特征，供草稿
-        # 首步输入与 MTP cache 教师强制构建）。
+        # Prefill 主干，取出末层 hidden 供草稿首步与 MTP cache 教师强制。
         out = self(
             input_ids,
             attention_mask=attention_mask,
@@ -729,23 +786,25 @@ class VibyForCausalLM(nn.Module):
             output_features=True,
         )
         past = out.past_key_values
-        feat_last = [f[:, -1:, :] for f in out.features]
+        h_trunk = out.features[-1]
+        feat_last = h_trunk[:, -1:, :]
         logits_last = out.logits[0, -1]
 
-        # MTP 草稿层 KV cache（对齐 vLLM/SGLang 的 NextN 推理）：训练时
-        # MTP block 对整流做因果注意力，草稿若拿不到上下文会显著偏离
-        # （r060 实测 argmax 命中率 45%→34%）。prefill 时用主干多层特征
-        # + 真实 token 嵌入教师强制构建；之后每轮验证后回滚草稿
-        # 追加、再按被接受位置追平。仅维护首个模块（depth-1 流）；有
-        # padding 时不启用（speculative 本就限 batch=1，eval 恒无 pad）。
+        # MTP KV cache（vLLM/SGLang NextN）：训练时对整流做因果注意力，
+        # 草稿若拿不到上下文会显著偏离。prefill 用末层 hidden + 真实
+        # token 嵌入教师强制构建；验证后回滚再按接受位置追平。
         mtp_past = None
         if seq_len > 1:
-            # 调用方（generate）已保证 attention_mask 全 1 或无 mask
-            # （mask_ok），显式全 1 mask 同样构建草稿上下文，不再静默
-            # 退化到无 cache 口径。
-            feats_pref = [f[:, : seq_len - 1, :] for f in out.features]
             e_pref = self.model.embed_tokens(input_ids[:, 1:])
-            _, mtp_past = self.mtp_modules[0](feats_pref, e_pref, use_cache=True)
+            mtp_t = e_pref.shape[1]
+            _, mtp_past = self.mtp_modules[0](
+                h_trunk[:, : seq_len - 1, :],
+                e_pref,
+                use_cache=True,
+                position_embeddings=self.model.position_embeddings(
+                    0, mtp_t, e_pref.dtype
+                ),
+            )
 
         # 激活 KDA 状态轨迹与 block 级 conv 尾部轨迹（rewind 精确回滚
         # 用）：以各 cache 当前位置（prefill 结束）的 state + conv 尾部
@@ -766,6 +825,8 @@ class VibyForCausalLM(nn.Module):
             for key in ("attn_out", "mlp_out"):
                 if key in c.extras:
                     c.extras[key + "_trace"] = [(c.offset, c.extras[key])]
+            if "ngram_tail" in c.extras:
+                c.extras["ngram_tail_trace"] = [(c.offset, c.extras["ngram_tail"])]
 
         if streamer:
             streamer.put(input_ids)
@@ -809,7 +870,7 @@ class VibyForCausalLM(nn.Module):
                 )
             stats["drafted"] += len(drafts)
             # 3. Verify the chain in parallel with the main model.
-            # 同时取出各被验证位置的多层特征，供验证后追平 MTP cache。
+            # 同时取出各被验证位置的末层 hidden，供验证后追平 MTP cache。
             verify_tokens = mx.array([[bonus] + drafts], dtype=mx.int32)
             past_before_verify = past
             vout = self(
@@ -925,22 +986,23 @@ class VibyForCausalLM(nn.Module):
                 past = _rewind_cache_list(past_full, seq_len)
                 break
 
-            # MTP cache：回滚草稿阶段的追加，再教师强制追平本轮新确定的
-            # (多层特征, next-token) 对。流位置 = 追加前 cache 长度（与训练
-            # 口径一致：条目 t = 主干在位置 t 的多层特征 + token t+1 的
-            # 嵌入）。
+            # MTP cache：回滚草稿追加，再教师强制追平本轮新确定的
+            # (末层 hidden, next-token) 对。流位置 = 追加前 cache 长度。
             if mtp_past is not None:
                 mtp_past = _rewind_cache(mtp_past, mtp_past_len)
                 n_e = len(new_tokens)
-                feats_in = [
-                    mx.concatenate(
-                        [feat_last[i], vout.features[i][:, : n_e - 1, :]], axis=1
-                    )
-                    for i in range(len(feat_last))
-                ]
+                feats_in = mx.concatenate(
+                    [feat_last, vout.features[-1][:, : n_e - 1, :]], axis=1
+                )
                 e_in = self.model.embed_tokens(mx.array([new_tokens], dtype=mx.int32))
                 _, mtp_past = self.mtp_modules[0](
-                    feats_in, e_in, past_key_value=mtp_past, use_cache=True
+                    feats_in,
+                    e_in,
+                    past_key_value=mtp_past,
+                    use_cache=True,
+                    position_embeddings=self.model.position_embeddings(
+                        mtp_past_len, e_in.shape[1], e_in.dtype
+                    ),
                 )
 
             keep = seq_len - 1  # old_seq_len + len(new_tokens[:-1])
@@ -953,7 +1015,7 @@ class VibyForCausalLM(nn.Module):
                 output_features=True,
             )
             past = tout.past_key_values
-            feat_last = [f[:, -1:, :] for f in tout.features]
+            feat_last = tout.features[-1][:, -1:, :]
             logits_last = tout.logits[0, -1]
 
         generated = generated[:max_new_tokens]
@@ -1005,11 +1067,11 @@ class VibyForCausalLM(nn.Module):
         """各 router 本次前向收集的 margin 样本堆叠 (n_gates, N, E)
         （无 MoE/未收集时 None）。
 
-        margin = 选择分 − per-token 阈值 alpha，是 QB 偏置快照的统计原料。
+        margin = 原始 sigmoid 分 − per-token 阈值 alpha（K3 Eq.14：旧
+        bias 只经 cutoff 进入更新），是 QB 偏置快照的统计原料。
         仅在 router 开启 collect_stats 且训练 forward 执行后有效；返回的
-        是图节点，可作为 loss 的额外输出一并物化。MTP 块 gate 比主干少
-        一个流位置（T−1 vs T），各 gate 的 N 不同，统一裁到最小 N 再
-        stack（margin 跨位置近似可交换，裁尾部 B 行无系统偏差）。
+        是图节点，可作为 loss 的额外输出一并物化。        MTP 块同一 gate 会把各展开步的 B·(T−k) 行拼起来，可能长于主干
+        B·T；统一裁到最小 N 再 stack。
         """
         stats = [g.last_margins for g in self.moe_gates() if g.last_margins is not None]
         if not stats:
@@ -1018,15 +1080,40 @@ class VibyForCausalLM(nn.Module):
         stats = [s[:n_min] for s in stats]
         return mx.stack(stats) if len(stats) > 1 else stats[0][None]
 
+    def moe_bias_stack(self) -> mx.array:
+        """各 router 的 expert_bias 堆成 (n_gates, E)，供 compile 图当运行时入参。
+
+        expert_bias 是 freeze buffer，不在 trainable_parameters 里；mx.compile
+        会把闭包里读到的数组收成常量，QB 覆写 module 也进不了已编译前向。
+        把它和 params 一起显式传入，下一步 bias 才会作用在路由上。
+        """
+        gates = self.moe_gates()
+        if not gates:
+            return mx.zeros((0,), dtype=mx.float32)
+        return mx.stack([g.expert_bias.astype(mx.float32) for g in gates])
+
+    def apply_moe_biases(self, biases: mx.array) -> None:
+        """把 moe_bias_stack() 的堆叠写回各 gate（stop-gradient，不进优化器）。"""
+        gates = self.moe_gates()
+        if not gates or biases is None or biases.size == 0:
+            return
+        if biases.ndim == 1:
+            biases = biases[None]
+        for i, g in enumerate(gates):
+            if i >= biases.shape[0]:
+                break
+            g.expert_bias = mx.stop_gradient(biases[i].astype(mx.float32))
+
     def update_moe_biases(self, margin_stats: mx.array):
         """QB（Quantile Balancing）路由偏置快照：每优化器步调用一次。
 
-        对本步全部 token 的 margin（选择分 − per-token 阈值 alpha）按专家
-        取 (1−K/E) 上分位数 beta_e，下一步 bias = −beta，零均值化后覆写
-        expert_bias（frozen buffer，stop-gradient，不进优化器、不接收
-        梯度）。直觉：−beta 把各专家"能进入 top-K 的上分位点"拉平到同一
-        水平，长期使每专家期望负载 ≈ K/E；零均值投影消掉 top-k 不变的
-        共模 gauge 自由度。替换原 V3 风格比例-截断逐步更新。
+        对本步全部 token 的 margin（原始 sigmoid 分 − per-token 阈值 alpha）
+        按专家取 (1−K/E) 上分位数 beta_e，下一步 bias = −beta，零均值化后
+        覆写 expert_bias（frozen buffer，stop-gradient，不进优化器、不接收
+        梯度）。K3 Eq.14：旧 bias 只经 cutoff alpha 进入更新，margin 不含
+        expert_bias。直觉：−beta 把各专家"能进入 top-K 的上分位点"拉平到
+        同一水平，长期使每专家期望负载 ≈ K/E；零均值投影消掉 top-k 不变
+        的共模 gauge 自由度。替换原 V3 风格比例-截断逐步更新。
         """
         gates = self.moe_gates()
         if not gates or margin_stats is None or margin_stats.size == 0:
@@ -1048,6 +1135,24 @@ class VibyForCausalLM(nn.Module):
 
         return sum(v.size for _, v in tree_flatten(self.parameters()))
 
+    def num_active_parameters(self) -> int:
+        """每 token 实际用到的参数量（Marin / DeepSeek 口径）。
+
+        路由专家栈 ``*.experts.*`` 第一维是 E，按 top-k / E 折算；
+        共享专家、latent 投影、注意力、embedding、router 全部计入。
+        """
+        from mlx.utils import tree_flatten
+
+        k = int(getattr(self.config, "num_experts_per_tok", 0) or 0)
+        n = 0
+        for path, v in tree_flatten(self.parameters()):
+            if ".experts." in path and v.ndim >= 3 and v.shape[0] > 0:
+                e = int(v.shape[0])
+                n += v.size // e * min(k, e)
+            else:
+                n += v.size
+        return n
+
     def save_pretrained(self, path: str):
         os.makedirs(path, exist_ok=True)
         self.config.save_pretrained(path)
@@ -1061,8 +1166,7 @@ class VibyForCausalLM(nn.Module):
         from mlx.utils import tree_flatten
 
         shapes = {k: v.shape for k, v in tree_flatten(model.parameters())}
-        # 旧 checkpoint 中已删除子系统（MLA/HRM/Engram/value-res）的权重
-        # 按键名/shape 过滤后自然丢弃
+        # 形状对不上的键（含旧 HRM/Engram 等）自然丢弃
         weights = {
             k: v for k, v in weights.items() if k in shapes and v.shape == shapes[k]
         }

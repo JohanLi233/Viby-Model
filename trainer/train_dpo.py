@@ -116,16 +116,21 @@ class DPOTrainer(BaseTrainer):
         super().__init__(args, model, tokenizer, lm_config, "dpo")
         self.ref_model = ref_model
 
-    def _dpo_loss_fn(self, params, x, y, mask, attn_mask, mask_has_pad, ref_log_probs):
+    def _dpo_loss_fn(
+        self, params, moe_biases, x, y, mask, attn_mask, mask_has_pad, ref_log_probs
+    ):
         """DPO loss 函数（value_and_grad 的目标）。
 
         params 必须显式作为第一个入参：mx.compile 会捕获 Python 闭包里的
         常量，若走 nn.value_and_grad(model, ...) + mx.compile，梯度会永远
         基于 trace 时的初始权重，优化器更新完全无效。
+        expert_bias 同样必须当入参（freeze buffer，不在 params 里）。
         mask_has_pad 在 eager 侧计算后以 python bool 传入（compile 图内
         不允许 .item() host sync）。
         """
         self.model.update(params)
+        if hasattr(self.model, "apply_moe_biases"):
+            self.model.apply_moe_biases(moe_biases)
         res = self.model(
             input_ids=x,
             attention_mask=attn_mask,
@@ -210,6 +215,8 @@ class DPOTrainer(BaseTrainer):
                 total_training_steps,
                 self.args.warmup_iters,
                 min_lr_ratio=getattr(self.args, "min_lr_ratio", 0.05),
+                schedule=getattr(self.args, "lr_schedule", "linear"),
+                wsd_decay_frac=getattr(self.args, "wsd_decay_frac", 0.2),
             )
 
             # 参考模型前向传播（不走 value_and_grad，不会计算梯度）
@@ -226,15 +233,22 @@ class DPOTrainer(BaseTrainer):
             mx.eval(ref_log_probs)
 
             # 当前模型前向 + 反向（loss 内部已除以 accumulation_steps）。
-            # 参数显式传入：compile 下保证梯度基于当前权重而非初始快照。
+            # params 与 expert_bias 显式传入：compile 下保证基于当前快照。
             params = self.model.trainable_parameters()
+            biases = (
+                self.model.moe_bias_stack()
+                if hasattr(self.model, "moe_bias_stack")
+                else mx.zeros((0,), dtype=mx.float32)
+            )
             loss, grads = self._loss_and_grad(
-                params, x, y, mask, attn_mask, mask_has_pad, ref_log_probs
+                params, biases, x, y, mask, attn_mask, mask_has_pad, ref_log_probs
             )
             if self._compiled:
-                # compiled fn 内部的 model.update(params) 只在 trace 时执行，
-                # 会把占位数组留在 module 上；立即恢复真实参数
+                # compiled fn 内部的 model.update 只在 trace 时执行，
+                # 会把占位数组留在 module 上；立即恢复真实参数和 bias
                 self.model.update(params)
+                if hasattr(self.model, "apply_moe_biases"):
+                    self.model.apply_moe_biases(biases)
             # 立即物化本微批的 loss/grads 并释放反向图（与 BaseTrainer 同理，
             # 避免 accumulation_steps 个惰性图同时存活导致显存倍增）。
             # 前向 loss 与梯度分两次 eval：合并 eval 会把 tape 滞留与反向

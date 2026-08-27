@@ -2,9 +2,12 @@
 Muon 混合优化器（MLX 单设备版）
 
 基于 mlx.optimizers.Muon / mlx.optimizers.MultiOptimizer 实现混合优化器：
-- Muon 仅用于 ndim >= 2 且非嵌入/输出头/ShortConv/router 的核心权重矩阵
-  （Newton-Schulz 正交化动量），weight_decay=0
-- 嵌入/输出头与其余标量参数（含 ShortConv depthwise 卷积核）使用 AdamW
+- Muon/MuonH：ndim >= 2 且非嵌入/输出头/ShortConv/router/零初始化门的
+  核心权重（含 muonh 下 3D 堆叠专家的逐专家 NS），weight_decay=0。
+  正交化每步全量重算（NS 降频复用已删）。Q/K/V per-head NS 默认关。
+- 嵌入/输出头、router、其余标量参数（ShortConv、1-D gain、KDA A_log/
+  dt_bias、attn_gate / KDA g_proj / GatedNorm.gate_up）使用 AdamW；
+  标量组 wd=0，embed/router wd=0.1（SFT 时 embed wd=0.01）
 - pretrain 下 muon/adam 双基础 lr 与 Adam 组 beta2/eps 由
   trainer.utils.resolve_compute_scaled_hparams 按 Hyperball compute 公式写入 args
 """
@@ -659,6 +662,7 @@ class BatchedMuon(optim.Muon):
         ns_bf16=False,
         stack_ns_steps=None,
         head_dim=0,
+        segment_map=None,
     ):
         super().__init__(
             learning_rate=learning_rate,
@@ -676,6 +680,9 @@ class BatchedMuon(optim.Muon):
         self.stack_ns_steps = stack_ns_steps
         # K3 Per-Head Muon：Q/K/V 沿 head 切开做 NS。0 关闭。
         self.head_dim = int(head_dim or 0)
+        # MLA 合并投影的行段分割：dotted path -> 行段尺寸。NS 与 lr
+        # 缩放按段独立，与未合并逐矩阵正交化同语义。
+        self.segment_map = segment_map or {}
         # 测量开关（默认关）：VIBY_MUONH_NO_NS=1 时跳过谱均衡，X 改为
         # F-范数匹配 NS 输出的归一化动量——隔离「hyperball 范数冻结」与
         # 「NS 谱均衡」各自的贡献。仅归因测量用，勿用于正式 run。
@@ -791,13 +798,18 @@ class BatchedMuon(optim.Muon):
         # Muon 组）以 axis0 为 batch 进堆叠组，逐矩阵 NS，无跨专家耦合
         groups: dict = {}
         stack_groups: dict = {}
+        seg_groups: dict = {}
         singles = []
         for path, g in flat_g.items():
             if g.ndim < 2:
                 singles.append(path)
                 continue
             orig = g.shape
-            if g.ndim > 2:
+            if path in self.segment_map and g.ndim == 2:
+                r, c = orig[0], orig[1]
+                key = (r, c, tuple(self.segment_map[path]))
+                seg_groups.setdefault(key, []).append((path, orig))
+            elif g.ndim > 2:
                 b, r = orig[0], orig[1]
                 c = g.size // (b * r)
                 stack_groups.setdefault((b, r, c), []).append((path, orig))
@@ -863,6 +875,29 @@ class BatchedMuon(optim.Muon):
             )
             scatter_back(items, V, apply_fn(P, X, lr))
 
+        # MLA 合并投影：NS 与 lr 缩放按行段独立（等价未合并的逐矩阵 Muon）
+        for (r, c, sizes), items in seg_groups.items():
+            dt = flat_g[items[0][0]].dtype
+            U, P, V, dt = momentum_stack(items, r, c)
+            split_at = []
+            acc = 0
+            for z in sizes[:-1]:
+                acc += z
+                split_at.append(acc)
+            u_segs = mx.split(U, split_at, axis=1)
+            p_segs = mx.split(P, split_at, axis=1)
+            np_segs = []
+            for rs, us, ps in zip(sizes, u_segs, p_segs):
+                if self._edge:
+                    xs = self._ns_edge(us, "std")
+                elif self._no_ns:
+                    xs = self._orth(us)
+                else:
+                    xs = self._ns5(us)
+                lr_s = lr0.astype(dt) * (max(1.0, rs / c) ** 0.5)
+                np_segs.append(apply_fn(ps, xs, lr_s))
+            scatter_back(items, V, mx.concatenate(np_segs, axis=1))
+
         # 堆叠组（ndim>2，逐专家语义）：逐张量直接处理，不跨层 stack。
         # NS 的 batch 维无耦合、动量/投影逐矩阵，三份整组 G/P/V stack 是纯
         # 搬运；逐张量路径（experiments/probe_stack_free_opt.py 同进程 A/B）
@@ -922,6 +957,35 @@ class BatchedMuon(optim.Muon):
         return tree_unflatten(list(new_params.items()))
 
 
+def _mla_segment_map(model):
+    """MLA 合并投影的 Muon 行段分割表：dotted path -> 行段尺寸。
+
+    qkv_proj 按 [q, kv_down, k_rope] 段、kv_up_proj 按 [k_up, v_up] 段
+    分别正交化，保持与未合并逐矩阵 Muon 相同的语义与 lr 缩放。
+    """
+    cfg = getattr(model, "config", None)
+    if cfg is None or bool(getattr(cfg, "use_linear_attn", False)):
+        return {}
+    qk = cfg.head_dim + cfg.qk_rope_head_dim
+    sizes = {
+        "self_attn.qkv_proj.weight": [
+            cfg.num_attention_heads * qk,
+            cfg.kv_lora_rank,
+            cfg.qk_rope_head_dim,
+        ],
+        "self_attn.kv_up_proj.weight": [
+            cfg.num_attention_heads * cfg.head_dim,
+            cfg.num_attention_heads * cfg.head_dim,
+        ],
+    }
+    out = {}
+    for path, arr in tree_flatten(model.trainable_parameters()):
+        for suffix, seg in sizes.items():
+            if path.endswith(suffix) and arr.shape[0] == sum(seg):
+                out[path] = seg
+    return out
+
+
 def create_adamw_optimizer(model, args, training_type="pretrain"):
     """全参数 AdamW（用于优化器杠杆对照实验；lr 需单独调优）。"""
     from .utils import Logger
@@ -930,7 +994,11 @@ def create_adamw_optimizer(model, args, training_type="pretrain"):
     trainable = tree_flatten(model.trainable_parameters())
 
     def _is_embed(path, arr):
-        return "embed_tokens" in path or "lm_head" in path
+        return (
+            "embed_tokens" in path
+            or "lm_head" in path
+            or (".ngram." in path and arr.ndim >= 2)
+        )
 
     embed_count = sum(1 for p, a in trainable if _is_embed(p, a))
     other_count = len(trainable) - embed_count
@@ -973,12 +1041,14 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     参数分组：
     - Muon：ndim >= 2 且非嵌入/输出头/router/ShortConv 的核心权重矩阵，wd=0
     - AdamH(lm_head)：Adam 方向 + 范数球投影，lr = muon_lr（仅 muonh 下）
-    - AdamW(embed)：embed_tokens / lm_head，lr = adam_lr，wd=0.1
+    - AdamW(embed)：embed_tokens / lm_head / ngram 表，lr = adam_lr，wd=0.1
     - AdamW(router)：base router/expert_bias，lr = adam_lr * 0.05
       （MOE_ROUTER_LR_MULT 可调），wd=0.1
-    - AdamW(scalar)：其余全部（含 ShortConv 的 (4,C) depthwise 卷积核——
-      不是矩阵语义，不做 NS 正交化），lr = adam_lr，wd=0.1
-    （SFT 时 embed/scalar lr 分别乘 0.1/0.3，wd=0.01）
+    - AdamW(scalar)：其余全部（含 ShortConv、零初始化门、1-D gain /
+      KDA A_log·dt_bias、AttnRes 查询），lr = adam_lr，**wd=0**
+      （这些参数要么零初始化、要么有校准过的尺度；wd=0.1 会在 1-epoch
+      内把它们径向缩到 ~10%）
+    （SFT 时 embed/scalar lr 分别乘 0.1/0.3；embed wd=0.01，scalar wd=0）
 
     --muonh（MuonH/AdamH/Adam 体系，Marin 口径，默认开启）：
     - Muon 组更新加 Frobenius 范数球投影（方向/范数解耦，hyperball）；
@@ -1007,7 +1077,11 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     def _is_embed(path, arr):
         # 精确匹配嵌入/输出头路径段："embed" 子串会误吞 embed_norm 的
         # gate_down/gate_up（2-D 矩阵，按 spec 属 Muon 组）
-        return "embed_tokens" in path or "lm_head" in path
+        return (
+            "embed_tokens" in path
+            or "lm_head" in path
+            or (".ngram." in path and arr.ndim >= 2)
+        )
 
     def _is_adamh(path, arr):
         # lm_head readout：Adam 方向 + 范数球投影（AdamH 类），仅 muonh 下
@@ -1028,16 +1102,14 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         )
 
     def _is_muon(path, arr):
-        # 3D 堆叠专家权重（*.experts.*）默认不走 Muon：基类 Muon 对 ndim>2
-        # 会 reshape 成 (E, out*in) 整体正交化，跨专家耦合尺度；分进 AdamW 组。
-        # muonh 下改由堆叠组逐专家 NS（见 BatchedMuon.apply_gradients）。
-        # MoE router 也不走 Muon：正交化更新步长恒定偏大，会把路由打分持续
-        # 推向失衡（实测 top-1 桶容量 C 从 ~6K 漂到 13K+，(E,C,D) 缓冲膨胀
-        # 顶爆内存、吞吐掉 ~30%）；单独小 lr AdamW 组，靠 bias 均衡项兜底
-        # GatedNorm.gate_up 零初始化，按 Marin 口径零初始化门进 Adam（其
-        # attn gate 同哲学，健康检查里从 0 长到 ~17）；且 hyperball 半径=
-        # 初始范数=0 会把它永久钉零（见 _stack_apply_kernel）。leaf 精确
-        # 匹配，不误伤专家堆叠 gate_up_w。
+        # 3D 堆叠专家：muonh 下（默认）由堆叠组逐专家 NS；`--no_muonh` 或
+        # VIBY_MUONH_EXPERTS=0 时排除进 AdamW，避免基类 reshape (E,out·in)
+        # 跨专家耦合。MoE router 也不走 Muon：正交化更新步长恒定偏大，会把
+        # 路由打分持续推向失衡；单独小 lr AdamW 组。
+        # GatedNorm.gate_up / attn_gate / KDA g_proj 零初始化，按 Marin
+        # 口径零初始化门进 Adam；hyperball 半径=初始范数=0 会把它永久钉零
+        # （见 _stack_apply_kernel）。g_proj 用 ".g_proj." 以免误伤 gate_proj。
+        # leaf 精确匹配 gate_up，不误伤专家堆叠 gate_up_w。
         return (
             arr.ndim >= 2
             and not _is_embed(path, arr)
@@ -1045,6 +1117,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
             and (experts_in_muon or ".experts." not in path)
             and ".router." not in path
             and "attn_gate" not in path
+            and ".g_proj." not in path
             and path.rsplit(".", 1)[-1] != "gate_up"
         )
 
@@ -1107,6 +1180,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         ns_steps=int(getattr(args, "muon_ns_steps", 5)),
         hyperball=muonh,
         head_dim=hd,
+        segment_map=_mla_segment_map(model),
         # muonh 加速旋钮（默认路径 muonh=False 时全部不影响数值）：
         # NS 迭代 bf16（范数仍 fp32）；逐专家 NS 的迭代步数
         ns_bf16=muonh and os.environ.get("VIBY_MUONH_NS_BF16", "1") == "1",
@@ -1140,7 +1214,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         learning_rate=adam_lr * scalar_lr_mult,
         betas=[0.9, beta2],
         eps=eps,
-        weight_decay=adam_wd,
+        weight_decay=0.0,
         bias_correction=True,
     )
 

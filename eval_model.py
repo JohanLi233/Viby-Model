@@ -142,6 +142,7 @@ def init_model(args):
             use_attn_gate=getattr(args, "use_attn_gate", False),
             mtp_depth=getattr(args, "mtp_depth", 0),
             mtp_loss_weight=getattr(args, "mtp_loss_weight", 0.3),
+            mtp_steps=getattr(args, "mtp_steps", 2),
             **(
                 {"head_dim": args.head_dim}
                 if getattr(args, "head_dim", None) is not None
@@ -156,7 +157,11 @@ def init_model(args):
     model.eval()
 
     total_params = model.num_parameters()
-    print(f"总参数量：{total_params / 1e6:.3f}M")
+    active_params = model.num_active_parameters()
+    print(
+        f"总参数量：{total_params / 1e6:.3f}M, "
+        f"每次激活：{active_params / 1e6:.3f}M"
+    )
 
     return model, tokenizer
 

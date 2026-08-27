@@ -1,8 +1,8 @@
 """optimizer 段耗时分解：clip_grad_norm / Muon NS / AdamW（分组）。
 
-655M 参数里 552M 是 3D 堆叠专家权重（走 AdamW 标量组），整步 optimizer
-实测占 13%。这里按参数组拆开计时，看是 Newton-Schulz、AdamW 的逐元素
-带宽、还是 clip_grad_norm 的全参数归约在主导。
+本脚本 `_Args` 未开 muonh，走旧分组：3D 堆叠专家在 AdamW 标量组。
+训练默认 `--muonh` 下专家改走 MuonH 逐专家 NS，optimizer 墙钟由专家
+NS GEMM 主导（见 bench_train_step.py --preset 1080m）。
 
 用法: uv run experiments/probe_optimizer.py
 """

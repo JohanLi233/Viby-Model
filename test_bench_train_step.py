@@ -26,8 +26,9 @@ class BenchTrainStepAccountingTest(unittest.TestCase):
         self.assertEqual(stats["tokens_per_second"], 12_288)
         self.assertEqual(stats["seconds_per_microbatch"], 1.0)
 
-    def test_1080m_has_six_main_and_one_mtp_kda_layer(self):
-        self.assertEqual(kda_layer_counts(num_hidden_layers=8, mtp_depth=1), (6, 1))
+    def test_1080m_has_six_main_kda_and_gqa_mtp(self):
+        # Qwen MTP 是 full-attn，不再占用 KDA 层。
+        self.assertEqual(kda_layer_counts(num_hidden_layers=8, mtp_depth=1), (6, 0))
 
     def test_periodic_optimizer_summary_keeps_refresh_cost(self):
         median, minimum, mean = summarize_samples([1.0] * 7 + [9.0])

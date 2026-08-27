@@ -43,7 +43,6 @@ cfg = VibyConfig(
     n_shared_experts=1,
     moe_intermediate_size=320,
     routed_scaling_factor=2.5,
-    moe_router_noise=0.05,
     moe_router_logit_norm=True,
     moe_router_logit_temp=1.0,
     moe_diversity_loss_weight=0.0,

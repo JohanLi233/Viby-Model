@@ -27,7 +27,7 @@
   --vocab_size 6400 --max_seq_len 1024 \
   --pack_sequences --doc_mask \
   --max_steps 2000 --max_train_minutes 55 --log_interval 500 \
-  --save_interval 100000 --min_lr_ratio 0.05 \
+  --save_interval 100000 --min_lr_ratio 0.05 --lr_schedule linear \
   --seed 1337 \
   --use_attn_gate --mtp_depth 1 --mtp_loss_weight 0.3 --z_loss_weight 0.0001 \
   --optimizer muon --muonh \
@@ -40,17 +40,27 @@
 
 要点：
 
-- lr / muon_lr / beta2 / eps 由 `--lr_scale_auto`（默认开）公式推导，日志第二行
-  `[lr_scale] 公式自动推导:` 会打印；上面显式给的 `--learning_rate` 是之前推出的
-  值，保持所有 probe 同口径。
-- warmup_iters 自动 = 总步数 1%（日志里 279）。
+- lr / muon_lr / beta2 / eps 由 `--lr_scale_auto`（默认开）公式推导，日志
+  `[lr_scale] 公式自动推导:` 会打印；上面显式给的 `--learning_rate` 是按
+  **全量 epoch token 预算**推出的值，保持历史 probe 同峰值。新短跑若不传
+  `--learning_rate` / `--token_budget`，峰值会按 `--max_steps` 的 token 数
+  重算（Marin ladder：每档用该档实际预算，tokens^-0.3461）。
+- warmup_iters 自动 = **本轮 LR horizon** 的 1%（`--max_steps 2000` → 20）。
+  要对齐历史 P 系列（warmup 279、峰值按全量 27863 微步）：显式
+  `--warmup_iters 279 --learning_rate 0.0015450949123618698`
+  `--lr_decay_steps 27863`（日程按长 run 排、短跑只走前缀，几乎不退火）。
+- CLI 默认已是 `--lr_schedule linear`（Marin #8435：warmup 1% 后立刻收到
+  `min_lr_ratio=0.05`，无平台）。`--lr_schedule wsd` 才是 warmup+平台+末尾
+  20%。数据 80% 处分相是 Marin 的 datamix，不是 LR 平台。
+- HEAD 相对 P19 基线还改了：KDA 输出门 `2·σ` 零初始化、TruncNormal 按
+  fan-in、Adam 标量组 wd=0。与下表 5.264 **不可跨减**；对照历史数字用
+  当时代码，对照新代码另开基线。
 - **指标读法**：console.log 的 `Epoch:[1/1](N/...)` 中 **N 是微步**
   （accumulation_steps=2，优化器步 = N/2）。论文报的 loss@500 是微步 500
   那一行：`Epoch:[1/1](500/27863) loss:5.264(...)`。
 - 500 微步短 probe ≈ 14 分钟（`--max_steps 550`，微批口径；**不要设 500**——
-  会在第 500 微步的日志行打印前停下，丢失 loss@500；warmup 279 由 epoch
-  总长推出，不受 max_steps 影响）；2000 优化器步全程 ≈ 45–55 分钟
-  （--max_steps 2000 + max_train_minutes 55 兜底）。
+  会在第 500 微步的日志行打印前停下，丢失 loss@500）。2000 微步全程 ≈
+  45–55 分钟（--max_steps 2000 + max_train_minutes 55 兜底）。
 
 ### 变体开关（env 变量，均定义在 trainer/muon.py）
 
@@ -97,6 +107,8 @@ VIBY_SNAPSHOT_STEPS=150,300,500,750,950 \
 3. probe 命名：`probe_p<编号>_<短名>`，编号递增不重用。
 4. 新旧代码口径**不可跨减**：gate_up 零初始化 bug 修复（P19 起）使基线移动 ~0.04，
    P13–P17 是旧口径，P19+ 是新口径。对比只在同口径内进行。
+   HEAD 相对 P19 又改了日程默认（linear / Marin #8435）、KDA 门、fan-in init、标量 wd=0，
+   再构成一档新口径。
 5. 跨 seed 噪声：σ≈0.11（P25 实测），配对差 ±0.05 以内算中性；小于此幅度
    不要下结论。
 6. 改优化器代码后跑四个测试：

@@ -334,7 +334,8 @@ def merge(w: mx.array, vs: list) -> mx.array:
             mx.eval(out, ref)  # 触发 JIT 编译；失败只回退这一档 N
             d = (out.astype(mx.float32) - ref.astype(mx.float32)).abs().max().item()
             tol = 1e-4 if w.dtype == mx.float32 else 5e-2
-            if d > tol:
+            # 不用 d > tol：NaN 经该比较恒为 False 会误过校验
+            if not (d <= tol):
                 raise RuntimeError(f"attn_res fused 校验失败 |Δ|={d:.2e} (key={key})")
             _VERIFIED.add(key)
         return out

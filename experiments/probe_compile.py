@@ -33,7 +33,6 @@ cfg = VibyConfig(
     n_shared_experts=2,
     moe_intermediate_size=320,
     routed_scaling_factor=2.5,
-    moe_router_noise=0.0,
 )
 
 X = mx.random.randint(1, V, (B, T))

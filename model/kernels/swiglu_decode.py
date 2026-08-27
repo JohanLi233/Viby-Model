@@ -101,7 +101,8 @@ def silu_mul_down_decode(gu, wd):
             mx.eval(out, ref)  # 触发 JIT；失败走 except 永久回退
             d = (out.astype(mx.float32) - ref.astype(mx.float32)).abs().max().item()
             tol = 1e-5 if gu.dtype == mx.float32 else 2e-2
-            if d > tol:
+            # 不用 d > tol：NaN 经该比较恒为 False 会误过校验
+            if not (d <= tol):
                 raise RuntimeError(f"swiglu_down 校验失败 |Δ|={d:.2e} (key={key})")
             _VERIFIED.add(key)
         return out

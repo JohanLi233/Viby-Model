@@ -44,6 +44,7 @@ if __name__ == "__main__":
         max_position_embeddings=args.max_seq_len,
         mtp_depth=args.mtp_depth,
         mtp_loss_weight=args.mtp_loss_weight,
+        mtp_steps=args.mtp_steps,
         use_attn_gate=args.use_attn_gate,
         n_routed_experts=args.n_routed_experts,
         num_experts_per_tok=args.num_experts_per_tok,
@@ -55,7 +56,13 @@ if __name__ == "__main__":
         moe_diversity_loss_weight=args.moe_diversity_loss_weight,
         z_loss_weight=args.z_loss_weight,
         moe_latent_dim=args.moe_latent_dim,
+        kda_v_head_ratio=args.kda_v_head_ratio,
+        ngram_table_size=args.ngram_table_size,
+        ngram_layer=args.ngram_layer,
         tie_word_embeddings=args.tie_word_embeddings,
+        use_linear_attn=args.use_linear_attn,
+        kv_lora_rank=args.kv_lora_rank,
+        qk_rope_head_dim=args.qk_rope_head_dim,
         **({"head_dim": args.head_dim} if args.head_dim is not None else {}),
         **(
             {"intermediate_size": args.intermediate_size}
@@ -68,7 +75,7 @@ if __name__ == "__main__":
     model, tokenizer = init_model(lm_config, args)
 
     # 数据集先于 trainer 创建：lr_scale_auto 在未传 --token_budget 时按
-    # epochs × 每轮步数推导总 token 预算，需要数据集长度
+    # 与 LR 日程相同的 horizon（max_steps / 全量 epoch）推导 token 预算
     train_ds = PretrainDataset(
         args.data_path,
         tokenizer,

@@ -1,7 +1,7 @@
 """KDA（Kimi Delta Attention）：逐通道门控 delta 规则线性注意力。
 
-Kimi Linear 3:1 混合中承担 "3" 的 local 层（global 层是 full-causal
-NoPE GQA，见 attention.py）。全模型无 RoPE。
+Kimi Linear 3:1 混合中承担 "3" 的 local 层（`use_linear_attn=True`；
+global 层是 full-causal NoPE GQA，见 attention.py）。该路径全模型无 RoPE。
 
 机制（fla/ops/kda 口径）：
   q/k/v = 线性投影 → 深度因果 ShortConv(kernel 4) + SiLU → 逐 head 无参
@@ -11,7 +11,10 @@ NoPE GQA，见 attention.py）。全模型无 RoPE。
   z = f_b(f_a(x)) + dt_bias（低秩 + 逐通道偏置，Kimi Linear 的 z 路径保留）；
   写强度 β = σ(b(x))。delta 规则递推：S ← Diag(e^g)·S + βk(v − Sᵀk)ᵀ，
   o = qᵀS（S 布局 (B, H, K, V)，衰减作用在 K 轴）。
-  输出：y = W_o[σ(W_g x) ⊙ RMSNorm(ō)]，W_g 满秩。无 RoPE。
+  输出：y = W_o[2·σ(W_g x) ⊙ RMSNorm(ō)]，W_g 满秩零初始化（初始门 1，
+  与 GQA attn_gate / GatedNorm 同哲学）。无 RoPE。
+  V 头可按 kda_v_head_ratio 扩张（默认 2）：Q/K/衰减/β 在 QK 头上计算后
+  沿 head 轴重复，V/输出门/o_proj 用 n_v 头；状态 S 为 (B, n_v, D, D)。
 
 训练前向：chunk 并行（C=16）。chunk 内 cumsum 得 gc，A 矩阵用
   e^{gc_i−gc_j} = e^{gc_i}·e^{−gc_j} 分解为 batched GEMM；e^{−gc} 一侧
@@ -32,6 +35,10 @@ state 与 conv 尾部（普通截断无轨迹时回退为清空状态，与 Shor
 打包序列：conv 按 segment_ids 逐 tap 段掩码（与 ShortConv 同）；循环
 状态在文档边界不重置（e^g 衰减使跨文档泄漏快速衰减，f 门可学习在
 边界加大衰减；如需严格隔离请逐文档前向）。
+
+EigenGate（默认关，VIBY_EIGENGATE=1 打开）：每隔 K 个 chunk 对状态做
+一次酉等变谱高通，见 eigengate.py。关闭时扫描/递推与本文件原路径逐位一致。
+打开后默认走一次融合扫描（门控收进 kernel，不再按段切开）。
 """
 
 import os
@@ -40,19 +47,27 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from . import eigengate as _eigengate
 from .kernels.conv import causal_conv
 from .kernels.kda_decode import kda_decode_step
 from .kernels.kda_inner import kda_inner
 from .kernels.kda_prep import kda_prep
 from .kernels.kda_scan import _supported as _scan_supported
 from .kernels.kda_scan import kda_scan_metal
+from .kernels.kda_scan_eg import _supported as _scan_eg_supported
+from .kernels.kda_scan_eg import kda_scan_eg_metal
 from .norms import _rms_unit
 
 _SCAN_KERNEL_VERIFIED: set = set()
+_SCAN_EG_VERIFIED: set = set()
+_GATED_EAGER_OPS: dict = {}
 # VIBY_KDA_SCAN=0 或 VIBY_FUSED_KERNELS=0：跨 chunk 扫描走 eager（run 81 口径）
 _SCAN_KERNEL_DISABLED = (
     os.environ.get("VIBY_KDA_SCAN", "1") != "1"
     or os.environ.get("VIBY_FUSED_KERNELS", "1") == "0"
+)
+_SCAN_EG_DISABLED = (
+    os.environ.get("VIBY_KDA_SCAN_EG", "1") != "1" or _SCAN_KERNEL_DISABLED
 )
 # VIBY_KDA_SCAN_ZSC=0：关闭 scan 反向的「状态 cotangent 恒零」特化
 # （仅训练路径使用；评估/prefill 消费末态 S，cot_Sall 非零，自动走通用版）
@@ -84,7 +99,7 @@ def _scan_dispatch(qe, w, u, Aqk, kd, egl, S, zsc: bool = False):
             # bug（如索引错位 O(1) 偏差）仍然敏感。
             d1 = ((o - o_ref).abs().max() / (o_ref.abs().max() + 1e-12)).item()
             d2 = ((Sall - Sall_ref).abs().max() / (Sall_ref.abs().max() + 1e-12)).item()
-            if max(d1, d2) > 1e-4:
+            if not (max(d1, d2) <= 1e-4):  # NaN 也会触发（NaN <= x 为 False）
                 raise RuntimeError(f"kda_scan fused 校验失败 rel={max(d1, d2):.2e}")
             _SCAN_KERNEL_VERIFIED.add(key)
         return o, Sall
@@ -124,14 +139,15 @@ def _scan_prewarm(NC: int, C: int, D: int, Dv: int, B: int = 1, H: int = 1) -> b
         lg, gg = mx.value_and_grad(fk, argnums=list(range(7)))(*ins)
         lr, gr = mx.value_and_grad(fe, argnums=list(range(7)))(*ins)
         mx.eval(lg, lr, *gg, *gr)
-        if abs(lg.item() - lr.item()) > 1e-3 * max(1.0, abs(lr.item())):
+        # 不用 > 阈值：NaN 经该比较恒为 False 会误过校验
+        if not (abs(lg.item() - lr.item()) <= 1e-3 * max(1.0, abs(lr.item()))):
             raise RuntimeError(
                 f"kda_scan prewarm loss 不一致 {lg.item()} vs {lr.item()}"
             )
         for a, b in zip(gg, gr):
             d = (a - b).abs().max().item()
             rel = d / (b.abs().max().item() + 1e-12)
-            if rel > 1e-3:
+            if not (rel <= 1e-3):
                 raise RuntimeError(f"kda_scan prewarm 梯度不一致 rel={rel:.2e}")
         _SCAN_KERNEL_VERIFIED.add(key)
         # ZSC 变体（训练路径实际使用）也必须在 compile 前完成校验，否则首个
@@ -150,14 +166,14 @@ def _scan_prewarm(NC: int, C: int, D: int, Dv: int, B: int = 1, H: int = 1) -> b
                 lz, gz = mx.value_and_grad(fk_z, argnums=list(range(7)))(*ins)
                 lz_r, gz_r = mx.value_and_grad(fe_z, argnums=list(range(7)))(*ins)
                 mx.eval(lz, lz_r, *gz, *gz_r)
-                if abs(lz.item() - lz_r.item()) > 1e-3 * max(1.0, abs(lz_r.item())):
+                if not (abs(lz.item() - lz_r.item()) <= 1e-3 * max(1.0, abs(lz_r.item()))):
                     raise RuntimeError(
                         f"kda_scan zsc prewarm loss 不一致 {lz.item()} vs {lz_r.item()}"
                     )
                 for a, b in zip(gz, gz_r):
                     d = (a - b).abs().max().item()
                     rel = d / (b.abs().max().item() + 1e-12)
-                    if rel > 1e-3:
+                    if not (rel <= 1e-3):
                         raise RuntimeError(
                             f"kda_scan zsc prewarm 梯度不一致 rel={rel:.2e}"
                         )
@@ -168,6 +184,232 @@ def _scan_prewarm(NC: int, C: int, D: int, Dv: int, B: int = 1, H: int = 1) -> b
         return False
 
 
+def _make_kda_scan_gated(gate_tuple: tuple[int, ...], lam: float, coeffs):
+    """eager 门控扫描 + STE VJP（Metal 对照 / 回退）。λ 当常数，polar 不反传。"""
+    n_gates = sum(gate_tuple)
+
+    @mx.custom_function
+    def _op(qe, w, u, Aqk, kd, egl, S0):
+        NC = int(qe.shape[2])
+        D = int(qe.shape[4])
+        Dv = int(u.shape[-1])
+        left = D <= Dv
+        side = "left" if left else "right"
+        S = S0
+        outs = [None] * NC
+        states = [S0]
+        Ws = []
+        for c in range(NC):
+            vt = u[:, :, c] - w[:, :, c] @ S
+            outs[c] = qe[:, :, c] @ S + Aqk[:, :, c] @ vt
+            S = S * egl[:, :, c][..., None] + mx.swapaxes(kd[:, :, c], -1, -2) @ vt
+            if gate_tuple[c]:
+                W = mx.stop_gradient(
+                    _eigengate.ste_weight(S, lam, coeffs, prefer=side)
+                )
+                S = (W @ S) if left else (S @ W)
+                Ws.append(W)
+            states.append(S)
+        Wg = mx.stack(Ws, axis=2)
+        return mx.stack(outs, axis=2), mx.stack(states, axis=2), Wg
+
+    @_op.vjp
+    def _op_vjp(primals, cotangent, output):
+        qe, w, u, Aqk, kd, egl, _S0 = primals
+        NC = qe.shape[2]
+        D = int(qe.shape[4])
+        Dv = int(u.shape[-1])
+        left = D <= Dv
+        cot_o, cot_Sall = cotangent[0], cotangent[1]
+        Sall = output[1]
+        Wg = output[2]
+        dS = mx.zeros_like(primals[6])
+        dqe = [None] * NC
+        dw = [None] * NC
+        du = [None] * NC
+        dAqk = [None] * NC
+        dkd = [None] * NC
+        degl = [None] * NC
+        gi = n_gates - 1
+        for c in range(NC - 1, -1, -1):
+            dS = dS + cot_Sall[:, :, c + 1]
+            if gate_tuple[c]:
+                W = Wg[:, :, gi]
+                dS = (
+                    mx.swapaxes(W, -1, -2) @ dS
+                    if left
+                    else dS @ mx.swapaxes(W, -1, -2)
+                )
+                gi -= 1
+            Sc = Sall[:, :, c]
+            do = cot_o[:, :, c]
+            vt = u[:, :, c] - w[:, :, c] @ Sc
+            dvt = mx.swapaxes(Aqk[:, :, c], -1, -2) @ do + kd[:, :, c] @ dS
+            dqe[c] = do @ mx.swapaxes(Sc, -1, -2)
+            dAqk[c] = do @ mx.swapaxes(vt, -1, -2)
+            dw[c] = -dvt @ mx.swapaxes(Sc, -1, -2)
+            du[c] = dvt
+            dkd[c] = mx.swapaxes(dS @ mx.swapaxes(vt, -1, -2), -1, -2)
+            degl[c] = (Sc * dS).sum(axis=-1)
+            dS = (
+                mx.swapaxes(qe[:, :, c], -1, -2) @ do
+                - mx.swapaxes(w[:, :, c], -1, -2) @ dvt
+                + dS * egl[:, :, c][..., None]
+            )
+        dS0 = dS + cot_Sall[:, :, 0]
+        return [
+            mx.stack(dqe, axis=2),
+            mx.stack(dw, axis=2),
+            mx.stack(du, axis=2),
+            mx.stack(dAqk, axis=2),
+            mx.stack(dkd, axis=2),
+            mx.stack(degl, axis=2),
+            dS0,
+        ]
+
+    return _op
+
+
+def _kda_scan_gated(qe, w, u, Aqk, kd, egl, S0, gate_tuple, lam):
+    coeffs = _eigengate.cubic_coeffs()
+    key = (gate_tuple, float(lam), tuple(coeffs))
+    op = _GATED_EAGER_OPS.get(key)
+    if op is None:
+        op = _make_kda_scan_gated(gate_tuple, float(lam), coeffs)
+        _GATED_EAGER_OPS[key] = op
+    o, Sall, _wg = op(qe, w, u, Aqk, kd, egl, S0)
+    return o, Sall
+
+
+def _scan_dispatch_gated(
+    qe, w, u, Aqk, kd, egl, S, gate_tuple, lam, zsc: bool = False
+):
+    """门控扫描：优先一次 Metal 发射，失败回退 eager STE。"""
+    global _SCAN_EG_DISABLED
+    NC, C, D = qe.shape[2], qe.shape[3], qe.shape[4]
+    Dv = u.shape[-1]
+    if (
+        _SCAN_EG_DISABLED
+        or qe.dtype != mx.float32
+        or not _scan_eg_supported(NC, C, D, Dv)
+    ):
+        return _kda_scan_gated(qe, w, u, Aqk, kd, egl, S, gate_tuple, lam)
+    key = (int(NC), int(C), int(D), int(Dv), gate_tuple, float(lam), zsc)
+    try:
+        o, Sall = kda_scan_eg_metal(
+            qe, w, u, Aqk, kd, egl, S, gate_tuple, float(lam), zsc=zsc
+        )
+        if key not in _SCAN_EG_VERIFIED:
+            o_ref, Sall_ref = _kda_scan_gated(
+                qe, w, u, Aqk, kd, egl, S, gate_tuple, lam
+            )
+            mx.eval(o, Sall, o_ref, Sall_ref)
+            d1 = ((o - o_ref).abs().max() / (o_ref.abs().max() + 1e-12)).item()
+            d2 = (
+                (Sall - Sall_ref).abs().max() / (Sall_ref.abs().max() + 1e-12)
+            ).item()
+            if not (max(d1, d2) <= 1e-3):
+                raise RuntimeError(
+                    f"kda_scan_eg 校验失败 rel={max(d1, d2):.2e}"
+                )
+            _SCAN_EG_VERIFIED.add(key)
+        return o, Sall
+    except Exception as e:
+        _SCAN_EG_DISABLED = True
+        print(f"[kda_scan_eg] Metal 回退 eager：{e}", flush=True)
+        return _kda_scan_gated(qe, w, u, Aqk, kd, egl, S, gate_tuple, lam)
+
+
+def _scan_prewarm_gated(
+    NC: int,
+    C: int,
+    D: int,
+    Dv: int,
+    gate_tuple: tuple[int, ...],
+    B: int = 1,
+    H: int = 1,
+    lam: float = 1.0,
+) -> bool:
+    """compile 前预编译门控扫描 + fwd/bwd 对照 eager STE。"""
+    global _SCAN_EG_DISABLED
+    if _SCAN_EG_DISABLED or not _scan_eg_supported(NC, C, D, Dv):
+        return False
+    if not any(gate_tuple):
+        return True
+    key = (NC, C, D, Dv, gate_tuple, float(lam), False)
+    key_z = (NC, C, D, Dv, gate_tuple, float(lam), True)
+    if key in _SCAN_EG_VERIFIED and key_z in _SCAN_EG_VERIFIED:
+        return True
+    try:
+        qe = (mx.random.normal((B, H, NC, C, D)) * 0.05).astype(mx.float32)
+        w = (mx.random.normal((B, H, NC, C, D)) * 0.02).astype(mx.float32)
+        u = (mx.random.normal((B, H, NC, C, Dv)) * 0.3).astype(mx.float32)
+        Aqk = (mx.random.normal((B, H, NC, C, C)) * 0.05).astype(mx.float32)
+        kd = (mx.random.normal((B, H, NC, C, D)) * 0.02).astype(mx.float32)
+        egl = mx.random.uniform(0.9, 1.0, (B, H, NC, D)).astype(mx.float32)
+        S = (mx.random.normal((B, H, D, Dv)) * 0.1).astype(mx.float32)
+        ins = [qe, w, u, Aqk, kd, egl, S]
+
+        def fk(*a):
+            o, Sall = kda_scan_eg_metal(
+                *a, gate_tuple=gate_tuple, lam=float(lam), zsc=False
+            )
+            return (o**2).sum() + (Sall**2).sum()
+
+        def fe(*a):
+            o, Sall = _kda_scan_gated(*a, gate_tuple, lam)
+            return (o**2).sum() + (Sall**2).sum()
+
+        lg, gg = mx.value_and_grad(fk, argnums=list(range(7)))(*ins)
+        lr, gr = mx.value_and_grad(fe, argnums=list(range(7)))(*ins)
+        mx.eval(lg, lr, *gg, *gr)
+        if not (abs(lg.item() - lr.item()) <= 1e-3 * max(1.0, abs(lr.item()))):
+            raise RuntimeError(
+                f"kda_scan_eg prewarm loss 不一致 {lg.item()} vs {lr.item()}"
+            )
+        for a, b in zip(gg, gr):
+            d = (a - b).abs().max().item()
+            rel = d / (b.abs().max().item() + 1e-12)
+            if not (rel <= 2e-3):
+                raise RuntimeError(f"kda_scan_eg prewarm 梯度不一致 rel={rel:.2e}")
+        _SCAN_EG_VERIFIED.add(key)
+        if _ZSC_ENABLED:
+
+            def fk_z(*a):
+                return (
+                    kda_scan_eg_metal(
+                        *a, gate_tuple=gate_tuple, lam=float(lam), zsc=True
+                    )[0]
+                    ** 2
+                ).sum()
+
+            def fe_z(*a):
+                return (_kda_scan_gated(*a, gate_tuple, lam)[0] ** 2).sum()
+
+            lz, gz = mx.value_and_grad(fk_z, argnums=list(range(7)))(*ins)
+            lz_r, gz_r = mx.value_and_grad(fe_z, argnums=list(range(7)))(*ins)
+            mx.eval(lz, lz_r, *gz, *gz_r)
+            if not (
+                abs(lz.item() - lz_r.item()) <= 1e-3 * max(1.0, abs(lz_r.item()))
+            ):
+                raise RuntimeError(
+                    f"kda_scan_eg zsc prewarm loss 不一致 {lz.item()} vs {lz_r.item()}"
+                )
+            for a, b in zip(gz, gz_r):
+                d = (a - b).abs().max().item()
+                rel = d / (b.abs().max().item() + 1e-12)
+                if not (rel <= 2e-3):
+                    raise RuntimeError(
+                        f"kda_scan_eg zsc prewarm 梯度不一致 rel={rel:.2e}"
+                    )
+            _SCAN_EG_VERIFIED.add(key_z)
+        return True
+    except Exception as e:
+        _SCAN_EG_DISABLED = True
+        print(f"[kda_scan_eg] prewarm 失败，回退 eager：{e}", flush=True)
+        return False
+
+
 KDA_CHUNK = 16  # chunk 内分解数值安全的衰减步数上限（见模块 docstring）
 KDA_CONV_KERNEL = 4
 # K3 下界门：g = g_min · σ(e^{A_h} z) ∈ (g_min, 0)。16-token tile 累计
@@ -175,6 +417,18 @@ KDA_CONV_KERNEL = 4
 KDA_G_MIN = -5.0
 # 仅给 test_kda 的「无界衰减会溢出」对照用；模块路径不再硬钳。
 KDA_MAX_STEP_DECAY = 4.0
+
+
+def _repeat_heads(x: mx.array, n_rep: int, axis: int) -> mx.array:
+    """把 QK 头沿 head 轴连续重复到 V 头数。n_rep=1 时原样返回。"""
+    if n_rep == 1:
+        return x
+    return mx.repeat(x, n_rep, axis=axis)
+
+
+def kda_out_gate(g_in: mx.array) -> mx.array:
+    """满秩输出门 2·σ(W_g x)。W_g 零初始化 ⇒ 门=1（恒等）。"""
+    return 2.0 * mx.sigmoid(g_in)
 
 
 def _shift_right_tokens(x: mx.array, offset: int) -> mx.array:
@@ -231,10 +485,13 @@ def _recurrent_kda(
     beta: mx.array,
     S0: Optional[mx.array] = None,
     collect: Optional[list] = None,
+    t0: int = 0,
+    eigengate_lam=None,
 ) -> tuple[mx.array, mx.array]:
     """逐 token 递推参考实现（f32）。q/k/v/log_g (B,H,T,D)，beta (B,H,T)，
     S0 (B,H,D,Dv)。解码（T 小）与数值对照共用。collect 非 None 时每步
-    追加该步后的 state，供投机解码 rewind 精确回滚。"""
+    追加该步后的 state，供投机解码 rewind 精确回滚。t0 是本段之前已
+    处理的 token 数（cache.offset），供 EigenGate 门控点对齐。"""
     B, H, T, D = q.shape
     Dv = v.shape[-1]
     S = (
@@ -242,6 +499,11 @@ def _recurrent_kda(
         if S0 is None
         else S0.astype(mx.float32)
     )
+    period = 0
+    if _eigengate.enabled():
+        if eigengate_lam is None:
+            eigengate_lam = _eigengate.mix_lambda()
+        period = _eigengate.period_tokens(KDA_CHUNK)
     outs = []
     for t in range(T):
         S = S * mx.exp(log_g[:, :, t])[..., None]
@@ -249,6 +511,8 @@ def _recurrent_kda(
         delta = beta[:, :, t][..., None] * (v[:, :, t] - kv)
         S = S + k[:, :, t][..., None] * delta[..., None, :]
         outs.append((S * q[:, :, t][..., None]).sum(axis=-2))
+        if period and _eigengate.should_gate(t0 + t + 1, period):
+            S = _eigengate.apply(S, eigengate_lam)
         if collect is not None:
             collect.append(S)
     return mx.stack(outs, axis=2), S
@@ -333,11 +597,14 @@ def _chunk_kda(
     S0: Optional[mx.array] = None,
     chunk_size: int = KDA_CHUNK,
     zero_state_cot: bool = False,
+    t0: int = 0,
+    eigengate_lam=None,
 ) -> tuple[mx.array, mx.array]:
     """chunk 并行训练前向（f32）。形状同 _recurrent_kda；T 非 C 整数倍时
     右侧零填充（k=0 不写状态、log_g=0 不衰减，对输出与最终状态无影响）。
     zero_state_cot=True 向调度器声明：返回的末态 S（即 Sall 全体）的
-    cotangent 恒为零，允许 scan 反向走零协梯度特化（仅训练路径满足）。"""
+    cotangent 恒为零，允许 scan 反向走零协梯度特化（仅训练路径满足）。
+    t0/eigengate_lam 供 EigenGate 在 chunk 边界插入谱高通。"""
     B, H, T, D = q.shape
     Dv = v.shape[-1]
     C = chunk_size
@@ -373,11 +640,69 @@ def _chunk_kda(
         if S0 is None
         else S0.astype(mx.float32)
     )
-    o, Sall = _scan_dispatch(qe, w, u, Aqk, kd, egl, S, zsc=zero_state_cot)
+    mask = (
+        tuple(_eigengate.chunk_gate_mask(NC, T, C, t0))
+        if _eigengate.enabled()
+        else ()
+    )
+    if mask and any(mask) and eigengate_lam is None:
+        eigengate_lam = _eigengate.mix_lambda()
+    lam_is_const = isinstance(eigengate_lam, (int, float))
+    gated = bool(mask) and any(mask) and not (
+        lam_is_const and float(eigengate_lam) == 0.0
+    )
+    fused_gate = (
+        gated
+        and lam_is_const
+        and not _eigengate.learnable()
+        and _eigengate.target_name() == "keep"
+    )
+    if fused_gate:
+        o, Sall = _scan_dispatch_gated(
+            qe,
+            w,
+            u,
+            Aqk,
+            kd,
+            egl,
+            S,
+            mask,
+            float(eigengate_lam),
+            zsc=zero_state_cot,
+        )
+        S_out = Sall[:, :, NC]
+    elif not gated:
+        o, Sall = _scan_dispatch(qe, w, u, Aqk, kd, egl, S, zsc=zero_state_cot)
+        S_out = Sall[:, :, NC]
+    else:
+        segs = _eigengate.scan_segments(NC, T, C, t0)
+        outs = []
+        start = 0
+        nseg = len(segs)
+        for i, (length, gate) in enumerate(segs):
+            sl = slice(start, start + length)
+            zsc = bool(zero_state_cot and i == nseg - 1)
+            o_seg, Sall = _scan_dispatch(
+                qe[:, :, sl],
+                w[:, :, sl],
+                u[:, :, sl],
+                Aqk[:, :, sl],
+                kd[:, :, sl],
+                egl[:, :, sl],
+                S,
+                zsc=zsc,
+            )
+            S = Sall[:, :, -1]
+            if gate:
+                S = _eigengate.apply(S, eigengate_lam)
+            outs.append(o_seg)
+            start += length
+        o = mx.concatenate(outs, axis=2)
+        S_out = S
     o = o.reshape(B, H, T + pad, Dv)
     if pad:
         o = o[:, :, :T]
-    return o, Sall[:, :, NC]
+    return o, S_out
 
 
 class KDAAttention(nn.Module):
@@ -390,36 +715,47 @@ class KDAAttention(nn.Module):
     def __init__(self, config, layer_idx: int = 0):
         super().__init__()
         d = config.hidden_size
-        self.n_heads = config.num_attention_heads
+        self.n_k_heads = config.num_attention_heads
+        self.n_v_heads = self.n_k_heads * int(
+            getattr(config, "kda_v_head_ratio", 2)
+        )
+        self.n_heads = self.n_k_heads
+        self.n_rep_v = self.n_v_heads // self.n_k_heads
         self.head_dim = config.head_dim
-        proj = self.n_heads * self.head_dim
+        qk = self.n_k_heads * self.head_dim
+        vv = self.n_v_heads * self.head_dim
         self.scale = self.head_dim**-0.5
-        self.q_proj = nn.Linear(d, proj, bias=False)
-        self.k_proj = nn.Linear(d, proj, bias=False)
-        self.v_proj = nn.Linear(d, proj, bias=False)
-        self.q_conv = _KDAConv(proj)
-        self.k_conv = _KDAConv(proj)
-        self.v_conv = _KDAConv(proj)
-        # 逐通道衰减门（低秩）与写强度门
+        self.q_proj = nn.Linear(d, qk, bias=False)
+        self.k_proj = nn.Linear(d, qk, bias=False)
+        self.v_proj = nn.Linear(d, vv, bias=False)
+        self.q_conv = _KDAConv(qk)
+        self.k_conv = _KDAConv(qk)
+        self.v_conv = _KDAConv(vv)
+        # 逐通道衰减门（低秩）与写强度门：在 QK 头上算，前向再重复到 V 头
         self.f_a_proj = nn.Linear(d, self.head_dim, bias=False)
-        self.f_b_proj = nn.Linear(self.head_dim, proj, bias=False)
-        self.b_proj = nn.Linear(d, self.n_heads, bias=False)
-        # K3 满秩输出门 W_g：y = W_o[σ(W_g x) ⊙ RMSNorm(ō)]
-        self.g_proj = nn.Linear(d, proj, bias=False)
-        H = self.n_heads
+        self.f_b_proj = nn.Linear(self.head_dim, qk, bias=False)
+        self.b_proj = nn.Linear(d, self.n_k_heads, bias=False)
+        # 满秩输出门 W_g：与 V 头对齐，y = W_o[2·σ(W_g x) ⊙ RMSNorm(ō)]
+        self.g_proj = nn.Linear(d, vv, bias=False)
+        self.g_proj.weight = mx.zeros_like(self.g_proj.weight)
+        Hk = self.n_k_heads
         # A_h 初始化为 0（K3）；仍叫 A_log 以免改 decode kernel 签名
-        self.A_log = mx.zeros((H,))
+        self.A_log = mx.zeros((Hk,))
         # 逐通道 z 偏置：直接按目标初始衰减率校准——r ~ U(0.001, 0.1)
         # nats/step（e-folding 记忆 10~1000 token，与 softplus 时代的
         # 初始分布一致），存 logit(r/|g_min|) 使 K3 门在 A_h=0 时
         # σ(z)=r/|g_min| ⇒ g = g_min·σ(z) = −r。z ∈ (−8.5, −3.9)；
         # 慢端 σ′≈r/5 很小（该侧衰减学得慢），快速整体调节靠
         # per-head 的 A_h（e^{A_h} 直接缩放 z）。
-        r = mx.random.uniform(0.001, 0.1, (proj,))
+        r = mx.random.uniform(0.001, 0.1, (qk,))
         self.dt_bias = mx.log(r / (-KDA_G_MIN - r))
         self.o_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.o_proj = nn.Linear(proj, d, bias=False)
+        self.o_proj = nn.Linear(vv, d, bias=False)
         self.resid_dropout = nn.Dropout(config.dropout)
+        # EigenGate 可学 λ（默认关）。ndim=1，自然进 Adam 标量组；长度跟 V 头
+        # （状态 S 的 head 轴）。
+        if _eigengate.enabled() and _eigengate.learnable():
+            self.eigengate_lam = mx.full((self.n_v_heads,), _eigengate.mix_lambda())
 
     def __call__(
         self,
@@ -434,10 +770,13 @@ class KDAAttention(nn.Module):
     ):
         del position_embeddings, causal_bias
         B, T, _ = x.shape
-        H, D = self.n_heads, self.head_dim
+        Hk, Hv, D = self.n_k_heads, self.n_v_heads, self.head_dim
+        n_rep = self.n_rep_v
         cache = past_key_value if use_cache else None
         extras = cache.extras if cache is not None else {}
         S0 = extras.get("kda_state")
+        t0 = int(cache.offset) if cache is not None else 0
+        eg_lam = _eigengate.lam_for(self)
 
         # pad 掩码（0/1）：pad 位清零 q/k/v（不写状态、不进 conv 历史），
         # 衰减置 0（state 原样穿过）。打包 segment_ids 走 conv 段掩码，
@@ -463,7 +802,7 @@ class KDAAttention(nn.Module):
         # 各参数切片）。放大 GEMM 形状、减少 kernel 发射。
         # eval 下缓存拼接结果（权重经 model.update 整体替换，按身份失效；
         # object.__setattr__ 绕过 nn.Module 的参数登记），训练每步重拼。
-        proj = H * D
+        qk, vv = Hk * D, Hv * D
         srcs = (
             self.q_proj.weight,
             self.k_proj.weight,
@@ -484,9 +823,10 @@ class KDAAttention(nn.Module):
         # 用 mx.split 而不是六个 `fused[..., a:b]`：切片的 VJP 各自 scatter 进
         # 一份全宽零张量再相加（六写五加，全宽 74MB/层），split 的 VJP 是单次
         # concatenate。实测 f+b 19.20 → 15.46ms/层，逐位一致。
+        # ratio=1 时切分点与旧 [proj, 2proj, 3proj, 3proj+D, 4proj+D] 相同。
         q_in, k_in, v_in, fa, g_in, bl = mx.split(
             x @ w_in.T,
-            [proj, 2 * proj, 3 * proj, 3 * proj + D, 4 * proj + D],
+            [qk, 2 * qk, 2 * qk + vv, 2 * qk + vv + D, 2 * qk + vv + D + vv],
             axis=-1,
         )
         if pad_mul is not None:
@@ -522,20 +862,35 @@ class KDAAttention(nn.Module):
         # log_g/β 门、SSM 状态递推与输出（替代下方 ~28 个小 kernel）。
         # pad 位语义（q/k/v 清零、不衰减）核内不表达，有 pad 时回退 eager。
         if cache is not None and T == 1 and pad_mul is None:
-            S_in = S0 if S0 is not None else mx.zeros((B, H, D, D), dtype=mx.float32)
+            qh = _repeat_heads(q.reshape(B, Hk, D), n_rep, 1)
+            kh = _repeat_heads(k.reshape(B, Hk, D), n_rep, 1)
+            vh = v.reshape(B, Hv, D)
+            ah = _repeat_heads(self.f_b_proj(fa).reshape(B, Hk, D), n_rep, 1)
+            blh = _repeat_heads(bl.reshape(B, Hk), n_rep, 1)
+            a_log = _repeat_heads(self.A_log, n_rep, 0)
+            dt = _repeat_heads(self.dt_bias.reshape(Hk, D), n_rep, 0).reshape(-1)
+            S_in = (
+                S0
+                if S0 is not None
+                else mx.zeros((B, Hv, D, D), dtype=mx.float32)
+            )
             r = kda_decode_step(
-                q.reshape(B, H, D),
-                k.reshape(B, H, D),
-                v.reshape(B, H, D),
-                self.f_b_proj(fa).reshape(B, H, D),
-                bl.reshape(B, H),
-                self.A_log,
-                self.dt_bias,
+                qh,
+                kh,
+                vh,
+                ah,
+                blh,
+                a_log,
+                dt,
                 S_in,
                 scale=self.scale,
             )
             if r is not None:
                 out, S = r
+                if eg_lam is not None and _eigengate.should_gate(
+                    t0 + 1, _eigengate.period_tokens(KDA_CHUNK)
+                ):
+                    S = _eigengate.apply(S, eg_lam)
                 trace = extras.get("kda_trace")
                 if trace is not None:
                     # 与下方 eager 分支同口径的快照（offset, S, 三个 conv 尾）
@@ -558,43 +913,49 @@ class KDAAttention(nn.Module):
                     )
                 extras["kda_state"] = S
                 cache.offset += 1
-                out = out.reshape(B, 1, H, D)
-                gate = mx.sigmoid(g_in).reshape(B, 1, H, D)
+                out = out.reshape(B, 1, Hv, D)
+                gate = kda_out_gate(g_in).reshape(B, 1, Hv, D)
                 out = self.o_norm(out.astype(x.dtype)) * gate
                 out = self.o_proj(out.reshape(B, 1, -1).astype(x.dtype))
                 return self.resid_dropout(out), cache
 
         # 逐 head 无参 RMS norm + scale 折叠（k 单位 L2，q 携 scale²）
-        q = (self.scale**2) * _rms_unit(q.reshape(B, T, H, D))
-        k = self.scale * _rms_unit(k.reshape(B, T, H, D))
-        v = v.reshape(B, T, H, D)
+        q = (self.scale**2) * _rms_unit(q.reshape(B, T, Hk, D))
+        k = self.scale * _rms_unit(k.reshape(B, T, Hk, D))
+        v = v.reshape(B, T, Hv, D)
+        q = _repeat_heads(q, n_rep, 2)
+        k = _repeat_heads(k, n_rep, 2)
 
-        a = self.f_b_proj(fa).reshape(B, T, H, D)
+        a = self.f_b_proj(fa).reshape(B, T, Hk, D)
         # K3：g = g_min · σ(e^{A_h} z)，z = 低秩投影 + dt_bias
-        z = a.astype(mx.float32) + self.dt_bias.reshape(H, D)
+        z = a.astype(mx.float32) + self.dt_bias.reshape(Hk, D)
         # e^{A_h} 先显式扩到 (H,D) 再广播：(H,) 直接对 (B,T,H,D) 广播时，
         # A_log 的 VJP 是「沿 (0,1,3) 归约、保留中间轴」，MLX 走通用慢路径
         # （单独一项就 5.0ms/层）；扩成 (H,D) 后变成沿 (0,1) 的连续归约加
         # 一次 768 元素小归约，实测该段 f+b 5.72 → 1.42ms/层。
-        e_a = mx.broadcast_to(mx.exp(self.A_log)[:, None], (H, D))
-        log_g = KDA_G_MIN * mx.sigmoid(e_a * z)  # (B,T,H,D) f32，∈ (g_min, 0)
-        beta = mx.sigmoid(bl.astype(mx.float32))  # (B,T,H)
+        e_a = mx.broadcast_to(mx.exp(self.A_log)[:, None], (Hk, D))
+        log_g = KDA_G_MIN * mx.sigmoid(e_a * z)  # (B,T,Hk,D) f32，∈ (g_min, 0)
+        log_g = _repeat_heads(log_g, n_rep, 2)
+        beta = mx.sigmoid(bl.astype(mx.float32))  # (B,T,Hk)
+        beta = _repeat_heads(beta, n_rep, 2)
         if pad_mul is not None:
             # pad 位不衰减（e^0=1）：state 原样穿过；写入已被 k=0 消除
             log_g = log_g * pad_mul.astype(mx.float32)[..., None]
 
-        # (B,H,T,D)
+        # (B,Hv,T,D)
         q = q.astype(mx.float32).transpose(0, 2, 1, 3)
         k = k.astype(mx.float32).transpose(0, 2, 1, 3)
         v = v.astype(mx.float32).transpose(0, 2, 1, 3)
         log_g = log_g.transpose(0, 2, 1, 3)
-        beta = beta.transpose(0, 2, 1)  # (B,H,T)
+        beta = beta.transpose(0, 2, 1)  # (B,Hv,T)
 
         if cache is not None and (T == 1 or S0 is not None):
             # decode / MTP verify / 带状态的短前向：逐 token 递推
             trace = extras.get("kda_trace")
             steps = [] if trace is not None else None
-            out, S = _recurrent_kda(q, k, v, log_g, beta, S0, collect=steps)
+            out, S = _recurrent_kda(
+                q, k, v, log_g, beta, S0, collect=steps, t0=t0, eigengate_lam=eg_lam
+            )
             if trace is not None:
                 # 逐步快照 (state, q/k/v conv 尾部)：rewind 精确回滚。
                 # 步 t 后的 conv 尾部 = 截至该步的最后 K-1 个 conv 输入。
@@ -626,13 +987,15 @@ class KDAAttention(nn.Module):
                 beta,
                 S0,
                 zero_state_cot=self.training and cache is None and _ZSC_ENABLED,
+                t0=t0,
+                eigengate_lam=eg_lam,
             )
         if cache is not None:
             extras["kda_state"] = S
             cache.offset += T
 
-        out = out.transpose(0, 2, 1, 3)  # (B,T,H,D)
-        gate = mx.sigmoid(g_in).reshape(B, T, H, D)
+        out = out.transpose(0, 2, 1, 3)  # (B,T,Hv,D)
+        gate = kda_out_gate(g_in).reshape(B, T, Hv, D)
         out = self.o_norm(out.astype(x.dtype)) * gate
         out = self.o_proj(out.reshape(B, T, -1).astype(x.dtype))
         return self.resid_dropout(out), cache

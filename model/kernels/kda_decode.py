@@ -1,7 +1,7 @@
 """KDA 逐 token decode 步的融合 Metal kernel（T=1，无前向梯度需求）。
 
 把 decode 单步从 ~28 个小 kernel 收成 1 个（外加无法折叠的 f_b_proj /
-o_proj 两个 GEMM；满秩 W_g 在 Python 侧 σ 后点乘）：
+o_proj 两个 GEMM；满秩 W_g 在 Python 侧走 kda_out_gate（2·σ）后点乘）：
   q/k 逐 head 无参 RMS 单位化 + scale 折叠（bf16 双舍入口径照抄
     _rms_unit + 标量乘）、逐通道 log 衰减 log_g = g_min·σ(e^{A} z)
     （g_min=−5，z=a+dt_bias）、β=σ(bl)、SSM 状态递推
@@ -72,6 +72,8 @@ def _build(D: int, Dv: int, H: int, dtype, scale: float, eps: float):
         uint bh = threadgroup_position_in_grid.y;
         uint h = bh % H;
         size_t row = (size_t)bh * D;
+        // v/out 的行宽是 Dv（q/k/a 的行宽才是 D；S 的基址 row*DV 恒正确）
+        size_t rowv = (size_t)bh * DV;
 
         // ---- q/k RMS 单位化（bf16 双舍入照抄 eager）+ log_g/beta ----
         float qv = 0.0f, kvv = 0.0f;
@@ -116,14 +118,14 @@ def _build(D: int, Dv: int, H: int, dtype, scale: float, eps: float):
             for (uint dd = 0; dd < D; dd++) {{
                 kvd += (sh_kh[dd] * sh_egl[dd]) * S[(row + dd) * DV + j];
             }}
-            float dl = beta * (float(v[row + j]) - kvd);
+            float dl = beta * (float(v[rowv + j]) - kvd);
             float o = 0.0f;
             for (uint dd = 0; dd < D; dd++) {{
                 float s = S[(row + dd) * DV + j] * sh_egl[dd] + sh_kh[dd] * dl;
                 Snew[(row + dd) * DV + j] = s;
                 o += sh_qh[dd] * s;
             }}
-            out[row + j] = ({mt})o;
+            out[rowv + j] = ({mt})o;
         }}
         """,
     )
@@ -182,7 +184,7 @@ def kda_decode_step(q, k, v, a, bl, A_log, dt_bias, S, *, scale, eps=1e-6):
             do = (out.astype(mx.float32) - ref_o.astype(mx.float32)).abs().max().item()
             ds = (Snew - ref_s).abs().max().item()
             st = float(mx.abs(ref_s).max().item())
-            if do > 2e-2 or ds > 2e-2 * max(1.0, st):
+            if not (do <= 2e-2) or not (ds <= 2e-2 * max(1.0, st)):  # NaN 也触发
                 raise RuntimeError(
                     f"kda_decode 校验失败 |Δout|={do:.2e} |ΔS|={ds:.2e} (key={key})"
                 )

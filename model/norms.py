@@ -21,17 +21,17 @@ class GatedNorm(nn.Module):
     y = RMSNorm(x)；g = 2·sigmoid(silu(y @ W_down) @ W_up)；输出 y * g。
     W_down (d, rank) / W_up (rank, d)，无 bias。
 
-    初始化：W_up 零初始化 + W_down 小随机均匀初始化（与 _StackedExperts
-    同口径）。初始 silu(y@W_down) @ 0 = 0 → 门 = 2·sigmoid(0) = 1，严格
-    恒等于裸 RMSNorm 起步；W_up 的梯度 dz/dW_up = silu(...) ≠ 0 从
-    step 0 即可学，W_down 的梯度经 W_up 回传、随其离地恢复（ΔW·V=0
-    式零初始化的标准启动动力学）。两矩阵同零会把双向梯度都堵死
-    （dz/dW_up = silu(0)=0 且 dz/dW_down ∝ W_up=0），故不采用；
-    sigmoid 裸零初始化（门=0.5）会把激活砍半，也不采用——2·sigmoid
-    使初始门恰为 1。
-    W_down/W_up 为 ndim=2 → 自动进 Muon 组；内部 RMSNorm 的 1-D gain
-    留 AdamW 标量组（embed_norm 的两个矩阵同样进 Muon，见
-    trainer/muon.py 分组规则）。
+    初始化：W_up 保持零；W_down 经 apply_trunc_normal_init 覆盖为
+    TruncNormal(0, (0.5/√fan_in)²)（构造期的均匀分布只是占位）。
+    初始 silu(y@W_down) @ 0 = 0 → 门 = 2·sigmoid(0) = 1，严格恒等于裸
+    RMSNorm 起步；W_up 的梯度 dz/dW_up = silu(...) ≠ 0 从 step 0 即可学，
+    W_down 的梯度经 W_up 回传、随其离地恢复（ΔW·V=0 式零初始化的标准
+    启动动力学）。两矩阵同零会把双向梯度都堵死（dz/dW_up = silu(0)=0
+    且 dz/dW_down ∝ W_up=0），故不采用；sigmoid 裸零初始化（门=0.5）
+    会把激活砍半，也不采用——2·sigmoid 使初始门恰为 1。
+    W_up 零初始化，进 Adam 标量组（wd=0）：MuonH 范数球半径=‖W₀‖_F=0
+    会把它永久钉零。W_down 进 Muon；内部 RMSNorm 的 1-D gain 留 Adam
+    标量组（wd=0）。见 trainer/muon.py 分组规则。
     """
 
     def __init__(self, dim: int, eps: float = 1e-5, rank: int = 128):

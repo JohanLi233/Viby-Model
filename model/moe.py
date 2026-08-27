@@ -74,7 +74,8 @@ class MoEGate(nn.Module):
     即 per-token 阈值 alpha，前 K 个入选。合并权重取原始 sigmoid 分
     （不含 bias）在命中集上归一化并乘 routed_scaling_factor。
     expert_bias 是 frozen 非梯度 buffer：训练期 forward 记录全部专家的
-    margin = 选择分 − alpha，训练循环每优化器步取各专家 margin 的
+    margin = 原始 sigmoid 分 − alpha（K3 Eq.14：旧 bias 只经 cutoff
+    alpha 进入更新），训练循环每优化器步取各专家 margin 的
     (1−K/E) 上分位数 beta，以 −beta（零均值化、stop-gradient）覆写
     bias（见 VibyForCausalLM.update_moe_biases）。
 
@@ -139,10 +140,12 @@ class MoEGate(nn.Module):
             w = w / mx.maximum(w.sum(axis=-1, keepdims=True), mx.array(1e-9))
         w = w * self.scaling
         if self.collect_stats and self.training:
-            # QB 统计原料：全部 E 个专家的 margin = 选择分 − alpha，
-            # (M, E) 图节点，跨调用沿 token 轴拼接（本 forward 内多次
-            # 调用时），跨微批由训练循环拼接。
-            margins = (sel - alpha).reshape(-1, self.n_routed)
+            # QB 统计原料：全部 E 个专家的 margin = 原始 sigmoid 分 − alpha
+            # （K3 Eq.14：旧 bias 只经 cutoff alpha 进入更新。若误用含
+            # bias 的选择分 sel，覆写式更新变成 b ← −Q − b_old，不动点
+            # 被砍半且逐步周期-2 振荡）。(M, E) 图节点，跨调用沿 token
+            # 轴拼接（本 forward 内多次调用时），跨微批由训练循环拼接。
+            margins = (scores - alpha).reshape(-1, self.n_routed)
             if self.last_margins is None:
                 object.__setattr__(self, "last_margins", margins)
             else:
@@ -185,9 +188,10 @@ class _StackedExperts(nn.Module):
     (E, C, 2I) 再 split，比两次独立 GEMM 的 kernel 数少、单 GEMM 更大
     （GPU 利用率高），数学严格等价（同分布独立初始化）。
 
-    独立模块以便优化器按路径名（"*.experts.*"）把 3D 专家权重分进
-    AdamW 组——Muon 对 ndim>2 参数会 reshape 成 (E, out*in) 整体正交化，
-    跨专家耦合尺度，不是逐专家语义。
+    独立模块以便优化器按路径名（"*.experts.*"）识别 3D 专家栈：
+    muonh 下（默认）逐专家 Newton-Schulz 进 MuonH；`--no_muonh` 或
+    VIBY_MUONH_EXPERTS=0 时进 AdamW，避免基类 Muon 把 ndim>2 reshape 成
+    (E, out*in) 整体正交化、跨专家耦合。
     """
 
     def __init__(self, n_routed: int, moe_in: int, dim: int):
@@ -233,9 +237,12 @@ class MoEFeedForward(nn.Module):
         self.router = MoEGate(config)
         # Latent MoE（moe_latent_dim>0）：路由专家的输入/输出维从 hidden
         # 压缩到 d，lat_down/lat_up 两个共享投影包住专家计算；lat_down 后
-        # 接 learnable-gain RMSNorm（latent_norm）再 dispatch。router 与
-        # 共享专家仍在全维 hidden 上。gather_mm / kernel 形状参数化，
-        # 传 d 维输入即可复用，dispatch 流量同步减半。
+        # 接 learnable-gain RMSNorm（latent_norm）再 dispatch；加权聚合
+        # 输出在 lat_up 前再过一次 RMSNorm（latent_out_norm，K3 Stable
+        # LatentMoE §2.3.1 Normalized LatentMoE：压低路由分支对专家
+        # 选择/路由权重尺度漂移的敏感度）。router 与共享专家仍在全维
+        # hidden 上。gather_mm / kernel 形状参数化，传 d 维输入即可
+        # 复用，dispatch 流量同步减半。
         self.latent_dim = int(getattr(config, "moe_latent_dim", 0) or 0)
         expert_dim = self.latent_dim if self.latent_dim > 0 else config.hidden_size
         self.experts = _StackedExperts(self.n_routed, moe_in, expert_dim)
@@ -243,21 +250,31 @@ class MoEFeedForward(nn.Module):
             D, d = config.hidden_size, self.latent_dim
             self.lat_down = nn.Linear(D, d, bias=False)
             self.lat_up = nn.Linear(d, D, bias=False)
-            # 与 _StackedExperts 同口径的均匀初始化（默认 Linear 初始化
-            # 含 glorot 因子，方差口径不同）
+            # 构造期均匀占位；随后 apply_trunc_normal_init 覆盖为
+            # TruncNormal(0, (0.5/√fan_in)²)（默认 Linear 含 glorot 因子，
+            # 方差口径不同，不能留）
             self.lat_down.weight = mx.random.uniform(-(D**-0.5), D**-0.5, (d, D))
             self.lat_up.weight = mx.random.uniform(-(d**-0.5), d**-0.5, (D, d))
-            # latent RMSNorm（learnable gain，1-D 自动落 AdamW 标量组）
+            # latent RMSNorm 两个（learnable gain，1-D 自动落 AdamW 标量组）：
+            # latent_norm 在 lat_down 后（dispatch 前），latent_out_norm 在
+            # 聚合后、lat_up 前（K3 Eq.11：y = Σ shared + W↑·RMSNorm(u)）
             self.latent_norm = RMSNorm(d, eps=config.rms_norm_eps)
+            self.latent_out_norm = RMSNorm(d, eps=config.rms_norm_eps)
         else:
             self.lat_down = None
             self.lat_up = None
             self.latent_norm = None
+            self.latent_out_norm = None
         n_shared = int(config.n_shared_experts)
         # N_s 个独立共享专家，各宽 moe_in，输出相加。
         self.shared = [
             FeedForward(config, intermediate_size=moe_in) for _ in range(n_shared)
         ]
+
+    def _latent_up(self, out: mx.array) -> mx.array:
+        """latent 聚合输出 → latent_out_norm → lat_up 回全维（K3 Eq.11：
+        y = Σ shared + W↑·RMSNorm(u)；三条路由路径共用同一口径）。"""
+        return self.lat_up(self.latent_out_norm(out))
 
     def _dense_forward(self, x, idx, w):
         """稠密批量路径：全专家广播 matmul + 路由权重加权合并。"""
@@ -368,7 +385,7 @@ class MoEFeedForward(nn.Module):
             threadgroup=(32, 1, 1),
         )[0]
         if lat:
-            out = self.lat_up(out)
+            out = self._latent_up(out)
         return out.reshape(B, T, D)
 
     def __call__(
@@ -392,7 +409,7 @@ class MoEFeedForward(nn.Module):
                     self.latent_norm(self.lat_down(x)) if lat else x, idx, w
                 )
                 if lat:
-                    out = self.lat_up(out)
+                    out = self._latent_up(out)
             else:
                 kk = (
                     D,
@@ -416,7 +433,7 @@ class MoEFeedForward(nn.Module):
                         self.latent_norm(self.lat_down(x)) if lat else x, idx, w
                     )
                     if lat:
-                        out = self.lat_up(out)
+                        out = self._latent_up(out)
         else:
             idx, w = self.router(x)  # (B,T,K) int32 / (B,T,K)
             xe = self.latent_norm(self.lat_down(x)) if lat else x
@@ -425,7 +442,7 @@ class MoEFeedForward(nn.Module):
             else:
                 out = self._sparse_forward(xe, idx, w)
             if lat:
-                out = self.lat_up(out)
+                out = self._latent_up(out)
         for ff in self.shared:
             out = out + ff(x)
         return out

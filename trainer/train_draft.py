@@ -1,11 +1,11 @@
-"""EAGLE-3 草稿微调（Kimi-K3 后训练口径）：冻结目标模型，只训练 MTP 草稿层。
+"""EAGLE-3 草稿微调：冻结目标模型，只训练 Qwen 口径 MTP 层。
 
-预训练已带 1 个 MTP 层（mtp_depth=1，与主干同构）；本阶段把该层微调为
-EAGLE-3 风格的草稿模型：输入 = 目标模型低/中/高三层特征（fc_l 融合）+
-下一 token 嵌入，用 training-time test (TTT) 多步 rollout 训练：
-step 1 消费目标特征 + 真实下一 token 嵌入；step≥2 消费草稿自身上一步
-block 输出 + 上一步 argmax 预测 token 的嵌入（离散选择天然 stop-grad，
-梯度经草稿 hidden 回传）；各步 CE 对真实未来 token 计算后取平均。
+预训练已带 1 个 full-attn MTP 层（mtp_depth>=1，teacher-forced 多步）；
+本阶段把它微调为投机草稿：输入 = 主干末层 hidden + 下一 token 嵌入，
+training-time test (TTT) 多步 rollout：step 1 消费目标末层 + 真实下一
+token 嵌入；step≥2 消费草稿自身上一步输出 + 上一步 argmax 预测 token
+嵌入（离散选择天然 stop-grad，梯度经草稿 hidden 回传）；各步 CE 对真实
+未来 token 平均。
 """
 
 import os
@@ -39,8 +39,8 @@ def draft_ttt_loss(
 
     X: (B, T) 输入 token；Y: next-token 移位的 labels；ttt_steps: rollout
     步数。step s 在流位置 j 预测 Y[:, s:][j]（即 token j+s+1）：
-    - step 1：输入目标模型多层特征 feats[:, j] 与 Emb(X[j+1])；
-    - step s≥2：输入草稿上一步 block 输出 h[j]（梯度回传）与上一步
+    - step 1：输入目标模型末层 hidden[:, j] 与 Emb(X[j+1])；
+    - step s≥2：输入草稿上一步输出 h[j]（梯度回传）与上一步
       argmax 预测 token 的嵌入（约等于 Emb(X[j+s]) 的自预测版）。
     返回各步 CE 的平均（掩码口径与 _mtp_loss 一致；segment_ids 非 None
     时按源位置的文档边界掩码自注意力，与 _mtp_loss 的 doc_mask 口径
@@ -88,7 +88,7 @@ def draft_ttt_loss(
             causal_bias = seg_bias if causal_bias is None else causal_bias + seg_bias
             mask_is_full = False
         if s == 1:
-            h_in = [f[:, :sub, :] for f in feats]
+            h_in = feats[-1][:, :sub, :]
             e_in = emb_all[:, 1 : sub + 1, :]
         else:
             h_in = h_prev[:, :sub, :]

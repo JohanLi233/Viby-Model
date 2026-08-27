@@ -26,6 +26,10 @@ _NT = 256
 
 
 def _metal_ok(C, D, Dv):
+    # fwd kernel 的 threadgroup 内存：ke/ki/qe/vv（4·C·D）+ beta（C）
+    # + X/P/T（3·C·C），f32；Apple GPU 上限 32768B（C=16, D=128 时需
+    # 35904B，超限的 JIT 编译错误在 mx.eval 才抛出、逃逸 dispatch 的
+    # try/except——必须在形状守卫阶段排除）。
     return (
         not _METAL_DISABLED
         and C >= 4
@@ -33,6 +37,7 @@ def _metal_ok(C, D, Dv):
         and D <= 128
         and Dv == D
         and (C & (C - 1)) == 0
+        and 4 * (4 * C * D + C + 3 * C * C) <= 32768
     )
 
 

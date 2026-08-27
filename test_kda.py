@@ -67,6 +67,8 @@ def test_module_train_vs_decode():
         vocab_size=512,
         n_routed_experts=8,
         num_experts_per_tok=2,
+        kda_v_head_ratio=1,
+        ngram_table_size=0,
     )
     attn = KDAAttention(cfg, layer_idx=0)
     mx.eval(attn.parameters())
@@ -125,6 +127,8 @@ def test_decay_clamp_no_overflow():
         vocab_size=512,
         n_routed_experts=8,
         num_experts_per_tok=2,
+        kda_v_head_ratio=1,
+        ngram_table_size=0,
     )
     attn = KDAAttention(cfg, layer_idx=0)
     mx.eval(attn.parameters())
@@ -189,10 +193,75 @@ def test_kda_inner_matches_eager():
     print("kda_inner vs eager: OK")
 
 
+def _kda_cfg(**kw):
+    base = dict(
+        hidden_size=192,
+        num_hidden_layers=8,
+        vocab_size=512,
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        ngram_table_size=0,
+    )
+    base.update(kw)
+    return VibyConfig(**base)
+
+
+def test_kda_v_head_ratio_shapes():
+    """Qwen GDN 口径：V 头 = ratio × QK 头；ratio=1 时与旧正方形投影同宽。"""
+    cfg1 = _kda_cfg(kda_v_head_ratio=1)
+    a1 = KDAAttention(cfg1, layer_idx=0)
+    d, h = cfg1.hidden_size, cfg1.num_attention_heads
+    hd = cfg1.head_dim
+    assert a1.n_k_heads == h and a1.n_v_heads == h
+    assert a1.q_proj.weight.shape == (h * hd, d)
+    assert a1.v_proj.weight.shape == (h * hd, d)
+    assert a1.g_proj.weight.shape == (h * hd, d)
+    assert a1.o_proj.weight.shape == (d, h * hd)
+
+    cfg2 = _kda_cfg(kda_v_head_ratio=2)
+    a2 = KDAAttention(cfg2, layer_idx=0)
+    assert a2.n_k_heads == h and a2.n_v_heads == 2 * h
+    assert a2.q_proj.weight.shape == (h * hd, d)
+    assert a2.k_proj.weight.shape == (h * hd, d)
+    assert a2.v_proj.weight.shape == (2 * h * hd, d)
+    assert a2.g_proj.weight.shape == (2 * h * hd, d)
+    assert a2.o_proj.weight.shape == (d, 2 * h * hd)
+    assert a2.v_conv.weight.shape[-1] == 2 * h * hd
+    print("kda v-head ratio shapes: OK")
+
+
+def test_kda_v_head_ratio_train_vs_decode():
+    mx.random.seed(5)
+    cfg = _kda_cfg(kda_v_head_ratio=2)
+    attn = KDAAttention(cfg, layer_idx=0)
+    mx.eval(attn.parameters())
+    x = mx.random.normal((2, 37, 192)).astype(mx.bfloat16)
+    y_train, _ = attn(x)
+    from model.cache import KVCache
+
+    cache = KVCache()
+    ys = []
+    for t in range(37):
+        y_t, _ = attn(x[:, t : t + 1], past_key_value=cache, use_cache=True)
+        ys.append(y_t)
+    y_dec = mx.concatenate(ys, axis=1)
+    mx.eval(y_train, y_dec)
+    d = (y_train.astype(mx.float32) - y_dec.astype(mx.float32)).abs().max().item()
+    print(f"v-head×2 train vs decode: max|Δ|={d:.3e}")
+    assert y_train.shape == (2, 37, 192)
+    assert d < 2e-2, d
+    assert cache.extras["kda_state"].shape == (2, 16, 24, 24), cache.extras[
+        "kda_state"
+    ].shape
+    print("kda v-head ratio train vs decode: OK")
+
+
 if __name__ == "__main__":
     test_chunk_vs_recurrent()
     test_grads()
     test_module_train_vs_decode()
     test_decay_clamp_no_overflow()
     test_kda_inner_matches_eager()
+    test_kda_v_head_ratio_shapes()
+    test_kda_v_head_ratio_train_vs_decode()
     print("ALL KDA TESTS PASSED")

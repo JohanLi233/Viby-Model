@@ -117,30 +117,58 @@ def prewarm_all(model, config, dtype, seq_len, log=None):
 
         try:
             from model.kda import KDA_CHUNK, _scan_prewarm
+            from model import eigengate as _eg
 
             from . import kda_prep
 
-            heads = int(getattr(config, "num_attention_heads", 0) or 0)
-            hd = int(getattr(config, "head_dim", 0) or 0) or (
-                int(config.hidden_size) // heads if heads else 0
-            )
-            if hd > 0 and seq_len > 0:
-                C = KDA_CHUNK
-                NC = (int(seq_len) + C - 1) // C
-                if kda_prep.prewarm(C, hd, NC):
-                    ok += 1
-                else:
-                    fails.append("kda_prep")
-                from . import kda_inner as kda_inner_mod
+            if not bool(getattr(config, "use_linear_attn", False)):
+                note("use_linear_attn=0：跳过 KDA kernel 预热")
+            else:
+                heads = int(getattr(config, "num_attention_heads", 0) or 0)
+                hd = int(getattr(config, "head_dim", 0) or 0) or (
+                    int(config.hidden_size) // heads if heads else 0
+                )
+                if hd > 0 and seq_len > 0:
+                    C = KDA_CHUNK
+                    NC = (int(seq_len) + C - 1) // C
+                    if kda_prep.prewarm(C, hd, NC):
+                        ok += 1
+                    else:
+                        fails.append("kda_prep")
+                    from . import kda_inner as kda_inner_mod
 
-                if kda_inner_mod.prewarm(C, hd):
-                    ok += 1
-                else:
-                    fails.append("kda_inner")
-                if _scan_prewarm(NC, C, hd, hd):
-                    ok += 1
-                else:
-                    fails.append("kda_scan")
+                    if kda_inner_mod.prewarm(C, hd):
+                        ok += 1
+                    else:
+                        fails.append("kda_inner")
+                    ncs = {NC}
+                    scan_ok = True
+                    if _eg.enabled():
+                        if (
+                            _eg.target_name() == "keep"
+                            and not _eg.learnable()
+                        ):
+                            mask = tuple(
+                                _eg.chunk_gate_mask(NC, int(seq_len), C, 0)
+                            )
+                            if any(mask):
+                                from model.kda import _scan_prewarm_gated
+
+                                if not _scan_prewarm_gated(NC, C, hd, hd, mask):
+                                    scan_ok = False
+                        else:
+                            for length, _ in _eg.scan_segments(
+                                NC, int(seq_len), C, 0
+                            ):
+                                ncs.add(int(length))
+                    for nc in sorted(ncs):
+                        if not _scan_prewarm(nc, C, hd, hd):
+                            scan_ok = False
+                            break
+                    if scan_ok:
+                        ok += 1
+                    else:
+                        fails.append("kda_scan")
         except Exception as e:
             fails.append(f"kda({e})")
 

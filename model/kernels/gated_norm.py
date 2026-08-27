@@ -123,6 +123,10 @@ def gated_norm_decode(x, wn, wd, wu, eps: float):
     rank = wd.shape[1]
     if wd.shape != (D, rank) or wu.shape != (rank, D):
         return None
+    # kernel 结构限制：第一 GEMM 只有 tid < RANK 的线程写 h_sh（rank > NT
+    # 会留未初始化段）；threadgroup 内存 y_sh/h_sh/red 不得超过 32KB。
+    if rank > _NT or (D + rank + _NT // 32) * 4 > 32768:
+        return None
     if not (wn.dtype == wd.dtype == wu.dtype == x.dtype):
         return None
     R = x.size // D
@@ -144,7 +148,8 @@ def gated_norm_decode(x, wn, wd, wu, eps: float):
             mx.eval(out, ref)  # 触发 JIT；失败走 except 永久回退
             d = (out.astype(mx.float32) - ref.astype(mx.float32)).abs().max().item()
             tol = 1e-5 if x.dtype == mx.float32 else 2e-2
-            if d > tol:
+            # 不用 d > tol：NaN 经该比较恒为 False 会误过校验
+            if not (d <= tol):
                 raise RuntimeError(f"gated_norm fused 校验失败 |Δ|={d:.2e} (key={key})")
             _VERIFIED.add(key)
         return out

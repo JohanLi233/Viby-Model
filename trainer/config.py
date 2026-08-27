@@ -75,7 +75,7 @@ def add_common_args(parser):
         "--warmup_iters",
         type=int,
         default=None,
-        help="线性 warmup 步数；默认按总步数的 1%（Marin / K3）",
+        help="线性 warmup 微批步数；默认按本轮 LR horizon 的 1%（Marin #8435）",
     )
     parser.add_argument(
         "--profile", action="store_true", help="Enable performance profiling"
@@ -84,7 +84,13 @@ def add_common_args(parser):
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--persistent_workers", action="store_true", default=True)
     parser.add_argument("--log_interval", type=int, default=8)
-    parser.add_argument("--save_interval", type=int, default=100)
+    parser.add_argument("--save_interval", type=int, default=500)
+    parser.add_argument(
+        "--no_save",
+        action="store_true",
+        help="吞吐/短探针：不写 checkpoint、sidecar、latest_checkpoint，"
+        "也不开 swanlab。终端 loss/tokens/s 仍按 --log_interval 打印",
+    )
     parser.add_argument(
         "--cache_limit_gb",
         type=float,
@@ -101,25 +107,62 @@ def add_common_args(parser):
         "checkpoint（不会因 resume 丢梯度）；默认不限制",
     )
     parser.add_argument(
+        "--use_linear_attn",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Kimi Linear 注意力（KDA local + NoPE GQA global + ShortConv）。"
+        "默认关：全层 MLA full softmax，无线性注意力、无短卷积",
+    )
+    parser.add_argument(
+        "--kv_lora_rank",
+        type=int,
+        default=192,
+        help="MLA 的 KV 低秩潜在维度（仅 --no-use_linear_attn，默认）",
+    )
+    parser.add_argument(
+        "--qk_rope_head_dim",
+        type=int,
+        default=32,
+        help="MLA 解耦 RoPE 键的维度（跨 head 共享）",
+    )
+    parser.add_argument(
         "--max_steps",
         type=int,
         default=None,
         help="最多训练多少个微批 step（与日志 (step/N) 同口径）。到步数后在当前"
-        "梯度累积窗口边界停止并保存 checkpoint；默认不限制。lr 调度不压缩，"
-        "便于与同调度全量跑的早期 step 直接对比",
+        "梯度累积窗口边界停止并保存 checkpoint。未显式传 --lr_decay_steps / "
+        "--token_budget 时，LR 日程和 compute 缩放的 token 预算都按该步数"
+        "（Marin #8435：缩短 horizon 仍在终点落到 min_lr_ratio）",
     )
     parser.add_argument(
         "--lr_decay_steps",
         type=int,
         default=None,
-        help="LR 线性衰减的总步数覆盖（短时限时训练时对齐到实际步数，"
-        "让 lr 在结束时落到 min_lr_ratio；默认用 epochs×每轮步数）",
+        help="LR 日程所用的总微批步数覆盖。比 --max_steps 优先；可长于本轮"
+        "数据（复现长 run 前缀、峰值仍按该 horizon 衰减）。默认："
+        "max_steps 与数据长度的较小值，否则 epochs×每轮",
     )
     parser.add_argument(
         "--min_lr_ratio",
         type=float,
         default=0.05,
-        help="线性衰减的下限比例（相对峰值），默认 0.05（Marin）；0 表示衰减到 0",
+        help="日程衰减下限比例（相对峰值），默认 0.05（Marin Hero；后面还有 "
+        "context extension / 后训练，不收到 0）",
+    )
+    parser.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="linear",
+        choices=["linear", "wsd"],
+        help="学习率日程。linear（默认，Marin Hero #8435）= warmup 1% 后立刻"
+        "线性收到 min_lr_ratio，无平台；wsd=warmup + 平台 + 末尾衰减。"
+        "数据 80% 处分相不是 LR 平台，不要用 wsd 去模拟",
+    )
+    parser.add_argument(
+        "--wsd_decay_frac",
+        type=float,
+        default=0.2,
+        help="WSD 末尾线性衰减占总步数的比例，默认 0.2；仅 --lr_schedule wsd 生效",
     )
     parser.add_argument(
         "--pack_sequences",
@@ -161,6 +204,13 @@ def add_common_args(parser):
     parser.add_argument("--mtp_depth", type=int, default=1)
     parser.add_argument("--mtp_loss_weight", type=float, default=0.3)
     parser.add_argument(
+        "--mtp_steps",
+        type=int,
+        default=2,
+        help="Qwen3.8-Next MTP 预训练展开步数：同一层 teacher-forced "
+        "预测 t+2, t+3, …，各步 CE 取平均。1=只预测下一额外 token",
+    )
+    parser.add_argument(
         "--z_loss_weight",
         type=float,
         default=1e-4,
@@ -185,7 +235,7 @@ def add_common_args(parser):
         "--n_routed_experts",
         type=int,
         default=0,
-        help="DeepSeekMoE 路由专家数（必须 >0，所有层均为 MoE）",
+        help="DeepSeekMoE 路由专家数（必须 >0，所有层均为 MoE；1080M 配方 256）",
     )
     parser.add_argument(
         "--num_experts_per_tok",
@@ -239,35 +289,65 @@ def add_common_args(parser):
         "默认 None → hidden_size//2（开启）；显式 0 关闭（消融）",
     )
     parser.add_argument(
+        "--kda_v_head_ratio",
+        type=int,
+        default=2,
+        help="KDA V 头 / QK 头比（Qwen GDN 口径）。默认 2：8 个 QK 头 → "
+        "16 个 V 头；1=旧正方形。只用于新训练",
+    )
+    parser.add_argument(
+        "--ngram_table_size",
+        type=int,
+        default=65536,
+        help="哈希 n-gram 查找表大小（0 关闭）。默认 2^16；表挂在 "
+        "--ngram_layer 入口，门零初始化。AdamW 嵌入组",
+    )
+    parser.add_argument(
+        "--ngram_layer",
+        type=int,
+        default=2,
+        help="n-gram 注入层（1-indexed）。默认 2，对齐 Qwen3.8-Flash-Next",
+    )
+    parser.add_argument(
         "--lr_scale_auto",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="compute 缩放超参（Hyperball 口径，仅 pretrain 生效）：adam_lr = "
-        "0.087571·tokens^-0.3461·hidden^-0.3448·sqrt(tpb)，muon_lr = 13/3×adam_lr，"
+        help="compute 缩放超参（Marin Hero / Hyperball 口径，仅 pretrain）："
+        "adam_lr = min(0.05, 0.087571·tokens^-0.3461·hidden^-0.3448·sqrt(tpb))，"
+        "muon_lr = min(0.05, 13/3×adam_lr)，"
         "beta2 = clip(0.999^(tpb/131072), 0.95, 0.9999)，"
         "eps = 9.676e-18·sqrt(tokens/tpb)（Adam/AdamH 组）。默认开启；"
         "--no-lr_scale_auto 回到旧常数（单一 lr 默认 0.01、betas (0.9,0.95)、eps 1e-8）。"
-        "优先级：显式 --learning_rate > 公式 > 0.01 兜底",
+        "优先级：显式 --learning_rate > 公式 > 0.01 兜底。"
+        "tokens 未传 --token_budget 时与 LR 日程 horizon 一致",
     )
     parser.add_argument(
         "--token_budget",
         type=float,
         default=None,
-        help="总训练 token 预算（供 lr_scale_auto 公式）；不传则按"
-        "epochs × 每轮步数 × batch_size × max_seq_len 推导",
+        help="峰值 LR 所用的 token 预算（lr_scale_auto）。显式传入则缩短 "
+        "max_steps 时只改衰减斜率、峰值仍按该预算（Hero 中途砍上限）。"
+        "不传则与 LR 日程 horizon 一致：max_steps 或 epochs×每轮 × tpb",
     )
     parser.add_argument(
         "--muonh",
-        action=argparse.BooleanOptionalAction,
+        dest="muonh",
+        action="store_true",
         default=True,
         help="MuonH/AdamH/Adam 体系（Marin 口径）：Muon 组更新加 Frobenius "
-        "范数球投影（方向/范数解耦）；3D 堆叠专家逐专家 NS 进 MuonH（默认 "
-        "AdamW）；lm_head（非 tied）走 AdamH（Adam 方向+范数球投影，lr=muon "
-        "基础 lr）。默认开启，--no-muonh 回退旧分组。注意：开关改变优化器分组，"
-        "不能用于续跑旧 checkpoint（optimizer state 分组对不上），只用于新 run。"
-        "VIBY_MUONH_EXPERTS=0 只开范数球投影、专家保持 AdamW（消融/省逐专家 "
-        "NS 开销）。正交化固定每步全量重算：NS 降频复用/Temporal Q 缓存是 "
-        "r082 回退的最大元凶（早期 −0.4~0.5 nat），机制已删除，勿重引入。",
+        "范数球投影（方向/范数解耦）；3D 堆叠专家逐专家 NS 进 MuonH（"
+        "`--no_muonh` 或 VIBY_MUONH_EXPERTS=0 时专家回 AdamW）；lm_head（非 tied）"
+        "走 AdamH（Adam 方向+范数球投影，lr=muon 基础 lr）。默认开启。"
+        "注意：开关改变优化器分组，不能用于续跑旧 checkpoint（optimizer state "
+        "分组对不上），只用于新 run。正交化固定每步全量重算：NS 降频复用/"
+        "Temporal Q 缓存是 r082 回退的最大元凶（早期 −0.4~0.5 nat），机制已删除，"
+        "勿重引入。",
+    )
+    parser.add_argument(
+        "--no_muonh",
+        dest="muonh",
+        action="store_false",
+        help="关闭 MuonH：专家不进逐专家 NS，回普通 Muon + AdamW 分组",
     )
 
 
@@ -313,6 +393,7 @@ def get_sft_parser():
         vocab_size=None,
         mtp_depth=None,
         mtp_loss_weight=None,
+        mtp_steps=None,
     )
     parser.set_defaults(
         use_attn_gate=None,
@@ -327,6 +408,12 @@ def get_sft_parser():
         moe_intermediate_size=None,
         routed_scaling_factor=None,
         moe_latent_dim=None,
+        kda_v_head_ratio=None,
+        ngram_table_size=None,
+        ngram_layer=None,
+        use_linear_attn=None,
+        kv_lora_rank=None,
+        qk_rope_head_dim=None,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-Full-SFT")
@@ -362,6 +449,7 @@ def get_draft_parser():
         vocab_size=None,
         mtp_depth=None,
         mtp_loss_weight=None,
+        mtp_steps=None,
     )
     parser.set_defaults(
         use_attn_gate=None,
@@ -376,6 +464,12 @@ def get_draft_parser():
         moe_intermediate_size=None,
         routed_scaling_factor=None,
         moe_latent_dim=None,
+        kda_v_head_ratio=None,
+        ngram_table_size=None,
+        ngram_layer=None,
+        use_linear_attn=None,
+        kv_lora_rank=None,
+        qk_rope_head_dim=None,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-Draft")
@@ -419,6 +513,7 @@ def get_dpo_parser():
         vocab_size=None,
         mtp_depth=None,
         mtp_loss_weight=None,
+        mtp_steps=None,
     )
     parser.set_defaults(
         use_attn_gate=None,
@@ -433,6 +528,12 @@ def get_dpo_parser():
         moe_intermediate_size=None,
         routed_scaling_factor=None,
         moe_latent_dim=None,
+        kda_v_head_ratio=None,
+        ngram_table_size=None,
+        ngram_layer=None,
+        use_linear_attn=None,
+        kv_lora_rank=None,
+        qk_rope_head_dim=None,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-DPO")
@@ -488,8 +589,15 @@ def setup_training_args(args, training_type="pretrain"):
 
     # 设置保存目录
     args.save_dir = os.path.join(args.out_dir)
-    os.makedirs(args.save_dir, exist_ok=True)
-    os.makedirs(args.out_dir, exist_ok=True)
+    if getattr(args, "no_save", False):
+        args.use_swanlab = False
+        if getattr(args, "auto_resume", False):
+            Logger("Warning: --no_save 已关闭落盘，忽略 --auto_resume")
+            args.auto_resume = False
+        Logger("--no_save：不写 checkpoint / sidecar / swanlab")
+    else:
+        os.makedirs(args.save_dir, exist_ok=True)
+        os.makedirs(args.out_dir, exist_ok=True)
 
     # 设置 swanlab 运行名称：out_dir 基名（通常即实验轮次名）+ 关键配置
     # learning_rate 为 None 时（pretrain 哨兵，稍后由 lr_scale_auto 解析）标 auto

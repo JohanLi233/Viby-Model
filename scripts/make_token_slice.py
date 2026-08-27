@@ -1,4 +1,7 @@
-"""按 token 预算切取 train 文件前缀，供短预算实验独立训练（线性衰减终点对齐）。
+"""按 token 预算切取 train 文件前缀，供短预算实验独立训练
+（`--token_budget` 显式保留原峰值；不传则峰值与 `--max_steps` 日程
+共用实际 horizon。默认 `--lr_schedule linear`，warmup 1% 后收到
+`--min_lr_ratio` 0.05，对齐 Marin Hero #8435）。
 用法: uv run scripts/make_token_slice.py <src> <dst> <max_tokens>
 token 计数口径 = len(enc)+2（<bos>+text+<eos>，与训练一致）。
 """

@@ -56,9 +56,9 @@ def kda_layer_counts(num_hidden_layers: int, mtp_depth: int) -> tuple[int, int]:
         not (((i + 1) % 4 == 0) or i == num_hidden_layers - 1)
         for i in range(num_hidden_layers)
     )
-    # 每个 MTP block 使用 layer_idx=0；主干多于一层时它是 local KDA。
-    mtp = mtp_depth if num_hidden_layers > 1 else 0
-    return int(main), int(mtp)
+    # 每个 MTP block 是 full-attn GQA（Qwen 口径），不计入 KDA。
+    del mtp_depth
+    return int(main), 0
 
 
 def summarize_samples(samples) -> tuple[float, float, float]:
@@ -84,7 +84,6 @@ def build_config(args):
         n_shared_experts=args.shared,
         moe_intermediate_size=args.moe_in,
         routed_scaling_factor=2.5,
-        moe_router_noise=0.05,
         moe_router_logit_norm=True,
         moe_router_logit_temp=1.0,
         moe_diversity_loss_weight=0.0,
@@ -212,8 +211,9 @@ def main():
     Yn = rng.integers(1, cfg.vocab_size, size=(B, T), dtype=np.int64)
     segn = np.cumsum(rng.random((B, T)) < (1.0 / 340.0), axis=1).astype(np.int64)
 
-    def loss_fn(params, X, Y, mask, seg):
+    def loss_fn(params, biases, X, Y, mask, seg):
         model.update(params)
+        model.apply_moe_biases(biases)
         res = model(
             input_ids=X,
             labels=Y,
@@ -270,10 +270,12 @@ def main():
         window_stats = None
         for microbatch in range(args.accumulation_steps):
             params = model.trainable_parameters()
-            (loss, stats), grads = vg(params, X, Y, mask, seg)
+            biases = model.moe_bias_stack()
+            (loss, stats), grads = vg(params, biases, X, Y, mask, seg)
             if args.compile:
                 # compiled fn 内 model.update 只在 trace 时执行，恢复真实参数引用。
                 model.update(params)
+                model.apply_moe_biases(biases)
 
             ts = time.perf_counter()
             mx.eval(loss, stats)

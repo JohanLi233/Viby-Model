@@ -49,26 +49,27 @@ def log_parameter_count(model):
     trainable_params = sum(
         v.size for _, v in tree_flatten(model.trainable_parameters())
     )
+    active_params = model.num_active_parameters()
     Logger(
-        f"总参数量：{total_params / 1e6:.3f}M, 可训练参数量：{trainable_params / 1e6:.3f}M"
+        f"总参数量：{total_params / 1e6:.3f}M, "
+        f"可训练参数量：{trainable_params / 1e6:.3f}M, "
+        f"每次激活：{active_params / 1e6:.3f}M"
     )
 
 
-# 旧 checkpoint 里的非持久 buffer（当前架构已无 RoPE，这些 buffer 不复存在；
-# 保留跳过逻辑仅为加载旧权重时不报错）。
+# 旧 checkpoint 里的非持久 buffer（RoPE 表按 config 重算；加载时允许缺失）。
 _NON_STRICT_WEIGHT_KEYS = (
     "freqs_cos",
     "freqs_sin",
+    "rope_freqs",
 )
 
-# 已从架构中删除的子系统（MLA / HRM / Engram / value-res / CycleDelta /
-# RoPE）遗留在旧 checkpoint 里的参数标记：加载时直接跳过，不进 strict 报错。
+# 已从架构中删除的子系统（HRM / Engram / value-res / CycleDelta）
+# 遗留在旧 checkpoint 里的参数标记：加载时直接跳过，不进 strict 报错。
+# MLA 的 qkv_proj / kv_up_proj 已恢复，不能再当废弃键跳过。
 _LEGACY_WEIGHT_MARKERS = (
     "kv_down",
-    "kv_up",
     "k_rope",
-    "qkv_proj",
-    "rope_freqs",
     ".engrams.",
     "hrm_",
     "v_res_lambda",
@@ -106,7 +107,7 @@ def load_model_weights(
     skipped = []
     for key, value in weights.items():
         if key not in model_shapes:
-            # 已删除子系统（MLA/HRM/Engram/value-res/CycleDelta）的旧参数
+            # 已删除子系统（HRM/Engram/value-res/CycleDelta）的旧参数
             # 属于已知可丢弃参数。
             if any(m in key for m in _LEGACY_WEIGHT_MARKERS):
                 skipped.append(key)
@@ -208,6 +209,7 @@ _ARCH_ARG_KEYS = (
     "use_attn_gate",
     "mtp_depth",
     "mtp_loss_weight",
+    "mtp_steps",
     "n_routed_experts",
     "num_experts_per_tok",
     "n_shared_experts",
@@ -218,7 +220,13 @@ _ARCH_ARG_KEYS = (
     "moe_diversity_loss_weight",
     "z_loss_weight",
     "moe_latent_dim",
+    "kda_v_head_ratio",
+    "ngram_table_size",
+    "ngram_layer",
     "tie_word_embeddings",
+    "use_linear_attn",
+    "kv_lora_rank",
+    "qk_rope_head_dim",
 )
 
 
@@ -278,6 +286,9 @@ def init_swanlab(args, trainer):
         config.update({f"model.{k}": v for k, v in _clean(vars(lm_cfg)).items()})
     try:
         config["model.params_total_m"] = round(trainer.model.num_parameters() / 1e6, 3)
+        config["model.params_active_m"] = round(
+            trainer.model.num_active_parameters() / 1e6, 3
+        )
     except Exception:
         pass
 
@@ -325,18 +336,63 @@ def finish_training(swanlab=None, interrupted=False):
         os._exit(0)
 
 
-def compute_scaled_hparams(tokens: float, tpb: float, hidden: int):
-    """Hyperball 口径的 compute 缩放公式，返回 (adam_lr, muon_lr, beta2, eps)。
+# Marin Hero MoeHeuristic.max_learning_rate（issue #8435）：公式推出的
+# adam_lr / muon_lr 都截到该上限；手动 --learning_rate 不截。
+_MARIN_MAX_LR = 0.05
 
-    tokens = 总训练 token 预算；tpb = 每个优化器步的 token 数
+
+def compute_scaled_hparams(tokens: float, tpb: float, hidden: int):
+    """Hyperball / Marin Hero 口径的 compute 缩放公式，返回
+    (adam_lr, muon_lr, beta2, eps)。
+
+    tokens = 本轮实际 token 预算；tpb = 每个优化器步的 token 数
     （batch_size × accumulation_steps × max_seq_len）；hidden = hidden_size。
+    公式与 Marin ``MoeHeuristic`` 一致（#7856 / #8003 / #8435）：
+    adam_lr = 0.087571 · tokens^-0.3461 · hidden^-0.3448 · √tpb，
+    muon_lr = 13/3 × adam_lr，二者再截到 0.05。
     eps 只用于 Adam/AdamH 组，Muon 的 eps 保持 1e-8。
     """
     adam_lr = 0.087571 * tokens**-0.3461 * hidden**-0.3448 * math.sqrt(tpb)
-    muon_lr = (13.0 / 3.0) * adam_lr
+    adam_lr = min(_MARIN_MAX_LR, adam_lr)
+    muon_lr = min(_MARIN_MAX_LR, (13.0 / 3.0) * adam_lr)
     beta2 = min(max(0.999 ** (tpb / 131072.0), 0.95), 0.9999)
     eps = 9.676e-18 * math.sqrt(tokens / tpb)
     return adam_lr, muon_lr, beta2, eps
+
+
+def resolve_lr_horizon(args, epoch_steps: int) -> int:
+    """学习率日程所用的总微批步数（与日志 (step/N) 同口径）。
+
+    对齐 Marin #8435：linear · warmup 1% · 终点落到 min_lr_ratio（默认 0.05）。
+    缩短 run 时重算衰减斜率，结束时仍是 0.05×peak——不是按原全量步数走、
+    以至于短跑从不退火。80% 处分相是 datamix，不是 LR 平台（那是 WSD）。
+
+    优先级：显式 --lr_decay_steps（按该长度排程，即使长于本轮数据；
+    用来复现「长 run 的前缀」）> --max_steps（截到 epochs×每轮，即实际
+    会跑的步数）> epochs×每轮步数。
+    """
+    epoch_total = int(getattr(args, "epochs", 1)) * int(epoch_steps)
+    lr_decay_steps = getattr(args, "lr_decay_steps", None)
+    if lr_decay_steps:
+        return int(lr_decay_steps)
+    max_steps = getattr(args, "max_steps", None)
+    if max_steps:
+        return min(int(max_steps), epoch_total)
+    return epoch_total
+
+
+def _token_budget_from_horizon(args, iter_per_epoch: int) -> float:
+    """未传 --token_budget 时，用与 LR 日程相同的 horizon 推 token 数。
+
+    Marin ladder 每档：tokens = num_train_steps × batch × seq。
+    显式 --token_budget 则保留「原计划预算」（缩短 horizon 时只改衰减斜率、
+    峰值仍按原预算——Hero 中途砍 token 上限的做法）。
+    """
+    horizon = resolve_lr_horizon(args, iter_per_epoch)
+    accum = max(1, int(getattr(args, "accumulation_steps", 1)))
+    tpb = args.batch_size * accum * args.max_seq_len
+    opt_steps = max(1, int(horizon) // accum)
+    return float(opt_steps) * float(tpb)
 
 
 def resolve_compute_scaled_hparams(args, iter_per_epoch: int):
@@ -345,18 +401,21 @@ def resolve_compute_scaled_hparams(args, iter_per_epoch: int):
     优先级：显式 --learning_rate > lr_scale_auto 公式 > 旧常数 0.01。
     - auto 开 + 无手动 lr：adam_lr/muon_lr/beta2/eps 全部按公式；
     - auto 开 + 手动 lr：adam_lr 取手动值，muon_lr 仍 13/3× 派生，
-      beta2/eps 按公式；
+      beta2/eps 按公式（手动值不套 0.05 上限）；
     - auto 关：单一 lr（手动值或 0.01），betas (0.9, 0.95)，eps 1e-8（旧行为）。
 
-    写回字段：learning_rate（= adam 基础 lr）、muon_lr、adam_beta2、adam_eps、
-    token_budget_resolved、tokens_per_batch。SFT/DPO 不调用本函数，
-    create_mixed_optimizer 内以 getattr 兜底回退单一 lr 旧行为。
+    未传 --token_budget 时预算与 LR 日程 horizon 一致（max_steps /
+    lr_decay_steps / 全量 epoch）。写回字段：learning_rate（= adam 基础 lr）、
+    muon_lr、adam_beta2、adam_eps、token_budget_resolved、tokens_per_batch。
+    SFT/DPO 不调用本函数，create_mixed_optimizer 内以 getattr 兜底回退单一 lr。
     """
     tpb = args.batch_size * args.accumulation_steps * args.max_seq_len
     tokens = getattr(args, "token_budget", None)
     if tokens is None:
-        opt_steps = (args.epochs * iter_per_epoch) // args.accumulation_steps
-        tokens = float(opt_steps) * tpb
+        tokens = _token_budget_from_horizon(args, iter_per_epoch)
+        tok_src = "horizon"
+    else:
+        tok_src = "token_budget"
     tokens = float(tokens)
 
     manual_lr = args.learning_rate  # None = 用户未显式传入
@@ -382,14 +441,14 @@ def resolve_compute_scaled_hparams(args, iter_per_epoch: int):
     args.token_budget_resolved = tokens
     args.tokens_per_batch = tpb
     Logger(
-        f"[lr_scale] {src}: tokens={tokens:.3e} tpb={tpb} "
+        f"[lr_scale] {src} ({tok_src}): tokens={tokens:.3e} tpb={tpb} "
         f"adam_lr={adam_lr:.4e} muon_lr={muon_lr:.4e} beta2={beta2:.5f} eps={eps:.3e}"
     )
     return args
 
 
 def resolve_warmup_iters(args, total_steps: int):
-    """warmup_iters 为 None 时按总步数的 1%（Marin / K3）。显式值不覆盖。"""
+    """warmup_iters 为 None 时按本轮 horizon 的 1%（Marin #8435）。显式值不覆盖。"""
     if getattr(args, "warmup_iters", None) is None:
         args.warmup_iters = max(1, int(round(0.01 * float(max(1, total_steps)))))
     return args
@@ -403,17 +462,37 @@ def get_lr_and_momentum(
     final_momentum: float = 0.95,
     momentum_warmup_steps: int = 300,
     min_lr_ratio: float = 0.05,
+    schedule: str = "linear",
+    wsd_decay_frac: float = 0.2,
 ) -> Tuple[float, float]:
     """
     计算当前步骤的学习率乘子和动量。
-    - 学习率: 线性 warmup + 线性衰减到 min_lr_ratio（Marin Hero 口径）
+    - linear: warmup 后立刻线性收到 min_lr_ratio（Marin Hero #8435：
+      ``lr_schedule=linear``、``warmup=0.01``、``decay=None``、``min_lr_ratio=0.05``。
+      80% 处分相是 datamix 换源，不是 LR 平台。）
+    - wsd: 线性 warmup + 平台期 + 末尾 wsd_decay_frac 线性收到 min_lr_ratio
     - 动量: Linear Warmup
+
+    函数默认 schedule=linear，避免旧单测无参调用改义；CLI / trainer
+    默认同样是 linear（见 --lr_schedule）。min_lr_ratio 默认 0.05 而不是 0，
+    因为后面还有 context extension / 后训练；decay-to-zero 只适合不再更新
+    权重的单阶段预训练。
     """
     # --- 学习率调度 ---
     if step < warmup_steps:
         lr_multiplier = float(step) / float(max(1, warmup_steps))
     elif step >= total_steps:
         lr_multiplier = min_lr_ratio
+    elif schedule == "wsd":
+        decay_start = int(round(float(total_steps) * (1.0 - float(wsd_decay_frac))))
+        decay_start = max(decay_start, warmup_steps)
+        if step < decay_start:
+            lr_multiplier = 1.0
+        else:
+            progress = float(step - decay_start) / float(
+                max(1, total_steps - decay_start)
+            )
+            lr_multiplier = 1.0 - (1.0 - min_lr_ratio) * progress
     else:
         progress = float(step - warmup_steps) / float(
             max(1, total_steps - warmup_steps)
@@ -466,6 +545,8 @@ def save_checkpoint(
     model, optimizer, epoch, step, args, lm_config, training_type="pretrain"
 ):
     """统一的检查点保存函数（safetensors 格式）"""
+    if getattr(args, "no_save", False):
+        return
     model.eval()
 
     # 根据训练类型确定文件名
@@ -582,14 +663,20 @@ def find_latest_checkpoint(save_dir):
 
 
 def apply_lr_schedule(
-    optimizer, global_step, total_training_steps, warmup_iters, min_lr_ratio=0.05
+    optimizer, global_step, total_training_steps, warmup_iters, min_lr_ratio=0.05,
+    schedule="linear", wsd_decay_frac=0.2,
 ):
-    """应用学习率调度（每微批 step 调用一次）"""
+    """应用学习率调度（每微批 step 调用一次）。
+
+    函数默认 schedule=linear（与 CLI / trainer 默认一致）。
+    """
     lr_multiplier, current_momentum = get_lr_and_momentum(
         global_step,
         warmup_steps=warmup_iters,
         total_steps=total_training_steps,
         min_lr_ratio=min_lr_ratio,
+        schedule=schedule,
+        wsd_decay_frac=wsd_decay_frac,
     )
 
     for opt in _sub_optimizers(optimizer):
