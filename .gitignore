@@ -250,3 +250,7 @@ pyrightconfig.json
 /research_runs/
 /out_exp/
 *.safetensors
+
+# local subproject (own git repo) and machine-local tools
+/autoresearch-mlx/
+/fan
