@@ -1,3 +1,9 @@
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..")))
+
+
 import unittest
 
 from experiments.bench_train_step import (

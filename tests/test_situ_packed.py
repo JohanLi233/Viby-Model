@@ -8,14 +8,22 @@ MoE 的 gate/up 是一次 GEMM 出 (..., 2I) 再切两半。切片是跨步视�
 且 dh 的两半分别等于 dg / du。
 """
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..")))
+
+
 import unittest
 
 import mlx.core as mx
 
 from model.acts import situ_glu_eager
 from model.kernels.situ import prewarm as situ_prewarm
+from model.kernels.situ import prewarm_packed as situ_prewarm_packed
 from model.kernels.situ import situ_glu as situ_two_arg
 from model.kernels.situ import situ_glu_packed
+from model.kernels import situ as situ_mod
 
 
 class SituPackedTest(unittest.TestCase):
@@ -78,6 +86,33 @@ class SituPackedTest(unittest.TestCase):
         mx.eval(h)
         with self.assertRaises(ValueError):
             situ_glu_packed(h)
+
+    def test_prewarm_packed_i512_stable(self):
+        # 旧校验用 (y·cot).sum()，|L|~O(1) 时 bf16 差 0.08 就会误杀 I=512
+        situ_mod._PACKED_FAILED.clear()
+        for seed in range(12):
+            mx.random.seed(seed)
+            situ_mod._PACKED_VERIFIED.discard((mx.bfloat16, 512))
+            self.assertTrue(
+                situ_prewarm_packed(mx.bfloat16, [512]),
+                f"seed={seed} failed={situ_mod._PACKED_FAILED}",
+            )
+        self.assertNotIn((mx.bfloat16, 512), situ_mod._PACKED_FAILED)
+        self.assertFalse(situ_mod._DISABLED)
+
+    def test_packed_fail_does_not_disable_two_arg(self):
+        situ_mod._PACKED_FAILED.add((mx.bfloat16, 32))
+        try:
+            self.assertFalse(situ_mod._DISABLED)
+            h = (mx.random.normal((4, 64)) * 0.5).astype(mx.bfloat16)
+            y = situ_glu_packed(h)
+            mx.eval(y)
+            g = (mx.random.normal((32,)) * 0.5).astype(mx.bfloat16)
+            u = (mx.random.normal((32,)) * 0.5).astype(mx.bfloat16)
+            mx.eval(situ_two_arg(g, u))
+            self.assertFalse(situ_mod._DISABLED)
+        finally:
+            situ_mod._PACKED_FAILED.discard((mx.bfloat16, 32))
 
 
 if __name__ == "__main__":

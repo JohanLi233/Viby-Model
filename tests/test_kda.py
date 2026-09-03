@@ -5,6 +5,12 @@
 3. 模块级：训练前向（chunk）与逐步 decode（cache 递推）一致（bf16 容差）。
 """
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..")))
+
+
 import mlx.core as mx
 
 from model.kda import KDAAttention, _chunk_kda, _recurrent_kda

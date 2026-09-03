@@ -9,6 +9,12 @@ _stack_apply_kernel 对 n0==0 的矩阵跳过当步投影（防御未来零初�
 参数再被钉零）。
 """
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..")))
+
+
 import types
 
 import mlx.core as mx

@@ -5,6 +5,12 @@
 0.5/√fan_in 截断正态、warmup 1% + 线性/WSD、Per-Head Muon（opt-in，默认关）。
 """
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..")))
+
+
 import math
 import os
 import sys
@@ -20,6 +26,7 @@ from model.kernels.attn_res_fused import _merge_eager, prewarm as attn_res_prewa
 from model.kernels.ce import cross_entropy
 from model.model import VibyForCausalLM
 from model.moe import FeedForward, situ_glu
+from model.acts import silu_glu
 from model.norms import _rms_unit
 from trainer.muon import BatchedMuon, create_mixed_optimizer
 from trainer.utils import (
@@ -156,14 +163,20 @@ def test_active_parameter_count():
     for p, v in tree_flatten(model.parameters()):
         if ".experts." in p and v.ndim >= 3:
             routed += v.size
-    expect = total - routed + routed // e * k
+    ngram = model.ngram_lookup_parameters()
+    expect = total - routed + routed // e * k - ngram
     check("激活 < 总量", active < total)
-    check("激活 = 总量 − 未选中路由专家", active == expect, f"{active} vs {expect}")
+    check(
+        "激活 = 总量 − 未选中路由专家 − n-gram 表",
+        active == expect,
+        f"{active} vs {expect}",
+    )
     cfg_full = tiny(num_experts_per_tok=cfg.n_routed_experts)
     m2 = VibyForCausalLM(cfg_full)
     check(
-        "K=E 激活等于总量",
-        m2.num_active_parameters() == m2.num_parameters(),
+        "K=E 激活等于总量 − n-gram 表",
+        m2.num_active_parameters()
+        == m2.num_parameters() - m2.ngram_lookup_parameters(),
     )
 
 
@@ -322,7 +335,9 @@ def test_lr_schedule():
     args.lr_decay_steps = 80
     check("lr_decay_steps 优先于 max_steps", resolve_lr_horizon(args, 100) == 80)
     args.lr_decay_steps = 500
-    check("lr_decay_steps 可长于数据（长 run 前缀）", resolve_lr_horizon(args, 100) == 500)
+    check(
+        "lr_decay_steps 可长于数据（长 run 前缀）", resolve_lr_horizon(args, 100) == 500
+    )
 
     # Marin #8435：峰值 LR 与日程共用实际 horizon；显式 token_budget 则保留原预算
     adam, muon, beta2, eps = compute_scaled_hparams(18.0e12, 11264 * 4096, 6144)
@@ -543,7 +558,7 @@ def test_attn_res_prewarm_not_global_kill():
 
 
 def test_feedforward_uses_situ():
-    cfg = tiny()
+    cfg = tiny(hidden_act="situ")
     ff = FeedForward(cfg, intermediate_size=32)
     x = mx.random.normal((2, 4, cfg.hidden_size))
     y = ff(x)
@@ -553,6 +568,19 @@ def test_feedforward_uses_situ():
     mx.eval(y, ref)
     d = float(mx.abs(y - ref).max().item())
     check("FeedForward 走 SiTU-GLU", d < 1e-5, f"Δ={d}")
+
+
+def test_feedforward_uses_silu():
+    cfg = tiny()  # hidden_act 默认 'silu'
+    ff = FeedForward(cfg, intermediate_size=32)
+    x = mx.random.normal((2, 4, cfg.hidden_size))
+    y = ff(x)
+    gu = x @ mx.concatenate([ff.gate_proj.weight, ff.up_proj.weight], axis=0).T
+    g, u = mx.split(gu, 2, axis=-1)
+    ref = ff.down_proj(silu_glu(g, u))
+    mx.eval(y, ref)
+    d = float(mx.abs(y - ref).max().item())
+    check("FeedForward 走 SiLU-GLU（默认）", d < 1e-5, f"Δ={d}")
 
 
 if __name__ == "__main__":
@@ -570,5 +598,6 @@ if __name__ == "__main__":
     test_lr_schedule()
     test_optimizer_groups_and_per_head()
     test_feedforward_uses_situ()
+    test_feedforward_uses_silu()
     print(f"\n{'全部通过' if FAIL == 0 else f'{FAIL} 项失败'}")
     sys.exit(1 if FAIL else 0)

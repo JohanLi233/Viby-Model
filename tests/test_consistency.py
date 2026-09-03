@@ -17,6 +17,12 @@ RoPE，无线性注意力、无 ShortConv）+ AttnRes + LatentMoE（QB 路由）
 运行：python test_consistency.py
 """
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..")))
+
+
 import sys
 
 import numpy as np
@@ -27,7 +33,7 @@ from model.cache import KVCache
 from model.config import VibyConfig
 from model.kernels.ce import cross_entropy
 from model.model import VibyForCausalLM
-from model.moe import MoEFeedForward, MoEGate
+from model.moe import MoEFeedForward, MoEGate, _col_quantile
 from model.norms import _rms_unit
 
 ATOL = 2e-3  # float32 下不同分块/增量路径的浮点误差上限
@@ -41,8 +47,24 @@ ARCH_VARIANTS = {
         "use_attn_gate": True,
         "mtp_depth": 1,
     },
+    # 专家写出基扩展 + 寄存器残差（s=0 起步，接线不得破坏因果/decode）
+    "moe+write_spread": {
+        "moe_latent_dim": 64,
+        "moe_write_spread": True,
+        "attn_res_register": True,
+    },
     # Kimi Linear 消融：KDA local + GQA global + ShortConv
     "linear_attn": {"use_linear_attn": True},
+    # 寄存器残差：加法写回 hidden，AttnRes 只做读
+    "moe+register": {"attn_res_register": True},
+    # 读寄存器本身：子层输入 = h，不再 softmax 混合 [h]+写入
+    "moe+read_h": {"attn_res_register": True, "attn_res_read_h": True},
+    # iHC：M 条流、H_res=I；α≠0 时与 AttnRes 分叉，prefill/decode 仍应对齐
+    "moe+ihc": {"ihc": True, "ihc_streams": 4},
+    "moe+ihc_typed": {"ihc": True, "ihc_streams": 4, "ihc_typed": True},
+    "moe+route_scale": {"moe_latent_dim": 64, "moe_route_scale": True},
+    # 第 0 层小 dense stem，其后 MoE（与专家同宽）
+    "moe+dense0": {"first_k_dense_replace": 1},
 }
 
 
@@ -445,15 +467,15 @@ def test_moe():
     dw_ = np.array(mlp.experts.down_w)
     xn, idxn, wn = np.array(x), np.array(idx), np.array(w)
 
-    def situ(g, u, b1=4.0, b2=25.0):
-        return (b1 * np.tanh(g / b1) / (1.0 + np.exp(-g))) * (b2 * np.tanh(u / b2))
+    def silu(g, u):
+        return (g / (1.0 + np.exp(-g))) * u
 
     ref = np.zeros((B, T, D), dtype=np.float32)
     for b in range(B):
         for t in range(T):
             for j in range(K):
                 e = idxn[b, t, j]
-                h = situ(xn[b, t] @ gw_[e].T, xn[b, t] @ uw_[e].T)
+                h = silu(xn[b, t] @ gw_[e].T, xn[b, t] @ uw_[e].T)
                 ref[b, t] += wn[b, t, j] * (h @ dw_[e].T)
     sh = 0
     for ff in mlp.shared:
@@ -481,7 +503,7 @@ def test_moe():
     xb = x.astype(mx.bfloat16)
     idxb, wb = mlp.router(xb)
     k_out = mlp._kernel_forward(xb)
-    d_out = mlp._dense_forward(xb, idxb, wb)
+    d_out, _ = mlp._dense_forward(xb, idxb, wb)
     rel = maxdiff(k_out, d_out) / maxdiff(d_out, mx.zeros_like(d_out))
     assert rel < 2e-2, f"bf16 kernel 与稠密路径不符: rel={rel}"
     (mlp.experts.gate_up_w, mlp.experts.down_w, mlp.router.weight) = saved
@@ -577,6 +599,201 @@ def test_moe():
     model_mtp.update_moe_biases(margins)
     bias = np.array(model_mtp.moe_gates()[0].expert_bias)
     assert np.isfinite(bias).all() and abs(float(bias.mean())) < 1e-6
+
+
+def test_attn_res_window_clips():
+    """window>0 时只混合最近 W 个残差；w=0 时 softmax 均匀，输出即均值。"""
+    from model.block import _attn_res_merge
+    from model.kernels import attn_res_fused
+
+    D = 32
+    assert attn_res_fused.prewarm(D, mx.float32, [4])
+    w = mx.zeros((D,), dtype=mx.float32)
+    vs = [mx.full((1, 2, D), float(i + 1), dtype=mx.float32) for i in range(6)]
+    win = _attn_res_merge(w, vs, 4)
+    ref = mx.mean(mx.stack(vs[-4:], axis=0), axis=0)
+    mx.eval(win, ref)
+    d = float(mx.max(mx.abs(win - ref)).item())
+    assert d < 1e-5, f"window=4 均匀混合应等于最后 4 个均值, |Δ|={d:.3e}"
+    full = _attn_res_merge(w, vs, 0)
+    mx.eval(full)
+    assert float(mx.max(mx.abs(full - win)).item()) > 0.1, "全历史与窗口混合应可分"
+
+
+def test_register_residual_sidecar_default_off():
+    """新开关默认关；旧 sidecar 缺键保持替换式 AttnRes。"""
+    cfg = tiny_config()
+    assert cfg.attn_res_register is False
+    d = cfg.to_dict()
+    assert d["attn_res_register"] is False
+    old = {k: v for k, v in d.items() if k != "attn_res_register"}
+    assert VibyConfig.from_dict(old).attn_res_register is False
+    on = tiny_config(attn_res_register=True)
+    assert on.attn_res_register is True
+    assert VibyConfig.from_dict(on.to_dict()).attn_res_register is True
+
+
+def test_register_residual_output_is_sum_of_writes():
+    """寄存器模式：块输出 = 输入 + attn 写入 + mlp 写入，不被 softmax 替换。"""
+    from model.block import VibyBlock
+
+    mx.random.seed(0)
+    cfg = tiny_config(attn_res_register=True, attn_res_window=4)
+    block = VibyBlock(cfg, layer_idx=0)
+    block.eval()
+    x = mx.random.normal((2, 3, cfg.hidden_size)).astype(mx.float32)
+    writes = []
+    y, _ = block(x, residuals=writes, mask_is_full=True)
+    mx.eval(y, *writes)
+    assert len(writes) == 2, f"应追加 attn/mlp 两次写入，得到 {len(writes)}"
+    ref = x + writes[0] + writes[1]
+    d = maxdiff(y, ref)
+    assert d < 1e-5, f"寄存器输出应等于输入+写入之和, |Δ|={d:.3e}"
+
+
+def test_default_attn_res_still_replaces():
+    """默认仍是替换式 AttnRes：w=0 时输出为残差列表的均匀混合，不是加和。"""
+    from model.block import VibyBlock
+
+    mx.random.seed(0)
+    cfg = tiny_config(attn_res_register=False, attn_res_window=0)
+    block = VibyBlock(cfg, layer_idx=0)
+    block.eval()
+    x = mx.random.normal((2, 3, cfg.hidden_size)).astype(mx.float32)
+    writes = [x]
+    y, _ = block(x, residuals=writes, mask_is_full=True)
+    mx.eval(y, *writes)
+    assert len(writes) == 3
+    summed = x + writes[1] + writes[2]
+    mean = mx.mean(mx.stack(writes, axis=0), axis=0)
+    mx.eval(summed, mean)
+    assert maxdiff(y, summed) > 0.1, "默认 AttnRes 不应退化为残差加和"
+    assert maxdiff(y, mean) < 1e-5, "w=0 时替换式 AttnRes 应是均匀混合"
+
+
+def test_attn_res_read_h_sidecar_default_off():
+    """新开关默认关；旧 sidecar 缺键保持 softmax 读；开时必须带寄存器写。"""
+    cfg = tiny_config()
+    assert cfg.attn_res_read_h is False
+    d = cfg.to_dict()
+    assert d["attn_res_read_h"] is False
+    old = {k: v for k, v in d.items() if k != "attn_res_read_h"}
+    assert VibyConfig.from_dict(old).attn_res_read_h is False
+    on = tiny_config(attn_res_register=True, attn_res_read_h=True)
+    assert on.attn_res_read_h is True
+    assert VibyConfig.from_dict(on.to_dict()).attn_res_read_h is True
+    try:
+        tiny_config(attn_res_register=False, attn_res_read_h=True)
+    except ValueError as e:
+        assert "attn_res_read_h" in str(e)
+    else:
+        raise AssertionError("read_h 不带 register 应报错")
+
+
+def test_attn_res_read_h_mlp_sees_register():
+    """读 h：mlp 输入是加法后的寄存器，不是 [h]+写入的均匀混合。"""
+    from model.block import VibyBlock
+
+    class _Rec:
+        def __init__(self, inner):
+            self.inner = inner
+            self.seen = None
+
+        def __call__(self, x):
+            self.seen = x
+            return self.inner(x)
+
+    mx.random.seed(0)
+    cfg = tiny_config(attn_res_register=True, attn_res_read_h=True, attn_res_window=4)
+    block = VibyBlock(cfg, layer_idx=0)
+    block.eval()
+    rec = _Rec(block.post_attention_layernorm)
+    block.post_attention_layernorm = rec
+    x = mx.random.normal((2, 3, cfg.hidden_size)).astype(mx.float32)
+    writes = []
+    y, _ = block(x, residuals=writes, mask_is_full=True)
+    mx.eval(y, *writes, rec.seen)
+    assert len(writes) == 2
+    h = x + writes[0]
+    assert maxdiff(y, x + writes[0] + writes[1]) < 1e-5
+    assert maxdiff(rec.seen, h) < 1e-5, "mlp 应读寄存器 h = x + v_attn"
+    mix = 0.5 * h + 0.5 * writes[0]
+    assert maxdiff(rec.seen, mix) > 0.1, "mlp 不应读 [h]+v_attn 的均匀混合"
+
+
+def test_attn_res_read_h_diverges_from_mix_read():
+    """同一权重下，读 h 与 softmax 读的块输出必须可分（否则开关是空转）。"""
+    from mlx.utils import tree_flatten, tree_unflatten
+    from model.block import VibyBlock
+
+    mx.random.seed(0)
+    cfg_mix = tiny_config(attn_res_register=True, attn_res_window=4)
+    a = VibyBlock(cfg_mix, layer_idx=0)
+    a.eval()
+    cfg_h = tiny_config(attn_res_register=True, attn_res_read_h=True, attn_res_window=4)
+    b = VibyBlock(cfg_h, layer_idx=0)
+    b.eval()
+    b.update(tree_unflatten(tree_flatten(a.parameters())))
+    x = mx.random.normal((2, 3, cfg_mix.hidden_size)).astype(mx.float32)
+    ya, _ = a(x, residuals=[], mask_is_full=True)
+    yb, _ = b(x, residuals=[], mask_is_full=True)
+    mx.eval(ya, yb)
+    assert maxdiff(ya, yb) > 0.1, "读 h 相对 softmax 读应改变块输出"
+
+
+def test_register_read_keeps_register_outside_window():
+    """读侧混合永远带上寄存器；window 只裁写入，不能把 h 裁掉。"""
+    from model.block import _attn_res_read
+    from model.kernels import attn_res_fused
+
+    D = 32
+    assert attn_res_fused.prewarm(D, mx.float32, [5])
+    w = mx.zeros((D,), dtype=mx.float32)
+    h = mx.full((1, 2, D), 100.0, dtype=mx.float32)
+    writes = [mx.full((1, 2, D), float(i + 1), dtype=mx.float32) for i in range(6)]
+    got = _attn_res_read(w, h, writes, 4)
+    ref = mx.mean(mx.stack([h] + writes[-4:], axis=0), axis=0)
+    dropped = mx.mean(mx.stack(writes[-4:], axis=0), axis=0)
+    mx.eval(got, ref, dropped)
+    assert maxdiff(got, ref) < 1e-5, "读 = 均匀混合(寄存器 + 最近 W 个写入)"
+    assert maxdiff(got, dropped) > 1.0, "窗口裁写入时不得丢掉寄存器"
+
+
+def test_col_quantile_matches_numpy():
+    """QB 分位数与 numpy 默认 linear 插值一致（含 q=0/1、重复值、3D token 轴）。"""
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(65, 12)).astype(np.float32)
+    xa = mx.array(x)
+    for q in (0.0, 0.5, 1.0 - 8 / 384, 1.0):
+        got = np.array(_col_quantile(xa, q))
+        exp = np.quantile(x, q, axis=0)
+        assert np.allclose(got, exp, atol=1e-6, rtol=0), (
+            f"q={q} max|Δ|={np.max(np.abs(got - exp)):.3e}"
+        )
+
+    x2 = np.array(
+        [[1, 3, 0], [1, 3, 0], [2, 0, 5], [4, 0, 5]],
+        dtype=np.float32,
+    )
+    got = np.array(_col_quantile(mx.array(x2), 0.5))
+    exp = np.quantile(x2, 0.5, axis=0)
+    assert np.allclose(got, exp, atol=1e-6), f"重复值中位数 {got} vs {exp}"
+
+    gne = rng.normal(size=(3, 32, 8)).astype(np.float32)
+    q = 1.0 - 2 / 8
+    got = np.array(_col_quantile(mx.array(gne), q, axis=1))
+    exp = np.quantile(gne, q, axis=1)
+    assert np.allclose(got, exp, atol=1e-6), (
+        f"3D axis=1 max|Δ|={np.max(np.abs(got - exp)):.3e}"
+    )
+
+    xb = xa.astype(mx.bfloat16)
+    xref = np.array(xb.astype(mx.float32))
+    got = np.array(_col_quantile(xb, 1.0 - 8 / 384))
+    exp = np.quantile(xref, 1.0 - 8 / 384, axis=0)
+    assert np.allclose(got, exp, atol=2e-3), (
+        f"bf16 选点再 f32 插值 max|Δ|={np.max(np.abs(got - exp)):.3e}"
+    )
 
 
 def test_qb_eq14_raw_score_margin():
@@ -727,7 +944,9 @@ def test_moe_latent():
     assert mlp.shared[0].gate_proj.weight.shape[0] == moe_in, "共享专家应保持全宽"
     assert mlp.latent_norm.weight.shape == (d,), "latent_norm gain 形状应为 (d,)"
     assert flat["model.stack.layers.1.mlp.latent_norm.weight"].shape == (d,)
-    assert mlp.latent_out_norm.weight.shape == (d,), "latent_out_norm gain 形状应为 (d,)"
+    assert mlp.latent_out_norm.weight.shape == (d,), (
+        "latent_out_norm gain 形状应为 (d,)"
+    )
     assert flat["model.stack.layers.1.mlp.latent_out_norm.weight"].shape == (d,)
 
     # 2) 逐专家参考（含 latent 投影 + latent_norm/latent_out_norm）vs
@@ -746,15 +965,15 @@ def test_moe_latent():
     xn = xl / np.sqrt((xl**2).mean(-1, keepdims=True) + model.config.rms_norm_eps)
     idxn, wn = np.array(idx), np.array(w)
 
-    def situ(g, u, b1=4.0, b2=25.0):
-        return (b1 * np.tanh(g / b1) / (1.0 + np.exp(-g))) * (b2 * np.tanh(u / b2))
+    def silu(g, u):
+        return (g / (1.0 + np.exp(-g))) * u
 
     ref = np.zeros((B, T, d), dtype=np.float32)
     for b in range(B):
         for t in range(T):
             for j in range(K):
                 e = idxn[b, t, j]
-                h = situ(xn[b, t] @ gw_[e].T, xn[b, t] @ uw_[e].T)
+                h = silu(xn[b, t] @ gw_[e].T, xn[b, t] @ uw_[e].T)
                 ref[b, t] += wn[b, t, j] * (h @ dw_[e].T)
     # latent_out_norm（gain 初始为 1）：加权聚合后、lat_up 前归一化
     ref = ref / np.sqrt((ref**2).mean(-1, keepdims=True) + model.config.rms_norm_eps)
@@ -820,6 +1039,15 @@ def main():
         test_draft_ttt,
         test_kvcache_rewind_clamp,
         test_moe,
+        test_attn_res_window_clips,
+        test_register_residual_sidecar_default_off,
+        test_register_residual_output_is_sum_of_writes,
+        test_default_attn_res_still_replaces,
+        test_attn_res_read_h_sidecar_default_off,
+        test_attn_res_read_h_mlp_sees_register,
+        test_attn_res_read_h_diverges_from_mix_read,
+        test_register_read_keeps_register_outside_window,
+        test_col_quantile_matches_numpy,
         test_qb_eq14_raw_score_margin,
         test_compile_qb_bias_is_live,
         test_moe_latent,

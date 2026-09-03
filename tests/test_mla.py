@@ -1,5 +1,11 @@
 """默认 MLA full attention：无 KDA / ShortConv，prefill 与 decode 一致。"""
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..")))
+
+
 import mlx.core as mx
 import numpy as np
 
@@ -80,6 +86,27 @@ def test_mla_block_no_shortconv():
     print("VibyBlock MLA 无 ShortConv: OK")
 
 
+def test_position_ids_rope_survives_corrupt_cos_table():
+    """position_ids 必须按 rope_freqs 建 cos/sin，不能读已被 init/ckpt 污染的表。"""
+    mx.random.seed(0)
+    model = VibyForCausalLM(_cfg())
+    model.eval()
+    ids = mx.array([[3, 7, 11, 19, 23, 29, 31]])
+    a = model(ids)
+    mx.eval(a.logits)
+    model.model.freqs_cos = mx.random.normal(model.model.freqs_cos.shape)
+    model.model.freqs_sin = mx.random.normal(model.model.freqs_sin.shape)
+    pos = mx.arange(ids.shape[1], dtype=mx.int32)[None, :]
+    b = model(ids, position_ids=pos)
+    mx.eval(b.logits)
+    np.testing.assert_allclose(
+        np.array(a.logits.astype(mx.float32)),
+        np.array(b.logits.astype(mx.float32)),
+        atol=5e-2,
+    )
+    print("position_ids RoPE ignores corrupt cos table: OK")
+
+
 def test_old_sidecar_keeps_linear_attn():
     old = _cfg().to_dict()
     old.pop("use_linear_attn", None)
@@ -96,5 +123,6 @@ if __name__ == "__main__":
     test_linear_attn_switch_keeps_kda()
     test_mla_prefill_decode_match()
     test_mla_block_no_shortconv()
+    test_position_ids_rope_survives_corrupt_cos_table()
     test_old_sidecar_keeps_linear_attn()
     print("all mla tests passed")

@@ -7,6 +7,12 @@
 5. 打开后 chunk 扫描与逐 token 递推（含门控点）对齐，梯度也对齐。
 """
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..")))
+
+
 import os
 
 import mlx.core as mx
