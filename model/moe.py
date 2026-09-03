@@ -4,13 +4,20 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .acts import situ_glu, situ_glu_gu
+from .acts import glu_gu, situ_glu, situ_glu_gu
 from .config import VibyConfig
 from .kernels.moe_decode import _MOE_METAL_TYPE, _build_moe_decode_kernels
 from .kernels.swiglu_decode import silu_mul_down_decode
 from .norms import RMSNorm, _rms_unit
 
-__all__ = ["FeedForward", "MoEGate", "MoEFeedForward", "situ_glu", "_col_quantile"]
+__all__ = [
+    "FeedForward",
+    "MoEGate",
+    "MoEFeedForward",
+    "situ_glu",
+    "_col_quantile",
+    "_tile_to_hidden",
+]
 
 
 class FeedForward(nn.Module):
@@ -24,6 +31,7 @@ class FeedForward(nn.Module):
         self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.hidden_act = getattr(config, "hidden_act", "silu")
 
     def __call__(self, x: mx.array) -> mx.array:
         # gate/up 输入相同，合并为单个 (2I, D) GEMM 再 split：放大 GEMM 形状、
@@ -40,30 +48,74 @@ class FeedForward(nn.Module):
             if not self.training:
                 object.__setattr__(self, "_gu_w_cache", (gu_w, srcs[0], srcs[1]))
         gu = x @ gu_w.T
-        # 推理小批量：silu·mul + down 投影融合 kernel（无梯度）
-        if not self.training:
+        # 推理小批量：glu·mul + down 投影融合 kernel（无梯度），按 hidden_act
+        # 选 silu（默认）或 situ 公式。
+        if not self.training and self.hidden_act in ("silu", "situ"):
             M = x.size // x.shape[-1]
             if M <= 512:
                 r = silu_mul_down_decode(
-                    gu.reshape(M, gu.shape[-1]), self.down_proj.weight
+                    gu.reshape(M, gu.shape[-1]), self.down_proj.weight,
+                    self.hidden_act,
                 )
                 if r is not None:
                     return r.reshape(x.shape)
-        return self.down_proj(situ_glu_gu(gu))
+        return self.down_proj(glu_gu(gu, self.hidden_act))
 
 
-def _col_quantile(x: mx.array, q: float) -> mx.array:
-    """x (N, E) 沿 axis 0 的 q 分位数（线性插值，同 numpy 默认）→ (E,)。
+def _col_quantile(x: mx.array, q: float, axis: int = 0) -> mx.array:
+    """沿 ``axis`` 的 q 分位数（线性插值，同 numpy 默认）。
 
-    MLX 0.32 无 mx.quantile，用 sort + 双点插值；lo/hi 是 shape 派生的
-    python int，不触发数据 sync。"""
-    s = mx.sort(x, axis=0)
-    n = s.shape[0]
+    QB 只要一个分位点。partition(kth=lo) 把第 lo 小放到位置 lo，其后全体
+    ≥ 它，故 min(尾部) 即第 lo+1 小——与全量 sort 逐位相同。选中的两行转
+    f32 再插值（bf16→f32 单调单射）。lo/hi 是 shape 派生的 python int，
+    不触发数据 sync。
+
+    墙钟：MLX 0.32 Metal 把 Partition::eval_gpu 直接转进 gpu_merge_sort
+    （源码 "We direct partition to sort for now"），目标形状 (13,24576,384)
+    与 sort 同为 ~34ms；两次 partition 则 2×。不要为了 lo/hi 调两次。
+    """
+    n = x.shape[axis]
     pos = q * (n - 1)
     lo = int(math.floor(pos))
     hi = min(lo + 1, n - 1)
     frac = pos - lo
-    return s[lo] * (1.0 - frac) + s[hi] * frac
+    p = mx.partition(x, lo, axis=axis)
+    sl = [slice(None)] * x.ndim
+    sl[axis] = lo
+    v_lo = p[tuple(sl)].astype(mx.float32)
+    if hi == lo:
+        return v_lo
+    sl[axis] = slice(lo + 1, None)
+    v_hi = mx.min(p[tuple(sl)], axis=axis).astype(mx.float32)
+    return v_lo * (1.0 - frac) + v_hi * frac
+
+
+def _tile_to_hidden(h: mx.array, dim: int) -> mx.array:
+    """把末维 d 无参扩到 dim：下标 i 取 h[..., i % d]。
+
+    用 broadcast 重复整段、余数再 concat，不要 ``concatenate([h]*n)[..., :dim]``
+    或 ``take(arange % d)``：前者切片 VJP 会 scatter 进一份 n·d 宽零张量，
+    后者的 gather VJP 在 compile 下同样拖垮 gather_mm 反传（见
+    research/MLX_PERF.md）。broadcast 的 VJP 是沿重复轴归约。
+    """
+    d = int(h.shape[-1])
+    if d == dim:
+        return h
+    if d <= 0:
+        raise ValueError("tile 输入末维必须为正")
+    if dim <= 0:
+        raise ValueError("tile 目标维必须为正")
+    n, r = divmod(dim, d)
+    lead = h.shape[:-1]
+    parts = []
+    if n:
+        tiled = mx.broadcast_to(h[..., None, :], lead + (n, d)).reshape(lead + (n * d,))
+        parts.append(tiled)
+    if r:
+        parts.append(h[..., :r])
+    if len(parts) == 1:
+        return parts[0]
+    return mx.concatenate(parts, axis=-1)
 
 
 class MoEGate(nn.Module):
@@ -113,7 +165,8 @@ class MoEGate(nn.Module):
     def __call__(
         self,
         x: mx.array,
-    ) -> tuple[mx.array, mx.array]:
+        return_amp: bool = False,
+    ) -> tuple:
         # 路由分数在 bf16 下计算（bf16 模型下保证 top-k 选择稳定）
         logits = (x @ self.weight.T).astype(mx.float32)
         if self.norm_logits:
@@ -135,7 +188,9 @@ class MoEGate(nn.Module):
         # argpartition 不保证有序，但第 _k1 个位置的元素即第 _k1 大）。
         alpha = mx.take_along_axis(sel, idx_ext[..., self._k1 - 1 : self._k1], axis=-1)
         # 合并权重来自 unbiased sigmoid 分（选择用 biased 分）。
-        w = mx.take_along_axis(scores, idx, axis=-1)
+        raw = mx.take_along_axis(scores, idx, axis=-1)
+        amp = raw.sum(axis=-1, keepdims=True)
+        w = raw
         if self.norm_topk_prob and self.top_k > 1:
             w = w / mx.maximum(w.sum(axis=-1, keepdims=True), mx.array(1e-9))
         w = w * self.scaling
@@ -145,7 +200,11 @@ class MoEGate(nn.Module):
             # bias 的选择分 sel，覆写式更新变成 b ← −Q − b_old，不动点
             # 被砍半且逐步周期-2 振荡）。(M, E) 图节点，跨调用沿 token
             # 轴拼接（本 forward 内多次调用时），跨微批由训练循环拼接。
-            margins = (scores - alpha).reshape(-1, self.n_routed)
+            # scores/alpha 的打分与阈值保持 f32；只在收集点把样本落成
+            # 激活 dtype（bf16 训练下 100MB→50MB/微批，且跨累积窗口常驻），
+            # 下游 update_moe_biases 在原生 dtype 上 partition 选点，只把
+            # 两行序统计量转 f32 插值；分位数对 bf16 误差不敏感。
+            margins = (scores - alpha).reshape(-1, self.n_routed).astype(x.dtype)
             if self.last_margins is None:
                 object.__setattr__(self, "last_margins", margins)
             else:
@@ -178,6 +237,8 @@ class MoEGate(nn.Module):
             else:
                 object.__setattr__(self, "last_div", self.last_div + div)
             self.div_calls += 1
+        if return_amp:
+            return idx.astype(mx.int32), w.astype(x.dtype), amp.astype(x.dtype)
         return idx.astype(mx.int32), w.astype(x.dtype)
 
 
@@ -206,12 +267,9 @@ class MoEFeedForward(nn.Module):
     """DeepSeekMoE FFN：共享专家（每 token 必走）+ top-k 路由专家。
 
     三路径实现（按 (token,choice) 对数 G = B*T*K 静态选择）：
-    - G <= _KERNEL_MAX_PAIRS（decode / 极小批量）：融合 Metal kernel 路径——
-      3 个手写 kernel 完成 router（打分+top-k）、SiTU-GLU 前半、加权合并，
-      只读 top-k 命中专家权重，kernel 数与权重读取量都远小于稠密路径
-      （见上方注释）。不可微，仅推理前向：model.train() 或
-      router.collect_stats 开启（训练负载统计）时不走本路径。
-      JIT 编译失败自动永久回退。
+    - G <= _KERNEL_MAX_PAIRS 且 E<=64（decode / 极小专家集）：融合 Metal
+      kernel。大 E（如 384）的标量 router 慢于 gather_mm，改走 sparse。
+    - 推理小 G 且 E>64：sorted gather_mm，只读 top-k，不走稠密全专家。
     - G <= _DENSE_MAX_PAIRS（小 prefill）：稠密批量路径——堆叠
       权重广播 matmul 一次算完全部专家，按路由权重（非命中为 0）加权
       合并。无 host sync、可微、可与 mx.compile 共存。
@@ -234,6 +292,7 @@ class MoEFeedForward(nn.Module):
         self.top_k = int(config.num_experts_per_tok)
         moe_in = int(config.moe_intermediate_size or config.intermediate_size)
         self.moe_in = moe_in
+        self.hidden_act = getattr(config, "hidden_act", "silu")
         self.router = MoEGate(config)
         # Latent MoE（moe_latent_dim>0）：路由专家的输入/输出维从 hidden
         # 压缩到 d，lat_down/lat_up 两个共享投影包住专家计算；lat_down 后
@@ -265,6 +324,14 @@ class MoEFeedForward(nn.Module):
             self.lat_up = None
             self.latent_norm = None
             self.latent_out_norm = None
+        # 专家写出基扩展：每专家一条 (D,) 对角，乘在 tile(h_k) 上再按
+        # 路由权重累加。零初始化 ⇒ 额外写出 ≡ 0。无 latent 时不建。
+        self.write_scale = None
+        if self.latent_dim > 0 and bool(getattr(config, "moe_write_spread", False)):
+            self.write_scale = mx.zeros((self.n_routed, config.hidden_size))
+        self.route_scale = bool(
+            self.latent_dim > 0 and getattr(config, "moe_route_scale", False)
+        )
         n_shared = int(config.n_shared_experts)
         # N_s 个独立共享专家，各宽 moe_in，输出相加。
         self.shared = [
@@ -273,24 +340,59 @@ class MoEFeedForward(nn.Module):
 
     def _latent_up(self, out: mx.array) -> mx.array:
         """latent 聚合输出 → latent_out_norm → lat_up 回全维（K3 Eq.11：
-        y = Σ shared + W↑·RMSNorm(u)；三条路由路径共用同一口径）。"""
+        y = Σ shared + W↑·RMSNorm(u)；三条路由路径共用同一口径）。
+        moe_route_scale 时在 _combine_routed 里再乘未归一化 top-k 和。"""
         return self.lat_up(self.latent_out_norm(out))
+
+    def _combine_routed(self, mixed: mx.array, spread, amp=None) -> mx.array:
+        if self.lat_up is not None:
+            mixed = self._latent_up(mixed)
+            if amp is not None:
+                mixed = mixed * amp.astype(mixed.dtype)
+        if spread is not None:
+            mixed = mixed + spread
+        return mixed
+
+    def _spread_tok(self, y_tok, idx_tok, w_tok, B, T):
+        """token-major 写出扩展：y_tok (M,K,d)，对 K 求和。
+
+        不要在 (G, hidden) 上再 scatter-add：训练图里它和 latent 混合的
+        (G, d) scatter 抢融合，compile f+b 能把单层从 ~5ms 拖到 ~30ms。
+        大形状走融合 Metal kernel（不物化 (M,K,hidden)）；失败回退 eager。
+        """
+        hid = int(self.write_scale.shape[-1])
+        from .kernels.moe_write_spread import write_spread
+
+        fused = write_spread(y_tok, w_tok, self.write_scale, idx_tok)
+        if fused is not None:
+            return fused.reshape(B, T, hid)
+        s = self.write_scale[idx_tok].astype(y_tok.dtype)
+        tiled = _tile_to_hidden(y_tok, hid)
+        wt = w_tok.astype(y_tok.dtype)[..., None]
+        return (tiled * s * wt).sum(axis=1).reshape(B, T, hid)
 
     def _dense_forward(self, x, idx, w):
         """稠密批量路径：全专家广播 matmul + 路由权重加权合并。"""
         B, T, D = x.shape
         M = B * T
+        K = self.top_k
         # 路由权重稠密化：S (M, E)，每行 top-k 个非零（top-k 内专家不重复）
         S = (
             mx.zeros((M, self.n_routed), dtype=x.dtype)
-            .at[mx.arange(M)[:, None], idx.reshape(M, self.top_k)]
-            .add(w.reshape(M, self.top_k).astype(x.dtype))
+            .at[mx.arange(M)[:, None], idx.reshape(M, K)]
+            .add(w.reshape(M, K).astype(x.dtype))
         )
         xf = x.reshape(M, D)
         # 广播 matmul：(M,D) @ (E,D,2I) -> (E,M,2I)，末维即 [gate|up]
-        h = situ_glu_gu(xf @ self.experts.gate_up_w.swapaxes(-1, -2))
+        h = glu_gu(xf @ self.experts.gate_up_w.swapaxes(-1, -2), self.hidden_act)
         y = h @ self.experts.down_w.swapaxes(-1, -2)  # (E,M,D)
-        return (y * S.T[..., None].astype(y.dtype)).sum(axis=0).reshape(B, T, D)
+        mixed = (y * S.T[..., None].astype(y.dtype)).sum(axis=0).reshape(B, T, D)
+        spread = None
+        if self.write_scale is not None:
+            ii = idx.reshape(M, K)
+            y_tok = y.swapaxes(0, 1)[mx.arange(M)[:, None], ii]
+            spread = self._spread_tok(y_tok, ii, w.reshape(M, K), B, T)
+        return mixed, spread
 
     def _sparse_forward(self, x, idx, w):
         """sorted gather_mm 路径：按专家 argsort → 免 padding 分段 GEMM →
@@ -304,7 +406,10 @@ class MoEFeedForward(nn.Module):
         实测（M=12288/K=8/E=256/D=384/I=320，mlx 0.32）：fwd 8.8ms、
         fwd+bwd 25.5ms，负载倾斜下耗时不变（旧桶路径倾斜下 padding
         1.7~3× 且反向慢 3~4×）。
-        K 个专家输出按 token 用 f32 累加器合并（与旧桶路径口径一致）。
+        K 个专家输出按 token 在激活 dtype 下 scatter-add 合并（bf16 训练
+        即 bf16 累加，不再绕 f32 累加器，省 (M,D) f32 物化与两趟读写；
+        K 路 bf16 累加的相对误差 ~1% 级，与稠密路径 x.dtype 加权求和、
+        kernel 路径 x.dtype 输出的口径一致）。
         """
         B, T, D = x.shape
         K = self.top_k
@@ -329,13 +434,20 @@ class MoEFeedForward(nn.Module):
             rhs_indices=exps_s,
             sorted_indices=True,
         )  # (G,1,2I)：逐 pair 的 gate/up 投影
-        act = situ_glu_gu(h)
+        act = glu_gu(h, self.hidden_act)
         y = mx.gather_mm(
             act, dw_t, lhs_indices=None, rhs_indices=exps_s, sorted_indices=True
         )[:, 0, :]  # (G, D)
         yw = y * w_s[:, None]
-        out = mx.zeros((M, D), dtype=mx.float32).at[tok_s].add(yw.astype(mx.float32))
-        return out.astype(x.dtype).reshape(B, T, D)
+        # 激活 dtype 累加器 + 不再 astype(f32)：bf16 训练下 scatter-add
+        # 直接 bf16 合并（见 docstring 口径说明）
+        out = mx.zeros((M, D), dtype=x.dtype).at[tok_s].add(yw)
+        mixed = out.reshape(B, T, D)
+        spread = None
+        if self.write_scale is not None:
+            y_tok = y[mx.argsort(order)].reshape(M, K, D)
+            spread = self._spread_tok(y_tok, idx.reshape(M, K), w.reshape(M, K), B, T)
+        return mixed, spread
 
     def _kernel_forward(self, x):
         """融合 Metal kernel 路径：3 个 kernel 完成 router 打分+top-k 选择、
@@ -360,6 +472,7 @@ class MoEFeedForward(nn.Module):
             logit_norm=g.norm_logits,
             logit_temp=g.logit_temp,
             latent_dim=self.latent_dim,
+            hidden_act=self.hidden_act,
         )
         xf = x.reshape(M, D)
         idx, w = router(
@@ -397,19 +510,29 @@ class MoEFeedForward(nn.Module):
         lat = self.lat_up is not None
         # 融合 kernel 仅推理路径：不可微（无 CustomKernel vjp），训练
         # （model.train()）一律旁路；collect_stats（训练负载统计）同理。
-        if (
+        # 大 E（如 384）上 kernel 的标量 router 点积慢于 gather_mm，只留给
+        # 小专家集；decode 小 G 一律 sparse（只读 top-k），不要走稠密全专家。
+        # 写出基扩展要逐专家 h_k，融合 down kernel 已在核内加权合并，旁路。
+        infer_small = (
             G <= self._KERNEL_MAX_PAIRS
             and not self.training
             and not self.router.collect_stats
-        ):
+        )
+        use_kernel = (
+            infer_small
+            and self.hidden_act in ("silu", "situ")
+            and self.n_routed <= 64
+            and self.write_scale is None
+            and not self.route_scale
+        )
+        if use_kernel:
             cls = type(self)
             if cls._KERNEL_DISABLED or x.dtype not in _MOE_METAL_TYPE:
                 idx, w = self.router(x)
-                out = self._dense_forward(
+                mixed, spread = self._dense_forward(
                     self.latent_norm(self.lat_down(x)) if lat else x, idx, w
                 )
-                if lat:
-                    out = self._latent_up(out)
+                out = self._combine_routed(mixed, spread)
             else:
                 kk = (
                     D,
@@ -420,6 +543,7 @@ class MoEFeedForward(nn.Module):
                     x.dtype,
                     self.router.norm_logits,
                     self.router.logit_temp,
+                    self.hidden_act,
                 )
                 try:
                     out = self._kernel_forward(x)
@@ -429,20 +553,22 @@ class MoEFeedForward(nn.Module):
                 except Exception:
                     cls._KERNEL_DISABLED = True
                     idx, w = self.router(x)
-                    out = self._dense_forward(
+                    mixed, spread = self._dense_forward(
                         self.latent_norm(self.lat_down(x)) if lat else x, idx, w
                     )
-                    if lat:
-                        out = self._latent_up(out)
+                    out = self._combine_routed(mixed, spread)
         else:
-            idx, w = self.router(x)  # (B,T,K) int32 / (B,T,K)
-            xe = self.latent_norm(self.lat_down(x)) if lat else x
-            if G <= self._DENSE_MAX_PAIRS:
-                out = self._dense_forward(xe, idx, w)
+            if self.route_scale:
+                idx, w, amp = self.router(x, return_amp=True)
             else:
-                out = self._sparse_forward(xe, idx, w)
-            if lat:
-                out = self._latent_up(out)
+                idx, w = self.router(x)
+                amp = None
+            xe = self.latent_norm(self.lat_down(x)) if lat else x
+            if infer_small or G > self._DENSE_MAX_PAIRS:
+                mixed, spread = self._sparse_forward(xe, idx, w)
+            else:
+                mixed, spread = self._dense_forward(xe, idx, w)
+            out = self._combine_routed(mixed, spread, amp)
         for ff in self.shared:
             out = out + ff(x)
         return out

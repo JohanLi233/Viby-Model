@@ -11,6 +11,14 @@ from .kernels.conv import causal_conv
 from .norms import RMSNorm, _rms_unit
 
 
+def _gate_heads(output: mx.array, gate: mx.array, head_dim: int) -> mx.array:
+    """gate (B,T,H) 广播乘到 (B,T,H·Hd)，避免 mx.repeat 沿最后一维物化副本。"""
+    bsz, seq, dim = output.shape
+    return (
+        output.reshape(bsz, seq, dim // head_dim, head_dim) * gate[..., None]
+    ).reshape(bsz, seq, dim)
+
+
 def _shift_right_tokens(x: mx.array, offset: int) -> mx.array:
     """沿序列维右移（左填 0），用于 n-gram 窗口与因果卷积。"""
     if offset == 0:
@@ -282,7 +290,7 @@ class GQAAttention(nn.Module):
             # bf16 下 sigmoid 误差 ~1e-2（远小于 gate 自身量级与训练
             # 噪声），无需把 (B,T,H) 小张量抬成 f32 再降回来。
             gate = (2.0 * mx.sigmoid(self.attn_gate(x))).astype(output.dtype)
-            output = output * mx.repeat(gate, self.head_dim, axis=-1)
+            output = _gate_heads(output, gate, self.head_dim)
         output = self.resid_dropout(self.o_proj(output))
         # site 2：attn 分支输出（o_proj 之后、residual 之前）的 ShortConv；
         # 解码状态挂在本层 KVCache.extras，随 cache 流转/rewind；投机解码
@@ -388,8 +396,12 @@ def apply_rotary_pos_emb(
         half = x.shape[-1] // 2
         return mx.concatenate([-x[..., half:], x[..., :half]], axis=-1)
 
-    cos = cos[:, None, :]
-    sin = sin[:, None, :]
+    if cos.ndim == 2:
+        cos = cos[:, None, :]
+        sin = sin[:, None, :]
+    else:
+        cos = cos[:, :, None, :]
+        sin = sin[:, :, None, :]
     q_embed = (q * cos + rotate_half(q) * sin).astype(q.dtype)
     k_embed = (k * cos + rotate_half(k) * sin).astype(k.dtype)
     return q_embed, k_embed
@@ -401,12 +413,13 @@ class MLAAttention(nn.Module):
     来自拆分 KDA 之前的高效实现：q+kv_down+k_rope 合并成一次 GEMM，
     k_up+v_up 再一次；解耦 RoPE 走 mx.fast.rope。训练路径用支持
     d_qk ≠ d_v 的手写 flash（不必把 V 零填到 QK 维）；回退 mlx SDPA
-    时仍用零填充命中等宽快路径。无 ShortConv / XSA / 线性注意力。
+    时仍用零填充命中等宽快路径。无 ShortConv / 线性注意力；可选 Gated XSA
+    （use_xsa 默认开，作用于最深 xsa_last_n 层，逐 head 可学习 tanh(α)，α=0
+    初始化 ⇒ 恒等）。
     """
 
     def __init__(self, config: VibyConfig, layer_idx: int = 0):
         super().__init__()
-        del layer_idx
         self.n_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.rope_dim = config.qk_rope_head_dim
@@ -443,6 +456,18 @@ class MLAAttention(nn.Module):
             self.attn_gate = nn.Linear(config.hidden_size, self.n_heads, bias=True)
             self.attn_gate.weight = mx.zeros_like(self.attn_gate.weight)
             self.attn_gate.bias = mx.zeros_like(self.attn_gate.bias)
+        # Gated XSA：仅 use_xsa 且层处于最深 xsa_last_n 层时挂逐 head 可学习
+        # tanh(α)（零初始化 ⇒ 起始恒等，不扰动 step-0）。MLA 头 1:1
+        # （n_heads==n_kv_heads），无需 GQA 那条 mx.repeat 扩展 V 的处理。
+        _deep = (
+            config.xsa_last_n > 0
+            and layer_idx >= config.num_hidden_layers - config.xsa_last_n
+        )
+        self.xsa_alpha = (
+            mx.zeros((self.n_heads,), dtype=mx.float32)
+            if (config.use_xsa and _deep)
+            else None
+        )
 
     def _fallback_pos(self, start_pos: int, seq_len: int, dtype):
         tbl = self.__dict__.get("_rope_tbl")
@@ -452,7 +477,11 @@ class MLAAttention(nn.Module):
                 scaling = dict(scaling)
                 scaling.setdefault("original_max_position_embeddings", orig_max)
             cos, sin, freqs, af = precompute_freqs_cis(
-                dim=dim, end=end, rope_base=base, rope_scaling=scaling, return_freqs=True
+                dim=dim,
+                end=end,
+                rope_base=base,
+                rope_scaling=scaling,
+                return_freqs=True,
             )
             tbl = (cos, sin, freqs, float(af))
             object.__setattr__(self, "_rope_tbl", tbl)
@@ -492,61 +521,89 @@ class MLAAttention(nn.Module):
             [self.n_heads * self.qk_dim, self.n_heads * self.qk_dim + self.kv_rank],
             axis=-1,
         )
-        xq = q_flat.reshape(bsz, seq_len, self.n_heads, self.qk_dim)
-        k_rope = k_rope_flat[:, :, None, :]
+        # 尽早转到 flash 的 (B,H,T,D)：RoPE 原生要这个布局，省掉
+        # q/k_rope 来回转置 + 拼接后再转一次。
+        xq = q_flat.reshape(bsz, seq_len, self.n_heads, self.qk_dim).transpose(
+            0, 2, 1, 3
+        )
+        q_nope, q_rope = mx.split(xq, [self.head_dim], axis=-1)
         kv = self.kv_up_proj(c_kv)
         xk, xv = mx.split(kv, 2, axis=-1)
-        xk = xk.reshape(bsz, seq_len, self.n_heads, self.head_dim)
-        xv = xv.reshape(bsz, seq_len, self.n_heads, self.head_dim)
-        q_nope, q_rope = mx.split(xq, [self.head_dim], axis=-1)
+        xk = xk.reshape(bsz, seq_len, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        xv = xv.reshape(bsz, seq_len, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
         q_nope, xk = self.q_norm(q_nope), self.k_norm(xk)
+        k_rope = k_rope_flat.reshape(bsz, seq_len, 1, self.rope_dim).transpose(
+            0, 2, 1, 3
+        )
 
         cos, sin = position_embeddings[:2]
         rope_meta = position_embeddings[2] if len(position_embeddings) > 2 else None
         if rope_meta is None:
-            q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, cos, sin)
-        else:
             q_rope, k_rope = apply_rotary_pos_emb(
-                q_rope,
-                k_rope,
+                q_rope.transpose(0, 2, 1, 3),
+                k_rope.transpose(0, 2, 1, 3),
                 cos,
                 sin,
-                rope_freqs=rope_meta[0],
-                rope_offset=rope_meta[1],
-                rope_attn_factor=rope_meta[2],
             )
-        k_rope = mx.broadcast_to(k_rope, (bsz, seq_len, self.n_heads, self.rope_dim))
+            q_rope = q_rope.transpose(0, 2, 1, 3)
+            k_rope = k_rope.transpose(0, 2, 1, 3)
+        else:
+            freqs, rope_offset, rope_attn_factor = rope_meta
+            q_rope = mx.fast.rope(
+                q_rope,
+                self.rope_dim,
+                traditional=False,
+                base=None,
+                scale=1.0,
+                offset=rope_offset,
+                freqs=freqs,
+            )
+            k_rope = mx.fast.rope(
+                k_rope,
+                self.rope_dim,
+                traditional=False,
+                base=None,
+                scale=1.0,
+                offset=rope_offset,
+                freqs=freqs,
+            )
+            if rope_attn_factor != 1.0:
+                q_rope = q_rope * rope_attn_factor
+                k_rope = k_rope * rope_attn_factor
+            q_rope = q_rope.astype(x.dtype)
+            k_rope = k_rope.astype(x.dtype)
+        k_rope = mx.broadcast_to(k_rope, (bsz, self.n_heads, seq_len, self.rope_dim))
         xq = mx.concatenate([q_nope, q_rope], axis=-1)
         xk = mx.concatenate([xk, k_rope], axis=-1)
 
         past_kv = None
         if use_cache:
-            if isinstance(past_key_value, KVCache):
+            if past_key_value is not None and hasattr(past_key_value, "update"):
                 cache = past_key_value
             else:
                 cache = KVCache()
                 if past_key_value is not None:
                     cache.update(past_key_value[0], past_key_value[1])
-            k_bhtd, v_bhtd = cache.update(xk, xv)
+            k_bhtd, v_bhtd = cache.update(
+                xk.transpose(0, 2, 1, 3), xv.transpose(0, 2, 1, 3)
+            )
             past_kv = cache
         elif past_key_value is not None:
             if isinstance(past_key_value, KVCache):
                 pk = past_key_value.keys[:, :, : past_key_value.offset]
                 pv = past_key_value.values[:, :, : past_key_value.offset]
-                k_bhtd = mx.concatenate([pk, xk.transpose(0, 2, 1, 3)], axis=2)
-                v_bhtd = mx.concatenate([pv, xv.transpose(0, 2, 1, 3)], axis=2)
+                k_bhtd = mx.concatenate([pk, xk], axis=2)
+                v_bhtd = mx.concatenate([pv, xv], axis=2)
             else:
-                k_bhtd = mx.concatenate([past_key_value[0], xk], axis=1).transpose(
-                    0, 2, 1, 3
-                )
-                v_bhtd = mx.concatenate([past_key_value[1], xv], axis=1).transpose(
-                    0, 2, 1, 3
-                )
+                k_bhtd = mx.concatenate(
+                    [past_key_value[0], xk.transpose(0, 2, 1, 3)], axis=1
+                ).transpose(0, 2, 1, 3)
+                v_bhtd = mx.concatenate(
+                    [past_key_value[1], xv.transpose(0, 2, 1, 3)], axis=1
+                ).transpose(0, 2, 1, 3)
         else:
-            k_bhtd = xk.transpose(0, 2, 1, 3)
-            v_bhtd = xv.transpose(0, 2, 1, 3)
+            k_bhtd, v_bhtd = xk, xv
 
-        xq = xq.transpose(0, 2, 1, 3)
         if mask_is_full is None:
             mask_is_full = attention_mask is None or bool(
                 mx.all(attention_mask == 1).item()
@@ -554,8 +611,11 @@ class MLAAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.qk_dim)
         key_len = k_bhtd.shape[2]
         has_past = key_len > seq_len
+        has_arr_mask = causal_bias is not None and not isinstance(causal_bias, str)
 
-        if seq_len == 1 and mask_is_full:
+        if has_arr_mask:
+            local_mask = causal_bias
+        elif seq_len == 1 and mask_is_full:
             local_mask = None
         elif has_past and seq_len > 1 and mask_is_full:
             local_mask = _offset_causal_mask(seq_len, key_len, xq.dtype)
@@ -567,11 +627,15 @@ class MLAAttention(nn.Module):
         use_flash = (
             self.flash
             and self.dropout == 0.0
-            and (mask_is_full or (causal_bias is not None and not has_past))
+            and (
+                mask_is_full
+                or has_arr_mask
+                or (causal_bias is not None and not has_past)
+            )
             and (
                 (seq_len > 1 and not has_past)
-                or (seq_len == 1 and mask_is_full)
-                or (seq_len > 1 and has_past and mask_is_full)
+                or (seq_len == 1 and (mask_is_full or has_arr_mask))
+                or (seq_len > 1 and has_past and (mask_is_full or has_arr_mask))
             )
         )
         if use_flash:
@@ -586,7 +650,7 @@ class MLAAttention(nn.Module):
             else:
                 scores = scores + local_mask.astype(scores.dtype)
 
-            if attention_mask is not None:
+            if attention_mask is not None and not has_arr_mask:
                 am = attention_mask
                 if am.shape[1] < key_len:
                     pad = mx.ones((am.shape[0], key_len - am.shape[1]), dtype=am.dtype)
@@ -603,9 +667,24 @@ class MLAAttention(nn.Module):
             attn_weights = self.attn_dropout(attn_weights)
             output = attn_weights @ v_bhtd
 
+        if self.xsa_alpha is not None:
+            # Gated XSA：z = y − tanh(α)·(yᵀv/‖v‖²)·v，逐 head；v 取 query
+            # 对齐的末尾 seq_len 个位置（cache 时 v_bhtd 覆盖全历史，与
+            # GQA 同口径）。除法在 f32 做，输出回落原 dtype。
+            vf = v_bhtd[:, :, -seq_len:, :].astype(mx.float32)
+            yf = output.astype(mx.float32)
+            coef = mx.sum(yf * vf, axis=-1, keepdims=True) / mx.maximum(
+                mx.sum(vf * vf, axis=-1, keepdims=True), mx.array(1e-12)
+            )
+            # output/V 在原生 (B,H,T,D) 布局，逐 head α 的 H 轴落 ndim=1。
+            alpha = mx.tanh(self.xsa_alpha).astype(mx.float32).reshape(
+                1, self.n_heads, 1, 1
+            )
+            output = (yf - alpha * coef * vf).astype(output.dtype)
+
         output = output.transpose(0, 2, 1, 3).reshape(bsz, seq_len, -1)
         if self.attn_gate is not None:
             gate = (2.0 * mx.sigmoid(self.attn_gate(x))).astype(output.dtype)
-            output = output * mx.repeat(gate, self.head_dim, axis=-1)
+            output = _gate_heads(output, gate, self.head_dim)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv

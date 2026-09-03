@@ -166,7 +166,9 @@ def _scan_prewarm(NC: int, C: int, D: int, Dv: int, B: int = 1, H: int = 1) -> b
                 lz, gz = mx.value_and_grad(fk_z, argnums=list(range(7)))(*ins)
                 lz_r, gz_r = mx.value_and_grad(fe_z, argnums=list(range(7)))(*ins)
                 mx.eval(lz, lz_r, *gz, *gz_r)
-                if not (abs(lz.item() - lz_r.item()) <= 1e-3 * max(1.0, abs(lz_r.item()))):
+                if not (
+                    abs(lz.item() - lz_r.item()) <= 1e-3 * max(1.0, abs(lz_r.item()))
+                ):
                     raise RuntimeError(
                         f"kda_scan zsc prewarm loss 不一致 {lz.item()} vs {lz_r.item()}"
                     )
@@ -204,9 +206,7 @@ def _make_kda_scan_gated(gate_tuple: tuple[int, ...], lam: float, coeffs):
             outs[c] = qe[:, :, c] @ S + Aqk[:, :, c] @ vt
             S = S * egl[:, :, c][..., None] + mx.swapaxes(kd[:, :, c], -1, -2) @ vt
             if gate_tuple[c]:
-                W = mx.stop_gradient(
-                    _eigengate.ste_weight(S, lam, coeffs, prefer=side)
-                )
+                W = mx.stop_gradient(_eigengate.ste_weight(S, lam, coeffs, prefer=side))
                 S = (W @ S) if left else (S @ W)
                 Ws.append(W)
             states.append(S)
@@ -236,9 +236,7 @@ def _make_kda_scan_gated(gate_tuple: tuple[int, ...], lam: float, coeffs):
             if gate_tuple[c]:
                 W = Wg[:, :, gi]
                 dS = (
-                    mx.swapaxes(W, -1, -2) @ dS
-                    if left
-                    else dS @ mx.swapaxes(W, -1, -2)
+                    mx.swapaxes(W, -1, -2) @ dS if left else dS @ mx.swapaxes(W, -1, -2)
                 )
                 gi -= 1
             Sc = Sall[:, :, c]
@@ -281,9 +279,7 @@ def _kda_scan_gated(qe, w, u, Aqk, kd, egl, S0, gate_tuple, lam):
     return o, Sall
 
 
-def _scan_dispatch_gated(
-    qe, w, u, Aqk, kd, egl, S, gate_tuple, lam, zsc: bool = False
-):
+def _scan_dispatch_gated(qe, w, u, Aqk, kd, egl, S, gate_tuple, lam, zsc: bool = False):
     """门控扫描：优先一次 Metal 发射，失败回退 eager STE。"""
     global _SCAN_EG_DISABLED
     NC, C, D = qe.shape[2], qe.shape[3], qe.shape[4]
@@ -305,13 +301,9 @@ def _scan_dispatch_gated(
             )
             mx.eval(o, Sall, o_ref, Sall_ref)
             d1 = ((o - o_ref).abs().max() / (o_ref.abs().max() + 1e-12)).item()
-            d2 = (
-                (Sall - Sall_ref).abs().max() / (Sall_ref.abs().max() + 1e-12)
-            ).item()
+            d2 = ((Sall - Sall_ref).abs().max() / (Sall_ref.abs().max() + 1e-12)).item()
             if not (max(d1, d2) <= 1e-3):
-                raise RuntimeError(
-                    f"kda_scan_eg 校验失败 rel={max(d1, d2):.2e}"
-                )
+                raise RuntimeError(f"kda_scan_eg 校验失败 rel={max(d1, d2):.2e}")
             _SCAN_EG_VERIFIED.add(key)
         return o, Sall
     except Exception as e:
@@ -389,9 +381,7 @@ def _scan_prewarm_gated(
             lz, gz = mx.value_and_grad(fk_z, argnums=list(range(7)))(*ins)
             lz_r, gz_r = mx.value_and_grad(fe_z, argnums=list(range(7)))(*ins)
             mx.eval(lz, lz_r, *gz, *gz_r)
-            if not (
-                abs(lz.item() - lz_r.item()) <= 1e-3 * max(1.0, abs(lz_r.item()))
-            ):
+            if not (abs(lz.item() - lz_r.item()) <= 1e-3 * max(1.0, abs(lz_r.item()))):
                 raise RuntimeError(
                     f"kda_scan_eg zsc prewarm loss 不一致 {lz.item()} vs {lz_r.item()}"
                 )
@@ -641,15 +631,13 @@ def _chunk_kda(
         else S0.astype(mx.float32)
     )
     mask = (
-        tuple(_eigengate.chunk_gate_mask(NC, T, C, t0))
-        if _eigengate.enabled()
-        else ()
+        tuple(_eigengate.chunk_gate_mask(NC, T, C, t0)) if _eigengate.enabled() else ()
     )
     if mask and any(mask) and eigengate_lam is None:
         eigengate_lam = _eigengate.mix_lambda()
     lam_is_const = isinstance(eigengate_lam, (int, float))
-    gated = bool(mask) and any(mask) and not (
-        lam_is_const and float(eigengate_lam) == 0.0
+    gated = (
+        bool(mask) and any(mask) and not (lam_is_const and float(eigengate_lam) == 0.0)
     )
     fused_gate = (
         gated
@@ -716,9 +704,7 @@ class KDAAttention(nn.Module):
         super().__init__()
         d = config.hidden_size
         self.n_k_heads = config.num_attention_heads
-        self.n_v_heads = self.n_k_heads * int(
-            getattr(config, "kda_v_head_ratio", 2)
-        )
+        self.n_v_heads = self.n_k_heads * int(getattr(config, "kda_v_head_ratio", 2))
         self.n_heads = self.n_k_heads
         self.n_rep_v = self.n_v_heads // self.n_k_heads
         self.head_dim = config.head_dim
@@ -869,11 +855,7 @@ class KDAAttention(nn.Module):
             blh = _repeat_heads(bl.reshape(B, Hk), n_rep, 1)
             a_log = _repeat_heads(self.A_log, n_rep, 0)
             dt = _repeat_heads(self.dt_bias.reshape(Hk, D), n_rep, 0).reshape(-1)
-            S_in = (
-                S0
-                if S0 is not None
-                else mx.zeros((B, Hv, D, D), dtype=mx.float32)
-            )
+            S_in = S0 if S0 is not None else mx.zeros((B, Hv, D, D), dtype=mx.float32)
             r = kda_decode_step(
                 qh,
                 kh,

@@ -45,8 +45,8 @@ def _conv_specs(model):
     return specs
 
 
-def _situ_halves(model):
-    """扫出所有 SiTU-GLU 打包核需要的半宽 I（每个 I 一份 kernel）。
+def _glu_halves(model):
+    """扫出所有 GLU（SiLU/SiTU）打包核需要的半宽 I（每个 I 一份 kernel）。
 
     打包核把 I 编译成常量，所以要覆盖实际用到的每个宽度：稠密/共享专家
     的 gate_proj 输出宽，以及堆叠路由专家 gate_up_w 的 2I 的一半。
@@ -88,12 +88,38 @@ def prewarm_all(model, config, dtype, seq_len, log=None):
         L = int(getattr(config, "num_hidden_layers", 0) or 0)
         D = int(config.hidden_size)
         if L > 0:
-            if attn_res_fused.prewarm(D, dtype, range(2, 2 * L + 2)):
+            max_n = 2 * L + 1
+            win = int(getattr(config, "attn_res_window", 0) or 0)
+            if win > 0:
+                max_n = min(max_n, win)
+                if getattr(config, "attn_res_register", False):
+                    # 读侧混合 = 寄存器 + 近 W 个写入，N 最大 W+1
+                    max_n = min(2 * L + 1, win + 1)
+            if getattr(config, "attn_res_read_h", False):
+                # 子层读 h，不走 AttnRes merge
+                note("attn_res_read_h：跳过 AttnRes 合并预热")
+            elif getattr(config, "ihc", False):
+                note("ihc：跳过 AttnRes 合并预热")
+            elif attn_res_fused.prewarm(D, dtype, range(2, max_n + 1)):
                 ok += 1
             else:
                 fails.append("attn_res")
     except Exception as e:
         fails.append(f"attn_res({e})")
+
+    try:
+        from . import ihc_fused
+
+        if not bool(getattr(config, "ihc", False)):
+            pass
+        elif not _FUSED:
+            note("VIBY_FUSED_KERNELS=0：跳过 iHC kernel 预热")
+        elif ihc_fused.prewarm_from_model(model, dtype):
+            ok += 1
+        else:
+            fails.append("ihc")
+    except Exception as e:
+        fails.append(f"ihc({e})")
 
     # ---- conv / kda_prep / kda_scan：run 81 未 prewarm，compile 下静默 eager ----
     if not _FUSED:
@@ -144,22 +170,15 @@ def prewarm_all(model, config, dtype, seq_len, log=None):
                     ncs = {NC}
                     scan_ok = True
                     if _eg.enabled():
-                        if (
-                            _eg.target_name() == "keep"
-                            and not _eg.learnable()
-                        ):
-                            mask = tuple(
-                                _eg.chunk_gate_mask(NC, int(seq_len), C, 0)
-                            )
+                        if _eg.target_name() == "keep" and not _eg.learnable():
+                            mask = tuple(_eg.chunk_gate_mask(NC, int(seq_len), C, 0))
                             if any(mask):
                                 from model.kda import _scan_prewarm_gated
 
                                 if not _scan_prewarm_gated(NC, C, hd, hd, mask):
                                     scan_ok = False
                         else:
-                            for length, _ in _eg.scan_segments(
-                                NC, int(seq_len), C, 0
-                            ):
+                            for length, _ in _eg.scan_segments(NC, int(seq_len), C, 0):
                                 ncs.add(int(length))
                     for nc in sorted(ncs):
                         if not _scan_prewarm(nc, C, hd, hd):
@@ -172,22 +191,65 @@ def prewarm_all(model, config, dtype, seq_len, log=None):
         except Exception as e:
             fails.append(f"kda({e})")
 
-        try:
-            from . import situ
+        # GLU 融合核按 hidden_act 择一预编译/校验：'silu'（默认）用
+        # kernels/silu.py，'situ' 用 kernels/situ.py（二者结构同构）。
+        if getattr(config, "hidden_act", "situ") == "situ":
+            try:
+                from . import situ
 
-            if situ.prewarm(dtype):
-                ok += 1
-            else:
-                fails.append("situ")
-            halves = _situ_halves(model)
-            if not halves:
-                note("未发现 gate/up 投影，跳过 situ 打包核预热")
-            elif situ.prewarm_packed(dtype, halves):
-                ok += 1
-            else:
-                fails.append(f"situ_packed(I={sorted(halves)})")
-        except Exception as e:
-            fails.append(f"situ({e})")
+                if situ.prewarm(dtype):
+                    ok += 1
+                else:
+                    fails.append("situ")
+                halves = _glu_halves(model)
+                if not halves:
+                    note("未发现 gate/up 投影，跳过 situ 打包核预热")
+                elif situ.prewarm_packed(dtype, halves):
+                    ok += 1
+                else:
+                    fails.append(f"situ_packed(I={sorted(halves)})")
+            except Exception as e:
+                fails.append(f"situ({e})")
+        elif getattr(config, "hidden_act", "silu") == "silu":
+            # 默认 hidden_act='silu'：SiLU-GLU 融合核（fwd+bwd + 打包入口）。
+            try:
+                from . import silu
+
+                if silu.prewarm(dtype):
+                    ok += 1
+                else:
+                    fails.append("silu")
+                halves = _glu_halves(model)
+                if not halves:
+                    note("未发现 gate/up 投影，跳过 silu 打包核预热")
+                elif silu.prewarm_packed(dtype, halves):
+                    ok += 1
+                else:
+                    fails.append(f"silu_packed(I={sorted(halves)})")
+            except Exception as e:
+                fails.append(f"silu({e})")
+
+    try:
+        from . import layer_decode
+
+        if getattr(config, "use_linear_attn", False):
+            note("use_linear_attn=1：跳过 layer_decode 预热")
+        elif layer_decode.prewarm_from_model(model, dtype):
+            ok += 1
+        else:
+            fails.append("layer_decode")
+    except Exception as e:
+        fails.append(f"layer_decode({e})")
+
+    try:
+        from . import moe_write_spread
+
+        if moe_write_spread.prewarm_from_model(model, dtype):
+            ok += 1
+        else:
+            fails.append("moe_write_spread")
+    except Exception as e:
+        fails.append(f"moe_write_spread({e})")
 
     if fails:
         note(f"融合 kernel 预热失败（已回退 eager）: {', '.join(fails)}")

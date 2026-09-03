@@ -558,9 +558,7 @@ def kda_scan_eg_metal(
     key = (NC, C, D, DV, gate_tuple, float(lam), tuple(coeffs), zsc)
     op = _OPS.get(key)
     if op is None:
-        op = _scan_op_factory(
-            NC, C, D, DV, gate_tuple, float(lam), coeffs, zsc=zsc
-        )
+        op = _scan_op_factory(NC, C, D, DV, gate_tuple, float(lam), coeffs, zsc=zsc)
         _OPS[key] = op
     o, Sall, _Wg = op(qe, w, u, Aqk, kd, egl, S0)
     return o, Sall

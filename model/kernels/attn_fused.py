@@ -862,6 +862,53 @@ def flash_forward(q, k, v, scale, mask=None, nt=None, strb=None):
     return o, lse
 
 
+_delta_kernels: dict = {}
+
+
+def _delta_rowsum(dout, o):
+    """Δ = rowsum(dO ⊙ O) 的融合 kernel：bf16 读入、f32 寄存器累加。
+
+    替代 (dout.astype(f32) * o.astype(f32)).sum(-1)：后者即使在 compile
+    下也要物化一份全尺寸 f32 乘积 (B,H,T,Dv) 再做归约；本 kernel 每个
+    warp 管一行（simd_sum 归约），只写 (B,H,T) f32。与 f32 参考的差
+    只有归约顺序（~1e-7 相对），与 _fro_norm 同一口径。
+    """
+    B, H, T, D = dout.shape
+    n = B * H * T
+    key = (n, D, dout.dtype)
+    kern = _delta_kernels.get(key)
+    if kern is None:
+        mt = _METAL_TYPE[dout.dtype]
+        kern = mx.fast.metal_kernel(
+            name=f"flash_delta_{n}_{D}_{mt}",
+            input_names=["dout", "o"],
+            output_names=["delta"],
+            source=f"""
+        uint tid = thread_position_in_grid.x;
+        uint row = tid / 32;
+        uint lane = tid % 32;
+        if (row < {n}u) {{
+            const device {mt}* a = dout + (size_t)row * {D};
+            const device {mt}* b = o + (size_t)row * {D};
+            float acc = 0.0f;
+            for (uint i = lane; i < {D}u; i += 32) acc += float(a[i]) * float(b[i]);
+            acc = simd_sum(acc);
+            if (lane == 0) delta[row] = acc;
+        }}
+            """,
+            header=_HEADER,
+        )
+        _delta_kernels[key] = kern
+    (delta,) = kern(
+        inputs=[dout.reshape(n, D), o.reshape(n, D)],
+        output_shapes=[(n,)],
+        output_dtypes=[mx.float32],
+        grid=(((n + 7) // 8) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+    )
+    return delta.reshape(B, H, T)
+
+
 def flash_backward(q, k, v, o, dout, scale, mask=None, nt=None, strb=None, lse=None):
     """因果注意力反向，返回 (dq, dk, dv)，dtype 与各自 primal 一致。
 
@@ -903,7 +950,9 @@ def flash_backward(q, k, v, o, dout, scale, mask=None, nt=None, strb=None, lse=N
 
     saved_lse = lse
     if saved_lse is not None and o is not None:
-        delta = (dout.astype(mx.float32) * o.astype(mx.float32)).sum(axis=-1)
+        # Δ = rowsum(dO ⊙ O)：融合 kernel 直读 bf16、f32 寄存器累加，
+        # 不再物化两份全尺寸 f32（dout 已在上方压回 q.dtype）
+        delta = _delta_rowsum(dout, o)
         lse = saved_lse
     elif split:
         if o is None:
@@ -928,7 +977,7 @@ def flash_backward(q, k, v, o, dout, scale, mask=None, nt=None, strb=None, lse=N
     else:
         if o is None:
             raise ValueError("非 split 路径需要前向输出 o 来计算 Δ")
-        delta = (dout.astype(mx.float32) * o.astype(mx.float32)).sum(axis=-1)
+        delta = _delta_rowsum(dout, o)
         lse = _get("lse", *key)(
             inputs=[q, k] + ([mask] if hm else []),
             output_shapes=[(B, H, tq_pad)],
@@ -938,12 +987,16 @@ def flash_backward(q, k, v, o, dout, scale, mask=None, nt=None, strb=None, lse=N
         )[0]
 
     base = [q, k, v, dout, lse, delta] + ([mask] if hm else [])
+    # split kernel 内部 simdgroup f32 累加、最终 store 直接写 MT（训练即
+    # bf16），与旧"f32 输出 + 外侧 astype"的舍入点相同、逐位等价；
+    # v1 fallback kernel 仍 f32 输出，在外侧转回。
+    out_dt = q.dtype if split else mx.float32
     if split and tq_pad == tk_pad and _COMBINED:
         key_comb = (B, Dk, Dv, tq_pad, tk_pad, H, scale, hm, mt, nt, strb)
         dq, dk, dv = _get_dqkv_combined(*key_comb)(
             inputs=base,
             output_shapes=[(B, H, tq_pad, Dk), (B, H, tk_pad, Dk), (B, H, tk_pad, Dv)],
-            output_dtypes=[mx.float32, mx.float32, mx.float32],
+            output_dtypes=[out_dt, out_dt, out_dt],
             grid=(nt, tq_pad // res, B * H * 2),
             threadgroup=(nt, 1, 1),
         )
@@ -951,14 +1004,14 @@ def flash_backward(q, k, v, o, dout, scale, mask=None, nt=None, strb=None, lse=N
         dq = _get("dq", *key)(
             inputs=base,
             output_shapes=[(B, H, tq_pad, Dk)],
-            output_dtypes=[mx.float32],
+            output_dtypes=[out_dt],
             grid=(nt, tq_pad // res, B * H),
             threadgroup=(nt, 1, 1),
         )[0]
         dk, dv = _get("dkv", *key)(
             inputs=base,
             output_shapes=[(B, H, tk_pad, Dk), (B, H, tk_pad, Dv)],
-            output_dtypes=[mx.float32, mx.float32],
+            output_dtypes=[out_dt, out_dt],
             grid=(nt, tk_pad // res, B * H),
             threadgroup=(nt, 1, 1),
         )
@@ -966,7 +1019,9 @@ def flash_backward(q, k, v, o, dout, scale, mask=None, nt=None, strb=None, lse=N
         dq = dq[:, :, :Tq]
     if tk_pad != Tk:
         dk, dv = dk[:, :, :Tk], dv[:, :, :Tk]
-    return dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
+    if not split:
+        return dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype)
+    return dq, dk, dv
 
 
 _FUSED_DISABLED = os.environ.get("VIBY_ATTN_FUSED", "1") != "1"

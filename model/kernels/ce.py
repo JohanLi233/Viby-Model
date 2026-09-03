@@ -135,53 +135,25 @@ def _ce_rows_vjp(primals, cotangents, outputs):
 _ce_rows.vjp(_ce_rows_vjp)
 
 
-def cross_entropy(
-    logits: mx.array,
-    labels: mx.array,
-    mask: Optional[mx.array] = None,
-    return_z: bool = False,
+def _reduce_ce_rows(
+    ce: mx.array,
+    lse: mx.array,
+    flat_labels: mx.array,
+    mask: Optional[mx.array],
+    return_z: bool,
 ):
-    """逐行 CE。return_z=True 时额外返回 z_mean：仅 CE 有效位置
-    （loss mask 内且 label != -100）的 logsumexp 均值，归一化与 CE 相同，
-    供 logit z-loss（loss += z_loss_weight * mean(lse²)，Marin 口径）使用。"""
-    global _CE_KERNEL_DISABLED
-    V = logits.shape[-1]
-    z_mean = None
-    # 行 buffer V*4 字节需放进 32KB threadgroup memory
-    if not _CE_KERNEL_DISABLED and V * 4 <= 28 * 1024:
-        try:
-            flat_labels = labels.reshape(-1).astype(mx.int32)
-            rows = _ce_rows(logits.reshape(-1, V), flat_labels)
-            ce, lse = rows[0], rows[1]
-            if return_z:
-                valid = (flat_labels != -100).astype(mx.float32)
-            if mask is None:
-                # 与原链的 mean 语义差异：原链 mean 含 -100 行（其 ce=0），
-                # 这里逐行 ce 同样为 0，mean 结果一致
-                loss = mx.mean(ce)
-                if return_z:
-                    z_mean = mx.mean((lse * lse) * valid)
-            else:
-                mask_flat = mask.reshape(-1).astype(ce.dtype)
-                denom = mx.maximum(mx.sum(mask_flat), mx.array(1.0))
-                loss = mx.sum(ce * mask_flat) / denom
-                if return_z:
-                    z_mean = mx.sum((lse * lse) * valid * mask_flat) / denom
-            return (loss, z_mean) if return_z else loss
-        except Exception:
-            _CE_KERNEL_DISABLED = True
-    logits_f = logits.astype(mx.float32)
-    log_z = mx.logsumexp(logits_f, axis=-1)
-    labels_safe = mx.where(labels == -100, 0, labels)
-    logp = logits_f - log_z[..., None]
-    picked = mx.take_along_axis(logp, labels_safe[..., None], axis=-1).squeeze(-1)
-    ce = mx.where(labels == -100, 0.0, -picked)
+    """(M,) 行级 CE / logsumexp → 标量 loss（+ z_mean）。
 
-    ce = ce.reshape(-1)
-    lse = log_z.reshape(-1)
+    z_mean：仅 CE 有效位置（loss mask 内且 label != -100）的 lse² 均值，
+    归一化与 CE 相同，供 logit z-loss（loss += z_loss_weight * mean(lse²)，
+    Marin 口径）使用。kernel 路径与 eager 回退共用此归约，保证语义一致。
+    """
+    z_mean = None
     if return_z:
-        valid = (labels.reshape(-1) != -100).astype(mx.float32)
+        valid = (flat_labels != -100).astype(mx.float32)
     if mask is None:
+        # 与原链的 mean 语义差异：原链 mean 含 -100 行（其 ce=0），
+        # 这里逐行 ce 同样为 0，mean 结果一致
         loss = mx.mean(ce)
         if return_z:
             z_mean = mx.mean((lse * lse) * valid)
@@ -192,3 +164,32 @@ def cross_entropy(
         if return_z:
             z_mean = mx.sum((lse * lse) * valid * mask_flat) / denom
     return (loss, z_mean) if return_z else loss
+
+
+def cross_entropy(
+    logits: mx.array,
+    labels: mx.array,
+    mask: Optional[mx.array] = None,
+    return_z: bool = False,
+):
+    """逐行 CE。return_z=True 时额外返回 z_mean（见 _reduce_ce_rows）。"""
+    global _CE_KERNEL_DISABLED
+    V = logits.shape[-1]
+    # 行 buffer V*4 字节需放进 32KB threadgroup memory
+    if not _CE_KERNEL_DISABLED and V * 4 <= 28 * 1024:
+        try:
+            flat_labels = labels.reshape(-1).astype(mx.int32)
+            rows = _ce_rows(logits.reshape(-1, V), flat_labels)
+            return _reduce_ce_rows(rows[0], rows[1], flat_labels, mask, return_z)
+        except Exception:
+            _CE_KERNEL_DISABLED = True
+    logits_f = logits.astype(mx.float32)
+    log_z = mx.logsumexp(logits_f, axis=-1)
+    labels_safe = mx.where(labels == -100, 0, labels)
+    logp = logits_f - log_z[..., None]
+    picked = mx.take_along_axis(logp, labels_safe[..., None], axis=-1).squeeze(-1)
+    ce = mx.where(labels == -100, 0.0, -picked)
+
+    return _reduce_ce_rows(
+        ce.reshape(-1), log_z.reshape(-1), labels.reshape(-1), mask, return_z
+    )

@@ -34,6 +34,9 @@ def _skip_init(path: str, arr: mx.array) -> bool:
         return True
     if ".g_proj." in path:
         return True
+    # 零初始化 scale：moe_write_spread 的 write_scale（s=0 ⇒ 额外写出恒等）
+    if "write_scale" in path:
+        return True
     # 只跳过 GatedNorm.gate_up，不要误伤专家堆叠 gate_up_w
     leaf = path.rsplit(".", 1)[-1]
     if leaf == "gate_up":

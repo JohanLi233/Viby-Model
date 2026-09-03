@@ -112,9 +112,7 @@ def cubic_coeffs(
     return gen(max_steps)[0]
 
 
-def scan_segments(
-    NC: int, T: int, C: int, t0: int = 0
-) -> list[tuple[int, bool]]:
+def scan_segments(NC: int, T: int, C: int, t0: int = 0) -> list[tuple[int, bool]]:
     """把 NC 个 chunk 切成段。每段 (length, gate_after)。
 
     门控点按**真实 token 计数** t0+min((c+1)C, T)，不是 padding 后的
@@ -140,8 +138,7 @@ def chunk_gate_mask(NC: int, T: int, C: int, t0: int = 0) -> list[int]:
         return []
     period = period_tokens(C)
     return [
-        1 if should_gate(t0 + min((c + 1) * C, T), period) else 0
-        for c in range(NC)
+        1 if should_gate(t0 + min((c + 1) * C, T), period) else 0 for c in range(NC)
     ]
 
 

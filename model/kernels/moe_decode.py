@@ -7,7 +7,7 @@
 # 3 个 kernel，且只读 top-k 命中专家的权重（~2.9MB/层）：
 #   moe_router: scores=sigmoid(x·W^T)+expert_bias，lane 分专家算分，
 #               threadgroup barrier 后 lane0 串行 top-k，归一化×scaling；
-#   moe_up:     h[m,k,i] = SiTU-GLU(x·W_g, x·W_u)  (β1=4, β2=25)
+#   moe_up:     h[m,k,i] = GLU(x·W_g, x·W_u)（silu=g·σ(g)·u，或 situ=β 软帽）
 #   moe_down:   out[m,d] = Σ_k w[m,k] · (h[m,k,:] · down_w[e,d,:])
 # 内存访问按 simdgroup（32 lane）协作布局：连续 lane 读连续地址（合并访问），
 # 点积经 simd_sum 归约；D/I/K 编译期注入为常量（循环可 unroll）。
@@ -38,10 +38,14 @@ def _build_moe_decode_kernels(
     logit_norm=False,
     logit_temp=1.0,
     latent_dim=0,
+    hidden_act: str = "situ",
 ):
     """构建 3 个融合 kernel：router（打分+top-k 选择）、up（SiTU-GLU 前半）、
     down（加权合并）。按 (D,moe_in,K,E,dtype,norm,scaling,logit_norm,
-    logit_temp,latent_dim) 缓存。
+    logit_temp,latent_dim,hidden_act) 缓存。
+
+    hidden_act='silu' 时 up 用 silu(g)·u（默认 hidden_act 即此），否则用
+    β1=4, β2=25 的 SiTU-GLU。
 
     latent_dim>0（Latent MoE）时 router kernel 仍在全维 D 上打分，
     up/down kernel 在 latent 维 DE 上计算（专家权重 in/out 维为 DE）；
@@ -58,6 +62,7 @@ def _build_moe_decode_kernels(
         logit_norm,
         logit_temp,
         latent_dim,
+        hidden_act,
     )
     if key in _moe_decode_kernel_cache:
         return _moe_decode_kernel_cache[key]
@@ -132,6 +137,18 @@ def _build_moe_decode_kernels(
             }}
         }}
     """
+    # GLU 逐元素：silu = g·σ(g)；situ = β1·tanh(g/β1)·σ(g) 与 β2·tanh(u/β2)。
+    up_glu = (
+        """
+            float gate = g * sg;
+            float up = u;
+        """
+        if hidden_act == "silu"
+        else """
+            float gate = 4.0f * metal::tanh(g / 4.0f) * sg;
+            float up = 25.0f * metal::tanh(u / 25.0f);
+        """
+    )
     up_src = f"""
         uint lane = thread_position_in_grid.x;
         uint ki = thread_position_in_grid.y;
@@ -151,8 +168,7 @@ def _build_moe_decode_kernels(
         u = metal::simd_sum(u);
         if (lane == 0) {{
             float sg = 1.0f / (1.0f + metal::exp(-g));
-            float gate = 4.0f * metal::tanh(g / 4.0f) * sg;
-            float up = 25.0f * metal::tanh(u / 25.0f);
+            {up_glu}
             h[m * {K * moe_in} + k * {moe_in} + i] = {mt}(gate * up);
         }}
     """

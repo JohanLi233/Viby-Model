@@ -88,6 +88,20 @@ class KVCache:
                     self.extras["ngram_tail_trace"] = []
             else:
                 self.extras.pop("ngram_tail", None)
+            nctr = self.extras.get("ngram_conv_tail_trace")
+            if nctr:
+                base = None
+                for entry in nctr:
+                    if entry[0] <= offset:
+                        base = entry
+                if base is not None:
+                    self.extras["ngram_conv_tail"] = base[1]
+                    self.extras["ngram_conv_tail_trace"] = [base]
+                else:
+                    self.extras.pop("ngram_conv_tail", None)
+                    self.extras["ngram_conv_tail_trace"] = []
+            else:
+                self.extras.pop("ngram_conv_tail", None)
             if not trace:
                 for key in ("q_conv", "k_conv", "v_conv", "kda_state"):
                     self.extras.pop(key, None)
@@ -127,6 +141,9 @@ def _seq_len_of_cache(cache) -> int:
         return 0
     if isinstance(cache, KVCache):
         return cache.offset
+    offset = getattr(cache, "offset", None)
+    if offset is not None and not isinstance(cache, (tuple, list)):
+        return int(offset)
     return cache[0].shape[1]
 
 

@@ -108,14 +108,15 @@ def tgmem(kind, Dk, Dv, nt, strb, strl=None):
         s = strl if strl is not None else strb
         ks = s * (Dk + PAD_B) * 2
         ss = 2 * res * (s + PAD_F) * 4  # Ss0 + Ss1
-        red = 2 * res * 4  # ls + delta partial
+        red = 3 * res * 4  # ls + ms + delta partial
         return ks + ss + red
     ks = strb * (Dk + PAD_B) * 2
     ss = 2 * res * (strb + PAD_F) * 4  # Ss0 + Ss1
     dp = 2 * res * (strb + PAD_F) * 4  # DPs0 + DPs1
     ps = 2 * res * (strb + PAD_B) * 2  # Ps + dSs（P 与 dS 各一份）
     red = 2 * res * 4  # Ls + Ds
-    return ks + ss + dp + ps + red
+    tmp = (nt // 32) * 64 * 4  # f32→MT 逐片转存暂存
+    return ks + ss + dp + ps + red + tmp
 
 
 def tgmem_combined(Dk, Dv, nt, strb):
@@ -126,7 +127,8 @@ def tgmem_combined(Dk, Dv, nt, strb):
     dp = ss  # DPs0 + DPs1
     ps = 2 * res * (strb + PAD_B) * 2  # Ps + dSs
     red = 2 * res * 4  # Ls + Ds（取 max(RES, STR)）
-    return stream + ss + dp + ps + red
+    tmp = (nt // 32) * 64 * 4  # f32→MT 逐片转存暂存
+    return stream + ss + dp + ps + red + tmp
 
 
 def tgmem_fwd(Dk, Dv, nt, strb):
@@ -136,7 +138,7 @@ def tgmem_fwd(Dk, Dv, nt, strb):
     vs = strb * (Dv + PAD_B) * 2
     ss = 2 * res * (strb + PAD_F) * 4
     tmp = (nt // 32) * 64 * 4
-    red = res * 4
+    red = 3 * res * 4  # ls + ms + as（online softmax）
     return ks + vs + ss + tmp + red
 
 
@@ -158,8 +160,13 @@ def tile_ok(Dk, Dv, nt, strb, strl=None):
 
 
 def fwd_str(Dk, Dv, nt):
-    """前向流过块高：优先 32，K/V 进 TG 塞不下时退到 16/8。"""
-    for s in (STR_LSE, 16, 8):
+    """前向流过块高。
+
+    Dk≥160 时 STR=16 的 f+b 优于 24/32（NHDK≥10 寄存器压）；更矮的
+    块高仍受 32KB TG 上限约束。Dk 较小时 STR=32 仍略快。
+    """
+    order = (16, 24, 32, 8) if Dk >= 160 else (32, 16, 8)
+    for s in order:
         if s % 8 == 0 and tgmem_fwd(Dk, Dv, nt, s) <= _TGMEM_LIMIT:
             return s
     return None
@@ -187,7 +194,8 @@ def _build_lse(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
         threadgroup float Ss1[RES * SF];
         threadgroup float ls[RES];
         threadgroup float ds[RES];
-        for (uint i = tid; i < RES; i += NT) ls[i] = 0.0f;
+        threadgroup float ms[RES];
+        for (uint i = tid; i < RES; i += NT) {{ ls[i] = 0.0f; ms[i] = -INFINITY; }}
 
         // delta = rowsum(dO * O), folded into the lse launch (same resident rows)
         float pd = 0.0f;
@@ -228,24 +236,39 @@ def _build_lse(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
                 simdgroup_store(Sf[c], Ss + (size_t)pair * 8 * SF + c * 8, SF);
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            float p = 0.0f;
+            // pass A 把带 mask/因果的 S 落回 Ss0，pass B 直接复用
+            float mblk = -INFINITY;
             uint gi = qs + row;
             for (uint j = chunk * (STR / 8); j < (chunk + 1) * (STR / 8); j++) {{
                 uint gj = ks + j;
                 float s = (Ss0[row * SF + j] + Ss1[row * SF + j]) * SCALE + {_mask_expr(has_mask)};
                 s = (gj <= gi) ? s : -INFINITY;
-                p += EXP(s);
+                Ss0[row * SF + j] = s;
+                mblk = metal::max(mblk, s);
+            }}
+            mblk = metal::max(mblk, simd_shuffle_xor(mblk, 1));
+            mblk = metal::max(mblk, simd_shuffle_xor(mblk, 2));
+            mblk = metal::max(mblk, simd_shuffle_xor(mblk, 4));
+            float mold = ms[row];
+            float mnew = metal::max(mold, mblk);
+            float alpha = (mold > -INFINITY) ? EXP(mold - mnew) : 0.0f;
+            float p = 0.0f;
+            for (uint j = chunk * (STR / 8); j < (chunk + 1) * (STR / 8); j++) {{
+                p += (mnew > -INFINITY) ? EXP(Ss0[row * SF + j] - mnew) : 0.0f;
             }}
             p += simd_shuffle_xor(p, 1);
             p += simd_shuffle_xor(p, 2);
             p += simd_shuffle_xor(p, 4);
-            if (chunk == 0) ls[row] += p;
+            if (chunk == 0) {{
+                ls[row] = ls[row] * alpha + p;
+                ms[row] = mnew;
+            }}
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = tid; i < RES; i += NT) {{
             // fully masked rows (padding) fall through as lse=0
             float l = ls[i];
-            lse[(size_t)bh * TQ + qs + i] = (l > 0.0f) ? metal::log(l) : 0.0f;
+            lse[(size_t)bh * TQ + qs + i] = (l > 0.0f) ? (ms[i] + metal::log(l)) : 0.0f;
         }}
     """
     )
@@ -262,9 +285,11 @@ def _build_lse(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
 def _build_fwd(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
     """Flash 前向：一次扫 K 写出 O 与 LSE。
 
-    不走在线缩放（每块把 O 卸到 TG 再乘 α 太贵）。P=exp(S) 留在 f32
-    Ss 里做 MMA，末尾再除以 Z；scale=1/sqrt(128) 下 exp(S) 不爆 f32。
-    K/V 一起进 TG。LSE 与旧 lse kernel 同口径：log(sum(exp(S)))。
+    Online softmax（FlashAttention-2）：每块 m_new=max(m, max S)，
+    P=exp(S−m_new)，O ← αO + P V，ℓ ← αℓ + sum(P)，α=exp(m−m_new)。
+    旧实现裸 exp(S) 在 S≳89 时 f32 溢出 → inf/inf=NaN（训练中后期
+    MLA RoPE 段无 QK-norm 就会打到这条线）。LSE 写 m+log(ℓ)。
+    accO 的 α 缩放走已有 Tmp 8×8 暂存，不另开 RES×Dv 的 TG。
     """
     res = res_split(nt)
     src = (
@@ -287,8 +312,13 @@ def _build_fwd(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
         threadgroup float Ss0[RES * SF];
         threadgroup float Ss1[RES * SF];
         threadgroup float ls[RES];
+        threadgroup float ms[RES];
+        threadgroup float as[RES];
         threadgroup float Tmp[NT / 32 * 64];
-        for (uint i = tid; i < RES; i += NT) ls[i] = 0.0f;
+        for (uint i = tid; i < RES; i += NT) {{
+            ls[i] = 0.0f;
+            ms[i] = -INFINITY;
+        }}
 
         simdgroup_matrix<MT, 8, 8> Qf[NHDK];
         const device MT* qp = q + ((size_t)bh * TQ + row0) * DK + side * HDK;
@@ -325,21 +355,54 @@ def _build_fwd(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
                 simdgroup_store(Sf[c], Ss + (size_t)pair * 8 * SF + c * 8, SF);
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            float psum = 0.0f;
+            // pass A 把带 mask/因果的 S 落回 Ss0，pass B 直接复用：省一次
+            // Ss1 读、一次 maskb 全局读与 mask/因果分支
+            float mblk = -INFINITY;
             uint gi = qs + row;
             for (uint j = chunk * (STR / 8); j < (chunk + 1) * (STR / 8); j++) {{
                 uint gj = ks + j;
                 float s = (Ss0[row * SF + j] + Ss1[row * SF + j]) * SCALE + {_mask_expr(has_mask)};
                 s = (gj <= gi) ? s : -INFINITY;
-                float p = EXP(s);
+                Ss0[row * SF + j] = s;
+                mblk = metal::max(mblk, s);
+            }}
+            mblk = metal::max(mblk, simd_shuffle_xor(mblk, 1));
+            mblk = metal::max(mblk, simd_shuffle_xor(mblk, 2));
+            mblk = metal::max(mblk, simd_shuffle_xor(mblk, 4));
+            float mold = ms[row];
+            float mnew = metal::max(mold, mblk);
+            float alpha = (mold > -INFINITY) ? EXP(mold - mnew) : 0.0f;
+            float psum = 0.0f;
+            for (uint j = chunk * (STR / 8); j < (chunk + 1) * (STR / 8); j++) {{
+                float p = (mnew > -INFINITY) ? EXP(Ss0[row * SF + j] - mnew) : 0.0f;
                 Ss0[row * SF + j] = p;
                 psum += p;
             }}
             psum += simd_shuffle_xor(psum, 1);
             psum += simd_shuffle_xor(psum, 2);
             psum += simd_shuffle_xor(psum, 4);
-            if (chunk == 0) ls[row] += psum;
+            if (chunk == 0) {{
+                ls[row] = ls[row] * alpha + psum;
+                ms[row] = mnew;
+                as[row] = alpha;
+            }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            // accO 行缩放。alpha=exp(m_old−m_new)：m 不变时为 1，可跳过。
+            // 不可把 alpha==0 当跳过——m 大跳时 exp 下溢成 0，必须把旧 O
+            // 清掉，否则新旧量纲混在一起（doc_mask 上会炸）。
+            float ax = as[pair * 8 + (lane & 7)];
+            if (kb == 0u || simd_any(ax != 1.0f)) {{
+                for (uint i = lane; i < 64; i += 32)
+                    Tmp[sg * 64 + i] = (i / 8 == i % 8) ? as[pair * 8 + i / 8] : 0.0f;
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                simdgroup_matrix<float, 8, 8> Af;
+                simdgroup_load(Af, Tmp + (size_t)sg * 64, 8);
+                for (uint e = 0; e < NHDV; e++) {{
+                    simdgroup_matrix<float, 8, 8> scaled;
+                    simdgroup_multiply(scaled, Af, accO[e]);
+                    accO[e] = scaled;
+                }}
+            }}
 
             for (uint c = 0; c < STR / 8; c++) {{
                 simdgroup_matrix<float, 8, 8> Pf;
@@ -353,23 +416,25 @@ def _build_fwd(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = tid; i < RES; i += NT)
-            lse[(size_t)bh * TQ + qs + i] = (ls[i] > 0.0f) ? metal::log(ls[i]) : 0.0f;
+            lse[(size_t)bh * TQ + qs + i] =
+                (ls[i] > 0.0f) ? (ms[i] + metal::log(ls[i])) : 0.0f;
         for (uint e = 0; e < NHDV; e++) {{
+            // Tmp 分片是本 simdgroup 私有的，用 simd 内 fence
             simdgroup_store(accO[e], Tmp + (size_t)sg * 64, 8);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             for (uint i = lane; i < 64; i += 32) {{
                 float z = ls[pair * 8 + i / 8];
                 float val = Tmp[sg * 64 + i] * ((z > 0.0f) ? (1.0f / z) : 0.0f);
                 o[((size_t)bh * TQ + qs + pair * 8 + i / 8) * DV
                   + side * HDV + e * 8 + (i % 8)] = MT(val);
             }}
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }}
     """
     )
     names = ["q", "k", "v"] + (["maskb"] if has_mask else [])
     return mx.fast.metal_kernel(
-        name=f"flash_fwd_v2_{Dk}_{Dv}_{Tq}_{Tk}_{nh}_{int(has_mask)}_{mt}_{nt}_{strb}",
+        name=f"flash_fwd_v3_{Dk}_{Dv}_{Tq}_{Tk}_{nh}_{int(has_mask)}_{mt}_{nt}_{strb}",
         input_names=names,
         output_names=["o", "lse"],
         source=src,
@@ -388,6 +453,7 @@ def _dq_src(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
         uint sg  = tid / 32;
         uint pair = sg >> 1;
         uint side = sg & 1;
+        uint lane = tid % 32;
         uint qs  = qb * RES;
         uint row0 = qs + pair * 8;
 
@@ -399,6 +465,8 @@ def _dq_src(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
         threadgroup MT Ps[RES * SP];
         threadgroup float Ls[RES];
         threadgroup float Ds[RES];
+        // f32 累加器 → MT 输出的逐片转存暂存（每 simdgroup 一片 8×8）
+        threadgroup float Tmp[NT / 32 * 64];
         for (uint i = tid; i < RES; i += NT) {{
             Ls[i] = lse[(size_t)bh * TQ + qs + i];
             Ds[i] = delta[(size_t)bh * TQ + qs + i];
@@ -414,7 +482,7 @@ def _dq_src(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
         for (uint d = 0; d < NHDK; d++) simdgroup_load(Qf[d], qp + d * 8, DK);
 
         const device MT* op = dout + ((size_t)bh * TQ + row0) * DV + side * HDV;
-        device float* dqp = dq + ((size_t)bh * TQ + row0) * DK + side * HDK;
+        device MT* dqp = dq + ((size_t)bh * TQ + row0) * DK + side * HDK;
 
         uint nkb = (qs + RES + STR - 1) / STR;
         for (uint kb = 0; kb < nkb; kb++) {{
@@ -482,8 +550,15 @@ def _dq_src(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
                 }}
             }}
         }}
-        for (uint dc = 0; dc < NHDK; dc++)
-            simdgroup_store(accLo[dc], dqp + dc * 8, DK);
+        // 最终 store 直接写 MT（训练即 bf16）：simdgroup f32 累加器经 Tmp
+        // 逐 8×8 片转出，舍入点与旧"f32 输出 + 外侧 astype"相同
+        for (uint dc = 0; dc < NHDK; dc++) {{
+            simdgroup_store(accLo[dc], Tmp + (size_t)sg * 64, 8);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lane; i < 64; i += 32)
+                dqp[(i / 8) * DK + dc * 8 + (i % 8)] = MT(Tmp[sg * 64 + i]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
     """
     )
     return src
@@ -493,7 +568,7 @@ def _build_dq(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
     src = _dq_src(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb)
     names = ["q", "k", "v", "dout", "lse", "delta"] + (["maskb"] if has_mask else [])
     return mx.fast.metal_kernel(
-        name=f"flash_dq_split_{Dk}_{Dv}_{Tq}_{Tk}_{nh}_{int(has_mask)}_{mt}_{nt}_{strb}",
+        name=f"flash_dq_split_v2_{Dk}_{Dv}_{Tq}_{Tk}_{nh}_{int(has_mask)}_{mt}_{nt}_{strb}",
         input_names=names,
         output_names=["dq"],
         source=src,
@@ -512,6 +587,7 @@ def _dkv_src(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
         uint sg  = tid / 32;
         uint pair = sg >> 1;
         uint side = sg & 1;
+        uint lane = tid % 32;
         uint kss = kbi * RES;
         uint row0 = kss + pair * 8;
 
@@ -524,6 +600,8 @@ def _dkv_src(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
         threadgroup MT dSs[RES * SP];
         threadgroup float Ls[STR];
         threadgroup float Ds[STR];
+        // f32 累加器 → MT 输出的逐片转存暂存（每 simdgroup 一片 8×8）
+        threadgroup float Tmp[NT / 32 * 64];
 
         // One pass over queries; each side keeps only its half of dK and dV.
         simdgroup_matrix<float, 8, 8> accK[NHDK];
@@ -535,8 +613,8 @@ def _dkv_src(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
 
         const device MT* kp = k + ((size_t)bh * TK + row0) * DK + side * HDK;
         const device MT* vp = v + ((size_t)bh * TK + row0) * DV + side * HDV;
-        device float* dkp = dk + ((size_t)bh * TK + row0) * DK + side * HDK;
-        device float* dvp = dv + ((size_t)bh * TK + row0) * DV + side * HDV;
+        device MT* dkp = dk + ((size_t)bh * TK + row0) * DK + side * HDK;
+        device MT* dvp = dv + ((size_t)bh * TK + row0) * DV + side * HDV;
         uint q0 = (kss / STR) * STR;
 
         for (uint qs = q0; qs < TQ; qs += STR) {{
@@ -618,10 +696,22 @@ def _dkv_src(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
                 }}
             }}
         }}
-        for (uint ec = 0; ec < NHDV; ec++)
-            simdgroup_store(accV[ec], dvp + ec * 8, DV);
-        for (uint dc = 0; dc < NHDK; dc++)
-            simdgroup_store(accK[dc], dkp + dc * 8, DK);
+        // 最终 store 直接写 MT（训练即 bf16）：simdgroup f32 累加器经 Tmp
+        // 逐 8×8 片转出，舍入点与旧"f32 输出 + 外侧 astype"相同
+        for (uint ec = 0; ec < NHDV; ec++) {{
+            simdgroup_store(accV[ec], Tmp + (size_t)sg * 64, 8);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lane; i < 64; i += 32)
+                dvp[(i / 8) * DV + ec * 8 + (i % 8)] = MT(Tmp[sg * 64 + i]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        for (uint dc = 0; dc < NHDK; dc++) {{
+            simdgroup_store(accK[dc], Tmp + (size_t)sg * 64, 8);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lane; i < 64; i += 32)
+                dkp[(i / 8) * DK + dc * 8 + (i % 8)] = MT(Tmp[sg * 64 + i]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
     """
     )
     return src
@@ -631,7 +721,7 @@ def _build_dkv(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
     src = _dkv_src(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb)
     names = ["q", "k", "v", "dout", "lse", "delta"] + (["maskb"] if has_mask else [])
     return mx.fast.metal_kernel(
-        name=f"flash_dkv_split_{Dk}_{Dv}_{Tq}_{Tk}_{nh}_{int(has_mask)}_{mt}_{nt}_{strb}",
+        name=f"flash_dkv_split_v2_{Dk}_{Dv}_{Tq}_{Tk}_{nh}_{int(has_mask)}_{mt}_{nt}_{strb}",
         input_names=names,
         output_names=["dk", "dv"],
         source=src,
@@ -692,6 +782,7 @@ def _build_dqkv(B, Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
         threadgroup MT dSs[RES * SP];
         threadgroup float Ls[RES];
         threadgroup float Ds[RES];
+        threadgroup float Tmp[NT / 32 * 64];
 
         if (mode == 0) {{
 {_branch(_dq_src(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb), True)}
@@ -702,7 +793,7 @@ def _build_dqkv(B, Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
     )
     names = ["q", "k", "v", "dout", "lse", "delta"] + (["maskb"] if has_mask else [])
     return mx.fast.metal_kernel(
-        name=f"flash_dqkv_{Dk}_{Dv}_{Tq}_{Tk}_{nh}_{int(has_mask)}_{mt}_{nt}_{strb}",
+        name=f"flash_dqkv_v2_{Dk}_{Dv}_{Tq}_{Tk}_{nh}_{int(has_mask)}_{mt}_{nt}_{strb}",
         input_names=names,
         output_names=["dq", "dk", "dv"],
         source=common,
@@ -738,7 +829,12 @@ def _build_lse_dp(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
         threadgroup float DPs1[RES * SF];
         threadgroup float ls[RES];
         threadgroup float ds[RES];
-        for (uint i = tid; i < RES; i += NT) {{ ls[i] = 0.0f; ds[i] = 0.0f; }}
+        threadgroup float ms[RES];
+        for (uint i = tid; i < RES; i += NT) {{
+            ls[i] = 0.0f;
+            ds[i] = 0.0f;
+            ms[i] = -INFINITY;
+        }}
 
         simdgroup_matrix<MT, 8, 8> Qf[NHDK];
         const device MT* qp = q + ((size_t)bh * TQ + row0) * DK + side * HDK;
@@ -786,14 +882,26 @@ def _build_lse_dp(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            float psum = 0.0f;
-            float dsum = 0.0f;
+            // pass A 把带 mask/因果的 S 落回 Ss0，pass B 直接复用
+            float mblk = -INFINITY;
             uint gi = qs + row;
             for (uint j = chunk * (STR / 8); j < (chunk + 1) * (STR / 8); j++) {{
                 uint gj = ks + j;
                 float s = (Ss0[row * SF + j] + Ss1[row * SF + j]) * SCALE + {_mask_expr(has_mask)};
                 s = (gj <= gi) ? s : -INFINITY;
-                float p = EXP(s);
+                Ss0[row * SF + j] = s;
+                mblk = metal::max(mblk, s);
+            }}
+            mblk = metal::max(mblk, simd_shuffle_xor(mblk, 1));
+            mblk = metal::max(mblk, simd_shuffle_xor(mblk, 2));
+            mblk = metal::max(mblk, simd_shuffle_xor(mblk, 4));
+            float mold = ms[row];
+            float mnew = metal::max(mold, mblk);
+            float alpha = (mold > -INFINITY) ? EXP(mold - mnew) : 0.0f;
+            float psum = 0.0f;
+            float dsum = 0.0f;
+            for (uint j = chunk * (STR / 8); j < (chunk + 1) * (STR / 8); j++) {{
+                float p = (mnew > -INFINITY) ? EXP(Ss0[row * SF + j] - mnew) : 0.0f;
                 psum += p;
                 dsum += p * (DPs0[row * SF + j] + DPs1[row * SF + j]);
             }}
@@ -803,12 +911,17 @@ def _build_lse_dp(Dk, Dv, Tq, Tk, nh, scale, has_mask, mt, nt, strb):
             dsum += simd_shuffle_xor(dsum, 1);
             dsum += simd_shuffle_xor(dsum, 2);
             dsum += simd_shuffle_xor(dsum, 4);
-            if (chunk == 0) {{ ls[row] += psum; ds[row] += dsum; }}
+            if (chunk == 0) {{
+                ls[row] = ls[row] * alpha + psum;
+                ds[row] = ds[row] * alpha + dsum;
+                ms[row] = mnew;
+            }}
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = tid; i < RES; i += NT) {{
             float l = ls[i];
-            lse[(size_t)bh * TQ + qs + i] = (l > 0.0f) ? metal::log(l) : 0.0f;
+            lse[(size_t)bh * TQ + qs + i] =
+                (l > 0.0f) ? (ms[i] + metal::log(l)) : 0.0f;
             delta[(size_t)bh * TQ + qs + i] = (l > 0.0f) ? (ds[i] / l) : 0.0f;
         }}
     """
