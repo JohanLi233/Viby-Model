@@ -12,6 +12,11 @@ from typing import Tuple
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from transformers import AutoTokenizer
+from model.flops import (
+    DEFAULT_PEAK_TFLOPS,
+    model_flops_utilization,
+    training_flops_per_token,
+)
 from model.model import VibyForCausalLM
 
 
@@ -44,16 +49,36 @@ def convert_model_dtype(model, dtype_name):
     return model
 
 
-def log_parameter_count(model):
+def log_parameter_count(model, args=None):
     total_params = model.num_parameters()
     trainable_params = sum(
         v.size for _, v in tree_flatten(model.trainable_parameters())
     )
     active_params = model.num_active_parameters()
+    ngram_params = model.ngram_lookup_parameters()
+    if ngram_params:
+        Logger(
+            f"总参数量：{total_params / 1e6:.3f}M"
+            f"（含 n-gram 表 {ngram_params / 1e6:.3f}M）, "
+            f"可训练参数量：{trainable_params / 1e6:.3f}M, "
+            f"每次激活：{active_params / 1e6:.3f}M（不含 n-gram 查找表）"
+        )
+    else:
+        Logger(
+            f"总参数量：{total_params / 1e6:.3f}M, "
+            f"可训练参数量：{trainable_params / 1e6:.3f}M, "
+            f"每次激活：{active_params / 1e6:.3f}M"
+        )
+    if args is None:
+        return
+    seq = int(getattr(args, "max_seq_len", 0) or 0)
+    peak = float(getattr(args, "peak_tflops", None) or DEFAULT_PEAK_TFLOPS)
+    args.peak_tflops = peak
+    flops = training_flops_per_token(model, seq) if seq > 0 else 0
+    args.flops_per_token = flops
     Logger(
-        f"总参数量：{total_params / 1e6:.3f}M, "
-        f"可训练参数量：{trainable_params / 1e6:.3f}M, "
-        f"每次激活：{active_params / 1e6:.3f}M"
+        f"训练 FLOPs/token：{flops / 1e9:.3f}G（6×激活 GEMM + softmax 注意力，"
+        f"MTP×steps），peak {peak:.1f} TFLOPS"
     )
 
 
@@ -173,7 +198,8 @@ def build_model_and_tokenizer(
     """
     model_path = getattr(args, "model_path", "./model/")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = VibyForCausalLM(lm_config)
+    # 严格加载基座时全部参数都会被 checkpoint 覆盖，跳过随机初始化
+    model = VibyForCausalLM(lm_config, skip_init=checkpoint_name is not None and strict)
 
     if checkpoint_name is not None:
         checkpoint_path = os.path.join(args.save_dir, checkpoint_name)
@@ -192,7 +218,7 @@ def build_model_and_tokenizer(
 
     convert_model_dtype(model, getattr(args, "dtype", ""))
 
-    log_parameter_count(model)
+    log_parameter_count(model, args)
     return model, tokenizer
 
 
@@ -207,6 +233,13 @@ _ARCH_ARG_KEYS = (
     "vocab_size",
     "intermediate_size",
     "use_attn_gate",
+    "attn_res_register",
+    "attn_res_read_h",
+    "ihc",
+    "ihc_streams",
+    "ihc_typed",
+    "ihc_collapse",
+    "ihc_ngram_stream",
     "mtp_depth",
     "mtp_loss_weight",
     "mtp_steps",
@@ -220,9 +253,16 @@ _ARCH_ARG_KEYS = (
     "moe_diversity_loss_weight",
     "z_loss_weight",
     "moe_latent_dim",
+    "moe_write_spread",
+    "moe_route_scale",
+    "first_k_dense_replace",
+    "dense_intermediate_size",
     "kda_v_head_ratio",
     "ngram_table_size",
     "ngram_layer",
+    "ngram_heads",
+    "ngram_logit_skip",
+    "ngram_conf_gate",
     "tie_word_embeddings",
     "use_linear_attn",
     "kv_lora_rank",
@@ -289,11 +329,27 @@ def init_swanlab(args, trainer):
         config["model.params_active_m"] = round(
             trainer.model.num_active_parameters() / 1e6, 3
         )
+        ngram_m = trainer.model.ngram_lookup_parameters() / 1e6
+        if ngram_m:
+            config["model.params_ngram_m"] = round(ngram_m, 3)
+        flops = getattr(args, "flops_per_token", None)
+        if flops:
+            config["model.flops_per_token"] = int(flops)
+        peak = getattr(args, "peak_tflops", None)
+        if peak:
+            config["train.peak_tflops"] = float(peak)
     except Exception:
         pass
 
-    # auto-resume 时尽量接回同一个 swanlab run；id 持久化在 out_dir 下。
-    run_id_path = os.path.join(args.save_dir, "swanlab_run_id.txt")
+    # auto-resume 时尽量接回同一个 swanlab run；id 按训练阶段持久化在 out_dir
+    # 下——pretrain/SFT/DPO 共享 out_dir，共用一个 run 会把不同阶段的
+    # loss 曲线混到同一块面板上。旧的无阶段后缀文件仅 pretrain 兼容回退。
+    training_type = getattr(trainer, "training_type", "pretrain")
+    run_id_path = os.path.join(args.save_dir, f"swanlab_run_id_{training_type}.txt")
+    if not os.path.exists(run_id_path) and training_type == "pretrain":
+        legacy = os.path.join(args.save_dir, "swanlab_run_id.txt")
+        if os.path.exists(legacy):
+            run_id_path = legacy
     run_id = None
     if os.path.exists(run_id_path):
         run_id = open(run_id_path, "r", encoding="utf-8").read().strip() or None
@@ -574,11 +630,8 @@ def save_checkpoint(
         mx.save_safetensors(step_ckp, weights)
         Logger(f"Step checkpoint saved: {step_ckp}")
 
-    # 优化器状态（打平为扁平字典后保存）
-    opt_path = os.path.join(args.save_dir, f"{ckp_name}.optimizer.safetensors")
-    mx.save_safetensors(opt_path, dict(tree_flatten(optimizer.state)))
-
-    # 元信息
+    # sidecar / latest 必须在优化器之前：optimizer 常数 GB，Ctrl-C 或写失败
+    # 会留下有权重无 json，eval 只能用残缺 CLI 配置建 MoE 然后炸掉。
     meta = {
         "epoch": epoch,
         "step": step,
@@ -590,13 +643,14 @@ def save_checkpoint(
     meta_path = os.path.join(args.save_dir, f"{ckp_name}.json")
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2, default=str)
-
-    Logger(f"Checkpoint saved: {ckp}")
-
-    # 保存最新的检查点路径 (使用绝对路径)
     latest_ckp = os.path.join(args.save_dir, "latest_checkpoint.txt")
     with open(latest_ckp, "w") as f:
         f.write(os.path.abspath(ckp))
+
+    opt_path = os.path.join(args.save_dir, f"{ckp_name}.optimizer.safetensors")
+    mx.save_safetensors(opt_path, dict(tree_flatten(optimizer.state)))
+
+    Logger(f"Checkpoint saved: {ckp}")
 
     model.train()
 
@@ -663,8 +717,13 @@ def find_latest_checkpoint(save_dir):
 
 
 def apply_lr_schedule(
-    optimizer, global_step, total_training_steps, warmup_iters, min_lr_ratio=0.05,
-    schedule="linear", wsd_decay_frac=0.2,
+    optimizer,
+    global_step,
+    total_training_steps,
+    warmup_iters,
+    min_lr_ratio=0.05,
+    schedule="linear",
+    wsd_decay_frac=0.2,
 ):
     """应用学习率调度（每微批 step 调用一次）。
 
@@ -721,6 +780,12 @@ def log_training_progress(
     effective_steps_done = max(1, (step - base_step_offset + 1))
     steps_per_sec = effective_steps_done / spend_time if spend_time > 0 else 0.0
     tokens_per_sec = steps_per_sec * args.batch_size * args.max_seq_len
+    flops_per_token = float(getattr(args, "flops_per_token", 0) or 0)
+    peak_tflops = float(getattr(args, "peak_tflops", None) or DEFAULT_PEAK_TFLOPS)
+    mfu = model_flops_utilization(tokens_per_sec, flops_per_token, peak_tflops)
+    achieved_tflops = (
+        tokens_per_sec * flops_per_token / 1e12 if flops_per_token else 0.0
+    )
     current_lr = get_current_lr(optimizer)
 
     loss_str = f"{current_loss:.3f}"
@@ -739,7 +804,8 @@ def log_training_progress(
     if unemb_lar is not None:
         lar_str = f" unemb_lar:{unemb_lar:.4f}"
 
-    log_msg = "Epoch:[{}/{}]({}/{}) loss:{}{} lr:{:.2e} grad_norm:{:.3f} step/s:{:.2f} tokens/s:{:.0f} eta:{}min".format(
+    mfu_str = f" mfu:{mfu:.1%}" if flops_per_token else ""
+    log_msg = "Epoch:[{}/{}]({}/{}) loss:{}{} lr:{:.2e} grad_norm:{:.3f} step/s:{:.2f} tokens/s:{:.0f}{} eta:{}min".format(
         epoch + 1,
         args.epochs,
         step,
@@ -750,6 +816,7 @@ def log_training_progress(
         grad_norm,
         steps_per_sec,
         tokens_per_sec,
+        mfu_str,
         int((iter_per_epoch - step - 1) / max(steps_per_sec, 1e-8) / 60),
     )
 
@@ -775,6 +842,9 @@ def log_training_progress(
             log_dict["z_loss"] = z_loss
         if unemb_lar is not None:
             log_dict["unembedding_lar"] = unemb_lar
+        if flops_per_token:
+            log_dict["mfu"] = mfu
+            log_dict["tflops"] = achieved_tflops
         if extra:
             log_dict.update(extra)
 

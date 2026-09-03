@@ -46,6 +46,17 @@ if __name__ == "__main__":
         mtp_loss_weight=args.mtp_loss_weight,
         mtp_steps=args.mtp_steps,
         use_attn_gate=args.use_attn_gate,
+        use_xsa=args.use_xsa,
+        xsa_last_n=getattr(args, "xsa_last_n", 0),
+        hidden_act=getattr(args, "hidden_act", "silu"),
+        attn_res_window=getattr(args, "attn_res_window", 4),
+        attn_res_register=getattr(args, "attn_res_register", False),
+        attn_res_read_h=getattr(args, "attn_res_read_h", False),
+        ihc=getattr(args, "ihc", False),
+        ihc_streams=getattr(args, "ihc_streams", 4),
+        ihc_typed=getattr(args, "ihc_typed", False),
+        ihc_collapse=getattr(args, "ihc_collapse", None),
+        ihc_ngram_stream=getattr(args, "ihc_ngram_stream", 1),
         n_routed_experts=args.n_routed_experts,
         num_experts_per_tok=args.num_experts_per_tok,
         n_shared_experts=args.n_shared_experts,
@@ -56,9 +67,20 @@ if __name__ == "__main__":
         moe_diversity_loss_weight=args.moe_diversity_loss_weight,
         z_loss_weight=args.z_loss_weight,
         moe_latent_dim=args.moe_latent_dim,
+        moe_write_spread=getattr(args, "moe_write_spread", False),
+        moe_route_scale=getattr(args, "moe_route_scale", False),
+        first_k_dense_replace=getattr(args, "first_k_dense_replace", 0),
+        **(
+            {"dense_intermediate_size": args.dense_intermediate_size}
+            if getattr(args, "dense_intermediate_size", None) is not None
+            else {}
+        ),
         kda_v_head_ratio=args.kda_v_head_ratio,
         ngram_table_size=args.ngram_table_size,
         ngram_layer=args.ngram_layer,
+        ngram_heads=getattr(args, "ngram_heads", 8),
+        ngram_logit_skip=getattr(args, "ngram_logit_skip", False),
+        ngram_conf_gate=getattr(args, "ngram_conf_gate", False),
         tie_word_embeddings=args.tie_word_embeddings,
         use_linear_attn=args.use_linear_attn,
         kv_lora_rank=args.kv_lora_rank,
@@ -82,6 +104,8 @@ if __name__ == "__main__":
         max_length=args.max_seq_len,
         pack_sequences=getattr(args, "pack_sequences", False),
         doc_mask=getattr(args, "doc_mask", False),
+        align_docs=getattr(args, "doc_align", True),
+        max_doc_len=getattr(args, "max_doc_len", None),
     )
     iter_per_epoch = len(train_ds) // args.batch_size  # drop_last 口径
     args = resolve_compute_scaled_hparams(args, iter_per_epoch)

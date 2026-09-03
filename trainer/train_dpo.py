@@ -90,8 +90,8 @@ def init_model(lm_config, args):
         checkpoint_label="SFT checkpoint",
     )
 
-    # 初始化参考模型
-    ref_model = VibyForCausalLM(lm_config)
+    # 初始化参考模型（严格加载 SFT 权重，随机初始化会被覆盖，跳过）
+    ref_model = VibyForCausalLM(lm_config, skip_init=True)
     convert_model_dtype(ref_model, getattr(args, "dtype", ""))
     # 与 policy 模型共用同一 config，严格加载：配置不一致时应直接报错，
     # 而不是静默跳过缺失参数
@@ -199,6 +199,8 @@ class DPOTrainer(BaseTrainer):
             # 跳过步骤（恢复训练时）
             if step < skip_steps:
                 continue
+            self._last_epoch = epoch
+            self._last_step = step
 
             # 合并数据
             x = mx.concatenate([batch["x_chosen"], batch["x_rejected"]], axis=0)

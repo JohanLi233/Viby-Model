@@ -59,8 +59,17 @@ if __name__ == "__main__":
     # 创建训练器
     trainer = BaseTrainer(args, model, tokenizer, lm_config, "sft")
 
-    # 创建数据集和数据加载器
-    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # 创建数据集和数据加载器（打包模式与 pretrain 同口径：定长块、无 pad、不截断）
+    if getattr(args, "doc_mask", False) and not getattr(args, "pack_sequences", False):
+        raise ValueError("--doc_mask 必须与 --pack_sequences 同时使用")
+    train_ds = SFTDataset(
+        args.data_path,
+        tokenizer,
+        max_length=args.max_seq_len,
+        pack_sequences=getattr(args, "pack_sequences", False),
+        doc_mask=getattr(args, "doc_mask", False),
+        empty_think_ratio=getattr(args, "empty_think_ratio", 0.0),
+    )
     train_loader = trainer.create_data_loader(train_ds)
 
     swanlab = init_swanlab(args, trainer)

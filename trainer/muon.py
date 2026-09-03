@@ -22,10 +22,17 @@ from mlx.utils import tree_flatten, tree_unflatten
 from . import snapshot
 
 _adamw_kernels: dict = {}
+_shapeful_adamw_kernels: dict = {}
 _stack_mom_kernels: dict = {}
 _stack_apply_kernels: dict = {}
+_polar_mom_kernels: dict = {}
 _ns_core_fns: dict = {}
 _fro_norm_kernels: dict = {}
+
+# shapeful AdamW 缓存上限（按形状+超参），超出回退 shapeless
+_SHAPEFUL_CACHE_MAX = 128
+# 逐 tensor 路径里多大才走 shapeful 编译（小于它是发射 bound，shapeless 即可）
+_SHAPEFUL_MIN_BYTES = 8 << 20
 
 # Newton-Schulz 五次数系数。
 # classic: Keller-Jordan 固定系数，5 步迭代共用一组。
@@ -450,21 +457,40 @@ def _stack_mom_kernel(m, nest, wd):
     return fn
 
 
-def _stack_apply_kernel(hyperball):
-    """P - lr*X，可选范数球投影。
+def _stack_apply_kernel(hyperball, apply_wd=0.0, cautious=False):
+    """P - lr*X，可选范数球投影与（cautious）解耦衰减。
 
     hyperball 版用 shapeful compile：内部 _fro_norm 的 Metal kernel
     grid 依赖具体形状，shapeless 追踪会把首次形状固化给所有组。
     非投影版保持 shapeless（纯逐元素，一个图通吃所有形状）。
+
+    apply_wd != 0：衰减从动量 kernel（耦合式 G += wd*P）移到此处做
+    解耦衰减（polar-ema 下动量建在极因子空间，耦合衰减无意义，只能
+    移到这里）。cautious=True 时再按 cautious weight decay（CWD，Chen
+    et al. 2025，arXiv 2510.12402；亦 speedrun 纪录组件；
+    autoresearch-mlx 战役 2026-09-01 双 regime keep：
+    d4@467 −0.0090 / d2@1070 −0.0034 bpb）加掩码——只在
+    sign(X)==sign(P) 的坐标上衰减：正在沿损失方向移动的坐标不被
+    无谓收缩，衰减税只落在被反向推（过冲/噪声主导）的坐标上。
+    掩码符号沿用参考实现的约定（作用于被减去的方向 X）。
     """
-    fn = _stack_apply_kernels.get(hyperball)
+    key = (hyperball, apply_wd, cautious)
+    fn = _stack_apply_kernels.get(key)
     if fn is None:
         if hyperball:
 
             @mx.compile
             def fn(P, X, lr):
-                NP = P - lr * X
+                # 范数球半径取衰减前的 P（冻结口径是「上一步建立的本体
+                # 半径」，衰减本身不该先缩它）。
                 n0 = _fro_norm_auto(P)
+                if apply_wd != 0:
+                    if cautious:
+                        mask = ((X * P) >= 0).astype(P.dtype)
+                        P = P * (1 - lr * apply_wd * mask)
+                    else:
+                        P = P * (1 - lr * apply_wd)
+                NP = P - lr * X
                 n1 = _fro_norm_auto(NP)
                 # 零初始化矩阵（如 GatedNorm.gate_up）范数球半径为 0，
                 # 直接投影会把参数永久钉死在 0（P18 实测：gate 全程恒等、
@@ -478,14 +504,85 @@ def _stack_apply_kernel(hyperball):
 
             @partial(mx.compile, shapeless=True)
             def fn(P, X, lr):
+                if apply_wd != 0:
+                    if cautious:
+                        mask = ((X * P) >= 0).astype(P.dtype)
+                        P = P * (1 - lr * apply_wd * mask)
+                    else:
+                        P = P * (1 - lr * apply_wd)
                 return P - lr * X
 
-        _stack_apply_kernels[hyperball] = fn
+        _stack_apply_kernels[key] = fn
     return fn
 
 
-def _adamw_kernel(b1, b2, eps, wd, bias_correction):
-    """(b1,b2,eps,wd,bias_correction) 对应的 mx.compile 融合 AdamW 更新。
+def _polar_mom_kernel(m):
+    """polar-ema 动量（autoresearch-mlx 战役 bar 组件）：EMA 建在极因子
+    空间而非梯度空间——O = NS(G) 先正交化，V ← m·V + O，Nesterov 读出
+    U = (1−m)·O + m·V。NS 每步全量重算（作用于原始梯度而非动量），
+    GEMM 数与标准路径相同，只是动量住的空间换了。"""
+    fn = _polar_mom_kernels.get(m)
+    if fn is None:
+
+        @partial(mx.compile, shapeless=True)
+        def fn(O, V):
+            V = m * V + O
+            U = (1.0 - m) * O + m * V
+            return U, V
+
+        _polar_mom_kernels[m] = fn
+    return fn
+
+
+def _normuon_tail(X, v, beta2):
+    """NorMuon 行 RMS 尾（arXiv 2510.05491）：神经元粒度的自适应。
+    X (…, r, c)，v (…, r) 为逐行二阶矩 EMA（None 时以首个样本播种）。
+    归一后整体 renorm 回尾前 F 范数——自适应性只重配行间预算，lr 的
+    标定语义不变。返回 (X_new, v_new)。"""
+    n0 = _fro_norm_auto(X)
+    row_sq = mx.mean((X * X).astype(mx.float32), axis=-1)
+    v_new = row_sq if v is None else beta2 * v + (1.0 - beta2) * row_sq
+    Xn = X / (mx.sqrt(v_new) + 1e-10)[..., None].astype(X.dtype)
+    n1 = _fro_norm_auto(Xn)
+    Xn = Xn * (n0 / mx.maximum(n1, 1e-12)).astype(X.dtype)
+    return Xn, v_new
+
+
+def _adamw_body(b1, b2, eps, wd, bias_correction, cautious=False):
+    """AdamW 更新链（未编译）。shapeless / shapeful 两个编译包装共用同一份
+    函数体，保证两条路径逐位一致。
+
+    cautious=True（cautious weight decay，CWD：Chen et al. 2025，
+    arXiv 2510.12402；autoresearch-mlx 战役双 regime keep）：衰减加掩码，只落在与 Adam
+    步同号的坐标上（该坐标正被损失利用则不收 decay 税）。wd==0 时
+    与原路径逐位一致。"""
+
+    def fn(p, g, m, v, lr, step):
+        m = b1 * m + (1 - b1) * g
+        v = b2 * v + (1 - b2) * mx.square(g)
+        if cautious and wd != 0:
+            # 掩码需要 Adam 步方向（不含 lr，符号等价）；bias 修正的
+            # 系数为正，不影响符号。
+            udir = m / (mx.sqrt(v) + eps)
+            mask = ((udir * p) >= 0).astype(p.dtype)
+            p = p * (1 - lr * wd * mask)
+        else:
+            # 算子顺序照抄 optim.AdamW.apply_single → Adam.apply_single：
+            # 先解耦 wd 缩放参数，再减去 Adam 步
+            p = p * (1 - lr * wd)
+        if bias_correction:
+            c1 = (lr / (1 - b1**step)).astype(p.dtype)
+            c2 = mx.rsqrt(1 - b2**step).astype(p.dtype)
+            p = p - (c1 * m) / (mx.sqrt(v) * c2 + eps)
+        else:
+            p = p - lr * m / (mx.sqrt(v) + eps)
+        return p, m, v
+
+    return fn
+
+
+def _adamw_kernel(b1, b2, eps, wd, bias_correction, cautious=False):
+    """(b1,b2,eps,wd,bias_correction,cautious) 对应的 mx.compile 融合 AdamW 更新。
 
     超参必须是 python float 而不是 traced 输入：MLX 的弱类型提升下
     `float * bf16 -> bf16`，换成 f32 数组会把整条链抬到 f32，数值和基类不再
@@ -496,27 +593,32 @@ def _adamw_kernel(b1, b2, eps, wd, bias_correction):
     (1-b1^t)/sqrt(1-b2^t)，beta2=0.9998 时前百余窗口放大 7~15 倍
     （r081_gqa_qb run 在 warmup 末端把 KDA 衰减参数推进 exp(-gc) 溢出区，
     前向永久 NaN）。
+
+    shapeless 版：一个图通吃所有形状（小 tensor / 堆叠组用）。
     """
-    key = (b1, b2, eps, wd, bias_correction)
+    key = (b1, b2, eps, wd, bias_correction, cautious)
     fn = _adamw_kernels.get(key)
     if fn is None:
-
-        @partial(mx.compile, shapeless=True)
-        def fn(p, g, m, v, lr, step):
-            m = b1 * m + (1 - b1) * g
-            v = b2 * v + (1 - b2) * mx.square(g)
-            # 算子顺序照抄 optim.AdamW.apply_single → Adam.apply_single：
-            # 先解耦 wd 缩放参数，再减去 Adam 步
-            p = p * (1 - lr * wd)
-            if bias_correction:
-                c1 = (lr / (1 - b1**step)).astype(p.dtype)
-                c2 = mx.rsqrt(1 - b2**step).astype(p.dtype)
-                p = p - (c1 * m) / (mx.sqrt(v) * c2 + eps)
-            else:
-                p = p - lr * m / (mx.sqrt(v) + eps)
-            return p, m, v
-
+        fn = partial(mx.compile, shapeless=True)(_adamw_body(*key))
         _adamw_kernels[key] = fn
+    return fn
+
+
+def _adamw_kernel_shapeful(b1, b2, eps, wd, bias_correction, shape, dtype, cautious=False):
+    """shapeful 版：按具体形状固化 grid 的编译 AdamW。
+
+    shapeless kernel 在 100M 级大 tensor（堆叠专家栈）上只跑到
+    ~250GB/s；shapeful 固化形状后 ~410GB/s（同进程对拍逐位一致）。
+    只给大 tensor 用：小 tensor 是发射 bound 且形状杂，shapeful 缓存
+    会膨胀；超过 _SHAPEFUL_CACHE_MAX 种形状回退 shapeless。
+    """
+    key = (b1, b2, eps, wd, bias_correction, tuple(shape), dtype, cautious)
+    fn = _shapeful_adamw_kernels.get(key)
+    if fn is None:
+        if len(_shapeful_adamw_kernels) >= _SHAPEFUL_CACHE_MAX:
+            return _adamw_kernel(b1, b2, eps, wd, bias_correction, cautious)
+        fn = mx.compile(_adamw_body(b1, b2, eps, wd, bias_correction, cautious))
+        _shapeful_adamw_kernels[key] = fn
     return fn
 
 
@@ -539,16 +641,54 @@ class FusedAdamW(optim.AdamW):
 
     同形状张量再堆成 (N,·) 一次更新：标量组 ~100 个小核变成每个形状
     1 次发射。单组超过 256MB 仍逐张量，避免再物化一份大栈。
+
+    逐张量路径里的大 tensor（>=8MB，堆叠专家栈）改用 shapeful 编译：
+    shapeless kernel 的动态形状索引在 100M 级 tensor 上只跑到
+    ~250GB/s，shapeful 固化 grid 后 ~410GB/s（同进程对拍逐位一致，
+    见 experiments/prof_target_step.py 的 [adamw kernel] 探针）。
     """
 
     _STACK_BYTES = 256 << 20
 
+    def __init__(self, *args, cautious=False, **kwargs):
+        # cautious weight decay（CWD，Chen et al. 2025，arXiv
+        # 2510.12402；autoresearch-mlx 战役
+        # 2026-09-01 双 regime keep）：掩码式解耦衰减，只衰减与 Adam 步
+        # 同号的坐标。wd==0 时逐位不变；create_mixed_optimizer 默认开启
+        # （VIBY_ADAM_CAUTIOUS=0 回退）。
+        self.cautious = cautious
+        super().__init__(*args, **kwargs)
+
+    def _kernel(self, shape, dtype):
+        """按形状选编译变体：大 tensor shapeful（带宽），小 tensor shapeless。"""
+        nbytes = int(dtype.size)
+        for s in shape:
+            nbytes *= int(s)
+        if nbytes >= _SHAPEFUL_MIN_BYTES:
+            return _adamw_kernel_shapeful(
+                self.betas[0],
+                self.betas[1],
+                self.eps,
+                self.weight_decay,
+                self.bias_correction,
+                shape,
+                dtype,
+                self.cautious,
+            )
+        return _adamw_kernel(
+            self.betas[0],
+            self.betas[1],
+            self.eps,
+            self.weight_decay,
+            self.bias_correction,
+            self.cautious,
+        )
+
     def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
         lr = self.learning_rate.astype(gradient.dtype)
-        b1, b2 = self.betas
-        p, m, v = _adamw_kernel(
-            b1, b2, self.eps, self.weight_decay, self.bias_correction
-        )(parameter, gradient, state["m"], state["v"], lr, self.step)
+        p, m, v = self._kernel(gradient.shape, gradient.dtype)(
+            parameter, gradient, state["m"], state["v"], lr, self.step
+        )
         state["m"] = m
         state["v"] = v
         return p
@@ -566,6 +706,7 @@ class FusedAdamW(optim.AdamW):
             self.eps,
             self.weight_decay,
             self.bias_correction,
+            self.cautious,
         )
         flat_g = tree_flatten(gradients)
         flat_p = dict(tree_flatten(parameters))
@@ -581,9 +722,10 @@ class FusedAdamW(optim.AdamW):
             for s in shape:
                 nbytes *= int(s)
             if len(paths) == 1 or nbytes > self._STACK_BYTES:
+                fn_t = self._kernel(shape, dt)
                 for path in paths:
                     st = _tree_get(self.state, path)
-                    p, m, v = fn(
+                    p, m, v = fn_t(
                         flat_p[path], gmap[path], st["m"], st["v"], lr, self.step
                     )
                     st["m"], st["v"] = m, v
@@ -605,15 +747,17 @@ class AdamH(FusedAdamW):
     """Adam 方向 + Frobenius 范数球投影（MuonH 体系中的 lm_head 组）。
 
     readout 的行是逐 token 词表语义，不做 NS 正交化；方向仍由 Adam 一
-    二阶矩给出，更新后 rescale 回更新前的 Frobenius 范数（fp32 算范数），
-    与 MuonH 同一超球约束：方向/范数解耦。wd 是径向分量，投影后近似
-    无操作，构造时置 0。lr 用 MuonH 的基础学习率而非 adam_lr。
+    二阶矩给出，更新后 rescale 回更新前的 Frobenius 范数（范数走
+    _fro_norm 融合 kernel：bf16 读入、f32 寄存器累加，与 MuonH 同口径，
+    不再每步物化两份 (V,D) f32），与 MuonH 同一超球约束：方向/范数解耦。
+    wd 是径向分量，投影后近似无操作，构造时置 0。lr 用 MuonH 的基础
+    学习率而非 adam_lr。
     """
 
     def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
-        n0 = mx.linalg.norm(parameter.astype(mx.float32))
+        n0 = _fro_norm_auto(parameter)
         p = super().apply_single(gradient, parameter, state)
-        n1 = mx.linalg.norm(p.astype(mx.float32))
+        n1 = _fro_norm_auto(p)
         return p * (n0 / mx.maximum(n1, 1e-12)).astype(p.dtype)
 
     def apply_gradients(self, gradients: dict, parameters: dict):
@@ -663,6 +807,9 @@ class BatchedMuon(optim.Muon):
         stack_ns_steps=None,
         head_dim=0,
         segment_map=None,
+        polar_ema=False,
+        normuon_beta2=0.0,
+        cautious_wd=False,
     ):
         super().__init__(
             learning_rate=learning_rate,
@@ -671,6 +818,28 @@ class BatchedMuon(optim.Muon):
             nesterov=nesterov,
             ns_steps=ns_steps,
         )
+        # ---- autoresearch-mlx 战役移植（2026-09-01，双 regime 验证）----
+        # polar_ema：动量 EMA 建在极因子空间——NS 每步作用于原始梯度 G，
+        # 动量/ Nesterov 读出都在 NS(G) 上做，读出后 renorm 回当前极因子
+        # 的 F 范数（尺度语义与标准路径一致）。是我们栈的 bar 组件。
+        # 注意：动量 buffer 语义变为极因子 EMA，与旧 checkpoint 的动量
+        # state 不兼容；wd 在此模式下从动量 kernel 移到 apply 阶段做
+        # 解耦衰减（极因子空间里耦合 wd 无意义）。
+        self.polar_ema = polar_ema
+        # NorMuon 行 RMS 尾（arXiv 2510.05491）：逐神经元二阶矩 EMA
+        # （β2=0.95）归一化正交化更新，再 renorm 回尾前 F 范数。bar 组件。
+        # v 存在 side dict（按组/per-tensor），不在 optimizer state 里——
+        # 续跑丢失后 ~20 步内热起来，可接受。
+        self.normuon_beta2 = float(normuon_beta2)
+        self._normuon_v = {}
+        # cautious_wd（CWD，Chen et al. 2025，arXiv 2510.12402；战役双
+        # regime keep：d4@467
+        # −0.0090 / d2@1070 −0.0034 bpb）：apply 阶段的解耦衰减加
+        # 逐坐标掩码 sign(X)==sign(P)。只在本组 weight_decay != 0 时有
+        # 意义（create_mixed_optimizer 默认 VIBY_MUON_WD=0.1）。
+        self.cautious_wd = cautious_wd
+        if polar_ema:
+            assert nesterov, "polar-ema 的读出公式即 Nesterov 形式"
         self.hyperball = hyperball
         # bf16 NS（Marin 口径：正交化 bf16、范数 fp32）：NS 是迭代求精，
         # bf16 精度足够，GEMM 减半字节流量。仅 muonh 下默认开。
@@ -829,12 +998,19 @@ class BatchedMuon(optim.Muon):
         lr0 = self.learning_rate
         new_params = {}
         new_v = {}
+        # polar-ema / cautious 下衰减从动量 kernel（耦合式 G += wd*P）移到
+        # apply 阶段：polar-ema 的动量住在极因子空间，耦合 wd 无意义；
+        # cautious 需要按更新方向掩码，动量 kernel 里拿不到 X。
+        decay_in_apply = self.polar_ema or self.cautious_wd
+        mom_wd = 0.0 if decay_in_apply else wd
+        apply_wd = wd if decay_in_apply else 0.0
         # snapshot 默认关闭；开启时整步只 int() 一次。否则每组一次
         # int(self.state["step"]) 就是每步每组一次 host sync（§3.5 纪律）。
         snap_step = int(self.state["step"]) if snapshot.active() else None
 
-        mom_fn = _stack_mom_kernel(m, nest, wd)
-        apply_fn = _stack_apply_kernel(self.hyperball)
+        mom_fn = _stack_mom_kernel(m, nest, mom_wd)
+        apply_fn = _stack_apply_kernel(self.hyperball, apply_wd, self.cautious_wd)
+        polar_mom_fn = _polar_mom_kernel(m) if self.polar_ema else None
 
         def momentum_stack(items, r, c):
             """逐元素部分（wd/动量/nesterov）整堆叠做，返回 (U, P, V, G.dtype)。"""
@@ -855,6 +1031,31 @@ class BatchedMuon(optim.Muon):
         for (r, c), items in groups.items():
             dt = flat_g[items[0][0]].dtype
             lr = lr0.astype(dt) * (max(1.0, r / c) ** 0.5)
+            if self.polar_ema:
+                # polar-ema：NS 前置到原始梯度上，动量建在极因子空间。
+                paths = [p for p, _ in items]
+                G = mx.stack([flat_g[p].reshape(r, c) for p in paths])
+                P = mx.stack([flat_p[p].reshape(r, c) for p in paths])
+                V = mx.stack([state_v[p].reshape(r, c) for p in paths])
+                O = (
+                    self._ns_edge(G, "std")
+                    if self._edge
+                    else self._orth(G)
+                    if self._no_ns
+                    else self._ns5(G)
+                )
+                U, V = polar_mom_fn(O, V)
+                # Nesterov 读出 renorm 回当前极因子的逐矩阵 F 范数。
+                X = U * (
+                    _fro_norm_auto(O) / mx.maximum(_fro_norm_auto(U), 1e-12)
+                ).astype(U.dtype)
+                if self.normuon_beta2 > 0:
+                    X, vn = _normuon_tail(
+                        X, self._normuon_v.get((r, c)), self.normuon_beta2
+                    )
+                    self._normuon_v[(r, c)] = vn
+                scatter_back(items, V, apply_fn(P, X, lr))
+                continue
             # 2D 组不用 Gram（_ns_auto 在非方阵上与 NS5 有谱差，warmup
             # 会把 MTP 打飞）。
             U, P, V, dt = momentum_stack(items, r, c)
@@ -873,6 +1074,11 @@ class BatchedMuon(optim.Muon):
                 if self._no_ns
                 else self._ns5(U)
             )
+            if self.normuon_beta2 > 0:
+                X, vn = _normuon_tail(
+                    X, self._normuon_v.get((r, c)), self.normuon_beta2
+                )
+                self._normuon_v[(r, c)] = vn
             scatter_back(items, V, apply_fn(P, X, lr))
 
         # MLA 合并投影：NS 与 lr 缩放按行段独立（等价未合并的逐矩阵 Muon）
@@ -908,11 +1114,28 @@ class BatchedMuon(optim.Muon):
             lr = lr0.astype(dt) * (max(1.0, r / c) ** 0.5)
             Us, Vs = [], []
             for path, orig in items:
-                U, Vn = mom_fn(
-                    flat_g[path].reshape(b, r, c),
-                    flat_p[path].reshape(b, r, c),
-                    state_v[path].reshape(b, r, c),
-                )
+                Gt = flat_g[path].reshape(b, r, c)
+                if self.polar_ema:
+                    # 与 2D 组同语义：NS 前置到原始梯度，动量在极因子空间。
+                    Ot = (
+                        self._ns_edge(Gt, "gram")
+                        if self._edge
+                        else self._orth(Gt)
+                        if self._no_ns
+                        else self._ns5_gram(Gt, steps=self.stack_ns_steps)
+                    )
+                    U, Vn = polar_mom_fn(
+                        Ot, state_v[path].reshape(b, r, c)
+                    )
+                    U = U * (
+                        _fro_norm_auto(Ot) / mx.maximum(_fro_norm_auto(U), 1e-12)
+                    ).astype(U.dtype)
+                else:
+                    U, Vn = mom_fn(
+                        Gt,
+                        flat_p[path].reshape(b, r, c),
+                        state_v[path].reshape(b, r, c),
+                    )
                 Us.append(U)
                 Vs.append(Vn)
             if snap_step is not None:
@@ -929,12 +1152,19 @@ class BatchedMuon(optim.Muon):
             # 堆叠专家一律 Gram-NS（短边迭代）。_ns_auto 会让方阵
             # 384×384 改走标准 NS5，谱差在 hyperball 下会被放大。
             for (path, orig), U, Vn in zip(items, Us, Vs):
-                if self._edge:
+                if self.polar_ema:
+                    Xo = U  # NS 已在动量前置段完成
+                elif self._edge:
                     Xo = self._ns_edge(U, "gram")
                 elif self._no_ns:
                     Xo = self._orth(U)
                 else:
                     Xo = self._ns5_gram(U, steps=self.stack_ns_steps)
+                if self.normuon_beta2 > 0:
+                    Xo, vn = _normuon_tail(
+                        Xo, self._normuon_v.get(path), self.normuon_beta2
+                    )
+                    self._normuon_v[path] = vn
                 new_v[path] = Vn.reshape(orig)
                 new_params[path] = (
                     apply_fn(flat_p[path].reshape(b, r, c), Xo, lr)
@@ -1034,18 +1264,21 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     双基础学习率：muon_lr（Muon/AdamH 组）与 adam_lr（AdamW 各组），由
     args.muon_lr / args.learning_rate 给出（train_pretrain 的
     resolve_compute_scaled_hparams 按 Hyperball compute 公式写入；SFT/DPO
-    未解析时 getattr 兜底回退单一 args.learning_rate 旧行为）。
+    未解析时 adam_lr 回退 args.learning_rate，muon_lr 按 13/3 × adam_lr
+    派生，上限 0.05）。
     Adam/AdamH 组的 beta2/eps 同样由 args.adam_beta2 / args.adam_eps 给出
     （兜底旧常数 0.95 / 1e-8），beta1 恒 0.9。
 
     参数分组：
     - Muon：ndim >= 2 且非嵌入/输出头/router/ShortConv 的核心权重矩阵，wd=0
     - AdamH(lm_head)：Adam 方向 + 范数球投影，lr = muon_lr（仅 muonh 下）
-    - AdamW(embed)：embed_tokens / lm_head / ngram 表，lr = adam_lr，wd=0.1
+    - AdamW(embed)：embed_tokens / lm_head，lr = adam_lr，wd=0.1
+    - Adam(ngram 表)：Engram 检索表，lr = adam_lr × 5，wd=0
+      （稀疏 gather 更新不适合 Muon/超球投影；Engram 论文规格）
     - AdamW(router)：base router/expert_bias，lr = adam_lr * 0.05
       （MOE_ROUTER_LR_MULT 可调），wd=0.1
-    - AdamW(scalar)：其余全部（含 ShortConv、零初始化门、1-D gain /
-      KDA A_log·dt_bias、AttnRes 查询），lr = adam_lr，**wd=0**
+    - AdamW(scalar)：其余全部（含 ShortConv、ngram w_v/conv_w 零初始化、
+      1-D gain / KDA A_log·dt_bias、AttnRes 查询），lr = adam_lr，**wd=0**
       （这些参数要么零初始化、要么有校准过的尺度；wd=0.1 会在 1-epoch
       内把它们径向缩到 ~10%）
     （SFT 时 embed/scalar lr 分别乘 0.1/0.3；embed wd=0.01，scalar wd=0）
@@ -1068,20 +1301,28 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     experts_in_muon = muonh and os.environ.get("VIBY_MUONH_EXPERTS", "1") == "1"
 
     # 双基础 lr + Adam 组超参（pretrain 由 resolve_compute_scaled_hparams
-    # 写入；未写入时回退单一 lr 与旧常数）
+    # 写入；未写入时 adam_lr 回退 args.learning_rate，muon_lr 按 Marin
+    # 口径 13/3 × adam_lr 派生——与 pretrain「auto + 手动 lr」规则一致。
+    # Muon 正交化步长语义本就需要数倍于 Adam 的 lr，1:1 兜底会让 SFT 的
+    # 矩阵组步长与 pretrain 校准口径（r086: adam 1.55e-3 / muon 6.7e-3）
+    # 脱节；该比例与是否开 hyperball 投影无关（投影约束权重范数，不改步长）。
     adam_lr = float(getattr(args, "adam_lr", None) or args.learning_rate)
-    muon_lr = float(getattr(args, "muon_lr", None) or args.learning_rate)
+    _muon_lr_arg = getattr(args, "muon_lr", None)
+    if _muon_lr_arg:
+        muon_lr = float(_muon_lr_arg)
+    else:
+        muon_lr = min(0.05, (13.0 / 3.0) * adam_lr)
     beta2 = float(getattr(args, "adam_beta2", None) or 0.95)
     eps = float(getattr(args, "adam_eps", None) or 1e-8)
 
     def _is_embed(path, arr):
         # 精确匹配嵌入/输出头路径段："embed" 子串会误吞 embed_norm 的
         # gate_down/gate_up（2-D 矩阵，按 spec 属 Muon 组）
-        return (
-            "embed_tokens" in path
-            or "lm_head" in path
-            or (".ngram." in path and arr.ndim >= 2)
-        )
+        return "embed_tokens" in path or "lm_head" in path
+
+    def _is_ngram_table(path, arr):
+        # Engram 检索表：稀疏 gather 更新，走独立 Adam 组（5× lr、wd=0）
+        return ".ngram.table" in path
 
     def _is_adamh(path, arr):
         # lm_head readout：Adam 方向 + 范数球投影（AdamH 类），仅 muonh 下
@@ -1098,6 +1339,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
                 ".v_conv.",
                 ".out_conv.",
                 ".mlp_out_conv.",
+                ".ngram.conv_w",
             )
         )
 
@@ -1119,6 +1361,11 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
             and "attn_gate" not in path
             and ".g_proj." not in path
             and path.rsplit(".", 1)[-1] != "gate_up"
+            # 零初始化 (E, D) 写出对角：MuonH 半径 0 会永久钉零
+            and path.rsplit(".", 1)[-1] != "write_scale"
+            # Engram：表走独立 Adam 组；w_v 零初始化，hyperball 半径 0 钉零
+            and ".ngram.table" not in path
+            and ".ngram.w_v." not in path
         )
 
     def _is_router(path, arr):
@@ -1131,6 +1378,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         for p, a in trainable
         if _is_embed(p, a) and not _is_muon(p, a) and not _is_adamh(p, a)
     )
+    ngram_table_count = sum(1 for p, a in trainable if _is_ngram_table(p, a))
     router_count = sum(
         1 for p, a in trainable if _is_router(p, a) and not _is_muon(p, a)
     )
@@ -1140,6 +1388,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         if not _is_muon(p, a)
         and not _is_adamh(p, a)
         and not _is_embed(p, a)
+        and not _is_ngram_table(p, a)
         and not _is_router(p, a)
     )
 
@@ -1151,6 +1400,8 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     if muonh:
         Logger(f"  - AdamH 参数组 (lm_head): {adamh_count} 个张量")
     Logger(f"  - 嵌入层参数组: {embed_count} 个张量")
+    if ngram_table_count:
+        Logger(f"  - Engram 检索表参数组 (Adam 5x lr, wd=0): {ngram_table_count} 个张量")
     Logger(f"  - MoE router 参数组: {router_count} 个张量")
     Logger(f"  - 标量参数组: {scalar_count} 个张量")
 
@@ -1173,22 +1424,66 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     hd = int(getattr(getattr(model, "config", None), "head_dim", 0) or 0)
     if os.environ.get("VIBY_MUONH_PER_HEAD", "0") != "1":
         hd = 0
-    muon_opt = BatchedMuon(
-        learning_rate=muon_lr,  # Muon 用 muon 基础学习率（13/3 × adam_lr）
-        momentum=0.95,
-        weight_decay=0.0,
-        ns_steps=int(getattr(args, "muon_ns_steps", 5)),
-        hyperball=muonh,
-        head_dim=hd,
-        segment_map=_mla_segment_map(model),
-        # muonh 加速旋钮（默认路径 muonh=False 时全部不影响数值）：
-        # NS 迭代 bf16（范数仍 fp32）；逐专家 NS 的迭代步数
-        ns_bf16=muonh and os.environ.get("VIBY_MUONH_NS_BF16", "1") == "1",
-        stack_ns_steps=int(os.environ.get("VIBY_MUONH_STACK_NS_STEPS", "0")) or None,
-        # 正交化固定每步全量重算。曾有的 NS 降频复用（EVERY=8）与
-        # Temporal Q 缓存是 r082 回退的最大单项元凶（早期 −0.4~0.5 nat，
-        # probe_p1/p5），已删除——负面结果见 BatchedMuon 类 docstring。
+    # autoresearch-mlx 战役（2026-09-01 结算）验证出的优化器组件。
+    # 默认开：NorMuon 行 RMS 尾、cautious weight decay（muon 组与 Adam
+    # 组）；默认关：polar-ema（用户决策 2026-09-02：先不上生产默认，
+    # VIBY_MUON_POLAR_EMA=1 手动开）。均与 muonh/hyperball 兼容（测试
+    # 覆盖见 tests/test_campaign_optim.py）：
+    # - VIBY_MUON_POLAR_EMA=1：开 polar-ema（动量 EMA 建在极因子空间：
+    #   NS 前置到原始梯度，Nesterov 读出 renorm 回逐矩阵 F 范数）。
+    # - VIBY_MUON_NORMUON=0：关 NorMuon 行 RMS 尾（arXiv 2510.05491，
+    #   beta2=0.95，归一后 renorm 回尾前 F 范数）。
+    # - VIBY_MUON_CAUTIOUS=0 / VIBY_MUON_WD：cautious weight decay
+    #   （Liang et al. 2024；战役双 regime keep：d4@467 −0.0090 /
+    #   d2@1070 −0.0034 bpb），muon 组 wd 默认 0.1。
+    # - VIBY_ADAM_CAUTIOUS=0：关 FusedAdamW 各组（embed/router 有 wd）
+    #   的 cautious 衰减；wd=0 的组（scalar/ngram/AdamH）本就无操作。
+    _polar_ema = os.environ.get("VIBY_MUON_POLAR_EMA", "0") == "1"
+    _normuon = os.environ.get("VIBY_MUON_NORMUON", "1") == "1"
+    _muon_cautious = os.environ.get("VIBY_MUON_CAUTIOUS", "1") == "1"
+    _muon_wd = float(os.environ.get("VIBY_MUON_WD", "0.1"))
+    _adam_cautious = os.environ.get("VIBY_ADAM_CAUTIOUS", "1") == "1"
+    # KL-SOAP-H（arXiv 2607.20548 Algorithm 2 + arXiv 2509.03378；hyperball
+    # 投影）：VIBY_KLSOAP=1 时矩阵组整体改走 KLSoaPH 替代 BatchedMuon
+    # （MLA 不切段、无 per-head；lr = muon_lr × VIBY_KLSOAP_LR_MULT；
+    # cautious/wd 沿用上面两个 env）。polar-ema/normuon 是 Muon 系组件，
+    # 对 KL-SOAP 无意义，不接。栈内未验证，默认关。
+    _klsoap = os.environ.get("VIBY_KLSOAP", "0") == "1"
+    Logger(
+        "战役优化器组件: polar_ema=%s normuon=%s muon_cautious=%s "
+        "(muon wd=%g) adam_cautious=%s klsoap=%s（env 可逐项开关）"
+        % (_polar_ema, _normuon, _muon_cautious, _muon_wd, _adam_cautious, _klsoap)
     )
+    if _klsoap:
+        from .klsoap import KLSoaPH
+
+        muon_opt = KLSoaPH(
+            learning_rate=muon_lr * float(os.environ.get("VIBY_KLSOAP_LR_MULT", "1.0")),
+            weight_decay=_muon_wd,
+            cautious=_muon_cautious,
+            hyperball=muonh,
+            basis_freq=int(os.environ.get("VIBY_KLSOAP_F", "1")),
+        )
+    else:
+        muon_opt = BatchedMuon(
+            learning_rate=muon_lr,  # Muon 用 muon 基础学习率（13/3 × adam_lr）
+            momentum=0.95,
+            weight_decay=_muon_wd,
+            polar_ema=_polar_ema,
+            normuon_beta2=0.95 if _normuon else 0.0,
+            cautious_wd=_muon_cautious,
+            ns_steps=int(getattr(args, "muon_ns_steps", 5)),
+            hyperball=muonh,
+            head_dim=hd,
+            segment_map=_mla_segment_map(model),
+            # muonh 加速旋钮（默认路径 muonh=False 时全部不影响数值）：
+            # NS 迭代 bf16（范数仍 fp32）；逐专家 NS 的迭代步数
+            ns_bf16=muonh and os.environ.get("VIBY_MUONH_NS_BF16", "1") == "1",
+            stack_ns_steps=int(os.environ.get("VIBY_MUONH_STACK_NS_STEPS", "0")) or None,
+            # 正交化固定每步全量重算。曾有的 NS 降频复用（EVERY=8）与
+            # Temporal Q 缓存是 r082 回退的最大单项元凶（早期 −0.4~0.5 nat，
+            # probe_p1/p5），已删除——负面结果见 BatchedMuon 类 docstring。
+        )
     adamh_head = AdamH(
         learning_rate=muon_lr,  # AdamH 用 MuonH 的基础 lr（muon_lr），非 adam_lr
         betas=[0.9, beta2],
@@ -1202,6 +1497,16 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         eps=eps,
         weight_decay=adam_wd,
         bias_correction=True,
+        cautious=_adam_cautious,
+    )
+    # Engram 检索表：论文规格 Adam 5× lr、wd=0（稀疏 gather 更新，wd 会
+    # 把大量未被检索的行径向缩没）
+    adamw_ngram_table = FusedAdamW(
+        learning_rate=adam_lr * embed_lr_mult * 5.0,
+        betas=[0.9, beta2],
+        eps=eps,
+        weight_decay=0.0,
+        bias_correction=True,
     )
     adamw_router = FusedAdamW(
         learning_rate=adam_lr * router_lr_mult,
@@ -1209,6 +1514,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         eps=eps,
         weight_decay=adam_wd,
         bias_correction=True,
+        cautious=_adam_cautious,
     )
     adamw_scalar = FusedAdamW(
         learning_rate=adam_lr * scalar_lr_mult,
@@ -1222,6 +1528,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     muon_opt.base_lr = muon_lr
     adamh_head.base_lr = muon_lr
     adamw_embed.base_lr = adam_lr * embed_lr_mult
+    adamw_ngram_table.base_lr = adam_lr * embed_lr_mult * 5.0
     adamw_router.base_lr = adam_lr * router_lr_mult
     adamw_scalar.base_lr = adam_lr * scalar_lr_mult
 
@@ -1233,6 +1540,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         muon_opt,
         adamh_head,
         adamw_embed,
+        adamw_ngram_table,
         adamw_router,
         adamw_scalar,
     ]
@@ -1240,6 +1548,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         muon_count,
         adamh_count,
         embed_count,
+        ngram_table_count,
         router_count,
         scalar_count,
     ]
@@ -1247,6 +1556,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         _is_muon,
         _is_adamh,
         _is_embed,
+        _is_ngram_table,
         _is_router,
         None,
     ]

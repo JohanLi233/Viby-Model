@@ -123,7 +123,10 @@ class DraftTrainer(BaseTrainer):
     （主干冻结、QB 偏置不更新），日志位以草稿 CE 填充。
     """
 
-    def _loss_fn(self, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None):
+    def _loss_fn(
+        self, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None, compute_lar=False
+    ):
+        # compute_lar 仅为主干 LAR 诊断服务；草稿训练不输出 LAR（占位 0）
         ce = draft_ttt_loss(
             self.model,
             X,
@@ -206,6 +209,8 @@ if __name__ == "__main__":
         max_length=args.max_seq_len,
         pack_sequences=getattr(args, "pack_sequences", False),
         doc_mask=getattr(args, "doc_mask", False),
+        align_docs=getattr(args, "doc_align", True),
+        max_doc_len=getattr(args, "max_doc_len", None),
     )
     train_loader = trainer.create_data_loader(train_ds)
 
