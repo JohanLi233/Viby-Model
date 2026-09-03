@@ -148,7 +148,8 @@ print(f"bwd 下界 {el * 14 / BW * 1e3:.2f}ms")       # x+dy+dx+dz 往返
 
 | 对象 | 实测 | 上界 | 倍数 | 结论 |
 |------|------|------|------|------|
-| KDA scan f+b | 15.01 ms | 带宽下界 3.24 ms | **4.6×** | 发射几何/occupancy 问题，值得做 |
+| KDA scan f+b | 15.01 ms | 带宽下界 3.24 ms | **4.6×** | 发射几何/occupancy 问题，值得做（H=8 旧口径；几何 sweep 后残余见下行） |
+| KDA scan f+b（H=16 真实口径，2026-08-31） | 23~26 ms | 带宽下界 5.32 ms | **4.4×** | 标量 JB 分块 fwd/bwd 都卡 ~1.5 TF/s，几何再 sweep 只有 2.9% ⇒ 根因是标量 FMA 天花板，换 simdgroup MMA 后 12.79 ms / 2.4×下界（1.81×，见 §9） |
 | flash bwd（早期） | 3.2 TFLOPS | MMA 12 | **3.8×** | MMA 操作数形态不对，值得做 |
 | MoE 整层 | 7.9 TFLOPS | 12.9 | 1.6× | 差距在索引和碎片 GEMM，收益有限 |
 | MoE gather_mm 单独 | 12.7~13.1 TF/s（均匀/倾斜/真实路由三者基本同速） | 同 FLOPs 稠密均匀 batched GEMM 13.4 TF/s | **1.05×** | 手写分段 GEMM 不值得做，见下行注 |
@@ -234,6 +235,18 @@ mx.set_cache_limit(int(cache_gb * 1024**3))   # --cache_limit_gb
 - 历史上曾出现 optimizer 临时 buffer 污染 freelist 拖慢激活分配
   （**243 → 442 ms/步**）；BatchedMuon 批量化后临时块少且形状固定，
   各档上限扫描均未复现。
+- **长跑要重新看这条（2026-08-29，1551M n-gram 配方，48GB 机）。**「不限
+  缓存」在**头 100 步更快**，之后被限缓存反超且差距持续拉大：
+
+  | 步 | cache=0（不限） | cache=8G |
+  |----|----|----|
+  | 20 | 12,217 tok/s（70.7%） | 11,753（68.0%） |
+  | 100 | 11,522（66.7%） | 11,466（66.3%） |
+  | 190 | 10,697（61.9%） | **11,121（64.4%）** |
+
+  不限缓存时 `cache` 稳定在 ~22G、`active` ~13G，合计 ~35G/48G——不触发
+  swap，但常驻页变多会抬高统一内存的整体功耗，与 §7.3 的降频叠加。
+  **结论：短 bench 用大缓存，真长跑（>1k 步）把上限压到 8~12G。**
 
 ### 3.4 不要每步 `mx.clear_cache()`
 
@@ -258,6 +271,22 @@ mx.clear_cache()
 - compile 图内需要观测的量（MoE 负载、QB margin）**必须作为 loss 的
   返回值**随图物化；写在 Python 属性上的侧信道会被 DCE 剪成无
   primitive 的占位数组，日志时 eval 不出来。
+
+### 3.6 梯度累加必须每个微批物化
+
+`accum_grads = tree_map(mx.add, accum_grads, grads)` 不 eval 的话，窗口内
+每个微批的梯度树都被下一条 add 引用着、全部钉在内存里：本配方一份梯度树
+**~3.1GB**，`accum=8` 就是 ~22GB。表现不是 OOM，而是**窗口后半段的微批
+越来越慢**——1551M/bs12×1024 实测微批从 978ms 涨到 1111ms（+13.6%），
+accum 越大越糟（这也是 `accum` 从 2 往上加时收益很快见顶的原因之一）。
+
+```python
+accum_grads = tree_map(mx.add, accum_grads, grads)
+mx.eval(accum_grads)   # 常驻降到「累加器 + 当前梯度」两份
+```
+
+数值逐位不变（只是求值时机）。同口径实测 accum=8 末行 **11,068 → 11,895
+tok/s（+7.5%）**。开关：`VIBY_ACCUM_EAGER=0` 退回旧行为。
 
 ---
 
@@ -542,7 +571,8 @@ MMA 只有 **1.3 TFLOPS**；让 B 每次从 threadgroup 载入反而是
 |------|------|
 | flash | `NTHREADS=256`, `STR=16`（dq/dkv）, `STR_LSE=32`, split-D `RES=32` |
 | conv | `_T_BLOCK=128`, `_TG_W=128`, `_DW_T_CHUNKS=128` |
-| kda_scan | `dv_split=2`, `nt_fwd=256`, `nt_bwd=256`, 寄存器分块 `JB=6` |
+| kda_scan（标量回退） | `dv_split=2`, `nt_fwd=256`, `nt_bwd=256`, 寄存器分块 `JB=6` |
+| kda_scan（MMA 默认路径） | `NT=4·D=384`（12 simdgroup），fwd 只 stage `-w`（qe/kd device 直读），bwd `dS` 常驻 TG + `dqe/dw` 拼接 GEMM 上提到 VJP；守卫 `C=16, D=DV, D%16==0`，TG≤30KB，否则回退标量 |
 | attn_res | 256 threads, `_MAX_N=26` |
 | ce / gated_norm / swiglu | 256 threads/行 |
 
@@ -750,6 +780,32 @@ l₀=0.007（cubic5）5.245 → l₀=0.05（b05）**5.223** → l₀=0.10（b10�
 内、成本相同，按预注册规则翻默认为 **cubic5b05**。切换复现：
 `VIBY_MUONH_NS_COEFF=classic|pe|cubic5|cubic5b05|cubic5b10`。
 
+**⑨ 优化器窗口是 MFU 的主杠杆，不是 kernel 问题。** 2026-08-29 在 1551M
+n-gram 配方（bs12×1024、48GB 机）上拆出来的整步结构：
+
+| 段 | ms/微批 | 说明 |
+|----|----|----|
+| fwd+bwd+eager 累加 | ~985 | 9.6 TFLOP / 985ms ≈ 9.7 TF/s，已是峰值的 ~72% |
+| optimizer（摊到每微批） | 44~66 | accum=12 / 8；**窗口净开销 ~530ms，与 batch 无关** |
+
+优化器**只随窗口数发生、不随 token 数发生**，所以提高
+`accumulation_steps` 是把固定成本摊薄的唯一大杠杆。NS 的 GEMM 已在
+~11.8 TF/s（§9），kernel 级只剩 <10%；`ns_steps 5→3` 省 ~60ms/窗口，
+在 accum≥8 时摊到 <5ms/微批，不值得动质量。
+
+**⑩ QB margin 统计是 accum 的隐藏 O(A²) 项。** 窗口内 margin 张量是
+`(n_gates, 12288·A, 128)` f32：
+
+- 跨微批 `concatenate` 的拷贝量 ∝ A²（A=16 时 ~7.2GB 搬运）；
+- 窗口末 `update_moe_biases` 的 `_col_quantile` 在 MLX 0.32 被转成
+  `gpu_merge_sort`，成本随行数**超线性**增长：实测 A=8→16 让优化器净开销
+  从 ~530ms 涨到 ~780ms/窗口。
+
+分位数对样本量极不敏感（每专家的 0.9375 上分位点由 N·0.0625 个上尾样本
+决定，N=16384 时每专家仍有 ~1024 个）。按 `VIBY_QB_STATS_ROWS`（默认
+16384）沿 token 轴等距抽稀后，张量尺寸与 A 无关。打包语料下 token 轴是
+「先 T 后 B」的展平顺序，等距抽样在文档间均匀散开，不偏向特定文档。
+
 ---
 
 ## 7. 失败清单（试过、更慢或被回退）
@@ -791,6 +847,9 @@ l₀=0.007（cubic5）5.245 → l₀=0.05（b05）**5.223** → l₀=0.10（b10�
 | D=128 单遍 dkv（两套累加器） | 寄存器撑爆；改两遍扫 query |
 | kda_scan「每线程一输出元素」朴素版 | 与 eager 同速；需寄存器分块 + 发射几何 sweep |
 | kda_scan fwd 用 Dv 全片 | 36KB > 32KB 上限；改 `dv_split=2` |
+| kda_scan MMA 把 qe/kd 也 stage 进 TG | NT=192 全 stage 5.0ms，vs 只 stage `-w` 3.35ms——qe/Aqk 作 A 操作数 device 直读更快，省下的 TG 换 NT=384 占用 |
+| kda_scan MMA bwd 里算 dqe/dw（各读一遍 Sall） | Sall 是最大流量项；上提到 VJP 用 `concat([cot_o,du]) @ Sᵀ` 一遍读完，bwd 10.5→8.7ms |
+| 用跨进程 bench_train_step 背靠背判定 kernel 收益 | 热节流下同配置窗口内漂移可达 30%、连 optimizer 段都慢 8%，曾把 1.8× 的 kernel 收益「测成」整步 −6%；必须同进程成对交替（`ab_kda_mma.py`：两份 compile 图在不同标志下 trace）或带冷却间隔的 A/B/A 括号取 min |
 | conv 不做 T 分块 | 9216 线程 ≈ 20% 占用 |
 | conv dw 用 atomic 输出 | 改 partial sum + host 归约 |
 | situ 一维 grid + `i/half` 除法 | 37.7M 元素上 fwd **慢 5×**；改二维 grid |
@@ -852,9 +911,13 @@ l₀=0.007（cubic5）5.245 → l₀=0.05（b05）**5.223** → l₀=0.10（b10�
 | `VIBY_MUONH_MOM_WARMUP` | 0.85→0.95 动量 warmup（默认 0；隔离实测单独无害也无益，r081 基线无此机制） |
 | `VIBY_SITU=0` | SiTU-GLU 回退无界 SwiGLU（A/B 用；实测早期无差异） |
 | `VIBY_KDA_SCAN_ZSC=0` | 关掉 kda_scan 反向的「状态 cotangent 恒零」特化（A/B 用） |
+| `VIBY_KDA_SCAN_MMA=0` | 关掉 kda_scan 的 simdgroup MMA 路径，回退标量寄存器分块核（A/B 用） |
 
 （`VIBY_MUONH_STACK_NS_EVERY` / `VIBY_MUONH_CACHE_Q` / `VIBY_MUONH_CACHE_Q_RES`
 已随 NS 降频复用机制一并删除——r082 归因质量灾难，见 §7.1。）
+| `VIBY_ACCUM_EAGER=0` | 梯度累加退回「惰性链」旧行为（A/B 用，见 §3.6） |
+| `VIBY_OPT_CHUNKED_EVAL=1` | optimizer 末尾按 512MB 分块 eval 参数树，替代一次性 eval(参数+state)（A/B 用，见 §6 ⑨） |
+| `VIBY_QB_STATS_ROWS=N` | 每个累积窗口喂给 QB 偏置的 margin 样本行数上限，0=不抽稀（默认 16384，见 §6 ⑩） |
 | `VIBY_DEBUG_MEM=1` | 打印 active/cache/peak + 分 gate 负载 + 桶容量 |
 | `VIBY_BENCH_B/T/D/E/I/K` | benchmark 脚本的形状口径 |
 
@@ -877,6 +940,30 @@ fwd+bwd（f+b）。
 | 一次 eval vs 两次 eval | 46 GB / 4.0 s → ~16 GB / 快 2× |
 | cache_limit 10G → 24G（bs16×640） | 提速 4.5%（峰值 14.8G，峰值+缓存 ≈39G） |
 | optimizer 占整步 | 历史上 ~48%（含每 8 步 NS 刷新摊平）；cubic5b05 + 每步全量 NS 口径（2026-08-25 实测）：**窗口 2620ms，fwd 590 / bwd 1175 / opt 833（31.8%），9380 tok/s，峰值 22.8GB**；专家组去 stack 逐张量化后 opt 段 833→789ms 中位（同进程 probe 口径 −41ms，逐位一致）。opt 中专家 NS GEMM ~660ms @ ~11.8 TF/s，已贴近 bf16 GEMM 峰值——优化器侧再无 kernel 级余量，只剩质量门控的算法杠杆（如 ns_steps 5→3，bench_muonh 示 −220ms/步） |
+
+### 1551M n-gram 配方：累积窗口 / 缓存上限（2026-08-29）
+
+口径：bs12×1024、M4 Max 48GB、`--compile_model`、0.781G FLOPs/token、
+peak 13.5。全部含 §3.6 的 eager 累加；cache=8G 两行另含 §6 ⑩ 的 QB
+抽稀。**看累积平均 tok/s（与训练日志同口径），不是边际值。**
+
+| 配置 | step 10 | step 100 | step 190/200 | 边际 ms/微批 |
+|------|------|------|------|------|
+| accum=2, cache=0（改前） | 10,745 / 62.2% | — | — | ~1165 且持续恶化 |
+| accum=8, cache=0 | 12,064 / 69.8% | 11,522 / 66.7% | 10,697 / 61.9% | 995 → 1309（**+32%**） |
+| accum=8, cache=8G | 11,736 / 67.9% | 11,466 / 66.3% | 11,121 / 64.4% | 1051 → 1182（+12%） |
+| **accum=12, cache=8G** | **12,009 / 69.5%** | **11,771 / 68.1%** | **11,635 / 67.3%** | 1042 → 1111（**+7%**） |
+
+结论：
+
+1. **accum 2→12 是主收益**（优化器窗口数降到 1/6），且**大窗口 + 限缓存
+   的热稳定性明显更好**——边际耗时几乎不随时间漂移，这对 48 小时的长跑
+   比峰值数字更重要。
+2. `cache_limit_gb=0` 只在**头 ~100 步**更快，之后被反超并持续拉开
+   （§3.3）。短 bench 与长跑的最优值不同，**不要拿 bench 的缓存结论直接
+   用到长跑**。
+3. 即使最好的配置，边际耗时也随步数涨 7~12%：这是**降频**（§7.3），软件
+   侧无解。报 MFU 必须说明是第几步。
 
 ### 组件（每层）
 
@@ -908,6 +995,7 @@ fwd+bwd（f+b）。
 | BatchedMuon | ~1700 → ~16 kernel/形状组 |
 | decode kernel 融合 | KDA ~28→1、GatedNorm ~7→1、MoE ~18→3 |
 | kda_scan ZSC（训练时 cot_Sall 恒零特化，逐位等价） | scan bwd 9.66→8.16 ms、`_chunk_kda` f+b 17.26→16.21 ms/层（同进程 compile 口径）；整步 bwd min 1173.0→1163.7 ms、峰值 22.83→22.67 GB（背靠背 bench，min 口径） |
+| kda_scan simdgroup MMA（2026-08-31，B=6 T=2048 H=16 D=96 真实形状） | 同进程成对 A/B：scan_zsc f+b 26.09→14.24 ms（1.83×）、`_chunk_kda_zsc` f+b 36.00→24.06 ms（1.49×）；整步 A/B/A min 口径 1482.9→1406.6 ms（−5.1%），吞吐 8287→8736 tok/s，MFU 43.9→46.3%（`ab_kda_mma.py`） |
 
 ### 硬件上限
 
@@ -929,7 +1017,8 @@ fwd+bwd（f+b）。
 | 硬件 MMA / simdgroup 上限 | `probe_mma_peak.py` / `probe_mma_operand.py` / `probe_simdgroup.py` |
 | flash tile 搜索 | `sweep_flash_tile.py` |
 | conv tile 搜索 | `sweep_conv_tile.py` |
-| kda_scan 发射几何搜索 | `sweep_kda_scan.py` |
+| kda_scan 发射几何搜索（标量版） | `sweep_kda_scan.py` |
+| kda_scan MMA 变体原型 / 收益验证 | `probe_kda_scan_mma.py` / `ab_kda_mma.py` |
 | 检查融合 kernel 有没有静默回退 | `verify_prewarm.py` / `probe_kernel_fallback.py` |
 | 检查 Muon NS 缓存路径 | `verify_muon_hit.py` |
 | 数值对拍 | `verify_flash_bwd.py` / `verify_kda_prep.py` / `verify_fused_adamw.py` |

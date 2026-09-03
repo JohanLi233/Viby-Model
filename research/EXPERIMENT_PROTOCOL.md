@@ -112,7 +112,7 @@ VIBY_SNAPSHOT_STEPS=150,300,500,750,950 \
 5. 跨 seed 噪声：σ≈0.11（P25 实测），配对差 ±0.05 以内算中性；小于此幅度
    不要下结论。
 6. 改优化器代码后跑四个测试：
-   `.venv/bin/python -m pytest test_align.py test_consistency.py test_kda.py test_muonh_zeroinit.py`
+   `.venv/bin/python -m pytest tests/test_align.py tests/test_consistency.py tests/test_kda.py tests/test_muonh_zeroinit.py`
 7. 改完代码核对注释/docstring 是否还描述旧行为（dt_bias 注释曾与实际 init 差 10×）。
 8. **发散处理**（P40 教训）：loss 先 spike 后 nan 且不再恢复 = 参数已污染，
    该 run 作废但须如实记录（nan guard 只跳过当窗更新，挡不住已污染的参数）。
