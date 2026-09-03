@@ -158,7 +158,9 @@ def analyze(q, k, k_null):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run_dir", default="research_runs/r084_gqa_qb_e256k8w384")
-    ap.add_argument("--data_path", default="/Volumes/pan/text/pretrain_t2t_mini_dedup.jsonl")
+    ap.add_argument(
+        "--data_path", default="/Volumes/pan/text/pretrain_t2t_mini_dedup.jsonl"
+    )
     ap.add_argument("--t", type=int, default=4096)
     ap.add_argument("--n_seq", type=int, default=4)
     ap.add_argument("--mode", default="packed", choices=["packed", "single"])
@@ -178,7 +180,9 @@ def main():
             )
     kda_mod._chunk_kda = _make_capture_wrapper()
 
-    seqs = iter_sequences(args.data_path, tokenizer, args.t, args.n_seq, args.mode, args.seed)
+    seqs = iter_sequences(
+        args.data_path, tokenizer, args.t, args.n_seq, args.mode, args.seed
+    )
     # 前 N-1 条作测量，序列 si+1 的 key 作序列 si 的跨序列零模型
     all_caps, layers = [], None
     for ids in seqs:
@@ -188,7 +192,9 @@ def main():
         mx.eval(out.logits if hasattr(out, "logits") else out[0])
         if layers is None:
             layers = len(_captures)
-            print(f"[capture] {layers} 个 KDA 层，每层 q/k 形状 {_captures[0][0].shape}")
+            print(
+                f"[capture] {layers} 个 KDA 层，每层 q/k 形状 {_captures[0][0].shape}"
+            )
         all_caps.append(list(_captures))
     _captures.clear()
     H = all_caps[0][0][0].shape[0]

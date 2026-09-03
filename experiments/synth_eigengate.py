@@ -74,9 +74,7 @@ def run_stream(k, v, log_g, beta, gates, q=None, rhos=None):
     gates = [
         (g, 1.0) if g is not None and not isinstance(g, tuple) else g for g in gates
     ]
-    coeffs = [
-        eigengate.cubic_coeffs(l0=g[0]) if g is not None else None for g in gates
-    ]
+    coeffs = [eigengate.cubic_coeffs(l0=g[0]) if g is not None else None for g in gates]
     if rhos is not None and any(r > 0 for r in rhos):
         rho_vec = mx.array(rhos, dtype=mx.float32)[:, None, None]  # (B,1,1)
     else:
@@ -98,7 +96,9 @@ def run_stream(k, v, log_g, beta, gates, q=None, rhos=None):
             for b in range(B):
                 if coeffs[b] is not None:
                     Sb = eigengate.apply(
-                        S[b : b + 1], lam=gates[b][1], coeffs=coeffs[b],
+                        S[b : b + 1],
+                        lam=gates[b][1],
+                        coeffs=coeffs[b],
                         target="keep",
                     )
                     S = mx.concatenate([S[:b], Sb, S[b + 1 :]], axis=0) if B > 1 else Sb
@@ -129,10 +129,15 @@ def _parity_check():
         v = rng.normal(size=(B, T, d)).astype(np.float32) / d**0.5
         lg = (-0.01 * rng.random(size=(B, T, d))).astype(np.float32)
         bt = (0.8 * rng.random(size=(B, T))).astype(np.float32)
-        S_mine = run_stream(mx.array(k), mx.array(v), mx.array(lg), mx.array(bt), [None] * B)
+        S_mine = run_stream(
+            mx.array(k), mx.array(v), mx.array(lg), mx.array(bt), [None] * B
+        )
         _, S_ref = _recurrent_kda(
-            mx.array(k[:, None]), mx.array(k[:, None]), mx.array(v[:, None]),
-            mx.array(lg[:, None]), mx.array(bt[:, None]),
+            mx.array(k[:, None]),
+            mx.array(k[:, None]),
+            mx.array(v[:, None]),
+            mx.array(lg[:, None]),
+            mx.array(bt[:, None]),
         )
         mx.eval(S_ref)
         dmax = np.abs(np.array(S_mine) - np.array(S_ref[:, 0])).max()
@@ -195,9 +200,7 @@ def exp1(seed):
     cells = [(None, 0.0), (None, 0.001)] + [
         (l0, dec) for l0 in (0.01, 0.05, 0.15) for dec in (0.0, 0.001)
     ]
-    labels = [
-        ("off" if l0 is None else f"l0={l0}") + f",g={dec}" for l0, dec in cells
-    ]
+    labels = [("off" if l0 is None else f"l0={l0}") + f",g={dec}" for l0, dec in cells]
     gates = [l0 for l0, _ in cells]
     print(f"\n=== Exp1 MQAR 容量（热键 25%×8 次，β=0.8，period={PERIOD}）===")
     for keytype in ("iid", "corr"):
@@ -246,11 +249,9 @@ def exp2(seed):
     cells = [(None, 0.0), (None, 0.001)] + [
         (l0, dec) for l0 in (0.01, 0.05, 0.15) for dec in (0.0, 0.001)
     ]
-    labels = [
-        ("off" if l0 is None else f"l0={l0}") + f",g={dec}" for l0, dec in cells
-    ]
+    labels = [("off" if l0 is None else f"l0={l0}") + f",g={dec}" for l0, dec in cells]
     gates = [l0 for l0, _ in cells]
-    print(f"\n=== Exp2 needle（t=0 一次写入 β=1，随后 m 个一次性干扰 β=0.8）===")
+    print("\n=== Exp2 needle（t=0 一次写入 β=1，随后 m 个一次性干扰 β=0.8）===")
     for m in (D, 2 * D, 4 * D, 8 * D):
         T = 1 + m
         ks = np.zeros((len(cells), T, D), np.float32)
@@ -307,14 +308,21 @@ def exp3(seed):
     lg = np.broadcast_to(log_g_c[None, None, :], (len(cells), T, D)).copy()
     bts = np.full((len(cells), T), 0.8, np.float32)
     S = run_stream(
-        mx.array(ks), mx.array(vs), mx.array(lg), mx.array(bts),
+        mx.array(ks),
+        mx.array(vs),
+        mx.array(lg),
+        mx.array(bts),
         [g for _, _, g in cells],
     )
     e = rel_rmse(S, mx.array(keys_q), mx.array(vals_q))
-    print(f"\n=== Exp3 旋转 key（m={m}，各向异性衰减适配旧基，{T // PERIOD} 次门控）===")
+    print(
+        f"\n=== Exp3 旋转 key（m={m}，各向异性衰减适配旧基，{T // PERIOD} 次门控）==="
+    )
     for ci, (lab, _, _) in enumerate(cells):
-        print(f"  {lab:<18}median RMSE = {np.median(e[ci]):.3f}  "
-              f"p90 = {np.percentile(e[ci], 90):.3f}")
+        print(
+            f"  {lab:<18}median RMSE = {np.median(e[ci]):.3f}  "
+            f"p90 = {np.percentile(e[ci], 90):.3f}"
+        )
 
 
 # ---------------------------------------------------------------- Exp 4
@@ -328,13 +336,10 @@ def exp4(seed):
     """
     rng = np.random.default_rng(seed)
     cells = [(None, 0.0)] + [
-        ((l0, lam), 0.001)
-        for l0 in (0.01, 0.05)
-        for lam in (0.25, 0.5, 1.0)
+        ((l0, lam), 0.001) for l0 in (0.01, 0.05) for lam in (0.25, 0.5, 1.0)
     ]
     labels = [
-        ("off,g=0" if g is None else f"l0={g[0]},lam={g[1]},g=.001")
-        for g, _ in cells
+        ("off,g=0" if g is None else f"l0={g[0]},lam={g[1]},g=.001") for g, _ in cells
     ]
     gates = [g for g, _ in cells]
     print(f"\n=== Exp4 λ 扫描（period={PERIOD}）===")
@@ -408,14 +413,19 @@ def exp5(seed):
                 for dec in (0.0, 0.001):
                     lg = np.full((1, T, D), -dec, np.float32)
                     S = run_stream(
-                        mx.array(ks[None]), mx.array(vs[None]), mx.array(lg),
-                        mx.array(bts[None]), [None],
+                        mx.array(ks[None]),
+                        mx.array(vs[None]),
+                        mx.array(lg),
+                        mx.array(bts[None]),
+                        [None],
                     )
                     Sn = np.array(S[0]).astype(np.float64)
                     A = Sn @ Sn.T
                     dist = np.linalg.norm(A / np.linalg.norm(A) - H / np.linalg.norm(H))
                     print(f" g={dec}  diag||SSᵀ−H||_F/||·||_F = {dist:.3f}")
-                    for lab, e in _spr_rows(Sn, keys.astype(np.float64), vals.astype(np.float64)):
+                    for lab, e in _spr_rows(
+                        Sn, keys.astype(np.float64), vals.astype(np.float64)
+                    ):
                         eh, ec = np.median(e[:n_hot]), np.median(e[n_hot:])
                         print(
                             f"  g={dec:<7}{lab:<8} hot {eh:.3f}  "
@@ -432,12 +442,17 @@ def exp5(seed):
         for dec in (0.0, 0.001):
             lg = np.full((1, T, D), -dec, np.float32)
             S = run_stream(
-                mx.array(keys[None]), mx.array(vals[None]), mx.array(lg),
-                mx.array(bts[None]), [None],
+                mx.array(keys[None]),
+                mx.array(vals[None]),
+                mx.array(lg),
+                mx.array(bts[None]),
+                [None],
             )
             Sn = np.array(S[0]).astype(np.float64)
             out = []
-            for lab, e in _spr_rows(Sn, keys[:1].astype(np.float64), vals[:1].astype(np.float64)):
+            for lab, e in _spr_rows(
+                Sn, keys[:1].astype(np.float64), vals[:1].astype(np.float64)
+            ):
                 out.append(f"{lab} {e[0]:.3f}")
             print(f"  g={dec:<7}needle: " + "  ".join(out))
 
@@ -540,8 +555,14 @@ def _run_np(k, v, log_g, beta, key_ids=None, replay=None):
         if e is not None:
             e["q"] += 1
         elif beta[t] > 0:
-            e = {"k": k[t].copy(), "v": v[t].copy(),
-                 "s": float(np.linalg.norm(delta)), "q": 0, "last": t, "id": kid}
+            e = {
+                "k": k[t].copy(),
+                "v": v[t].copy(),
+                "s": float(np.linalg.norm(delta)),
+                "q": 0,
+                "last": t,
+                "id": kid,
+            }
             if len(buf) < R:
                 buf.append(e)
                 by_id[kid] = e
@@ -574,10 +595,10 @@ def _rel_rmse_np(S, keys, vals):
 
 def exp7(seed):
     """E1′：巩固回放。预测（touch 未达门槛的同一把尺子）：
-      query-hot 0.87 → ≤0.35（R≥热键数时），改善 <0.1 → kill；
-      rewrite 中性（复写清零赤字，回放近无操作——由 deficit 列直接验证）；
-      once 无复用负载 = 污染上界（剂量-反应）；
-      iso-D=124 对照：同等额外内存扩容必须输，否则回放只是变相扩容。
+    query-hot 0.87 → ≤0.35（R≥热键数时），改善 <0.1 → kill；
+    rewrite 中性（复写清零赤字，回放近无操作——由 deficit 列直接验证）；
+    once 无复用负载 = 污染上界（剂量-反应）；
+    iso-D=124 对照：同等额外内存扩容必须输，否则回放只是变相扩容。
     """
     global D, DV
     rng = np.random.default_rng(seed)
@@ -636,13 +657,17 @@ def exp7(seed):
                         D = DV = 124
                         try:
                             keys_i = _make_keys(rng, m, keytype)
-                            vals_i = (
-                                rng.normal(size=(m, DV)) / DV**0.5
-                            ).astype(np.float64)
+                            vals_i = (rng.normal(size=(m, DV)) / DV**0.5).astype(
+                                np.float64
+                            )
                             lg_i = np.full((T, D), -dec)
                             S, _, _ = _run_np(
-                                keys_i[idx].astype(np.float64), vals_i[idx],
-                                lg_i, bts, idx, None,
+                                keys_i[idx].astype(np.float64),
+                                vals_i[idx],
+                                lg_i,
+                                bts,
+                                idx,
+                                None,
                             )
                             e = _rel_rmse_np(S, keys_i, vals_i)
                             eh, ec = np.median(e[:n_hot]), np.median(e[n_hot:])
@@ -680,8 +705,14 @@ def _run_np2(k, v, log_g, beta, key_ids=None, replay=None):
         if e is not None:
             e["q"] += 1
         elif beta[t] > 0:
-            e = {"k": k[t].copy(), "v": v[t].copy(),
-                 "s": float(np.linalg.norm(delta)), "q": 0, "last": t, "id": kid}
+            e = {
+                "k": k[t].copy(),
+                "v": v[t].copy(),
+                "s": float(np.linalg.norm(delta)),
+                "q": 0,
+                "last": t,
+                "id": kid,
+            }
             if len(buf) < R:
                 buf.append(e)
                 by_id[kid] = e
@@ -695,9 +726,9 @@ def _run_np2(k, v, log_g, beta, key_ids=None, replay=None):
             if mode == "lru":
                 sel = sorted(buf, key=lambda e: (-e["q"], e["last"]))[:B]
             elif mode == "deficit":
-                sel = sorted(
-                    buf, key=lambda e: -np.linalg.norm(e["v"] - e["k"] @ S)
-                )[:B]
+                sel = sorted(buf, key=lambda e: -np.linalg.norm(e["v"] - e["k"] @ S))[
+                    :B
+                ]
             else:
                 sel = [buf[(rr_ptr + j) % len(buf)] for j in range(min(B, len(buf)))]
                 rr_ptr = (rr_ptr + B) % len(buf)
@@ -774,7 +805,10 @@ def exp9(seed):
             lg = np.full((len(betas), T, D), -dec, np.float32)
             bts = np.array(betas, np.float32)[:, None] * np.ones((1, T), np.float32)
             S = run_stream(
-                mx.array(ks), mx.array(vs), mx.array(lg), mx.array(bts),
+                mx.array(ks),
+                mx.array(vs),
+                mx.array(lg),
+                mx.array(bts),
                 [None] * len(betas),
             )
             e = rel_rmse(S, mx.array(kq), mx.array(vq))
@@ -783,7 +817,9 @@ def exp9(seed):
             for ci, bw in enumerate(betas):
                 eh, ec = np.median(e[ci, :n_hot]), np.median(e[ci, n_hot:])
                 hots.append(eh)
-                print(f"  β={bw:<5} hot {eh:.3f}  cold {ec:.3f}  all {np.median(e[ci]):.3f}")
+                print(
+                    f"  β={bw:<5} hot {eh:.3f}  cold {ec:.3f}  all {np.median(e[ci]):.3f}"
+                )
             lb, lh = np.log(np.array(betas)), np.log(np.array(hots))
             slope = np.polyfit(lb, lh, 1)[0]
             print(f"  log-log 斜率（hot ~ β^x）: x = {slope:.2f}  [预测 0.5]")
@@ -794,7 +830,8 @@ def exp9(seed):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--exp", default="all",
+        "--exp",
+        default="all",
         choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "all"],
     )
     ap.add_argument("--seed", type=int, default=0)

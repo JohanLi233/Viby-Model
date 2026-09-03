@@ -25,7 +25,8 @@ from model.kernels.kda_scan import kda_scan_metal
 
 B = int(os.environ.get("VIBY_BENCH_B", 12))
 T = int(os.environ.get("VIBY_BENCH_T", 1024))
-H = 8
+# scan 跑在 V 头上：kda_v_head_ratio=2 → H=16（旧口径 8，数字不可混比）
+H = int(os.environ.get("VIBY_BENCH_H", 16))
 Dh = 96
 C = KDA_CHUNK
 NC = T // C

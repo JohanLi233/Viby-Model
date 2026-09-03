@@ -20,6 +20,11 @@ import numpy as np
 from mlx.utils import tree_map
 
 from model.config import VibyConfig
+from model.flops import (
+    DEFAULT_PEAK_TFLOPS,
+    model_flops_utilization,
+    training_flops_per_token,
+)
 from model.model import VibyForCausalLM
 from trainer.muon import create_mixed_optimizer
 
@@ -361,6 +366,15 @@ def main():
         f"吞吐: {med['tokens_per_second']:.0f} tokens/s（中位口径） / "
         f"{cycle['tokens_per_second']:.0f}（周期均值） / "
         f"{best['tokens_per_second']:.0f}（min）"
+    )
+    flops = training_flops_per_token(model, T)
+    mfu_med = model_flops_utilization(med["tokens_per_second"], flops)
+    mfu_cycle = model_flops_utilization(cycle["tokens_per_second"], flops)
+    mfu_best = model_flops_utilization(best["tokens_per_second"], flops)
+    print(
+        f"MFU: {mfu_med:.1%}（中位） / {mfu_cycle:.1%}（周期均值） / "
+        f"{mfu_best:.1%}（min）  "
+        f"[{flops / 1e9:.2f}G FLOPs/token, peak {DEFAULT_PEAK_TFLOPS:.1f} TFLOPS]"
     )
     print(f"峰值内存: {mx.get_peak_memory() / 2**30:.2f} GB")
 

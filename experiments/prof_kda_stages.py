@@ -18,7 +18,15 @@ import mlx.core as mx
 from mlx.utils import tree_map
 
 from model.config import VibyConfig
-from model.kda import KDA_CHUNK, KDA_G_MIN, KDAAttention, _chunk_kda, _rms_unit
+from model.kda import (
+    KDA_CHUNK,
+    KDA_G_MIN,
+    KDAAttention,
+    _chunk_kda,
+    _repeat_heads,
+    _rms_unit,
+    kda_out_gate,
+)
 from model.kernels import prewarm_all
 
 B = int(os.environ.get("VIBY_BENCH_B", 12))
@@ -33,6 +41,7 @@ cfg = VibyConfig(
     max_position_embeddings=T,
     mtp_depth=1,
     use_attn_gate=True,
+    use_linear_attn=True,
     n_routed_experts=256,
     num_experts_per_tok=8,
     n_shared_experts=2,
@@ -58,11 +67,14 @@ m.train()
 # 落在 compile trace 里会被吞掉并永久回退 eager（分段数据会整体失真）。
 prewarm_all(m, cfg, mx.bfloat16, T, log=print)
 H, Dh = m.n_heads, m.head_dim
+Hv, n_rep = m.n_v_heads, m.n_rep_v
 
 x = (mx.random.normal((B, T, D)) * 0.5).astype(mx.bfloat16)
 seg = mx.cumsum((mx.random.uniform(shape=(B, T)) < 1 / 340).astype(mx.int32), axis=1)
 mx.eval(x, seg)
-print(f"B={B} T={T} H={H} head_dim={Dh} chunk={KDA_CHUNK} NC={T // KDA_CHUNK}\n")
+print(
+    f"B={B} T={T} H={H} Hv={Hv} head_dim={Dh} chunk={KDA_CHUNK} NC={T // KDA_CHUNK}\n"
+)
 
 
 def timed(fn, it=6, w=3):
@@ -89,8 +101,12 @@ def s1_proj(x_):
         ),
         axis=0,
     )
-    p = H * Dh
-    return mx.split(x_ @ w_in.T, [p, 2 * p, 3 * p, 3 * p + Dh, 4 * p + Dh], axis=-1)
+    qk, vv = H * Dh, Hv * Dh
+    return mx.split(
+        x_ @ w_in.T,
+        [qk, 2 * qk, 2 * qk + vv, 2 * qk + vv + Dh, 2 * qk + vv + Dh + vv],
+        axis=-1,
+    )
 
 
 def s2_conv(x_):
@@ -105,12 +121,16 @@ def s3_gates(x_):
     q, k, v, fa, g, bl = s2_conv(x_)
     q = (m.scale**2) * _rms_unit(q.reshape(B, T, H, Dh))
     k = m.scale * _rms_unit(k.reshape(B, T, H, Dh))
-    v = v.reshape(B, T, H, Dh)
+    v = v.reshape(B, T, Hv, Dh)
+    q = _repeat_heads(q, n_rep, 2)
+    k = _repeat_heads(k, n_rep, 2)
     a = m.f_b_proj(fa).reshape(B, T, H, Dh)
     z = a.astype(mx.float32) + m.dt_bias.reshape(H, Dh)
     e_a = mx.broadcast_to(mx.exp(m.A_log)[:, None], (H, Dh))
     log_g = KDA_G_MIN * mx.sigmoid(e_a * z)
+    log_g = _repeat_heads(log_g, n_rep, 2)
     beta = mx.sigmoid(bl.astype(mx.float32))
+    beta = _repeat_heads(beta, n_rep, 2)
     return q, k, v, log_g, beta, g
 
 
@@ -128,16 +148,18 @@ def s4_transpose(x_):
 
 def s5_chunk(x_):
     q, k, v, log_g, beta, ga = s4_transpose(x_)
-    out, S = _chunk_kda(q, k, v, log_g, beta, None)
-    return out, S, ga
+    # 训练路径：末态 S 不被下游消费 → ZSC 特化；S 不进 loss（否则违反
+    # zero_state_cot 前提）。
+    out, _S = _chunk_kda(q, k, v, log_g, beta, None, zero_state_cot=True)
+    return out, ga
 
 
 def s6_out(x_):
-    out, S, g = s5_chunk(x_)
+    out, g = s5_chunk(x_)
     out = out.transpose(0, 2, 1, 3)
-    gate = g.reshape(B, T, H, Dh)
-    out = m.o_norm(out.astype(x_.dtype)) * mx.sigmoid(gate)
-    return (m.o_proj(out.reshape(B, T, -1).astype(x_.dtype)), S)
+    gate = kda_out_gate(g).reshape(B, T, Hv, Dh)
+    out = m.o_norm(out.astype(x_.dtype)) * gate
+    return (m.o_proj(out.reshape(B, T, -1).astype(x_.dtype)),)
 
 
 STAGES = [

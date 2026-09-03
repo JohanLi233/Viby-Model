@@ -102,9 +102,7 @@ def main():
     med_a, min_a = _report("off", times["off"])
     med_b, min_b = _report("on", times["on"])
     med_c, min_c = _report("on_end", times["on_end"])
-    print(
-        f"fwd+bwd  off     median {med_a:.2f} ms  min {min_a:.2f} ms"
-    )
+    print(f"fwd+bwd  off     median {med_a:.2f} ms  min {min_a:.2f} ms")
     print(
         f"fwd+bwd  on K={K:<3} median {med_b:.2f} ms  min {min_b:.2f} ms  "
         f"ratio {med_b / med_a:.3f} (min {min_b / min_a:.3f})"
