@@ -1,185 +1,99 @@
+"""V4.1 的解码状态。
+
+每层持有三类状态（对照参考实现的 window_kv_cache / compress_kv_cache /
+indexer.k_cache + 压缩器的 kv_state/score_state）：
+
+- 滑动窗口环：最近 window_size 个 token 的 KV（已按绝对位置做过 RoPE）；
+- 压缩 KV 池：只有 kv_source 层持有，被其后同 ratio 的层共享；
+- 索引器 K 池：只有同时是 kv_source 的 index_source 层持有（owns_k）。
+
+跨层共享的"当前步产物"（压缩 KV / index K / top-k 索引 / 候选块）放在
+SharedAttnState 里，由层循环按顺序传递——层序保证源先写、消费者后读，
+与参考实现的全局 shared_attn 运行时等价。
+"""
+
 import mlx.core as mx
 
 
-class KVCache:
-    """预分配、按块增长的 KV cache。
+class LayerCache:
+    """单层解码状态。"""
 
-    内部布局 (B, H, T, D)，decode 可直接送 ``scaled_dot_product_attention``，
-    不必每步把整段历史从 (B, T, H, D) 转置一遍。
+    def __init__(self, config, layer_idx: int, batch_size: int = 1):
+        self.layer_idx = layer_idx
+        self.batch_size = batch_size
+        self.window_size = config.window_size
+        hd = config.head_dim
+        self.window = mx.zeros((batch_size, config.window_size, hd))
+        self.ratio = int(config.compress_ratios[layer_idx])
+        self.is_kv_source = layer_idx in config.kv_source_layers
+        self.is_index_source = layer_idx in config.index_source_layers
+        self.owns_index_k = self.is_index_source and self.is_kv_source
+        max_seq = config.max_seq_len
+        self.compress_kv = (
+            mx.zeros((batch_size, max_seq // max(self.ratio, 1) + 1, hd))
+            if (self.is_kv_source and self.ratio > 0)
+            else None
+        )
+        self.kv_state = None
+        self.score_state = None
+        self.filled = 0  # 未成组的尾巴长度（ratio>1 时）
+        self.pool_scratch = max_seq // max(self.ratio, 1)  # 池尾多留一行当丢弃槽
+        self.index_k = (
+            mx.zeros((batch_size, self.pool_scratch + 1, config.index_head_dim))
+            if self.owns_index_k
+            else None
+        )
 
-    兼容旧 tuple 接口：``cache[0]`` / ``cache[1]`` 返回 (B, T, H, D) 有效
-    切片（与旧 ``concatenate`` 结果同布局），``shape[1]`` 即当前长度。
 
-    ``extras``：解码期附属状态存放处（如 ShortConv 的历史输入尾部），
-    随 cache 一起在生成循环里流转；rewind 截断时无法重建，直接清空。
+class SharedAttnState:
+    """一次前向内跨层传递的注意力产物（对应参考实现的 SharedAttentionRuntime）。
+
+    层序保证源先写、消费者后读，所以每类产物一个槽位就够，无需在两次
+    前向之间清理。
     """
 
-    __slots__ = ("keys", "values", "offset", "chunk", "extras")
+    __slots__ = ("compress_kv", "index_k", "keep_mask", "topk_idx", "candidates", "latent_pos")
 
-    def __init__(self, chunk: int = 256):
-        self.keys = None
-        self.values = None
-        self.offset = 0
-        self.chunk = int(chunk)
-        self.extras = {}
+    def __init__(self):
+        self.compress_kv = None
+        self.index_k = None
+        self.keep_mask = None   # 稠密路径：被 indexer 选中的压缩位置 [B,T,N] bool
+        self.topk_idx = None    # 解码路径：选中的压缩位置（含窗口 offset，-1 = 无效）
+        self.candidates = None  # 分层索引的一级候选块掩码 [B,T,N] bool
+        self.latent_pos = None  # 压缩组首的绝对位置 [n]
 
-    def update(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
-        """写入当前段 keys/values (B, t, H, D)，返回有效 (B, H, T, D)。"""
-        k = keys.transpose(0, 2, 1, 3)
-        v = values.transpose(0, 2, 1, 3)
-        t = k.shape[2]
-        need = self.offset + t
-        if self.keys is None or need > self.keys.shape[2]:
-            cap = ((need + self.chunk - 1) // self.chunk) * self.chunk
-            if self.keys is None:
-                cap = max(cap, need + self.chunk)
-            nk = mx.zeros((k.shape[0], k.shape[1], cap, k.shape[3]), dtype=k.dtype)
-            nv = mx.zeros((v.shape[0], v.shape[1], cap, v.shape[3]), dtype=v.dtype)
-            if self.keys is not None and self.offset > 0:
-                nk[:, :, : self.offset] = self.keys[:, :, : self.offset]
-                nv[:, :, : self.offset] = self.values[:, :, : self.offset]
-            self.keys, self.values = nk, nv
-        self.keys[:, :, self.offset : need] = k
-        self.values[:, :, self.offset : need] = v
-        self.offset = need
-        return self.keys[:, :, : self.offset], self.values[:, :, : self.offset]
 
-    def rewind(self, offset: int) -> "KVCache":
-        if offset < 0:
-            raise ValueError(f"KVCache.rewind({offset}) 不能为负")
-        # 允许 offset > 当前长度：投机解码在「全草稿命中后额外采样的
-        # tail 恰好是 EOS」时，seq_len 含该 token，但 past_full 还没
-        # 前向过它（EOS 截断故意跳过 tail 前向）。旧 tuple 切片
-        # ``c[:, :seq_len]`` 超出时静默截到实际长度；这里对齐该语义。
-        trace = self.extras.get("kda_trace")
-        if offset < self.offset:
-            # block 级 conv（attn_out/mlp_out）尾部：有逐步快照轨迹（投机
-            # 解码在 prefill 后挂载）时按不超过 offset 的最近快照精确恢复；
-            # 无轨迹时对应被截掉位置的尾部无法重建，丢弃，随后 ≤kernel-1
-            # 个位置按零历史卷积（近似口径）。KDA 的 q/k/v conv 尾部与
-            # SSM state 同理由 kda_trace 快照精确恢复（快照条目为
-            # (offset, S, q尾, k尾, v尾)），无轨迹时才丢弃。
-            for key in ("attn_out", "mlp_out"):
-                ctr = self.extras.get(key + "_trace")
-                if ctr:
-                    base = None
-                    for entry in ctr:
-                        if entry[0] <= offset:
-                            base = entry
-                    if base is not None:
-                        self.extras[key] = base[1]
-                        self.extras[key + "_trace"] = [base]
-                    else:
-                        self.extras.pop(key, None)
-                        self.extras[key + "_trace"] = []
-                else:
-                    self.extras.pop(key, None)
-            ntr = self.extras.get("ngram_tail_trace")
-            if ntr:
-                base = None
-                for entry in ntr:
-                    if entry[0] <= offset:
-                        base = entry
-                if base is not None:
-                    self.extras["ngram_tail"] = base[1]
-                    self.extras["ngram_tail_trace"] = [base]
-                else:
-                    self.extras.pop("ngram_tail", None)
-                    self.extras["ngram_tail_trace"] = []
-            else:
-                self.extras.pop("ngram_tail", None)
-            nctr = self.extras.get("ngram_conv_tail_trace")
-            if nctr:
-                base = None
-                for entry in nctr:
-                    if entry[0] <= offset:
-                        base = entry
-                if base is not None:
-                    self.extras["ngram_conv_tail"] = base[1]
-                    self.extras["ngram_conv_tail_trace"] = [base]
-                else:
-                    self.extras.pop("ngram_conv_tail", None)
-                    self.extras["ngram_conv_tail_trace"] = []
-            else:
-                self.extras.pop("ngram_conv_tail", None)
-            if not trace:
-                for key in ("q_conv", "k_conv", "v_conv", "kda_state"):
-                    self.extras.pop(key, None)
-        if trace:
-            # 只保留不超过 offset 的最近快照作为下一轮验证的回滚点
-            base = None
-            for entry in trace:
-                if entry[0] <= offset:
-                    base = entry
-            if base is not None:
-                self.extras["kda_state"] = base[1]
-                self.extras["q_conv"] = base[2]
-                self.extras["k_conv"] = base[3]
-                self.extras["v_conv"] = base[4]
-                self.extras["kda_trace"] = [base]
-            else:
-                for key in ("kda_state", "q_conv", "k_conv", "v_conv"):
-                    self.extras.pop(key, None)
-                self.extras["kda_trace"] = []
-        self.offset = min(int(offset), self.offset)
-        return self
+class VibyCache:
+    """整个模型的解码缓存（逐层 LayerCache + 已处理长度）。"""
+
+    def __init__(self, config, batch_size: int = 1):
+        self.config = config
+        self.layers = [LayerCache(config, i, batch_size) for i in range(config.n_layers)]
+        self.start_pos = 0
+        self.engram_prev = None  # [B, max_ngram-1] 最近 token id（Engram 哈希用）
+        self._wire_sources()
+
+    def _wire_sources(self):
+        """消费者层直接指向源层的 LayerCache：压缩 KV 池 / index K 池都存在源层上。"""
+        cfg = self.config
+        for i, c in enumerate(self.layers):
+            c.src_cache = self.layers[cfg.kv_source_of(i)]
 
     def __getitem__(self, idx):
-        arr = self.keys if idx == 0 else self.values
-        return arr[:, :, : self.offset].transpose(0, 2, 1, 3)
-
-    def __iter__(self):
-        yield self[0]
-        yield self[1]
+        return self.layers[idx]
 
     def __len__(self):
-        return 2
+        return len(self.layers)
 
+    def rewind(self, offset: int):
+        """回退 offset 个 token（前缀缓存命中 / 投机解码回滚用）。
 
-def _seq_len_of_cache(cache) -> int:
-    if cache is None:
-        return 0
-    if isinstance(cache, KVCache):
-        return cache.offset
-    offset = getattr(cache, "offset", None)
-    if offset is not None and not isinstance(cache, (tuple, list)):
-        return int(offset)
-    return cache[0].shape[1]
-
-
-def _rewind_cache(cache, offset: int):
-    if cache is None:
-        return None
-    if isinstance(cache, KVCache):
-        return cache.rewind(offset)
-    return tuple(c[:, :offset] for c in cache)
-
-
-def _rewind_cache_list(caches, offset: int) -> list:
-    return [_rewind_cache(c, offset) for c in caches]
-
-
-def _eval_kv_caches(caches) -> None:
-    if not caches:
-        return
-    bufs = []
-    for c in caches:
-        if isinstance(c, KVCache):
-            if c.keys is not None:
-                bufs.append(c.keys)
-                bufs.append(c.values)
-        elif c is not None:
-            bufs.extend(c)
-    if bufs:
-        mx.eval(*bufs)
-
-
-def _offset_causal_mask(q_len: int, k_len: int, dtype):
-    """query i 可见 key j iff j <= (k_len - q_len) + i。"""
-    q = mx.arange(q_len)[:, None]
-    k = mx.arange(k_len)[None, :]
-    return mx.where(
-        k <= q + (k_len - q_len),
-        mx.array(0.0, dtype=dtype),
-        mx.array(-mx.inf, dtype=dtype),
-    )
+        压缩池与索引器 K 池按整组回退：只有落在回退区间之外的组保留。
+        """
+        self.start_pos = max(0, self.start_pos - offset)
+        for c in self.layers:
+            c.filled = 0
+            c.kv_state = None
+            c.score_state = None
+        self.engram_prev = None
+        return self

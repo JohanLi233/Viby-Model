@@ -3,8 +3,22 @@
 """
 
 import argparse
-from model.flops import DEFAULT_PEAK_TFLOPS
-from .utils import Logger
+import os
+import sys
+
+from model.config import VibyConfig
+
+from .flops import DEFAULT_PEAK_TFLOPS
+from .utils import ARCH_ARG_ALIASES, ARCH_ARG_TO_FIELD, Logger
+
+# 结构参数的 parser 默认值直接取自 VibyConfig（≈1B 配方），CLI 不复制配方；
+# --preset 只在用户未显式传入某字段时把它换成预设值（见 apply_preset）。
+_DEFAULT_CFG = VibyConfig()
+
+
+def _int_list(text: str):
+    """逗号/空格分隔的整数串 → tuple[int]（与 utils._as_int_tuple 同口径）。"""
+    return tuple(int(x) for x in text.replace(",", " ").split())
 
 
 def add_common_args(parser):
@@ -28,30 +42,245 @@ def add_common_args(parser):
         default="mlx",
         help="仅作信息展示；MLX 使用统一内存，无设备概念",
     )
-    # 模型结构参数（与 eval_model.py 保持一致，默认 768/8）
-    parser.add_argument("--hidden_size", type=int, default=768)
-    parser.add_argument("--num_hidden_layers", type=int, default=8)
-    parser.add_argument("--num_attention_heads", type=int, default=8)
+    # ---- 模型结构参数（DeepSeek-V4.1 缩放版）----
+    # 默认值全部取自 VibyConfig 的 ≈1B 配方；--preset 只补"未显式传入"的字段。
+    # SFT/DPO 的 parser 会把这些默认抹成 None，让基座 checkpoint 的 sidecar 生效。
     parser.add_argument(
-        "--head_dim",
-        type=int,
+        "--preset",
+        type=str,
+        choices=["tiny", "base"],
         default=None,
-        help="默认 hidden_size // num_attention_heads",
+        help="结构预设：tiny 是小配置（单测/冒烟）；base 与不传等价，都是 "
+        "VibyConfig 的 ≈1B 配方。命令行显式传入的结构参数优先于预设",
     )
-    parser.add_argument("--vocab_size", type=int, default=6400)
+    parser.add_argument("--hidden_size", type=int, default=_DEFAULT_CFG.dim)
+    parser.add_argument("--num_hidden_layers", type=int, default=_DEFAULT_CFG.n_layers)
+    parser.add_argument("--num_attention_heads", type=int, default=_DEFAULT_CFG.n_heads)
+    parser.add_argument("--head_dim", type=int, default=_DEFAULT_CFG.head_dim)
+    parser.add_argument("--rope_head_dim", type=int, default=_DEFAULT_CFG.rope_head_dim)
+    parser.add_argument("--q_lora_rank", type=int, default=_DEFAULT_CFG.q_lora_rank)
+    parser.add_argument("--o_groups", type=int, default=_DEFAULT_CFG.o_groups)
+    parser.add_argument("--o_lora_rank", type=int, default=_DEFAULT_CFG.o_lora_rank)
+    parser.add_argument("--vocab_size", type=int, default=_DEFAULT_CFG.vocab_size)
     parser.add_argument(
-        "--intermediate_size",
+        "--window_size",
+        type=int,
+        default=_DEFAULT_CFG.window_size,
+        help="滑窗分支窗口（V4.1-Flash 为 128）",
+    )
+    parser.add_argument(
+        "--hc_mult",
+        type=int,
+        default=_DEFAULT_CFG.hc_mult,
+        help="mHC 残差流条数（V4.1 扩展因子 4）",
+    )
+    parser.add_argument(
+        "--hc_sinkhorn_iters", type=int, default=_DEFAULT_CFG.hc_sinkhorn_iters
+    )
+    parser.add_argument("--hc_eps", type=float, default=_DEFAULT_CFG.hc_eps)
+    parser.add_argument(
+        "--compress_ratios",
+        type=_int_list,
+        default=None,
+        help="逐层压缩率，逗号分隔（如 0,0,2,2,1,1）；默认按 n_layers 推导"
+        "（浅层纯滑窗、编码器 r=2、解码器 r=1）",
+    )
+    parser.add_argument(
+        "--kv_source_layers",
+        type=_int_list,
+        default=None,
+        help="压缩 KV 的产出层（逗号分隔、严格递增、不含第 0 层）；默认按 "
+        "n_layers 推导",
+    )
+    parser.add_argument(
+        "--index_source_layers",
+        type=_int_list,
+        default=None,
+        help="Lightning Indexer 的产出层；默认按 n_layers 推导",
+    )
+    parser.add_argument(
+        "--candidate_source_layer",
         type=int,
         default=None,
-        help="默认按 hidden_size 自动计算",
+        help="分层稀疏索引的候选块产出层（更深的 indexer 只在候选池里打分）；"
+        "默认 CED 边界层",
+    )
+    parser.add_argument(
+        "--candidate_topk_blocks",
+        type=int,
+        default=_DEFAULT_CFG.candidate_topk_blocks,
+        help="候选块个数（V4.1-Flash 2048，缩放版默认 64）",
+    )
+    parser.add_argument(
+        "--candidate_block_size", type=int, default=_DEFAULT_CFG.candidate_block_size
+    )
+    parser.add_argument("--index_n_heads", type=int, default=_DEFAULT_CFG.index_n_heads)
+    parser.add_argument("--index_head_dim", type=int, default=_DEFAULT_CFG.index_head_dim)
+    parser.add_argument("--index_topk", type=int, default=_DEFAULT_CFG.index_topk)
+    parser.add_argument(
+        "--rope_theta",
+        type=float,
+        default=_DEFAULT_CFG.rope_theta,
+        help="纯滑窗层的 RoPE base",
+    )
+    parser.add_argument(
+        "--compress_rope_theta",
+        type=float,
+        default=_DEFAULT_CFG.compress_rope_theta,
+        help="压缩分支的 RoPE base（配 YaRN）",
+    )
+    parser.add_argument("--original_seq_len", type=int, default=_DEFAULT_CFG.original_seq_len)
+    parser.add_argument("--rope_factor", type=float, default=_DEFAULT_CFG.rope_factor)
+    parser.add_argument("--beta_fast", type=int, default=_DEFAULT_CFG.beta_fast)
+    parser.add_argument("--beta_slow", type=int, default=_DEFAULT_CFG.beta_slow)
+    parser.add_argument(
+        "--n_routed_experts",
+        type=int,
+        default=_DEFAULT_CFG.n_routed_experts,
+        help="MoE 路由专家数（V4.1 主干全层 MoE，默认 ≈1B 配方 96）",
+    )
+    parser.add_argument(
+        "--num_experts_per_tok",
+        type=int,
+        default=_DEFAULT_CFG.n_activated_experts,
+        help="每 token 激活的路由专家数（V4.1-Flash 为 6）",
+    )
+    parser.add_argument(
+        "--n_shared_experts",
+        type=int,
+        default=_DEFAULT_CFG.n_shared_experts,
+        help="共享专家个数（V4.1 固定 1）",
+    )
+    parser.add_argument(
+        "--moe_intermediate_size",
+        type=int,
+        default=_DEFAULT_CFG.moe_inter_dim,
+        help="单个路由专家的中间维",
+    )
+    parser.add_argument(
+        "--score_func",
+        type=str,
+        choices=["sqrtsoftplus", "softmax", "sigmoid"],
+        default=_DEFAULT_CFG.score_func,
+        help="路由亲和度（V4.1 用 sqrtsoftplus）",
+    )
+    parser.add_argument("--gate_temp", type=float, default=_DEFAULT_CFG.gate_temp)
+    parser.add_argument(
+        "--route_scale",
+        type=float,
+        default=_DEFAULT_CFG.route_scale,
+        help="路由权重缩放（论文 route scale，默认 1.5）",
+    )
+    parser.add_argument(
+        "--routed_scaling_factor",
+        dest="route_scale",
+        type=float,
+        default=None,
+        help="--route_scale 的旧名别名（保留兼容；两者都传时后者生效）",
+    )
+    parser.add_argument(
+        "--swiglu_limit",
+        type=float,
+        default=_DEFAULT_CFG.swiglu_limit,
+        help="专家 clamped SwiGLU 的 clamp 上界（V4.1-Flash 为 10）",
+    )
+    parser.add_argument(
+        "--bias_update_rate",
+        type=float,
+        default=_DEFAULT_CFG.bias_update_rate,
+        help="noaux_tc 的 e_score_correction_bias 更新步长 γ："
+        "b += γ·sign(load_frac − 1/E)（V4.1 训练用 1e-3）",
+    )
+    parser.add_argument(
+        "--engram_layer_ids",
+        type=_int_list,
+        default=None,
+        help="挂 Engram 的主干层下标（逗号分隔）；默认第 2 层 + 约 35%% 深度处",
+    )
+    parser.add_argument(
+        "--engram_max_ngram_size",
+        type=int,
+        default=_DEFAULT_CFG.engram_max_ngram_size,
+        help="最大 n-gram 阶（至少 2）",
+    )
+    parser.add_argument(
+        "--engram_vocab_size",
+        type=int,
+        default=_DEFAULT_CFG.engram_vocab_size,
+        help="n-gram 素数桶的模数上界（压缩 id 空间大小，决定表行数）",
+    )
+    parser.add_argument("--engram_n_heads", type=int, default=_DEFAULT_CFG.engram_n_heads)
+    parser.add_argument("--engram_head_dim", type=int, default=_DEFAULT_CFG.engram_head_dim)
+    parser.add_argument(
+        "--mtp_depth",
+        type=int,
+        default=_DEFAULT_CFG.n_mtp_layers,
+        help="DSpark 草稿层数（n_mtp_layers，V4.1-Flash 为 3）",
+    )
+    parser.add_argument(
+        "--dspark_block_size",
+        type=int,
+        default=_DEFAULT_CFG.dspark_block_size,
+        help="DSpark 半自回归草稿块大小（V4.1-Flash 为 5：1 锚点 + 4 草稿槽）",
+    )
+    parser.add_argument(
+        "--dspark_noise_token_id",
+        type=int,
+        default=_DEFAULT_CFG.dspark_noise_token_id,
+        help="草稿槽的噪声 token（默认 pad_token_id）",
+    )
+    parser.add_argument(
+        "--dspark_target_layer_ids",
+        type=_int_list,
+        default=None,
+        help="DSpark 读取的主干目标层（逗号分隔，取这些层的注意力输入）；"
+        "默认最深 3 层",
+    )
+    parser.add_argument(
+        "--dspark_markov_rank", type=int, default=_DEFAULT_CFG.dspark_markov_rank
+    )
+    parser.add_argument(
+        "--dspark_n_routed_experts",
+        type=int,
+        default=_DEFAULT_CFG.dspark_n_routed_experts,
+        help="draft 层 MoE 的路由专家数（比主干窄）",
+    )
+    parser.add_argument(
+        "--dspark_n_activated_experts",
+        type=int,
+        default=_DEFAULT_CFG.dspark_n_activated_experts,
+    )
+    parser.add_argument(
+        "--mtp_loss_weight",
+        type=float,
+        default=_DEFAULT_CFG.mtp_loss_weight,
+        help="DSpark 草稿损失权重（主干 loss + w·mtp_loss）",
+    )
+    parser.add_argument(
+        "--z_loss_weight",
+        type=float,
+        default=_DEFAULT_CFG.z_loss_weight,
+        help="logit z-loss 权重：loss += z_loss_weight * mean(lse²)（Marin），"
+        "主 LM 与 DSpark 各 head 同权重；0 关闭",
+    )
+    parser.add_argument(
+        "--norm_topk_prob",
+        action=argparse.BooleanOptionalAction,
+        default=_DEFAULT_CFG.norm_topk_prob,
+        help="top-k 路由权重归一化（V4.1 开启）",
     )
     parser.add_argument(
         "--tie_word_embeddings",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="绑定输入/输出 embedding（True 时 lm_head 复用 embed_tokens，"
-        "无额外参数）；默认 False：单独创建 nn.Linear，muonh 下走 AdamH 组。"
-        "解绑增加约 vocab_size × hidden_size 参数，但给 unembedding 独立梯度",
+        default=_DEFAULT_CFG.tie_word_embeddings,
+        help="绑定输入/输出 embedding（True 时 lm_head 复用 embed，无额外参数）；"
+        "默认 False：单独创建 nn.Linear，muonh 下走 AdamH 组",
+    )
+    parser.add_argument(
+        "--freeze_backbone",
+        action="store_true",
+        help="冻结主干，只训练 mtp_modules.*：对应论文 §2.4.3 的 DSpark 独立"
+        "训练阶段（DSpark 目标本就不回传主干，这里连其余参数也不更新）",
     )
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument(
@@ -113,25 +342,6 @@ def add_common_args(parser):
         default=None,
         help="最长训练时长（分钟）。到时后在当前梯度累积窗口边界停止并保存 "
         "checkpoint（不会因 resume 丢梯度）；默认不限制",
-    )
-    parser.add_argument(
-        "--use_linear_attn",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Kimi Linear 注意力（KDA local + NoPE GQA global + ShortConv）。"
-        "默认关：全层 MLA full softmax，无线性注意力、无短卷积",
-    )
-    parser.add_argument(
-        "--kv_lora_rank",
-        type=int,
-        default=192,
-        help="MLA 的 KV 低秩潜在维度（仅 --no-use_linear_attn，默认）",
-    )
-    parser.add_argument(
-        "--qk_rope_head_dim",
-        type=int,
-        default=32,
-        help="MLA 解耦 RoPE 键的维度（跨 head 共享）",
     )
     parser.add_argument(
         "--max_steps",
@@ -219,161 +429,6 @@ def add_common_args(parser):
     parser.add_argument("--seed", type=int, default=1337, help="全局随机种子")
     parser.add_argument("--max_seq_len", default=1024, type=int)
     parser.add_argument(
-        "--use_attn_gate",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="注意力输出门：2·σ(W_g x)，零初始化门=1（Marin，默认开）",
-    )
-    parser.add_argument("--no_attn_gate", action="store_false", dest="use_attn_gate")
-    parser.add_argument(
-        "--use_xsa",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Gated XSA（可学习 Exclusive Self-Attention，arXiv:2603.09078 / "
-        "modded-nanogpt record #82）：逐 head 学 tanh(α) 扣掉注意力输出中 "
-        "与自身 V 平行的分量 z = y − tanh(α)·(yᵀv/‖v‖²)·v，α=0 初始化 ⇒ "
-        "恒等。作用在最深 --xsa_last_n 层（MLA 头 1:1，无需 GQA 的 V-扩展）。"
-        "默认开",
-    )
-    parser.add_argument(
-        "--xsa_last_n",
-        type=int,
-        default=0,
-        help="启用 gated XSA 的最深 N 层；0=自动按配方取最深 ≈1/3 层"
-        "（`max(1, num_hidden_layers // 3)`）。取 num_hidden_layers 则全层应用。"
-        "仅 --use_xsa 时生效",
-    )
-    parser.add_argument(
-        "--hidden_act",
-        choices=["silu", "situ"],
-        default="silu",
-        help="FFN 激活：silu（默认，SwiGLU/silu(g)·u）或 situ（SiTU-GLU "
-        "β1=4, β2=25 的 tanh 软帽版，走 SiTU 融合核）",
-    )
-    parser.add_argument(
-        "--attn_res_window",
-        type=int,
-        default=4,
-        help="AttnRes 只混合最近 W 个残差（默认 4）。0=论文全历史混合。"
-        "窗口把每层重读全部历史 v 的 O(L²) 流量收到 O(L·W)，是 MFU 主杠杆",
-    )
-    parser.add_argument(
-        "--attn_res_register",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="寄存器残差：hidden 用加法写回（h ← h+F），AttnRes 只混合 "
-        "[h]+近 W 个写入作为下一子层的读。默认关（论文替换式 AttnRes）。"
-        "与 r086 对照时打开此开关即可，其余超参保持不变",
-    )
-    parser.add_argument(
-        "--attn_res_read_h",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="寄存器读侧用 h 本身（prenorm(h)），不再 softmax 混合 [h]+写入。"
-        "需要 --attn_res_register。默认关。旧 sidecar 缺键保持混合读",
-    )
-    parser.add_argument(
-        "--ihc",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="identity Hyper-Connections：M 条残差流，读 Σ h_pre R、写 R+h_post Δ，"
-        "H_res=I（无 Sinkhorn）。开时接管残差，AttnRes merge/read 不走。"
-        "默认关。旧 sidecar 缺键保持关",
-    )
-    parser.add_argument(
-        "--ihc_streams",
-        type=int,
-        default=4,
-        help="iHC 残差流数 M（Hy4 hc_mult=4）。仅 --ihc 时生效",
-    )
-    parser.add_argument(
-        "--ihc_typed",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="分型 iHC：流 0 恒等、n-gram 只进 --ihc_ngram_stream 且在进栈前注入，"
-        "collapse 默认 identity。需要 --ihc。默认关",
-    )
-    parser.add_argument(
-        "--ihc_collapse",
-        choices=["mean", "identity"],
-        default=None,
-        help="iHC 出口：mean=流上均值（默认），identity=只读流 0。"
-        "--ihc_typed 且未显式指定时为 identity",
-    )
-    parser.add_argument(
-        "--ihc_ngram_stream",
-        type=int,
-        default=1,
-        help="分型 iHC 下 n-gram 写入的流下标（默认 1）。identity 塌缩时不能为 0",
-    )
-    parser.add_argument(
-        "--loop_span",
-        type=int,
-        default=0,
-        help="SMELT 中间层 loop 跨度（arXiv:2609.01343）：居中内部 span 层"
-        "连续执行 --loop_count 次（权重共享，参数量不变，effective depth ="
-        " L + (r−1)·span）。0（默认）=关闭；需 >0 且 loop_count>1 才生效。"
-        "loop 跨度 KV 翻倍，KV 预算对齐可调低 --kv_lora_rank（如 256→192）",
-    )
-    parser.add_argument(
-        "--loop_count",
-        type=int,
-        default=2,
-        help="SMELT loop 次数 r（默认 2，SMELT/Loopie 消融均表明 r=2 最优）。"
-        "仅 --loop_span > 0 时生效",
-    )
-    parser.add_argument(
-        "--loop_res_scale",
-        choices=["rsqrt", "r", "none"],
-        default="rsqrt",
-        help="loop 跨度内 sublayer 残差写入缩放（防 weight-tied 更新吹大"
-        "残差流，SMELT Eq.8/9）：rsqrt=r**-0.5（默认）/ r=1/r / none=不缩放（消融）",
-    )
-    parser.add_argument(
-        "--loop_grad_mode",
-        choices=["full", "jfb"],
-        default="full",
-        help="loop 跨度反向模式：full（默认，全展开反传）/ jfb（单步梯度，"
-        "0th-order IFT，HRM/TRM 口径）：前 r−1 次 visit 断梯度，只反传末次"
-        "visit + x_entry 恒等通路。前向数值与 full 逐位一致；反向算力与"
-        "激活内存降到约 1 次 visit（r=2 时 span 反向减半）",
-    )
-    parser.add_argument(
-        "--loop_extrap",
-        type=float,
-        default=0.0,
-        help="Richardson 外推 λ：末次 visit 后 h += λ(h − h_prev_visit)"
-        "（h_i=第 i 次 visit 结束的 hidden，r>2 取最后两次）。0（默认）=关；"
-        "λ=1 是经典 Richardson（误差随 visit 减半）。固定标量不加参数，"
-        "可对旧 checkpoint 直接做推理探针。需要 --loop_span>0 且 loop_count>=2",
-    )
-    parser.add_argument(
-        "--loop_anchor",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="loop 锚点读出（默认开，仅 replace 模式 AttnRes 生效）：span "
-        "区段的 merge 常驻 [span 入口 hidden] + [各 visit 出口摘要] + 全部 "
-        "pre-span 写入，窗口只裁 span 内写入——修复滑窗把输入侧/跨 visit "
-        "历史挤出后 span 闭环递归、主 loss 卡平台的问题。不加参数、不改残差"
-        "语义。--no_loop_anchor 做消融",
-    )
-    parser.add_argument("--mtp_depth", type=int, default=1)
-    parser.add_argument("--mtp_loss_weight", type=float, default=0.3)
-    parser.add_argument(
-        "--mtp_steps",
-        type=int,
-        default=2,
-        help="Qwen3.8-Next MTP 预训练展开步数：同一层 teacher-forced "
-        "预测 t+2, t+3, …，各步 CE 取平均。1=只预测下一额外 token",
-    )
-    parser.add_argument(
-        "--z_loss_weight",
-        type=float,
-        default=1e-4,
-        help="logit z-loss 权重：loss += z_loss_weight * mean(lse²)（Marin），"
-        "主 LM 与 MTP 各 head 同权重；0 关闭",
-    )
-    parser.add_argument(
         "--optimizer",
         type=str,
         default="muon",
@@ -386,136 +441,6 @@ def add_common_args(parser):
         default=5,
         help="Muon Newton-Schulz 迭代步数（默认 5 对齐原版；减到 3 整步快 ~5%%，"
         "但正交化精度下降、训练动力学改变）",
-    )
-    parser.add_argument(
-        "--n_routed_experts",
-        type=int,
-        default=0,
-        help="DeepSeekMoE 路由专家数（必须 >0，所有层均为 MoE；1080M 配方 256）",
-    )
-    parser.add_argument(
-        "--num_experts_per_tok",
-        type=int,
-        default=6,
-        help="MoE 每 token 激活的路由专家数（V4 为 6）",
-    )
-    parser.add_argument(
-        "--n_shared_experts",
-        type=int,
-        default=1,
-        help="独立共享专家个数；每个中间维 = moe_intermediate_size，输出相加",
-    )
-    parser.add_argument(
-        "--moe_intermediate_size",
-        type=int,
-        default=None,
-        help="MoE 单个路由专家中间维；默认取 intermediate_size",
-    )
-    parser.add_argument(
-        "--routed_scaling_factor",
-        type=float,
-        default=2.5,
-        help="MoE 路由权重缩放因子（sigmoid 归一化后乘该系数）",
-    )
-    parser.add_argument(
-        "--moe_router_logit_norm",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="路由 logits 逐 token 标准化（默认开启，防 sigmoid 饱和）",
-    )
-    parser.add_argument(
-        "--moe_router_logit_temp",
-        type=float,
-        default=1.0,
-        help="logits 标准化后的温度/标准差",
-    )
-    parser.add_argument(
-        "--moe_diversity_loss_weight",
-        type=float,
-        default=0.0,
-        help="router 输入 token 多样性正则权重；0 关闭",
-    )
-    parser.add_argument(
-        "--moe_latent_dim",
-        type=int,
-        default=None,
-        help="Latent MoE：路由专家在压缩后的 latent 空间计算——共享 "
-        "lat_down(hidden→d)/lat_up(d→hidden) 投影包住路由专家，lat_down 后"
-        "接 learnable latent_norm；router 仍在全维打分，共享专家仍走全宽。"
-        "默认 None → hidden_size//2（开启）；显式 0 关闭（消融）",
-    )
-    parser.add_argument(
-        "--moe_write_spread",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="LatentMoE 专家写出基扩展：共享 lat_up 之外按专家对角缩放 "
-        "tile(h_k) 写入残差补空间。s 零初始化 ⇒ 起步与关掉逐位一致。"
-        "需要 moe_latent_dim > 0。默认关",
-    )
-    parser.add_argument(
-        "--moe_route_scale",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="LatentMoE 路由尺度：latent_out_norm 之后乘未归一化 top-k "
-        "sigmoid 和。关掉时 RMSNorm 把 routed_scaling_factor 乘成 1。"
-        "需要 moe_latent_dim > 0。默认关",
-    )
-    parser.add_argument(
-        "--first_k_dense_replace",
-        type=int,
-        default=0,
-        help="前 K 层 FFN 用 dense SwiGLU，其后保持 MoE。0=全层 MoE（默认）。"
-        "1=第 0 层 dense stem。旧 sidecar 缺键保持 0",
-    )
-    parser.add_argument(
-        "--dense_intermediate_size",
-        type=int,
-        default=None,
-        help="浅层 dense 中间维。未传且 --first_k_dense_replace>0 时取 "
-        "moe_intermediate_size（小 stem，与单个专家同宽）",
-    )
-    parser.add_argument(
-        "--kda_v_head_ratio",
-        type=int,
-        default=2,
-        help="KDA V 头 / QK 头比（Qwen GDN 口径）。默认 2：8 个 QK 头 → "
-        "16 个 V 头；1=旧正方形。只用于新训练",
-    )
-    parser.add_argument(
-        "--ngram_table_size",
-        type=int,
-        default=65536,
-        help="Engram 哈希检索表总桶数（0 关闭）。全部 (阶×头) 子表共用此"
-        "预算，各自素数取整后实际略小；每头维度 = d_mem/(阶数×头数)。"
-        "表走独立 Adam 组（5x lr, wd=0）",
-    )
-    parser.add_argument(
-        "--ngram_heads",
-        type=int,
-        default=8,
-        help="Engram 每个 n-gram 阶的哈希头数（各头不同滚动乘子，碰撞去"
-        "相关，检索向量拼接）。默认 8，对齐 Engram (arXiv 2601.07372)",
-    )
-    parser.add_argument(
-        "--ngram_layer",
-        type=int,
-        default=2,
-        help="n-gram 注入层（1-indexed）。默认 2，对齐 Qwen3.8-Flash-Next",
-    )
-    parser.add_argument(
-        "--ngram_logit_skip",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="n-gram 表向量（不过 hidden 门）经 lm_head 加到 logits，"
-        "标量尺度零初始化。默认关。与 r086 对照时打开此开关即可",
-    )
-    parser.add_argument(
-        "--ngram_conf_gate",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="n-gram 置信门控：用表向量 unembed 的 max-softmax 缩放每层 "
-        "attn/mlp 写入（g=1−s·stopgrad(max p)，s 零初始化）。默认关。"
-        "A0 只缩放写入、不跳过 FLOP。需要 --ngram_table_size > 0",
     )
     parser.add_argument(
         "--lr_scale_auto",
@@ -601,56 +526,9 @@ def get_sft_parser():
         accumulation_steps=1,
         max_seq_len=2048,
     )
-    # 结构参数默认 None：优先从 pretrain checkpoint 的 sidecar config 继承，
-    # 仅在用户显式传入时覆盖（sidecar 缺失时回退 VibyConfig 默认值）。
-    parser.set_defaults(
-        num_hidden_layers=None,
-        num_attention_heads=None,
-        vocab_size=None,
-        mtp_depth=None,
-        mtp_loss_weight=None,
-        mtp_steps=None,
-    )
-    parser.set_defaults(
-        use_attn_gate=None,
-        tie_word_embeddings=None,
-        moe_router_logit_norm=None,
-        moe_router_logit_temp=None,
-        moe_diversity_loss_weight=None,
-        z_loss_weight=None,
-        n_routed_experts=None,
-        num_experts_per_tok=None,
-        n_shared_experts=None,
-        moe_intermediate_size=None,
-        routed_scaling_factor=None,
-        moe_latent_dim=None,
-        moe_write_spread=None,
-        moe_route_scale=None,
-        first_k_dense_replace=None,
-        dense_intermediate_size=None,
-        kda_v_head_ratio=None,
-        ngram_table_size=None,
-        ngram_layer=None,
-        ngram_heads=None,
-        ngram_logit_skip=None,
-        ngram_conf_gate=None,
-        use_linear_attn=None,
-        kv_lora_rank=None,
-        qk_rope_head_dim=None,
-        attn_res_register=None,
-        attn_res_read_h=None,
-        ihc=None,
-        ihc_streams=None,
-        ihc_typed=None,
-        ihc_collapse=None,
-        ihc_ngram_stream=None,
-        loop_span=None,
-        loop_count=None,
-        loop_res_scale=None,
-        loop_grad_mode=None,
-        loop_extrap=None,
-        loop_anchor=None,
-    )
+    # 结构参数默认 None：优先从基座 checkpoint 的 sidecar config 继承，
+    # 仅在用户显式传入时覆盖（无 sidecar 时回退 VibyConfig 默认值 / --preset）。
+    parser.set_defaults(**{key: None for key in ARCH_ARG_TO_FIELD})
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-Full-SFT")
     parser.add_argument("--data_path", type=str, default="../dataset/sft_512.jsonl")
@@ -659,90 +537,6 @@ def get_sft_parser():
         type=str,
         default=None,
         help="预训练检查点文件名（默认按 hidden_size 自动推导）",
-    )
-
-    return parser
-
-
-def get_draft_parser():
-    """获取 EAGLE-3 草稿微调参数解析器"""
-    parser = argparse.ArgumentParser(description="Viby Draft (EAGLE-3) Finetune")
-    add_common_args(parser)
-
-    # 草稿微调特定参数
-    parser.set_defaults(
-        epochs=1,
-        batch_size=16,
-        learning_rate=0.001,
-        accumulation_steps=1,
-        max_seq_len=2048,
-    )
-    # 结构参数默认 None：优先从基座 checkpoint 的 sidecar config 继承，
-    # 仅在用户显式传入时覆盖（sidecar 缺失时回退 VibyConfig 默认值）。
-    parser.set_defaults(
-        num_hidden_layers=None,
-        num_attention_heads=None,
-        vocab_size=None,
-        mtp_depth=None,
-        mtp_loss_weight=None,
-        mtp_steps=None,
-    )
-    parser.set_defaults(
-        use_attn_gate=None,
-        tie_word_embeddings=None,
-        moe_router_logit_norm=None,
-        moe_router_logit_temp=None,
-        moe_diversity_loss_weight=None,
-        z_loss_weight=None,
-        n_routed_experts=None,
-        num_experts_per_tok=None,
-        n_shared_experts=None,
-        moe_intermediate_size=None,
-        routed_scaling_factor=None,
-        moe_latent_dim=None,
-        moe_write_spread=None,
-        moe_route_scale=None,
-        first_k_dense_replace=None,
-        dense_intermediate_size=None,
-        kda_v_head_ratio=None,
-        ngram_table_size=None,
-        ngram_layer=None,
-        ngram_heads=None,
-        ngram_logit_skip=None,
-        ngram_conf_gate=None,
-        use_linear_attn=None,
-        kv_lora_rank=None,
-        qk_rope_head_dim=None,
-        attn_res_register=None,
-        attn_res_read_h=None,
-        ihc=None,
-        ihc_streams=None,
-        ihc_typed=None,
-        ihc_collapse=None,
-        ihc_ngram_stream=None,
-        loop_span=None,
-        loop_count=None,
-        loop_res_scale=None,
-        loop_grad_mode=None,
-        loop_extrap=None,
-        loop_anchor=None,
-    )
-
-    parser.add_argument("--swanlab_project", type=str, default="Viby-Draft")
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl")
-    parser.add_argument(
-        "--pretrain_checkpoint",
-        type=str,
-        default=None,
-        help="基座检查点文件名（默认按 hidden_size 自动推导）",
-    )
-    parser.add_argument(
-        "--draft_ttt_steps",
-        type=int,
-        default=4,
-        help="EAGLE-3 training-time test (TTT) rollout 步数：step 1 消费目标"
-        "多层特征 + 真实下一 token 嵌入；step≥2 消费草稿自身上一步 hidden + "
-        "自预测 token 嵌入；各步 CE 平均",
     )
 
     return parser
@@ -762,55 +556,8 @@ def get_dpo_parser():
         max_seq_len=1024,
     )
     # 结构参数默认 None：优先从 SFT checkpoint 的 sidecar config 继承，
-    # 仅在用户显式传入时覆盖。
-    parser.set_defaults(
-        num_hidden_layers=None,
-        num_attention_heads=None,
-        vocab_size=None,
-        mtp_depth=None,
-        mtp_loss_weight=None,
-        mtp_steps=None,
-    )
-    parser.set_defaults(
-        use_attn_gate=None,
-        tie_word_embeddings=None,
-        moe_router_logit_norm=None,
-        moe_router_logit_temp=None,
-        moe_diversity_loss_weight=None,
-        z_loss_weight=None,
-        n_routed_experts=None,
-        num_experts_per_tok=None,
-        n_shared_experts=None,
-        moe_intermediate_size=None,
-        routed_scaling_factor=None,
-        moe_latent_dim=None,
-        moe_write_spread=None,
-        moe_route_scale=None,
-        first_k_dense_replace=None,
-        dense_intermediate_size=None,
-        kda_v_head_ratio=None,
-        ngram_table_size=None,
-        ngram_layer=None,
-        ngram_heads=None,
-        ngram_logit_skip=None,
-        ngram_conf_gate=None,
-        use_linear_attn=None,
-        kv_lora_rank=None,
-        qk_rope_head_dim=None,
-        attn_res_register=None,
-        attn_res_read_h=None,
-        ihc=None,
-        ihc_streams=None,
-        ihc_typed=None,
-        ihc_collapse=None,
-        ihc_ngram_stream=None,
-        loop_span=None,
-        loop_count=None,
-        loop_res_scale=None,
-        loop_grad_mode=None,
-        loop_extrap=None,
-        loop_anchor=None,
-    )
+    # 仅在用户显式传入时覆盖（无 sidecar 时回退 VibyConfig 默认值 / --preset）。
+    parser.set_defaults(**{key: None for key in ARCH_ARG_TO_FIELD})
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-DPO")
     parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl")
@@ -827,10 +574,44 @@ def get_dpo_parser():
     return parser
 
 
+def _explicit_cli_keys() -> set:
+    """命令行上真正出现过的选项名（dest 口径）。
+
+    argparse 分不清"默认值"与"用户显式传了默认值"，而 --preset 的语义是
+    "只补未显式传入的字段"：直接扫 argv 是唯一无歧义的判据。
+    """
+    seen = set()
+    for tok in sys.argv[1:]:
+        if tok.startswith("--"):
+            name = tok[2:].split("=", 1)[0]
+            if name:
+                seen.add(name.replace("-", "_"))
+    return seen
+
+
+def apply_preset(args):
+    """--preset：把未显式传入的结构参数换成预设值（显式值优先）。
+
+    只在 pretrain 调用：SFT/DPO 的结构参数默认 None 表示"继承基座 sidecar"，
+    预设由 build_config_from_sidecar 在没有 sidecar 时并入。
+    """
+    preset = getattr(args, "preset", None)
+    if not preset:
+        return args
+    cfg = VibyConfig(preset=preset)
+    explicit = _explicit_cli_keys()
+    # 旧名别名（--routed_scaling_factor → route_scale）同样算显式传入
+    explicit |= {
+        dest for alias, dest in ARCH_ARG_ALIASES.items() if alias in explicit
+    }
+    for arg, field in ARCH_ARG_TO_FIELD.items():
+        if arg not in explicit:
+            setattr(args, arg, getattr(cfg, field))
+    return args
+
+
 def setup_training_args(args, training_type="pretrain"):
     """设置训练参数"""
-    import os
-
     # 基础参数校验
     if args.epochs <= 0:
         raise ValueError("epochs 必须大于 0")
@@ -848,6 +629,11 @@ def setup_training_args(args, training_type="pretrain"):
         raise ValueError("max_train_minutes 必须大于 0（或不传入以禁用时间限制）")
     if getattr(args, "max_steps", None) is not None and args.max_steps <= 0:
         raise ValueError("max_steps 必须大于 0（或不传入以禁用步数限制）")
+
+    # 结构预设：只覆盖未显式传入的结构参数（pretrain 从零建模型；
+    # SFT/DPO 的结构参数默认 None，交给 sidecar 继承逻辑）
+    if training_type == "pretrain":
+        apply_preset(args)
 
     # checkpoint 保存点必须落在梯度累积窗口边界上：窗口中间保存的 checkpoint
     # 不含已累加但未更新的梯度，resume 时这部分梯度会永久丢失

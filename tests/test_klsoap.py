@@ -125,16 +125,16 @@ def test_wiring():
     from model.model import VibyForCausalLM
     from trainer.muon import BatchedMuon, create_mixed_optimizer
 
+    # V4.1 架构：n_layers >= 4（CED 至少 2 编码 + 2 解码）
     cfg = VibyConfig(
         hidden_size=128,
-        num_hidden_layers=1,
+        num_hidden_layers=4,
         num_attention_heads=4,
         head_dim=32,
         vocab_size=256,
         n_routed_experts=8,
         num_experts_per_tok=2,
         moe_intermediate_size=48,
-        moe_latent_dim=64,
         tie_word_embeddings=False,
     )
     args = types.SimpleNamespace(learning_rate=0.01, muon_ns_steps=5, muonh=True)

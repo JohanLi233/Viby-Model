@@ -2,7 +2,6 @@
 基础训练器类，提供通用的训练逻辑（MLX 单设备版）
 """
 
-import math
 import os
 import queue
 import sys
@@ -38,10 +37,9 @@ _ACCUM_EAGER = os.environ.get("VIBY_ACCUM_EAGER", "1") != "0"
 # 提前释放。A/B 开关：VIBY_OPT_CHUNKED_EVAL=1。
 _OPT_CHUNKED_EVAL = os.environ.get("VIBY_OPT_CHUNKED_EVAL", "0") == "1"
 _OPT_CHUNK_BYTES = 512 << 20
-# 每个梯度累积窗口喂给 QB 偏置快照的 margin 样本总行数上限（沿 token 轴）。
-# 超过就按 stride 抽稀，使统计张量尺寸与 accumulation_steps 无关。
-# 0 = 不抽稀（旧行为，A/B 用）。见 _qb_stats_slice 的注释。
-_QB_STATS_MAX_ROWS = int(os.environ.get("VIBY_QB_STATS_ROWS", "16384"))
+# 注：MoE 负载均衡已从旧的分位数 QB（margin 样本拼接）换成 V4.1 的
+# noaux_tc：forward 物化每专家 token 计数 out.moe_loads，窗口内直接累加，
+# 不需要样本抽稀/拼接。
 
 
 def _collate_numpy(samples):
@@ -246,24 +244,14 @@ class BaseTrainer:
                 self.model, self.args, self.training_type
             )
 
-        # QB 路由偏置快照：开启 router 统计（margin 样本为图节点随 loss
-        # 输出），供 _optimizer_step 每优化器步计算分位数并覆写 expert_bias
-        self._moe_gates = (
-            self.model.moe_gates() if hasattr(self.model, "moe_gates") else []
-        )
-        for gate in self._moe_gates:
-            gate.collect_stats = True
+        # noaux_tc 的 e_score_correction_bias 更新：forward 把 [L,E] 的每专家
+        # token 计数作为图输出物化（out.moe_loads），_optimizer_step 在窗口
+        # 末尾按 b += γ·sign(load_frac − 1/E) 覆写 frozen 的 bias
+        self._moe_gates = list(getattr(self.model, "moe_gates", None) or [])
 
-        # loss + 梯度函数（MoE 已改 sorted gather_mm 分发，形状只随
-        # (B,T,E,K) 静态确定，mx.compile 可用，见 _build_loss_and_grad）
+        # loss + 梯度函数（MoE 用 sorted gather_mm 分发，形状只随 (B,T,E,K)
+        # 静态确定，mx.compile 可用，见 _build_loss_and_grad）
         self._loss_and_grad = self._build_loss_and_grad()
-        unembedding = (
-            self.model.lm_head
-            if self.model.lm_head is not None
-            else self.model.model.embed_tokens
-        )
-        self._unembedding_input_dim = int(unembedding.weight.shape[1])
-        self._unembedding_output_dim = int(unembedding.weight.shape[0])
 
         # Metal 分配器缓存上限（--cache_limit_gb，默认 0=不限）：
         # 上限内的空闲块常驻复用、不归还 OS，避免每步"释放-重分配"抖动
@@ -279,83 +267,37 @@ class BaseTrainer:
         # 处理检查点恢复
         self.start_epoch, self.start_step = self._handle_checkpoint_resume()
 
-    def _loss_fn(
-        self, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None, compute_lar=False
-    ):
+    def _loss_fn(self, X, Y, loss_mask, attn_mask, seg_ids=None):
         """训练 loss 函数（model 走闭包引用）
 
-        返回 (加权和 loss / accumulation_steps, mtp 分量 loss, moe margin 统计, ...)。
-        mtp 分量仅作日志展示、不缩放；无 MTP 时返回 0 常量。
-        总 loss 中已包含 z-loss；
-        z_loss（已加权）仅作日志展示，无 z-loss 时返回 0 常量。
-        moe margin 统计为各 router 本微批的 margin 样本堆叠
-        (n_gates, N, E)，供 QB 偏置快照更新；无 MoE 时返回零长占位，
-        保持 compile 图结构稳定。
-        compute_lar：本步是否计算 LAR 诊断（python bool，与 mask_has_pad
-        同机制——编译期常量，至多两个图变体）；False 时 lar 位返回 0 占位。
+        返回 (加权和 loss / accumulation_steps, mtp 分量 loss, moe_loads,
+        lm_loss / accumulation_steps, z_loss)。mtp/lm/z 分量仅作日志展示、
+        不缩放；总 loss 里已含加权后的 mtp 与 z-loss。
+
+        moe_loads 是 forward 物化的 [L, E] 每专家 token 计数（compile 下纯
+        侧信道 g._last_load 会被剪枝，必须经返回值出图）。累积窗口内按元素
+        累加即可（计数可加），窗口末尾交给 model.update_moe_biases 做
+        noaux_tc 偏置更新；无 MoE 时用零长占位保持图结构稳定。
         """
         res = self.model(
             input_ids=X,
             labels=Y,
             loss_mask=loss_mask,
             attention_mask=attn_mask,
-            mask_has_pad=mask_has_pad,
             segment_ids=seg_ids,
-            need_logits=compute_lar,
         )
         mtp_loss = res.mtp_loss if res.mtp_loss is not None else mx.array(0.0)
         lm_loss = res.lm_loss if res.lm_loss is not None else res.loss
-        div_loss = (
-            res.diversity_loss if res.diversity_loss is not None else mx.array(0.0)
-        )
         z_loss = res.z_loss if res.z_loss is not None else mx.array(0.0)
-        moe_stats = self.model.qb_margin_stats() if self._moe_gates else None
-        if moe_stats is None:
-            moe_stats = mx.zeros((0,), dtype=mx.float32)
-        # 各 router 的每专家 token 计数：作为输出随图物化（compile 下纯
-        # 侧信道 g.last_load 会被剪枝成无 primitive 占位，log 时无法 eval）
-        load_stats = self.model.moe_load_stats() if self._moe_gates else None
-        if load_stats is None:
-            load_stats = mx.zeros((0,), dtype=mx.float32)
-        # LAR 是训练诊断指标：log_n(||WX||_RMS/(||W||_RMS*||X||_RMS))。
-        # res.logits 已等于 X @ W.T，这里只做逐元素平方/求和；不参与梯度。
-        # 只在 log step 计算：每微批都算会白物化 bs×T×V 的 f32 logits 与
-        # bs×T×D 的 f32 hidden（~600MB 流量），而它仅随日志消费一次。
-        if compute_lar:
-            valid_f32 = (loss_mask > 0).astype(mx.float32)
-            unemb_weight = (
-                self.model.lm_head.weight
-                if self.model.lm_head is not None
-                else self.model.model.embed_tokens.weight
-            ).astype(mx.float32)
-            hidden_f32 = res.hidden_states.astype(mx.float32)
-            logits_f32 = res.logits.astype(mx.float32)
-            token_count = mx.maximum(mx.sum(valid_f32), 1.0)
-            output_dim = self._unembedding_output_dim
-            input_dim = self._unembedding_input_dim
-            wx_ms = mx.sum(logits_f32 * logits_f32 * valid_f32[:, :, None]) / (
-                token_count * output_dim
-            )
-            weight_ms = mx.sum(unemb_weight * unemb_weight) / (output_dim * input_dim)
-            hidden_ms = mx.sum(hidden_f32 * hidden_f32 * valid_f32[:, :, None]) / (
-                token_count * input_dim
-            )
-            lar = (
-                0.5
-                * (mx.log(wx_ms) - mx.log(weight_ms) - mx.log(hidden_ms))
-                / mx.log(mx.array(input_dim, dtype=mx.float32))
-            )
-        else:
-            lar = mx.array(0.0)
+        moe_loads = res.moe_loads
+        if moe_loads is None:
+            moe_loads = mx.zeros((0,), dtype=mx.float32)
         return (
             res.loss / self.args.accumulation_steps,
             mtp_loss,
-            moe_stats,
+            moe_loads,
             lm_loss / self.args.accumulation_steps,
-            div_loss,
-            lar,
             z_loss,
-            load_stats,
         )
 
     def _loss_and_grad_with_params(
@@ -366,30 +308,25 @@ class BaseTrainer:
         Y,
         loss_mask,
         attn_mask,
-        mask_has_pad,
         seg_ids=None,
-        compute_lar=False,
     ):
         """参数与 MoE bias 显式作为入参的 loss 函数（value_and_grad 的目标）。
 
         不能用 nn.value_and_grad + mx.compile：那样 params 通过闭包
         （model.trainable_parameters()）被 compile 捕获为常量，梯度永远
         基于初始权重、优化器更新完全无效。显式传参后参数成为运行时输入。
-        expert_bias 是 freeze buffer，同样必须当入参：只传 params 时
-        compile 会把 bias 收成 trace 时的全 0，QB 覆写进不了图。
-        mask_has_pad / compute_lar 是 python bool，作为编译期常量
-        （每个取值至多一个图变体）。
+        moe_biases 是 freeze buffer（e_score_correction_bias），同样必须当
+        入参：只传 params 时 compile 会把 bias 收成 trace 时的快照，训练
+        循环的 noaux_tc 覆写进不了图。
         value_and_grad 只对 params（argnums=0）求梯度。
         """
         self.model.update(params)
         if hasattr(self.model, "apply_moe_biases"):
             self.model.apply_moe_biases(moe_biases)
-        return self._loss_fn(
-            X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids, compute_lar=compute_lar
-        )
+        return self._loss_fn(X, Y, loss_mask, attn_mask, seg_ids)
 
     def _compute_loss_and_grad(
-        self, X, Y, loss_mask, attn_mask, mask_has_pad, seg_ids=None, compute_lar=False
+        self, X, Y, loss_mask, attn_mask, seg_ids=None
     ):
         """一次微批的 value_and_grad；compile 后立刻恢复 params 与 bias。"""
         params = self.model.trainable_parameters()
@@ -409,23 +346,17 @@ class BaseTrainer:
             else mx.zeros((0,), dtype=mx.float32)
         )
         outputs, grads = self._loss_and_grad(
-            eval_params,
-            biases,
-            X,
-            Y,
-            loss_mask,
-            attn_mask,
-            mask_has_pad,
-            seg_ids,
-            compute_lar,
+            eval_params, biases, X, Y, loss_mask, attn_mask, seg_ids
         )
-        if self._compiled:
-            # compiled fn 内部的 model.update / apply_moe_biases 只在 trace
-            # 时执行，会把无 primitive 的占位数组留在 module 上；立即用
-            # 真实参数和本步传入的 bias 恢复，避免污染后续 optimizer step。
-            self.model.update(params)
-            if hasattr(self.model, "apply_moe_biases"):
-                self.model.apply_moe_biases(biases)
+        # 无论 eager 还是 compile，f 内部的 model.update / apply_moe_biases 都
+        # 只把模块的叶子换成了"trace 期的中间量"（compile 下是无 primitive 的
+        # 占位数组，eager 下是 vjp trace 的 tracer）。不恢复的话，下一个微批的
+        # model.trainable_parameters() 会把这些残留物当成参数再喂进新 trace，
+        # 前向直接变 NaN（实测 SFT 第 2 个微批起 loss=nan）。这里统一用本步
+        # 传入的真实参数与 bias 恢复模块状态。
+        self.model.update(params)
+        if hasattr(self.model, "apply_moe_biases"):
+            self.model.apply_moe_biases(biases)
         return outputs, grads
 
     def _build_loss_and_grad(self):
@@ -439,25 +370,6 @@ class BaseTrainer:
                 Logger(f"dropout={dropout} 在 mx.compile 下 RNG 被冻结，自动回退 eager")
                 use_compile = False
         if use_compile:
-            # 所有融合 kernel 的首次校验含 .item() host sync，不能在 compile
-            # trace 内发生：异常会被 dispatch 的 except 吞掉并永久禁用该
-            # kernel，整轮训练静默走 eager（KDA 层实测 49.7→72.0ms/层）。
-            # 这里在编译前用 dummy 输入把实际会用到的形状全部预编译 + 校验。
-            try:
-                from mlx.utils import tree_flatten
-
-                from model.kernels import prewarm_all
-
-                dtype = tree_flatten(self.model.parameters())[0][1].dtype
-                prewarm_all(
-                    self.model,
-                    self.lm_config,
-                    dtype,
-                    int(getattr(self.args, "max_seq_len", 0) or 0),
-                    log=Logger,
-                )
-            except Exception as e:
-                Logger(f"融合 kernel 预热跳过（{e}），运行时按需回退 eager")
             Logger("使用 mx.compile 编译 loss 函数")
             fn = mx.compile(fn)
         self._compiled = use_compile
@@ -529,33 +441,7 @@ class BaseTrainer:
             drop_last=True,
         )
 
-    def _qb_stats_slice(self, stats):
-        """把 QB margin 样本沿 token 轴抽稀到「每微批预算行数」。
-
-        窗口内的 margin 张量形状是 (n_gates, 12288·A, 128) f32，A 为
-        accumulation_steps：A=16 时单份 905MB，跨微批拼接的拷贝量是
-        O(A²)（A=16 约 7.2GB 搬运），而窗口末 update_moe_biases 里的
-        _col_quantile 在 MLX 0.32 上被转成 gpu_merge_sort，成本随行数超
-        线性增长（实测 A=8 的 (9,98304,128) 与 A=16 的 (9,196608,128)
-        让优化器净开销从 ~530ms 涨到 ~780ms/窗口）。
-
-        分位数本身对样本量极不敏感：每专家的 (1−K/E)=0.9375 上分位点由
-        N·(1−0.9375) 个上尾样本决定，N=16384 时每专家仍有 ~1024 个上尾
-        样本，抽稀一个数量级仍在蒙特卡洛噪声内。抽稀后张量尺寸与 A 无关。
-
-        沿 token 轴等距取 stride：打包语料下该轴是「batch 内先 T 后 B」
-        的展平顺序，等距抽样在文档间是均匀散开的，不会偏向某些文档。
-        """
-        if stats is None or stats.size == 0 or _QB_STATS_MAX_ROWS <= 0:
-            return stats
-        budget = _QB_STATS_MAX_ROWS // max(1, int(self.args.accumulation_steps))
-        n = int(stats.shape[1])
-        if budget <= 0 or n <= budget:
-            return stats
-        stride = int(math.ceil(n / budget))
-        return stats[:, ::stride]
-
-    def _optimizer_step(self, accum_grads, accum_count, moe_stats=None):
+    def _optimizer_step(self, accum_grads, accum_count, moe_loads=None):
         """累积窗口结束：梯度裁剪 + 优化器更新 + MoE 路由偏置更新"""
         if accum_count <= 0 or accum_grads is None:
             return 0.0
@@ -603,11 +489,12 @@ class BaseTrainer:
                 ]
             )
 
-        # QB 路由偏置快照：各专家 margin 的 (1−K/E) 上分位数 → −beta
-        # 零均值覆写 expert_bias（见 update_moe_biases）。margin 样本为
-        # 累积窗口内全部微批的拼接。
-        if moe_stats is not None and moe_stats.size > 0:
-            self.model.update_moe_biases(moe_stats)
+        # noaux_tc 偏置更新：窗口内各微批的 [L,E] 计数已累加（计数可加），
+        # 这里按 b += γ·sign(load_frac − 1/E) 覆写每个 gate 的
+        # e_score_correction_bias。必须在 compile 图外调用：它写的是冻结的
+        # buffer，下一次前向作为显式入参进图。
+        if moe_loads is not None and getattr(moe_loads, "size", 0) > 0:
+            self.model.update_moe_biases(moe_loads)
 
         if _OPT_CHUNKED_EVAL:
             # 注意：不能在这里 `from mlx.utils import tree_flatten`——那会让
@@ -689,8 +576,7 @@ class BaseTrainer:
         accum_grads = None
         accum_count = 0
         last_grad_norm = 0.0
-        last_moe_stats = None
-        current_unemb_lar = None
+        last_moe_loads = None
 
         for step, batch in enumerate(loader_iter):
             # 跳过步骤（恢复训练时）
@@ -717,39 +603,19 @@ class BaseTrainer:
                 wsd_decay_frac=getattr(self.args, "wsd_decay_frac", 0.2),
             )
 
-            # 构造 attention_mask，屏蔽 PAD 位置
+            # 构造 attention_mask，屏蔽 PAD 位置（模型内部按 bool 掩码处理）
             attn_mask = (X != self.tokenizer.pad_token_id).astype(mx.int32)
-            # mx.compile 图内不允许 .item() host sync，在 eager 侧算好传入；
-            # eager 模式下模型内部也会做同样的判断，成本相同
-            mask_has_pad = bool(mx.any(attn_mask != 1).item())
-            # LAR 诊断只在 log step 计算（python bool 入参，compile 下与
-            # mask_has_pad 同为编译期常量，至多两个图变体）
             is_log_step = step % self.args.log_interval == 0
 
             # 前向 + 反向（loss 内部已除以 accumulation_steps）
-            # params 与 expert_bias 都显式传入：compile 下保证梯度基于当前
-            # 权重、QB 偏置基于当前快照，而不是 trace 时的常量。
+            # params 与 moe bias 都显式传入：compile 下保证梯度基于当前权重、
+            # 路由偏置基于当前快照，而不是 trace 时的常量。
             # mtp_loss 是辅助输出，仅用于日志展示，不参与梯度
             (
-                (
-                    loss,
-                    mtp_loss,
-                    moe_stats,
-                    lm_loss,
-                    div_loss,
-                    unemb_lar,
-                    z_loss,
-                    load_stats,
-                ),
+                (loss, mtp_loss, moe_loads, lm_loss, z_loss),
                 grads,
             ) = self._compute_loss_and_grad(
-                X,
-                Y,
-                loss_mask,
-                attn_mask,
-                mask_has_pad,
-                seg_ids,
-                compute_lar=is_log_step,
+                X, Y, loss_mask, attn_mask, seg_ids
             )
 
             # 立即物化本微批的 loss/grads 并释放反向图。MLX 是惰性求值，
@@ -759,16 +625,7 @@ class BaseTrainer:
             # 时 MLX 的图调度会把前向 tape 滞留与反向临时量同时顶到峰值
             # （r073 配置实测 46GB/4.0s）；拆开后前向先落定（~14.5GB）再跑
             # 反向（峰值 ~16GB），显存省 ~3×、单步快 ~2×，数值不变。
-            mx.eval(
-                loss,
-                mtp_loss,
-                moe_stats,
-                lm_loss,
-                div_loss,
-                unemb_lar,
-                z_loss,
-                load_stats,
-            )
+            mx.eval(loss, mtp_loss, moe_loads, lm_loss, z_loss)
             mx.eval(grads)
             # P-0/P-1 快照（env 门控，默认零开销）：捕获本微批梯度，
             # 供跨 microbatch 方向相关分析（research/OPTIMIZER_RESEARCH §0.5）
@@ -779,13 +636,11 @@ class BaseTrainer:
                 snapshot.maybe_dump_grads(
                     step // acc + 1, step % acc, dict(tree_flatten(grads)), acc
                 )
-            # margin 样本跨微批沿 token 轴拼接：QB 偏置快照看到整个累积
-            # 窗口的 margin 分布，比只用最后一个微批噪声更小
-            if last_moe_stats is None or last_moe_stats.size == 0:
-                last_moe_stats = self._qb_stats_slice(moe_stats)
-            elif moe_stats.size > 0:
-                last_moe_stats = mx.concatenate(
-                    [last_moe_stats, self._qb_stats_slice(moe_stats)], axis=1
+            # noaux_tc 的每专家 token 计数跨微批直接相加（计数可加，不需要
+            # 旧 QB 的 margin 样本拼接）：窗口末尾一次性更新路由偏置
+            if getattr(moe_loads, "size", 0) > 0:
+                last_moe_loads = (
+                    moe_loads if last_moe_loads is None else last_moe_loads + moe_loads
                 )
 
             # 梯度累加
@@ -805,11 +660,11 @@ class BaseTrainer:
             # 梯度累积窗口结束，执行更新
             if (step + 1) % self.args.accumulation_steps == 0:
                 last_grad_norm = self._optimizer_step(
-                    accum_grads, accum_count, moe_stats=last_moe_stats
+                    accum_grads, accum_count, moe_loads=last_moe_loads
                 )
                 accum_grads = None
                 accum_count = 0
-                last_moe_stats = None
+                last_moe_loads = None
 
                 # 时长/步数预算只在窗口边界检查：中途停止会丢掉已累加但未更新的梯度
                 if self._time_limit_exceeded():
@@ -853,15 +708,10 @@ class BaseTrainer:
                 mx.eval(loss)
                 current_loss = float(loss.item()) * self.args.accumulation_steps
                 # 各 loss 分量（未加权），用于日志与 swanlab
-                has_mtp = getattr(self.lm_config, "mtp_depth", 0) > 0
+                has_mtp = getattr(self.lm_config, "n_mtp_layers", 0) > 0
                 current_mtp_loss = float(mtp_loss.item()) if has_mtp else None
                 current_main_loss = float(lm_loss.item()) * self.args.accumulation_steps
-                current_div_loss = float(div_loss.item()) * float(
-                    getattr(self.lm_config, "moe_diversity_loss_weight", 0.0) or 0.0
-                )
                 current_z_loss = float(z_loss.item())
-                if unemb_lar is not None:
-                    current_unemb_lar = float(unemb_lar.item())
 
                 # 使用上次计算的梯度范数
                 grad_norm_to_log = last_grad_norm
@@ -874,15 +724,19 @@ class BaseTrainer:
                     act = mx.get_active_memory() / 2**30
                     cache = mx.get_cache_memory() / 2**30
                     peak = mx.get_peak_memory() / 2**30
-                    # load_stats 是随 loss 输出物化的各 gate 负载拼接向量
-                    # （compile 下侧信道 last_load 会被剪枝，不可直接 eval）
-                    gate_max = []
-                    off = 0
-                    for g in self._moe_gates:
-                        e = int(g.n_routed)
-                        if off + e <= load_stats.size:
-                            gate_max.append(float(load_stats[off : off + e].max()))
-                        off += e
+                    # moe_loads 是随 loss 输出物化的 [L,E] 每专家 token 计数
+                    # （compile 下侧信道 g._last_load 会被剪枝，不可直接 eval）；
+                    # 行序与 self._moe_gates 一致
+                    gate_max = (
+                        [
+                            float(moe_loads[gi].max())
+                            for gi in range(
+                                min(len(self._moe_gates), int(moe_loads.shape[0]))
+                            )
+                        ]
+                        if getattr(moe_loads, "ndim", 0) == 2
+                        else []
+                    )
                     extra = {
                         "mem/active_gb": round(act, 3),
                         "mem/cache_gb": round(cache, 3),
@@ -910,9 +764,7 @@ class BaseTrainer:
                     base_step_offset=base_step_offset_for_speed,
                     mtp_loss=current_mtp_loss,
                     main_loss=current_main_loss,
-                    diversity_loss=current_div_loss,
                     z_loss=current_z_loss,
-                    unemb_lar=current_unemb_lar,
                     extra=extra,
                 )
             # 模型保存

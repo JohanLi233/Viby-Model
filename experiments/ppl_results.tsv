@@ -1,2 +1,0 @@
-round	date	n_docs	tokens	mean_ce	overall_ppl	doc_ppl	eval_s	ckpt	notes
-r079_seq8_quick	2026-08-21 08:57	2000	821378	2.0544	7.8021	8.1195	50.8	research_runs/r079_seq8_quick/pretrain_768.safetensors	

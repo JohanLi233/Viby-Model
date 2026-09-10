@@ -308,17 +308,12 @@ def main():
     print(f"[device] 默认计算设备: {mx.default_device()}")
 
     model, tokenizer = init_model(args)
-    use_engine = not model.config.use_linear_attn
-    engine = (
-        VibyEngine(model, tokenizer, page_size=16, max_num_seqs=1)
-        if use_engine
-        else None
-    )
-    if engine is not None:
-        extra = " + MTP 投机解码" if args.use_mtp_speculative else ""
-        print(f"[engine] VibyEngine（paged KV / 连续 batch / 前缀复用{extra}）")
-    else:
-        print("[engine] use_linear_attn 检查点走 model.generate")
+    # 新架构（DeepSeek-V4.1 缩放版）只有一条推理路径：engine 的连续 batch。
+    # 旧的 use_linear_attn 分支随旧架构一起删除了。
+    engine = VibyEngine(model, tokenizer, max_num_seqs=1)
+    print("[engine] VibyEngine（window / compress_kv / index_k 三类池，连续 batch + 前缀复用）")
+    if args.use_mtp_speculative:
+        print("[engine] 注意：新引擎暂未实现 DSpark 投机解码，--use_mtp_speculative 被忽略")
 
     prompts = get_prompt_datas(args)
     test_mode = int(input("[0] 自动测试\n[1] 手动输入\n"))
@@ -339,59 +334,32 @@ def main():
         tok = tokenizer(
             new_prompt,
             truncation=True,
-            max_length=model.config.max_position_embeddings,
+            max_length=model.config.max_seq_len,
         )
         prompt_ids = list(tok.input_ids)
-        input_ids = mx.array([prompt_ids])
         slice_start = len(prompt_ids)
         prompt_len = len(prompt_ids)
-        max_new = max(0, model.config.max_position_embeddings - prompt_len)
+        max_new = max(0, model.config.max_seq_len - prompt_len)
 
         print("🤖️: ", end="")
         t0 = time.perf_counter()
-        if engine is not None:
-            out = engine.generate(
-                [prompt_ids],
-                _sampling_params(args, tokenizer, max_new),
-                streamer=streamer,
-            )
-            gen_ids = out[0].outputs[0].token_ids
-            generated_ids = mx.array([prompt_ids + gen_ids])
-        else:
-            generated_ids = model.generate(
-                input_ids,
-                attention_mask=None,
-                max_new_tokens=max_new,
-                num_return_sequences=1,
-                do_sample=True,
-                top_k=50,
-                eos_token_id=tokenizer.eos_token_id,
-                streamer=streamer,
-                top_p=args.top_p,
-                temperature=args.temperature,
-                repetition_penalty=args.repetition_penalty,
-                use_mtp_speculative=args.use_mtp_speculative,
-                num_speculative_tokens=args.num_speculative_tokens,
-            )
+        out = engine.generate(
+            [prompt_ids],
+            _sampling_params(args, tokenizer, max_new),
+            streamer=streamer,
+        )
+        gen_ids = out[0].outputs[0].token_ids
+        generated_ids = mx.array([prompt_ids + gen_ids])
         elapsed = time.perf_counter() - t0
-        if engine is not None:
-            engine_prefix += engine.stats.get("prefix_tokens", 0)
-            engine_mtp_acc += engine.stats.get("mtp_accepted", 0)
-            engine_mtp_dr += engine.stats.get("mtp_drafted", 0)
-        if engine is not None and engine.stats.get("mtp_drafted"):
+        engine_prefix += engine.stats.get("prefix_tokens", 0)
+        engine_mtp_acc += engine.stats.get("mtp_accepted", 0)
+        engine_mtp_dr += engine.stats.get("mtp_drafted", 0)
+        if engine.stats.get("mtp_drafted"):
             stats = engine.stats
             acc = stats["mtp_accepted"] / max(stats["mtp_drafted"], 1)
             print(
                 f"\n[MTP speculative] 草稿接受率: {acc:.1%} "
                 f"({stats['mtp_accepted']}/{stats['mtp_drafted']}，"
-                f"每轮草稿 {args.num_speculative_tokens})"
-            )
-        elif args.use_mtp_speculative and hasattr(model, "_last_spec_stats"):
-            stats = model._last_spec_stats
-            acc = stats["accepted"] / max(stats["drafted"], 1)
-            print(
-                f"\n[MTP speculative] 草稿接受率: {acc:.1%} "
-                f"({stats['accepted']}/{stats['drafted']}，"
                 f"每轮草稿 {args.num_speculative_tokens})"
             )
 
@@ -412,12 +380,10 @@ def main():
         total_time = sum(s[1] for s in perf_stats)
         tps_list = [s[2] for s in perf_stats]
         overall_tps = total_tokens / total_time if total_time > 0 else 0.0
-        extra = ""
-        if engine is not None:
-            extra = f"，engine prefix_hit={engine_prefix}"
-            if engine_mtp_dr:
-                acc = engine_mtp_acc / max(engine_mtp_dr, 1)
-                extra += f"，MTP 接受率 {acc:.1%} ({engine_mtp_acc}/{engine_mtp_dr})"
+        extra = f"，engine prefix_hit={engine_prefix}"
+        if engine_mtp_dr:
+            acc = engine_mtp_acc / max(engine_mtp_dr, 1)
+            extra += f"，MTP 接受率 {acc:.1%} ({engine_mtp_acc}/{engine_mtp_dr})"
         print(
             f"[TPS 汇总] 共 {len(perf_stats)} 题，生成 {total_tokens} tokens，"
             f"总耗时 {total_time:.2f}s，整体 {overall_tps:.2f} tokens/s"

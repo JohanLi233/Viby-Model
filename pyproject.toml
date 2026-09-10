@@ -1,7 +1,7 @@
 [project]
 name = "viby"
 version = "0.1.0"
-description = "Viby: a small dense LLM (pretrain / SFT / DPO) built on Apple MLX"
+description = "Viby: DeepSeek-V4.1 architecture (CED + CSA2 + mHC + MoE + Engram + DSpark) scaled down, built on Apple MLX"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

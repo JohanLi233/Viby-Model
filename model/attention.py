@@ -1,690 +1,571 @@
-import math
-from typing import Optional
+"""DeepSeek-V4.1 的混合稀疏注意力（CSA2 + Lightning Indexer + 滑窗分支）。
+
+结构（对照 V4.1 tech report §2.3 与官方 inference/model.py）：
+
+1. **共享 K=V 的 MQA**：wkv 只产 1 个 head，同一个张量既当 K 又当 V；
+   每个 head 的尾部 rope_head_dim 通道做交错对部分旋转，注意力输出端用
+   同一个旋转按 -i 转回去（inverse=True），使 cache 只保留一种旋转形式。
+2. **两条 KV 分支拼接**：query 能看窗口内的原始 KV（滑动窗口环），加上
+   indexer 为它挑出的 index_topk 个压缩位置。
+3. **分组低秩输出投影**：o_groups 组 → 组内 block-diagonal 的 wo_a →
+   o_lora_rank → wo_b 回 hidden。
+
+逐层模式（CSA2 的 Full / Reindex / Reuse）由 config.layer_mode 给出：
+Full = 自己产压缩 KV 且自己跑 indexer；Reindex = 复用上游压缩 KV、自己跑
+indexer；Reuse = 两者都复用上游。压缩 KV 与 indexer 的 K 由 kv_source_layers
+指定的层产生（CED 边界层是解码段的全局源），其后同 ratio 的层共享同一份
+cache——这正是 CED 的实现方式：解码层的全局 KV 来自编码器末层的 hidden。
+
+位置约定：token_pos 统一是 [B,T] 的绝对位置（稠密路径用 [1,T] 广播，
+解码用 [B,1]），这样同一份代码既能做整段 prefill，也能做"连续 batch 里
+各请求长度不同"的逐步解码。
+"""
 
 import mlx.core as mx
-import mlx.nn as nn
+from mlx import nn
 
-from .cache import KVCache, _offset_causal_mask
-from .config import VibyConfig
-from .kernels.attn_fused import flash_sdpa as _flash_sdpa
-from .kernels.conv import causal_conv
-from .norms import RMSNorm, _rms_unit
+from .norms import RMSNorm
+from .rope import precompute_freqs_cis, rope_partial
 
-
-def _gate_heads(output: mx.array, gate: mx.array, head_dim: int) -> mx.array:
-    """gate (B,T,H) 广播乘到 (B,T,H·Hd)，避免 mx.repeat 沿最后一维物化副本。"""
-    bsz, seq, dim = output.shape
-    return (
-        output.reshape(bsz, seq, dim // head_dim, head_dim) * gate[..., None]
-    ).reshape(bsz, seq, dim)
+NEG_INF = -1e30
 
 
-def _shift_right_tokens(x: mx.array, offset: int) -> mx.array:
-    """沿序列维右移（左填 0），用于 n-gram 窗口与因果卷积。"""
-    if offset == 0:
-        return x
-    pad = mx.zeros_like(x[:, :offset, ...])
-    return mx.concatenate([pad, x[:, :-offset, ...]], axis=1)
+def _cos_sin(cos_all, sin_all, pos, head_axis: bool):
+    """取位置 pos 的 cos/sin；head_axis 时在 head 维前插一个广播轴。"""
+    c, s = cos_all[pos], sin_all[pos]
+    if head_axis:
+        c, s = c[..., None, :], s[..., None, :]
+    return c, s
 
 
-class ShortConv(nn.Module):
-    """深度因果 1-D 卷积（depthwise，kernel=4，identity-init，dilation=1）。
+def select_candidate_blocks(logits: mx.array, compress_lens, topk_blocks: int, block_size: int):
+    """分层索引第一级：每个 query 只保留得分最高的 topk_blocks 个块。
 
-    输入 (B, T, C)，沿时间轴逐通道卷积：y[t] = Σ_j w[j]·x[t-j]。
-    identity 初始化（w[0]=1，其余 0）⇒ 初始严格恒等。传入 segment_ids (B, T) 时逐 tap 重验文档
-    边界（跨段的历史 tap 清零），消除打包序列的跨文档泄漏。
+    logits: [B,T,N]，不可达位置已经是 -inf（块得分 -inf 即"还不可达"）。
+    compress_lens: 标量或可广播的每 query 可达压缩位置数。
+    返回与 logits 同形状的 bool 掩码。
     """
-
-    def __init__(self, dim: int, kernel_size: int = 4):
-        super().__init__()
-        self.dim = dim
-        self.kernel_size = int(kernel_size)
-        w = mx.zeros((self.kernel_size, dim))
-        w = w.at[0].add(1.0)  # MLX ArrayAt 只支持 add/subtract 等
-        self.weight = w
-
-    def __call__(self, x: mx.array, segment_ids: Optional[mx.array] = None) -> mx.array:
-        w = self.weight.astype(x.dtype)
-        return causal_conv(x, w, seg=segment_ids, silu=False)
-
-    def cached_call(
-        self,
-        x: mx.array,
-        state: Optional[mx.array],
-        trace: Optional[list] = None,
-        trace_base: int = 0,
-    ):
-        """缓存解码：state 为 (B, K-1, C) 的历史输入尾部（None 视为全零），
-        返回 (y, 新 state)。segment 掩码只在完整前向（训练）出现，解码侧
-        不打包文档，无需传入。trace 非 None 时把每步处理后的输入尾部按
-        (trace_base + t + 1, tail) 逐步追加（与 KDA kda_trace 同口径），
-        供投机解码 rewind 精确恢复任意截断点的 conv 历史。"""
-        B, T, C = x.shape
-        K = self.kernel_size
-        if state is None:
-            state = mx.zeros((B, K - 1, C), dtype=x.dtype)
-        hist = mx.concatenate([state, x], axis=1)  # (B, K-1+T, C)
-        w = self.weight.astype(x.dtype)
-        y = causal_conv(hist, w, seg=None, silu=False)[:, K - 1 :, :]
-        if trace is not None:
-            # 步 t 后的尾部 = 截至该步的最后 K-1 个 conv 输入
-            for t in range(T):
-                trace.append((trace_base + t + 1, hist[:, t + 1 : t + K, :]))
-        return y, hist[:, T:, :]
-
-
-class GQAAttention(nn.Module):
-    """GQA global 层（full-causal NoPE；仅 use_linear_attn 路径）。
-
-    仅部署在 global 层（(layer_idx+1)%4==0 或最后一层），KV head 数
-    n_kv_heads_global。无 RoPE（NoPE：位置结构由 KDA 层承担）。
-
-    结构：q_proj / kv_proj（2×n_kv_heads×head_dim）/ o_proj；Q/K 逐 head
-    无参 RMS norm（全 head_dim）；K 在投影+norm 之后过 ShortConv
-    （site 1，KV cache 存 conv 前的 K，拼好全历史后统一卷积，训练/解码
-    口径严格一致）；注意力输出先做 XSA（逐 head 扣除与自身 V 平行的
-    分量），再经可选逐 head 门（use_attn_gate）与 o_proj；o_proj 之后
-    再过 ShortConv（site 2，解码状态存于本层 KVCache.extras）。
-    """
-
-    def __init__(self, config: VibyConfig, layer_idx: int = 0):
-        super().__init__()
-        self.n_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
-        self.n_kv_heads = config.n_kv_heads_global
-        self.n_rep = self.n_heads // self.n_kv_heads
-        self.is_causal = True
-        self.q_proj = nn.Linear(
-            config.hidden_size, self.n_heads * self.head_dim, bias=False
+    width = logits.shape[-1]
+    pad = (-width) % block_size
+    if pad:
+        logits = mx.concatenate(
+            [logits, mx.full((*logits.shape[:-1], pad), NEG_INF, dtype=logits.dtype)], axis=-1
         )
-        self.kv_proj = nn.Linear(
-            config.hidden_size, 2 * self.n_kv_heads * self.head_dim, bias=False
-        )
-        self.o_proj = nn.Linear(
-            self.n_heads * self.head_dim, config.hidden_size, bias=False
-        )
-        self.qk_norm_eps = config.rms_norm_eps
-        self.k_conv = ShortConv(self.n_kv_heads * self.head_dim)
-        self.out_conv = ShortConv(config.hidden_size)
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.dropout = config.dropout
-        self.flash = config.flash_attn
-        # 注意力输出门：2·σ(W_g x)，零初始化（初始门 1）。加在 o_proj 之前。
-        self.attn_gate = None
-        if config.use_attn_gate:
-            self.attn_gate = nn.Linear(config.hidden_size, self.n_heads, bias=True)
-            self.attn_gate.weight = mx.zeros_like(self.attn_gate.weight)
-            self.attn_gate.bias = mx.zeros_like(self.attn_gate.bias)
-
-    def _conv_k(self, k_bthd: mx.array, segment_ids) -> mx.array:
-        """site 1：对 (B, T, Hkv, D) 的 pre-conv K 沿时间轴做 ShortConv，
-        返回 (B, Hkv, T, D)。"""
-        B, T = k_bthd.shape[0], k_bthd.shape[1]
-        k = k_bthd.reshape(B, T, self.n_kv_heads * self.head_dim)
-        k = self.k_conv(k, segment_ids=segment_ids)
-        return k.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-
-    def __call__(
-        self,
-        x: mx.array,
-        position_embeddings=None,
-        past_key_value: Optional[tuple[mx.array, mx.array]] = None,
-        use_cache: bool = False,
-        attention_mask: Optional[mx.array] = None,
-        causal_bias: Optional[mx.array] = None,
-        mask_is_full: Optional[bool] = None,
-        segment_ids: Optional[mx.array] = None,
-    ) -> tuple[mx.array, Optional[tuple[mx.array, mx.array]]]:
-        del position_embeddings
-        bsz, seq_len, _ = x.shape
-        # 融合单 GEMM：[q|kv] 一次乘完再切分（参数独立存储，同 KDA 口径；
-        # eval 下按身份缓存拼接结果，见 KDAAttention）
-        nq = self.n_heads * self.head_dim
-        srcs = (self.q_proj.weight, self.kv_proj.weight)
-        w_qkv = None
-        if not self.training:
-            c = self.__dict__.get("_w_qkv_cache")
-            if c is not None and all(s is t for s, t in zip(c[1], srcs)):
-                w_qkv = c[0]
-        if w_qkv is None:
-            w_qkv = mx.concatenate(srcs, axis=0)
-            if not self.training:
-                object.__setattr__(self, "_w_qkv_cache", (w_qkv, srcs))
-        nkv = self.n_kv_heads * self.head_dim
-        # 一次 mx.split 而不是「切片 + 再 split」：切片的 VJP 要 scatter 进一份
-        # 全宽零张量，split 的 VJP 是单次 concatenate（见 KDAAttention 同处注释）
-        xq, xk, xv = mx.split(x @ w_qkv.T, [nq, nq + nkv], axis=-1)
-        xq = xq.reshape(bsz, seq_len, self.n_heads, self.head_dim)
-        xk = xk.reshape(bsz, seq_len, self.n_kv_heads, self.head_dim)
-        xv = xv.reshape(bsz, seq_len, self.n_kv_heads, self.head_dim)
-
-        # 逐 head 无参 RMS qk-norm（全 head_dim）
-        xq = _rms_unit(xq, self.qk_norm_eps)
-        xk = _rms_unit(xk, self.qk_norm_eps)
-
-        # KV cache 存 conv 前的 K：site 1 卷积在拼好全历史后施加。
-        past_kv = None
-        if use_cache:
-            if isinstance(past_key_value, KVCache):
-                cache = past_key_value
-            else:
-                cache = KVCache()
-                if past_key_value is not None:
-                    cache.update(past_key_value[0], past_key_value[1])
-            cache.update(xk, xv)
-            past_kv = cache
-            k_bhtd = self._conv_k(cache[0], None)
-            v_bhtd = cache.values[:, :, : cache.offset]
-        elif past_key_value is not None:
-            if isinstance(past_key_value, KVCache):
-                pk = past_key_value[0]
-                pv = past_key_value[1]
-            else:
-                pk, pv = past_key_value
-            k_bhtd = self._conv_k(mx.concatenate([pk, xk], axis=1), None)
-            v_bhtd = mx.concatenate([pv, xv], axis=1).transpose(0, 2, 1, 3)
-        else:
-            k_bhtd = self._conv_k(xk, segment_ids)
-            v_bhtd = xv.transpose(0, 2, 1, 3)
-
-        # (bsz, heads, seq_len, head_dim)；GQA：K/V 按 n_rep 扩展到全头数
-        # （q head h 用 kv head h // n_rep，mx.repeat 的连续重复正好对应）。
-        # decode/verify（Tq≠Tk，fused kernel 本就走 mlx SDPA）跳过 repeat，
-        # 用 0.32.1 原生 GQA SDPA（已验证与 repeat 逐位一致），省去每步
-        # O(T×n_rep) 的 K/V 物化；XSA 只重复 query 对应的末尾 seq_len 个 V。
-        xq = xq.transpose(0, 2, 1, 3)
-        if mask_is_full is None:
-            mask_is_full = attention_mask is None or bool(
-                mx.all(attention_mask == 1).item()
-            )
-        scale = 1.0 / math.sqrt(self.head_dim)
-        key_len = k_bhtd.shape[2]
-        has_past = key_len > seq_len
-
-        # global 层 full-causal mask 快路径选择
-        if seq_len == 1 and mask_is_full:
-            local_mask = None
-        elif has_past and seq_len > 1 and mask_is_full:
-            local_mask = _offset_causal_mask(seq_len, key_len, xq.dtype)
-        elif mask_is_full:
-            local_mask = "causal"
-        else:
-            local_mask = causal_bias
-
-        use_flash = (
-            self.flash
-            and self.dropout == 0.0
-            and (mask_is_full or (causal_bias is not None and not has_past))
-            and (
-                (seq_len > 1 and not has_past)
-                # decode：单 query 对全部历史可见，global 层 mask 为 None 即可
-                or (seq_len == 1 and mask_is_full)
-                # chunk decode / MTP 验证：qlen>1 且已有 cache，构造 offset
-                # causal 后仍走 flash（内部对 Tq!=Tk 自动回退 mlx SDPA）
-                or (seq_len > 1 and has_past and mask_is_full)
-            )
-        )
-        native_gqa = self.n_rep > 1 and use_flash and (seq_len == 1 or has_past)
-        if native_gqa:
-            k_att, v_att = k_bhtd, v_bhtd
-        elif self.n_rep > 1:
-            k_att = mx.repeat(k_bhtd, self.n_rep, axis=1)
-            v_att = mx.repeat(v_bhtd, self.n_rep, axis=1)
-        else:
-            k_att, v_att = k_bhtd, v_bhtd
-
-        if use_flash:
-            if native_gqa:
-                # 手写 fused kernel 不支持 GQA（含 Tq==Tk 的边界情形，
-                # 如首 token decode），native GQA 一律直连 mlx SDPA。
-                output = mx.fast.scaled_dot_product_attention(
-                    xq, k_att, v_att, scale=scale, mask=local_mask
-                )
-            else:
-                output = _flash_sdpa(xq, k_att, v_att, scale=scale, mask=local_mask)
-        else:
-            scores = (xq @ mx.swapaxes(k_att, -1, -2)) * scale
-
-            if local_mask is None or isinstance(local_mask, str):
-                causal_mask = mx.triu(mx.full((seq_len, seq_len), -mx.inf), k=1).astype(
-                    scores.dtype
-                )
-                scores = scores.at[..., -seq_len:].add(causal_mask)
-            else:
-                scores = scores + local_mask.astype(scores.dtype)
-
-            if attention_mask is not None:
-                am = attention_mask
-                if am.shape[1] < key_len:
-                    pad = mx.ones((am.shape[0], key_len - am.shape[1]), dtype=am.dtype)
-                    am = mx.concatenate([am, pad], axis=1)
-                elif am.shape[1] > key_len:
-                    am = am[:, -key_len:]
-                scores = (
-                    scores + (1.0 - am[:, None, None, :].astype(scores.dtype)) * -1e9
-                )
-
-            attn_weights = mx.softmax(scores.astype(mx.float32), axis=-1).astype(
-                xq.dtype
-            )
-            attn_weights = self.attn_dropout(attn_weights)
-            output = attn_weights @ v_att
-
-        # XSA（Exclusive Self-Attention）：逐 head 从输出扣除与自身 V
-        # 平行的分量 z = y − (yᵀv/‖v‖²)·v；除法在 f32 做。v 取 query 对应
-        # 的末尾 seq_len 个位置（有 cache 时 v_att 覆盖全部历史）。
-        # native_gqa 时 v_att 是未扩展的 Hkv 头，只重复这一小段。
-        yf = output.astype(mx.float32)
-        vf = v_att[:, :, -seq_len:, :]
-        if native_gqa:
-            vf = mx.repeat(vf, self.n_rep, axis=1)
-        vf = vf.astype(mx.float32)
-        coef = mx.sum(yf * vf, axis=-1, keepdims=True) / mx.maximum(
-            mx.sum(vf * vf, axis=-1, keepdims=True), mx.array(1e-12)
-        )
-        output = (yf - coef * vf).astype(output.dtype)
-
-        output = output.transpose(0, 2, 1, 3).reshape(bsz, seq_len, -1)
-        if self.attn_gate is not None:
-            # bf16 下 sigmoid 误差 ~1e-2（远小于 gate 自身量级与训练
-            # 噪声），无需把 (B,T,H) 小张量抬成 f32 再降回来。
-            gate = (2.0 * mx.sigmoid(self.attn_gate(x))).astype(output.dtype)
-            output = _gate_heads(output, gate, self.head_dim)
-        output = self.resid_dropout(self.o_proj(output))
-        # site 2：attn 分支输出（o_proj 之后、residual 之前）的 ShortConv；
-        # 解码状态挂在本层 KVCache.extras，随 cache 流转/rewind；投机解码
-        # 挂了 attn_out_trace 时逐步记录尾部快照，rewind 可精确恢复。
-        if isinstance(past_kv, KVCache):
-            output, st = self.out_conv.cached_call(
-                output,
-                past_kv.extras.get("attn_out"),
-                trace=past_kv.extras.get("attn_out_trace"),
-                trace_base=past_kv.offset - seq_len,
-            )
-            past_kv.extras["attn_out"] = st
-        else:
-            output = self.out_conv(output, segment_ids=segment_ids)
-        return output, past_kv
-
-
-def precompute_freqs_cis(
-    dim: int,
-    end: int = int(32 * 1024),
-    rope_base: float = 1e6,
-    rope_scaling: Optional[dict] = None,
-    return_freqs: bool = False,
-) -> tuple:
-    """MLA 解耦 RoPE 的 cos/sin 表；可选 YaRN 与 mx.fast.rope 的周期表。"""
-    freqs = 1.0 / (
-        rope_base ** (mx.arange(0, dim, 2)[: (dim // 2)].astype(mx.float32) / dim)
-    )
-    attn_factor = 1.0
-
-    if rope_scaling is not None:
-        orig_max = rope_scaling.get("original_max_position_embeddings", 2048)
-        factor = rope_scaling.get("factor", 16)
-        beta_fast = rope_scaling.get("beta_fast", 32.0)
-        beta_slow = rope_scaling.get("beta_slow", 1.0)
-        attn_factor = rope_scaling.get("attention_factor", 1.0)
-
-        if end / orig_max > 1.0:
-
-            def inv_dim(b):
-                return (dim * math.log(orig_max / (b * 2 * math.pi))) / (
-                    2 * math.log(rope_base)
-                )
-
-            low = max(math.floor(inv_dim(beta_fast)), 0)
-            high = min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
-            ramp = mx.clip(
-                (mx.arange(dim // 2).astype(mx.float32) - low) / max(high - low, 0.001),
-                0,
-                1,
-            )
-            freqs = freqs * (1 - ramp + ramp / factor)
-
-    t = mx.arange(end).astype(mx.float32)
-    base_freqs = freqs
-    freqs = mx.outer(t, freqs)
-    freqs_cos = mx.concatenate([mx.cos(freqs), mx.cos(freqs)], axis=-1) * attn_factor
-    freqs_sin = mx.concatenate([mx.sin(freqs), mx.sin(freqs)], axis=-1) * attn_factor
-    if return_freqs:
-        # mx.fast.rope 的 freqs 是「周期/分母」口径（angle = pos / freqs）
-        return freqs_cos, freqs_sin, 1.0 / base_freqs, attn_factor
-    return freqs_cos, freqs_sin
-
-
-def apply_rotary_pos_emb(
-    q: mx.array,
-    k: mx.array,
-    cos: mx.array,
-    sin: mx.array,
-    rope_freqs: Optional[mx.array] = None,
-    rope_offset: int = 0,
-    rope_attn_factor: float = 1.0,
-) -> tuple[mx.array, mx.array]:
-    # q: (bsz, seq_len, heads, rope_dim)；k: (bsz, seq_len, 1, rope_dim)
-    if rope_freqs is not None:
-        q_t = q.transpose(0, 2, 1, 3)
-        k_t = k.transpose(0, 2, 1, 3)
-        dim = q.shape[-1]
-        q_embed = mx.fast.rope(
-            q_t,
-            dim,
-            traditional=False,
-            base=None,
-            scale=1.0,
-            offset=rope_offset,
-            freqs=rope_freqs,
-        ).transpose(0, 2, 1, 3)
-        k_embed = mx.fast.rope(
-            k_t,
-            dim,
-            traditional=False,
-            base=None,
-            scale=1.0,
-            offset=rope_offset,
-            freqs=rope_freqs,
-        ).transpose(0, 2, 1, 3)
-        if rope_attn_factor != 1.0:
-            q_embed = q_embed * rope_attn_factor
-            k_embed = k_embed * rope_attn_factor
-        return q_embed.astype(q.dtype), k_embed.astype(k.dtype)
-
-    def rotate_half(x: mx.array) -> mx.array:
-        half = x.shape[-1] // 2
-        return mx.concatenate([-x[..., half:], x[..., :half]], axis=-1)
-
-    if cos.ndim == 2:
-        cos = cos[:, None, :]
-        sin = sin[:, None, :]
+    blocks = logits.reshape(*logits.shape[:-1], -1, block_size)
+    scores = mx.max(blocks, axis=-1)  # 块得分 = 块内最好位置
+    num_blocks = scores.shape[-1]
+    # 最新位置所在的那个块只填了一部分，可能被更老的满块压过去：钉住它。
+    # scores 是 [B,T,num_blocks]，钉住条件必须广播成 [B,?,1]：
+    #   - 标量 compress_lens（所有 query 相同）→ [1,1,1]
+    #   - [B]（decode 每序列一个）→ [B,1,1]
+    #   - [B,T]/[1,T]（prefill 每 query 一个）→ [B,T,1]
+    # 原实现用 last[..., None]，在 decode（T=1、B>1）下会与 [B,T,num_blocks]
+    # 广播成 [B,B,num_blocks]，候选池掩码凭空多出一个 batch 维。
+    last = (compress_lens - 1) // block_size
+    if not isinstance(last, mx.array):
+        last = mx.array(last)
+    if last.ndim == 0:
+        last = last[None, None, None]
+    elif last.ndim == 1:
+        last = last[:, None, None]
     else:
-        cos = cos[:, :, None, :]
-        sin = sin[:, :, None, :]
-    q_embed = (q * cos + rotate_half(q) * sin).astype(q.dtype)
-    k_embed = (k * cos + rotate_half(k) * sin).astype(k.dtype)
-    return q_embed, k_embed
+        last = last[..., None]
+    idx = mx.arange(num_blocks)
+    scores = mx.where(idx == last, mx.array(float("inf"), dtype=scores.dtype), scores)
+    k = min(topk_blocks, num_blocks)
+    # tiebreak：按块下标给极小偏移，保证"阈值比较"与 argpartition 选出同一集合
+    # （indexer 的 ReLU 打分里 0 值大量并列，没有 tiebreak 时两条路径会选出不同个数）
+    sel = scores - mx.arange(num_blocks, dtype=scores.dtype) * 1e-7
+    thr = mx.partition(sel, kth=num_blocks - k, axis=-1)[..., num_blocks - k]
+    keep = (sel >= thr[..., None]) & (scores > NEG_INF)
+    keep = mx.repeat(keep, block_size, axis=-1)
+    return keep[..., :width]
 
 
-class MLAAttention(nn.Module):
-    """MLA（Multi-head Latent Attention，DeepSeek V2/V3）。
+def _topk_masks(score: mx.array, reach: mx.array, k: int, offset: int):
+    """从打分矩阵里取出每 query 的 k 个压缩位置。
 
-    来自拆分 KDA 之前的高效实现：q+kv_down+k_rope 合并成一次 GEMM，
-    k_up+v_up 再一次；解耦 RoPE 走 mx.fast.rope。训练路径用支持
-    d_qk ≠ d_v 的手写 flash（不必把 V 零填到 QK 维）；回退 mlx SDPA
-    时仍用零填充命中等宽快路径。无 ShortConv / 线性注意力；可选 Gated XSA
-    （use_xsa 默认开，作用于最深 xsa_last_n 层，逐 head 可学习 tanh(α)，α=0
-    初始化 ⇒ 恒等）。
+    返回 (keep_mask [B,T,N] bool, topk_idx [B,T,k'] int32)：
+    - keep_mask："被选中且可达"的布尔掩码（稠密/prefill 路径用）；
+    - topk_idx：按位置排序、加 offset、不可达为 -1 的下标（解码 gather 用）。
+
+    索引一律 stop_gradient：MLX 不允许对 gather/scatter 的索引求 VJP。
+    """
+    B, T, N = score.shape
+    if N == 0:
+        return mx.zeros((B, T, 0), dtype=mx.bool_), mx.zeros((B, T, 0), dtype=mx.int32)
+    k_eff = min(k, N)
+    sg = mx.stop_gradient(score)
+    # tiebreak：按位置下标给极小偏移。indexer 的 ReLU 打分并列很多，没有它
+    # "阈值比较"会选出多于 k 个位置，与解码路径的 argpartition 结果不一致。
+    sel_score = sg - mx.arange(N, dtype=sg.dtype) * 1e-7
+    # 分数为 NEG_INF 的位置是"明确不可选"（分层索引的候选池之外），必须与
+    # 不可达位置一样当成硬屏蔽：可达候选中不足 k 个时，阈值为 -inf 会让这些
+    # 位置靠 tiebreak 混进 keep，候选池就不再是更深 indexer 的搜索域上界。
+    selectable = sg > NEG_INF
+    # keep：第 k 大分数当阈值（可达位置少于 k 时阈值为 -inf，恰好等价"全取可达"）
+    thr = mx.partition(sel_score, kth=N - k_eff, axis=-1)[..., N - k_eff]
+    keep = (sel_score >= thr[..., None]) & reach & selectable
+    sel = mx.argpartition(-sel_score, kth=k_eff - 1, axis=-1)[..., :k_eff].astype(mx.int32)
+    idx = mx.sort(sel, axis=-1)
+    valid = mx.take_along_axis(reach, idx, axis=-1) & mx.take_along_axis(selectable, idx, axis=-1)
+    idx = mx.where(valid, idx + offset, -1).astype(mx.int32)
+    return keep, idx
+
+
+class Compressor(nn.Module):
+    """把 compress_ratio 个连续 token 用可学 softmax 门池化成一个 KV latent。
+
+    ratio == 1 就是一次普通投影（CED 解码段的全局 KV 来源）。返回**未做
+    RoPE** 的 latent：indexer 需要未旋转形式，由 Attention 决定何时旋转。
+    组首位置 = j * ratio（一个 latent 代表它那组里第一个 token 的位置）。
     """
 
-    def __init__(self, config: VibyConfig, layer_idx: int = 0):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
-        self.n_heads = config.num_attention_heads
+        self.ratio = int(config.compress_ratios[layer_idx])
         self.head_dim = config.head_dim
-        self.rope_dim = config.qk_rope_head_dim
-        self.qk_dim = self.head_dim + self.rope_dim
-        self.kv_rank = config.kv_lora_rank
-        self.is_causal = True
-        self.qkv_proj = nn.Linear(
-            config.hidden_size,
-            self.n_heads * self.qk_dim + config.kv_lora_rank + self.rope_dim,
+        self.norm = RMSNorm(config.head_dim, config.norm_eps)
+        self.wkv = nn.Linear(config.dim, config.head_dim, bias=False)
+        self.wgate = nn.Linear(config.dim, config.head_dim, bias=False) if self.ratio > 1 else None
+
+    def init_state(self, batch: int, dtype):
+        shape = (batch, self.ratio, self.head_dim)
+        return (
+            mx.zeros(shape, dtype=dtype),
+            mx.full(shape, -mx.inf, dtype=mx.float32),
+            mx.zeros((batch,), dtype=mx.int32),
+        )
+
+    def step(self, x: mx.array, state):
+        """解码一步（batch 内各序列位置可不同）。
+
+        state: (kv [B,r,hd], score [B,r,hd], filled [B])。返回
+        (pooled [B,1,hd], valid [B], 新 state)：valid 为该序列这一步是否
+        刚好凑满一组（未凑满时 pooled 无效，由 reach 掩掉）。
+        """
+        B = x.shape[0]
+        kv, sc = self.wkv(x)[:, 0], self.wgate(x)[:, 0]  # [B,hd]
+        filled = state[2]
+        slot = filled % self.ratio
+        # 用 one-hot 掩码做函数式写入（MLX 的 .at[] 没有 set；where 版可微且可 compile）
+        oh = (mx.arange(self.ratio)[None, :] == slot[:, None])[..., None]  # [B,r,1]
+        kv_st = mx.where(oh, kv[:, None, :], state[0])
+        sc_st = mx.where(oh, sc[:, None, :], state[1])
+        new_filled = filled + 1
+        valid = new_filled >= self.ratio
+        pooled = self.norm(mx.sum(kv_st * mx.softmax(sc_st, axis=1), axis=1, keepdims=True))
+        # 组满后必须把 score 缓冲清成 -inf：否则上一组的 token 会混进下一组的池化
+        sc_st = mx.where(valid[:, None, None], mx.full_like(sc_st, -mx.inf), sc_st)
+        return pooled, valid, (kv_st, sc_st, mx.where(valid, 0, new_filled))
+
+    def __call__(self, x: mx.array, start_pos: int, state=None):
+        """整段/分块 prefill：返回 (latent [B,n,hd] | None, 新 state, 组首位置 | None, first_group)。"""
+        B, T, _ = x.shape
+        r = self.ratio
+        if r == 1:
+            return self.norm(self.wkv(x)), None, start_pos + mx.arange(T)[None, :], start_pos
+        kv, sc = self.wkv(x), self.wgate(x)
+        filled = 0 if state is None else int(mx.max(state[2]).item())
+        if filled:
+            kv = mx.concatenate([state[0][:B, :filled], kv], axis=1)
+            sc = mx.concatenate([state[1][:B, :filled], sc], axis=1)
+        total = kv.shape[1]
+        n = total // r
+        rem = total - n * r
+        base = (start_pos - filled) // r
+        # 定长 [B,r,hd] 状态缓冲：解码时要按同一形状和 one-hot 写入，
+        # 未填的位置 kv=0 / score=-inf（softmax 权重 0，不参与池化）。
+        pad = r - rem
+        tail_kv, tail_sc = kv[:, n * r :], sc[:, n * r :]
+        if pad:
+            tail_kv = mx.concatenate([tail_kv, mx.zeros((B, pad, self.head_dim), dtype=kv.dtype)], axis=1)
+            tail_sc = mx.concatenate([tail_sc, mx.full((B, pad, self.head_dim), -mx.inf, dtype=mx.float32)], axis=1)
+        new_state = (tail_kv, tail_sc, mx.full((B,), rem, dtype=mx.int32))
+        if n == 0:
+            return None, new_state, None, base
+        kv_g = kv[:, : n * r].reshape(B, n, r, self.head_dim)
+        sc_g = sc[:, : n * r].reshape(B, n, r, self.head_dim)
+        pooled = self.norm(mx.sum(kv_g * mx.softmax(sc_g, axis=2), axis=2))
+        pos = (base + mx.arange(n))[None, :] * r
+        return pooled, new_state, pos, base
+
+
+class Indexer(nn.Module):
+    """Lightning Indexer：给每个 query 选 index_topk 个压缩位置。
+
+    一路小注意力：q（来自与主注意力共享的 qr 低秩表示）对一个共享的 index K
+    打分，ReLU 后按 head 权重（weights_proj）合并。候选层额外产出一级候选块
+    掩码，更深的 indexer 只在候选池里打分（分层稀疏索引）。
+    """
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.owns_k = layer_idx in config.kv_source_layers
+        self.is_candidate_source = layer_idx == config.candidate_source_layer
+        self.uses_candidates = 0 <= config.candidate_source_layer < layer_idx
+        self.candidate_topk_blocks = config.candidate_topk_blocks
+        self.candidate_block_size = config.candidate_block_size
+        self.n_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.rope_head_dim = config.rope_head_dim
+        self.index_topk = config.index_topk
+        self.softmax_scale = self.head_dim ** -0.5
+        self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.weights_proj = nn.Linear(config.dim, self.n_heads, bias=False)
+        if self.owns_k:
+            self.wk = nn.Linear(config.head_dim, self.head_dim, bias=False)
+            self.k_norm = RMSNorm(self.head_dim, config.norm_eps)
+
+    def index_keys(self, latent: mx.array, pos, cos_all, sin_all):
+        """latent（未旋转）→ 归一化 + 部分 RoPE 的 index K。"""
+        c, s = _cos_sin(cos_all, sin_all, pos, False)
+        return rope_partial(self.k_norm(self.wk(latent)), c, s, self.rope_head_dim)
+
+    def scores(self, x, qr, index_k, token_pos, reach, cos_all, sin_all):
+        """返回 [B,T,N] 的打分（不可达位置 = -inf，fp32）。"""
+        B, T, _ = x.shape
+        q = self.wq_b(qr).reshape(B, T, self.n_heads, self.head_dim)
+        c, s = _cos_sin(cos_all, sin_all, token_pos, True)
+        q = rope_partial(q, c, s, self.rope_head_dim)
+        sc = mx.einsum("bthd,bnd->bthn", q, index_k).astype(mx.float32)
+        sc = mx.maximum(sc, 0.0)
+        w = self.weights_proj(x).astype(mx.float32) * (self.softmax_scale * self.n_heads ** -0.5)
+        sc = mx.sum(sc * w[:, :, :, None], axis=2)  # [B,T,N]
+        return mx.where(reach, sc, NEG_INF)
+
+
+def _group_doc_mask(ratio: int, segment_ids: mx.array):
+    """压缩组的文档掩码 [B,T,N]：组内 token 与 query 同文档才可见。"""
+    B, T = segment_ids.shape
+    n = T // ratio
+    if n == 0:
+        return mx.zeros((B, T, 0), dtype=mx.bool_)
+    g = segment_ids[:, : n * ratio].reshape(B, n, ratio)
+    clean = mx.all(g == g[:, :, :1], axis=-1)  # 组内同文档
+    return clean[:, None, :] & (g[:, :, 0][:, None, :] == segment_ids[:, :, None])
+
+
+def _group_pad_mask(ratio: int, pad_mask: mx.array):
+    """压缩组的 pad 掩码 [B,T,N]：组内全是真实 token 才可见。"""
+    B, T = pad_mask.shape
+    n = T // ratio
+    if n == 0:
+        return mx.zeros((B, T, 0), dtype=mx.bool_)
+    g = pad_mask[:, : n * ratio].reshape(B, n, ratio)
+    return mx.all(g, axis=-1)[:, None, :] & mx.ones((1, T, 1), dtype=mx.bool_)
+
+
+class Attention(nn.Module):
+    """一层 V4.1 注意力：滑窗 K=V MQA + 压缩分支 + 分组低秩输出。"""
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.dim = config.dim
+        self.n_heads = config.n_heads
+        self.head_dim = config.head_dim
+        self.rope_head_dim = config.rope_head_dim
+        self.o_groups = config.o_groups
+        self.o_lora_rank = config.o_lora_rank
+        self.window_size = config.window_size
+        self.eps = config.norm_eps
+        self.ratio = int(config.compress_ratios[layer_idx])
+        self.mode = config.layer_mode(layer_idx)
+        self.is_kv_source = layer_idx in config.kv_source_layers
+        self.is_index_source = layer_idx in config.index_source_layers
+        self.softmax_scale = self.head_dim ** -0.5
+
+        self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
+        self.wq_a = nn.Linear(config.dim, config.q_lora_rank, bias=False)
+        self.q_norm = RMSNorm(config.q_lora_rank, self.eps)
+        self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.wkv = nn.Linear(config.dim, self.head_dim, bias=False)
+        self.kv_norm = RMSNorm(self.head_dim, self.eps)
+        self.wo_a = nn.Linear(
+            self.n_heads * self.head_dim // self.o_groups,
+            self.o_groups * self.o_lora_rank,
             bias=False,
         )
-        self.kv_up_proj = nn.Linear(
-            config.kv_lora_rank, 2 * self.n_heads * self.head_dim, bias=False
-        )
-        self.o_proj = nn.Linear(
-            self.n_heads * self.head_dim, config.hidden_size, bias=False
-        )
-        # QK-norm 只作用于 nope（内容）段，rope 段保持 RoPE 几何。
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.dropout = config.dropout
-        self.flash = config.flash_attn
-        self._rope_spec = (
-            config.qk_rope_head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
-            dict(config.rope_scaling) if config.rope_scaling is not None else None,
-            config.original_max_position_embeddings,
-        )
-        self.attn_gate = None
-        if config.use_attn_gate:
-            self.attn_gate = nn.Linear(config.hidden_size, self.n_heads, bias=True)
-            self.attn_gate.weight = mx.zeros_like(self.attn_gate.weight)
-            self.attn_gate.bias = mx.zeros_like(self.attn_gate.bias)
-        # Gated XSA：仅 use_xsa 且层处于最深 xsa_last_n 层时挂逐 head 可学习
-        # tanh(α)（零初始化 ⇒ 起始恒等，不扰动 step-0）。MLA 头 1:1
-        # （n_heads==n_kv_heads），无需 GQA 那条 mx.repeat 扩展 V 的处理。
-        _deep = (
-            config.xsa_last_n > 0
-            and layer_idx >= config.num_hidden_layers - config.xsa_last_n
-        )
-        self.xsa_alpha = (
-            mx.zeros((self.n_heads,), dtype=mx.float32)
-            if (config.use_xsa and _deep)
-            else None
-        )
+        self.wo_b = nn.Linear(self.o_groups * self.o_lora_rank, config.dim, bias=False)
 
-    def _fallback_pos(self, start_pos: int, seq_len: int, dtype):
-        tbl = self.__dict__.get("_rope_tbl")
-        if tbl is None:
-            dim, end, base, scaling, orig_max = self._rope_spec
-            if scaling is not None:
-                scaling = dict(scaling)
-                scaling.setdefault("original_max_position_embeddings", orig_max)
-            cos, sin, freqs, af = precompute_freqs_cis(
-                dim=dim,
-                end=end,
-                rope_base=base,
-                rope_scaling=scaling,
-                return_freqs=True,
-            )
-            tbl = (cos, sin, freqs, float(af))
-            object.__setattr__(self, "_rope_tbl", tbl)
-        cos, sin, freqs, af = tbl
-        c = cos[start_pos : start_pos + seq_len]
-        s = sin[start_pos : start_pos + seq_len]
-        if c.dtype != dtype:
-            c, s = c.astype(dtype), s.astype(dtype)
-        return c, s, (freqs, start_pos, af)
+        self.compressor = Compressor(config, layer_idx) if self.is_kv_source else None
+        self.indexer = Indexer(config, layer_idx) if self.is_index_source else None
+        # 每层一张 RoPE 表：压缩层用 compress_rope_theta + YaRN；纯滑窗层用
+        # rope_theta 且不做 YaRN（对应参考实现 original_seq_len=0 的分支）。
+        if self.ratio:
+            seq, theta = config.original_seq_len, config.compress_rope_theta
+        else:
+            seq, theta = 0, config.rope_theta
+        self.freq_cos, self.freq_sin = precompute_freqs_cis(
+            config.rope_head_dim,
+            config.max_seq_len,
+            seq,
+            theta,
+            config.rope_factor,
+            config.beta_fast,
+            config.beta_slow,
+        )
+        # RoPE 表是常量：留在 parameters() 里（checkpoint 随权重一起落盘、
+        # 换 max_seq_len 时由 trainer 重算），但不进 trainable_parameters()，
+        # 否则优化器会把它当普通矩阵更新/衰减。
+        self.freeze(recurse=False, keys=["freq_cos", "freq_sin"])
 
-    def __call__(
-        self,
-        x: mx.array,
-        position_embeddings=None,
-        past_key_value: Optional[tuple[mx.array, mx.array]] = None,
-        use_cache: bool = False,
-        attention_mask: Optional[mx.array] = None,
-        causal_bias: Optional[mx.array] = None,
-        mask_is_full: Optional[bool] = None,
-        segment_ids: Optional[mx.array] = None,
-    ) -> tuple[mx.array, Optional[tuple[mx.array, mx.array]]]:
-        del segment_ids
-        bsz, seq_len, _ = x.shape
-        if position_embeddings is None:
-            start = 0
-            if use_cache and isinstance(past_key_value, KVCache):
-                start = past_key_value.offset
-            elif past_key_value is not None:
-                if isinstance(past_key_value, KVCache):
-                    start = past_key_value.offset
+    # ------------------------------------------------------------------
+    def _q(self, x, token_pos):
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).reshape(*x.shape[:2], self.n_heads, self.head_dim)
+        c, s = _cos_sin(self.freq_cos, self.freq_sin, token_pos, True)
+        return qr, rope_partial(q, c, s, self.rope_head_dim)
+
+    def _window_kv(self, x, token_pos):
+        kv = self.kv_norm(self.wkv(x))
+        c, s = _cos_sin(self.freq_cos, self.freq_sin, token_pos, False)
+        return rope_partial(kv, c, s, self.rope_head_dim)
+
+    def _out_proj(self, o, token_pos):
+        c, s = _cos_sin(self.freq_cos, self.freq_sin, token_pos, True)
+        o = rope_partial(o, c, s, self.rope_head_dim, inverse=True)
+        B, T = o.shape[:2]
+        g = self.o_groups
+        o = o.reshape(B, T, g, -1)
+        wo_a = self.wo_a.weight.reshape(g, self.o_lora_rank, -1)
+        o = mx.einsum("btgd,grd->btgr", o.astype(wo_a.dtype), wo_a)
+        return self.wo_b(o.reshape(B, T, -1))
+
+    # ------------------------------------------------------------------
+    def _compress_dense(self, x, qr, token_pos, shared, cache, start_pos,
+                        segment_ids=None, pad_mask=None):
+        """压缩分支（prefill / 训练）：产出/复用压缩 KV 并算出 top-k 掩码。"""
+        B, T, _ = x.shape
+        ratio = self.ratio
+        N = (start_pos + T) // ratio
+        keep = None
+        latent = None
+        first_group = start_pos // ratio
+        pos = None
+        if self.is_kv_source:
+            state = None
+            if cache is not None and cache.kv_state is not None:
+                state = cache.kv_state
+            latent, new_state, pos, first_group = self.compressor(x, start_pos, state)
+            if cache is not None and new_state is not None:
+                cache.kv_state = new_state
+                cache.filled = int(mx.max(new_state[2]).item())
+        # indexer 需要未旋转的 latent，故先跑 indexer，再写旋转后的压缩 KV
+        if self.is_index_source:
+            idxo = self.indexer
+            if idxo.owns_k and latent is not None:
+                k = idxo.index_keys(latent, pos, self.freq_cos, self.freq_sin)
+                if cache is not None:
+                    cache.index_k[:B, first_group : first_group + k.shape[1]] = k
+                    shared.index_k = cache.index_k[:, :N]
                 else:
-                    start = past_key_value[0].shape[1]
-            position_embeddings = self._fallback_pos(start, seq_len, x.dtype)
-        qkv = self.qkv_proj(x)
-        q_flat, c_kv, k_rope_flat = mx.split(
-            qkv,
-            [self.n_heads * self.qk_dim, self.n_heads * self.qk_dim + self.kv_rank],
-            axis=-1,
-        )
-        # 尽早转到 flash 的 (B,H,T,D)：RoPE 原生要这个布局，省掉
-        # q/k_rope 来回转置 + 拼接后再转一次。
-        xq = q_flat.reshape(bsz, seq_len, self.n_heads, self.qk_dim).transpose(
-            0, 2, 1, 3
-        )
-        q_nope, q_rope = mx.split(xq, [self.head_dim], axis=-1)
-        kv = self.kv_up_proj(c_kv)
-        xk, xv = mx.split(kv, 2, axis=-1)
-        xk = xk.reshape(bsz, seq_len, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        xv = xv.reshape(bsz, seq_len, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        q_nope, xk = self.q_norm(q_nope), self.k_norm(xk)
-        k_rope = k_rope_flat.reshape(bsz, seq_len, 1, self.rope_dim).transpose(
-            0, 2, 1, 3
-        )
-
-        cos, sin = position_embeddings[:2]
-        rope_meta = position_embeddings[2] if len(position_embeddings) > 2 else None
-        if rope_meta is None:
-            q_rope, k_rope = apply_rotary_pos_emb(
-                q_rope.transpose(0, 2, 1, 3),
-                k_rope.transpose(0, 2, 1, 3),
-                cos,
-                sin,
-            )
-            q_rope = q_rope.transpose(0, 2, 1, 3)
-            k_rope = k_rope.transpose(0, 2, 1, 3)
-        else:
-            freqs, rope_offset, rope_attn_factor = rope_meta
-            q_rope = mx.fast.rope(
-                q_rope,
-                self.rope_dim,
-                traditional=False,
-                base=None,
-                scale=1.0,
-                offset=rope_offset,
-                freqs=freqs,
-            )
-            k_rope = mx.fast.rope(
-                k_rope,
-                self.rope_dim,
-                traditional=False,
-                base=None,
-                scale=1.0,
-                offset=rope_offset,
-                freqs=freqs,
-            )
-            if rope_attn_factor != 1.0:
-                q_rope = q_rope * rope_attn_factor
-                k_rope = k_rope * rope_attn_factor
-            q_rope = q_rope.astype(x.dtype)
-            k_rope = k_rope.astype(x.dtype)
-        k_rope = mx.broadcast_to(k_rope, (bsz, self.n_heads, seq_len, self.rope_dim))
-        xq = mx.concatenate([q_nope, q_rope], axis=-1)
-        xk = mx.concatenate([xk, k_rope], axis=-1)
-
-        past_kv = None
-        if use_cache:
-            if past_key_value is not None and hasattr(past_key_value, "update"):
-                cache = past_key_value
-            else:
-                cache = KVCache()
-                if past_key_value is not None:
-                    cache.update(past_key_value[0], past_key_value[1])
-            k_bhtd, v_bhtd = cache.update(
-                xk.transpose(0, 2, 1, 3), xv.transpose(0, 2, 1, 3)
-            )
-            past_kv = cache
-        elif past_key_value is not None:
-            if isinstance(past_key_value, KVCache):
-                pk = past_key_value.keys[:, :, : past_key_value.offset]
-                pv = past_key_value.values[:, :, : past_key_value.offset]
-                k_bhtd = mx.concatenate([pk, xk], axis=2)
-                v_bhtd = mx.concatenate([pv, xv], axis=2)
-            else:
-                k_bhtd = mx.concatenate(
-                    [past_key_value[0], xk.transpose(0, 2, 1, 3)], axis=1
-                ).transpose(0, 2, 1, 3)
-                v_bhtd = mx.concatenate(
-                    [past_key_value[1], xv.transpose(0, 2, 1, 3)], axis=1
-                ).transpose(0, 2, 1, 3)
-        else:
-            k_bhtd, v_bhtd = xk, xv
-
-        if mask_is_full is None:
-            mask_is_full = attention_mask is None or bool(
-                mx.all(attention_mask == 1).item()
-            )
-        scale = 1.0 / math.sqrt(self.qk_dim)
-        key_len = k_bhtd.shape[2]
-        has_past = key_len > seq_len
-        has_arr_mask = causal_bias is not None and not isinstance(causal_bias, str)
-
-        if has_arr_mask:
-            local_mask = causal_bias
-        elif seq_len == 1 and mask_is_full:
-            local_mask = None
-        elif has_past and seq_len > 1 and mask_is_full:
-            local_mask = _offset_causal_mask(seq_len, key_len, xq.dtype)
-        elif mask_is_full:
-            local_mask = "causal"
-        else:
-            local_mask = causal_bias
-
-        use_flash = (
-            self.flash
-            and self.dropout == 0.0
-            and (
-                mask_is_full
-                or has_arr_mask
-                or (causal_bias is not None and not has_past)
-            )
-            and (
-                (seq_len > 1 and not has_past)
-                or (seq_len == 1 and (mask_is_full or has_arr_mask))
-                or (seq_len > 1 and has_past and (mask_is_full or has_arr_mask))
-            )
-        )
-        if use_flash:
-            output = _flash_sdpa(xq, k_bhtd, v_bhtd, scale=scale, mask=local_mask)
-        else:
-            scores = (xq @ mx.swapaxes(k_bhtd, -1, -2)) * scale
-            if local_mask is None or isinstance(local_mask, str):
-                causal_mask = mx.triu(mx.full((seq_len, seq_len), -mx.inf), k=1).astype(
-                    scores.dtype
+                    shared.index_k = k
+            if shared.index_k is not None:
+                # 注意轴：token_pos 是 [1,T]，要显式补成 [1,T,1] 才能和 [1,1,N] 按 query 广播
+                reach = mx.arange(N)[None, None, :] < ((token_pos + 1) // ratio)[..., None]
+                # 文档/pad 隔离必须在选择阶段生效：否则候选块与 top-k 会按
+                # 别的文档的内容来挑，packed 序列会跨文档泄漏。
+                if segment_ids is not None:
+                    reach = reach & _group_doc_mask(ratio, segment_ids)
+                if pad_mask is not None:
+                    reach = reach & _group_pad_mask(ratio, pad_mask)
+                sc = idxo.scores(
+                    x, qr, shared.index_k, token_pos, reach, self.freq_cos, self.freq_sin
                 )
-                scores = scores.at[..., -seq_len:].add(causal_mask)
-            else:
-                scores = scores + local_mask.astype(scores.dtype)
+                if idxo.is_candidate_source:
+                    shared.candidates = select_candidate_blocks(
+                        sc,
+                        (token_pos + 1) // ratio,
+                        idxo.candidate_topk_blocks,
+                        idxo.candidate_block_size,
+                    )
+                elif idxo.uses_candidates and shared.candidates is not None:
+                    sc = mx.where(shared.candidates, sc, NEG_INF)
+                keep, topk = _topk_masks(sc, reach, idxo.index_topk, 0)
+                shared.keep_mask, shared.topk_idx = keep, topk
+        else:
+            keep = shared.keep_mask
+        # 压缩 KV 入池：必须是 RoPE 之后的（indexer 用未旋转形式，已在上面用完）
+        if self.is_kv_source and latent is not None:
+            c, s = _cos_sin(self.freq_cos, self.freq_sin, pos, False)
+            lat = rope_partial(latent, c, s, self.rope_head_dim)
+            if cache is not None:
+                cache.compress_kv[:B, first_group : first_group + lat.shape[1]] = lat
+            shared.compress_kv = lat
+        if cache is not None:
+            # 解码/分块 prefill：池子在源层的 LayerCache 上，直接读全量前缀
+            comp = cache.src_cache.compress_kv[:B, :N] if N else None
+        else:
+            comp = shared.compress_kv
+        return comp, keep
 
-            if attention_mask is not None and not has_arr_mask:
-                am = attention_mask
-                if am.shape[1] < key_len:
-                    pad = mx.ones((am.shape[0], key_len - am.shape[1]), dtype=am.dtype)
-                    am = mx.concatenate([am, pad], axis=1)
-                elif am.shape[1] > key_len:
-                    am = am[:, -key_len:]
-                scores = (
-                    scores + (1.0 - am[:, None, None, :].astype(scores.dtype)) * -1e9
+    # ------------------------------------------------------------------
+    def __call__(self, x, start_pos: int, shared, cache=None, segment_ids=None, pad_mask=None):
+        """prefill / 训练路径：窗口与压缩两组掩码拼在一次 sdpa 里做稠密计算。"""
+        B, T, _ = x.shape
+        token_pos = (start_pos + mx.arange(T))[None, :]  # [1,T]，对所有 batch 相同
+        qr, q = self._q(x, token_pos)
+        kv_win = self._window_kv(x, token_pos)
+        # sdpa 的 mask 用 [B,T] 的绝对位置：[1,T] 广播
+        tpos = token_pos[0]
+
+        L = 0
+        kv_hist = None
+        if cache is not None and start_pos > 0:
+            L = min(self.window_size, start_pos)
+            slots = (start_pos - L + mx.arange(L)) % self.window_size
+            kv_hist = cache.window[:, slots]
+        if kv_hist is not None:
+            kv_all = mx.concatenate([kv_hist, kv_win], axis=1)
+            pos_all = mx.concatenate([start_pos - L + mx.arange(L), tpos])
+        else:
+            kv_all = kv_win
+            pos_all = tpos
+        if cache is not None:
+            n = min(self.window_size, T)
+            if n:
+                slots = (start_pos + T - n + mx.arange(n)) % self.window_size
+                cache.window[:, slots] = kv_win[:, T - n :]
+
+        visible = (pos_all[None, :] <= tpos[:, None]) & (pos_all[None, :] > tpos[:, None] - self.window_size)
+        if segment_ids is not None:
+            if start_pos != 0:
+                raise ValueError("segment_ids 只在整段 prefill（start_pos=0）时支持")
+            visible = visible & (segment_ids[:, None, :] == segment_ids[:, :, None])
+        if pad_mask is not None:
+            visible = visible & pad_mask[:, None, :]
+        mask = visible[None, None, :, :] if visible.ndim == 2 else visible[:, None, :, :]
+
+        if self.ratio > 0:
+            comp, keep = self._compress_dense(
+                x, qr, token_pos, shared, cache, start_pos, segment_ids, pad_mask
+            )
+            if comp is not None:
+                kv_all = mx.concatenate([kv_all, comp], axis=1)
+                cmask = mx.arange(comp.shape[1])[None, None, :] < (
+                    (tpos + 1) // self.ratio
+                )[None, :, None]
+                if keep is not None:
+                    cmask = cmask & keep
+                if segment_ids is not None:
+                    cmask = cmask & _group_doc_mask(self.ratio, segment_ids)
+                if pad_mask is not None:
+                    cmask = cmask & _group_pad_mask(self.ratio, pad_mask)
+                cm = cmask[None, None, :, :] if cmask.ndim == 2 else cmask[:, None, :, :]
+                if mask.shape[0] != cm.shape[0]:
+                    mask = mx.broadcast_to(mask, (cm.shape[0],) + mask.shape[1:])
+                mask = mx.concatenate([mask, cm], axis=-1)
+
+        o = mx.fast.scaled_dot_product_attention(
+            q.transpose(0, 2, 1, 3),
+            kv_all[:, None, :, :],
+            kv_all[:, None, :, :],
+            scale=self.softmax_scale,
+            mask=mask,
+            sinks=self.attn_sink,
+        ).transpose(0, 2, 1, 3)
+        return self._out_proj(o, token_pos)
+
+    # ------------------------------------------------------------------
+    def decode(self, x, start_pos, shared, cache):
+        """单步解码：滑窗环 + indexer 挑出的压缩位置，gather 后做注意力。
+
+        start_pos 可以是 int，也可以是 [B] 的逐序列位置（连续 batch 里各
+        请求长度不同）：窗口按各自槽位写入、按各自绝对位置取用；压缩池与
+        index K 池按各自的分组对齐写入，池长取 batch 内最大值并用 reach 掩掉。
+        """
+        B, T, _ = x.shape
+        if T != 1:
+            raise ValueError("decode 只接受单 token")
+        if not isinstance(start_pos, mx.array):
+            start_pos = mx.full((B,), int(start_pos), dtype=mx.int32)
+        start_pos = start_pos.astype(mx.int32)
+        token_pos = start_pos[:, None]  # [B,1]
+        bidx = mx.arange(B)
+        qr, q = self._q(x, token_pos)
+        kv_new = self._window_kv(x, token_pos)
+        cache.window[bidx, start_pos % self.window_size] = kv_new[:, 0]
+
+        win_pos = start_pos[:, None] - (self.window_size - 1) + mx.arange(self.window_size)[None, :]
+        win_idx = mx.where(win_pos >= 0, win_pos % self.window_size, -1)[:, None, :].astype(mx.int32)
+        kv_src = cache.window
+        comp_idx = None
+
+        if self.ratio > 0:
+            offset = self.window_size
+            pool = cache.src_cache
+            latent, pos, first_group, valid = None, None, None, None
+            if self.is_kv_source:
+                if self.ratio == 1:
+                    latent = self.compressor.norm(self.compressor.wkv(x))
+                    first_group = start_pos
+                    valid = mx.ones((B,), dtype=mx.bool_)
+                else:
+                    state = cache.kv_state
+                    if state is None:
+                        state = self.compressor.init_state(B, x.dtype)
+                    latent, valid, state = self.compressor.step(x, state)
+                    cache.kv_state = state
+                    first_group = (start_pos + 1 - self.ratio) // self.ratio
+                # cos/sin 按 (*pos.shape, d/2) 取用；解码时位置是 [B,1]，
+                # 与 latent/x 的 [B,1,...] 对齐（[B] 会被广播进 T 轴）
+                pos = (first_group * self.ratio)[:, None]
+                c, s = _cos_sin(self.freq_cos, self.freq_sin, pos, False)
+                lat = rope_partial(latent, c, s, self.rope_head_dim)
+                # 没凑满一组的序列不能写池子（会覆盖上一组的有效条目），
+                # 改写到池尾的丢弃槽里，靠 reach 掩掉。
+                wslot = mx.where(valid, first_group, cache.pool_scratch)
+                cache.compress_kv[bidx, wslot] = mx.where(
+                    valid[:, None], lat[:, 0], mx.zeros_like(lat[:, 0])
                 )
-
-            attn_weights = mx.softmax(scores.astype(mx.float32), axis=-1).astype(
-                xq.dtype
-            )
-            attn_weights = self.attn_dropout(attn_weights)
-            output = attn_weights @ v_bhtd
-
-        if self.xsa_alpha is not None:
-            # Gated XSA：z = y − tanh(α)·(yᵀv/‖v‖²)·v，逐 head；v 取 query
-            # 对齐的末尾 seq_len 个位置（cache 时 v_bhtd 覆盖全历史，与
-            # GQA 同口径）。除法在 f32 做，输出回落原 dtype。
-            vf = v_bhtd[:, :, -seq_len:, :].astype(mx.float32)
-            yf = output.astype(mx.float32)
-            coef = mx.sum(yf * vf, axis=-1, keepdims=True) / mx.maximum(
-                mx.sum(vf * vf, axis=-1, keepdims=True), mx.array(1e-12)
-            )
-            # output/V 在原生 (B,H,T,D) 布局，逐 head α 的 H 轴落 ndim=1。
-            alpha = mx.tanh(self.xsa_alpha).astype(mx.float32).reshape(
-                1, self.n_heads, 1, 1
-            )
-            output = (yf - alpha * coef * vf).astype(output.dtype)
-
-        output = output.transpose(0, 2, 1, 3).reshape(bsz, seq_len, -1)
-        if self.attn_gate is not None:
-            gate = (2.0 * mx.sigmoid(self.attn_gate(x))).astype(output.dtype)
-            output = _gate_heads(output, gate, self.head_dim)
-        output = self.resid_dropout(self.o_proj(output))
-        return output, past_kv
+            N = (start_pos + 1) // self.ratio  # [B]
+            n_max = int(mx.max(N).item()) if B else 0
+            if self.is_index_source:
+                idxo = self.indexer
+                if idxo.owns_k and latent is not None:
+                    k = idxo.index_keys(latent, pos, self.freq_cos, self.freq_sin)
+                    wslot = mx.where(valid, first_group, cache.pool_scratch)
+                    cache.index_k[bidx, wslot] = mx.where(
+                        valid[:, None], k[:, 0], mx.zeros_like(k[:, 0])
+                    )
+                if idxo.owns_k and n_max:
+                    shared.index_k = cache.index_k[:, :n_max]
+                if n_max:
+                    reach = (mx.arange(n_max)[None, :] < N[:, None])[:, None, :]  # [B,1,N]
+                    sc = idxo.scores(
+                        x, qr, shared.index_k, token_pos, reach, self.freq_cos, self.freq_sin
+                    )
+                    if idxo.is_candidate_source:
+                        shared.candidates = select_candidate_blocks(
+                            sc, N, idxo.candidate_topk_blocks, idxo.candidate_block_size
+                        )
+                    elif idxo.uses_candidates and shared.candidates is not None:
+                        sc = mx.where(shared.candidates, sc, NEG_INF)
+                    _, comp_idx = _topk_masks(sc, reach, idxo.index_topk, offset)
+                    shared.topk_idx = comp_idx
+                else:
+                    comp_idx = mx.zeros((B, 1, 0), dtype=mx.int32)
+                    shared.topk_idx = comp_idx
+            else:
+                comp_idx = shared.topk_idx
+            if n_max:
+                kv_src = mx.concatenate([kv_src, pool.compress_kv[:, :n_max]], axis=1)
+        if comp_idx is None:
+            comp_idx = mx.zeros((B, 1, 0), dtype=mx.int32)
+        idx = mx.concatenate([win_idx, comp_idx], axis=-1)
+        valid_slots = idx >= 0
+        gathered = mx.take_along_axis(
+            kv_src[:, None, :, :], mx.maximum(idx, 0)[..., None], axis=2
+        )
+        o = mx.fast.scaled_dot_product_attention(
+            q.transpose(0, 2, 1, 3),
+            gathered,
+            gathered,
+            scale=self.softmax_scale,
+            mask=valid_slots[:, None, :, :],
+            sinks=self.attn_sink,
+        ).transpose(0, 2, 1, 3)
+        return self._out_proj(o, token_pos)

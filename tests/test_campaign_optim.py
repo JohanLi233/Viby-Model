@@ -211,6 +211,17 @@ def test_expl_nest_hook():
         def parameters(self):
             return self.p
 
+        # base_trainer._compute_loss_and_grad 在 trace 结束后用真实参数/偏置
+        # 恢复模块状态（compile 下 trace 期占位数组会留在叶子上）
+        def update(self, params):
+            self.p = params
+
+        def moe_bias_stack(self):
+            return mx.zeros((0,), dtype=mx.float32)
+
+        def apply_moe_biases(self, biases):
+            self.biases = biases
+
     class _Opt:
         state = {}
 

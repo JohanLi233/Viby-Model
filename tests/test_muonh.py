@@ -109,16 +109,16 @@ def test_grouping():
     from model.config import VibyConfig
     from model.model import VibyForCausalLM
 
+    # V4.1 架构：n_layers >= 4（CED 至少 2 编码 + 2 解码），MoE 全层
     cfg = VibyConfig(
         hidden_size=128,
-        num_hidden_layers=1,
+        num_hidden_layers=4,
         num_attention_heads=4,
         head_dim=32,
         vocab_size=256,
         n_routed_experts=8,
         num_experts_per_tok=2,
         moe_intermediate_size=48,
-        moe_latent_dim=64,
         tie_word_embeddings=False,  # 让 lm_head 存在
     )
     model = VibyForCausalLM(cfg)
@@ -132,8 +132,8 @@ def test_grouping():
 
     flat = dict(tree_flatten(model.trainable_parameters()))
     n_exp = sum(1 for p in flat if ".experts." in p)
-    # 每个 MoE 块 2 张（gate_up_w + down_w）：主干 1 层 + 每个 MTP 模块 1 块
-    check("专家张量存在", n_exp == 2 * (1 + int(getattr(cfg, "mtp_depth", 0))))
+    # 每个 MoE 块 2 张（gate_up_w + down_w）：主干 n_layers + 每个 MTP 模块 1 块
+    check("专家张量存在", n_exp == 2 * (cfg.n_layers + cfg.n_mtp_layers))
 
     ids = mx.array([[1, 2, 3, 4]])
     model(ids, labels=ids).loss
@@ -144,14 +144,15 @@ def test_grouping():
 
     val, grads = mx.value_and_grad(loss_fn)(model.trainable_parameters())
     mx.eval(val, grads)
-    n_before = fnorm(flat["model.stack.layers.0.self_attn.o_proj.weight"])
-    ne_before = fnorm(flat["model.stack.layers.0.mlp.experts.gate_up_w"])
+    # V4.1 主干命名：Block.attn / Block.ffn（不再有 stack/self_attn/mlp）
+    n_before = fnorm(flat["model.layers.0.attn.wo_b.weight"])
+    ne_before = fnorm(flat["model.layers.0.ffn.experts.gate_up_w"])
     nh_before = fnorm(flat["lm_head.weight"])
     opt.update(model, grads)
     mx.eval(model.parameters())
     flat2 = dict(tree_flatten(model.parameters()))
-    n_after = fnorm(flat2["model.stack.layers.0.self_attn.o_proj.weight"])
-    ne_after = fnorm(flat2["model.stack.layers.0.mlp.experts.gate_up_w"])
+    n_after = fnorm(flat2["model.layers.0.attn.wo_b.weight"])
+    ne_after = fnorm(flat2["model.layers.0.ffn.experts.gate_up_w"])
     nh_after = fnorm(flat2["lm_head.weight"])
     check(
         "muonh 一步后 Muon 矩阵范数冻结",

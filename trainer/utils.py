@@ -12,12 +12,13 @@ from typing import Tuple
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from transformers import AutoTokenizer
-from model.flops import (
+from model.config import VibyConfig
+from model.model import VibyForCausalLM
+from .flops import (
     DEFAULT_PEAK_TFLOPS,
     model_flops_utilization,
     training_flops_per_token,
 )
-from model.model import VibyForCausalLM
 
 
 def Logger(content):
@@ -55,13 +56,14 @@ def log_parameter_count(model, args=None):
         v.size for _, v in tree_flatten(model.trainable_parameters())
     )
     active_params = model.num_active_parameters()
-    ngram_params = model.ngram_lookup_parameters()
-    if ngram_params:
+    # Engram 检索表是稀疏寻址的大表，单列出来避免"总参"里看不出它的占比
+    engram_params = model.ngram_lookup_parameters()
+    if engram_params:
         Logger(
             f"总参数量：{total_params / 1e6:.3f}M"
-            f"（含 n-gram 表 {ngram_params / 1e6:.3f}M）, "
+            f"（含 Engram n-gram 检索表 {engram_params / 1e6:.3f}M）, "
             f"可训练参数量：{trainable_params / 1e6:.3f}M, "
-            f"每次激活：{active_params / 1e6:.3f}M（不含 n-gram 查找表）"
+            f"每次激活：{active_params / 1e6:.3f}M（不含检索表）"
         )
     else:
         Logger(
@@ -77,16 +79,20 @@ def log_parameter_count(model, args=None):
     flops = training_flops_per_token(model, seq) if seq > 0 else 0
     args.flops_per_token = flops
     Logger(
-        f"训练 FLOPs/token：{flops / 1e9:.3f}G（6×激活 GEMM + softmax 注意力，"
-        f"MTP×steps），peak {peak:.1f} TFLOPS"
+        f"训练 FLOPs/token：{flops / 1e9:.3f}G（6×激活 GEMM + CSA2 注意力，"
+        f"MTP 草稿前向已折算），peak {peak:.1f} TFLOPS"
     )
 
 
-# 旧 checkpoint 里的非持久 buffer（RoPE 表按 config 重算；加载时允许缺失）。
+# 非持久 buffer（RoPE 表按 config 重算；加载时允许缺失/形状不一致）。
+# 新模型的 Attention 把表存成 freq_cos/freq_sin 属性，形状随 max_seq_len 变，
+# 跨阶段（pretrain→SFT→DPO 的上下文长度不同）必须允许按当前 config 重算。
 _NON_STRICT_WEIGHT_KEYS = (
     "freqs_cos",
     "freqs_sin",
     "rope_freqs",
+    "freq_cos",
+    "freq_sin",
 )
 
 # 已从架构中删除的子系统（HRM / Engram / value-res / CycleDelta）
@@ -181,6 +187,60 @@ def load_model_weights(
     return True
 
 
+def _reset_rope_tables(model, lm_config):
+    """按 config 重算 Attention 的 RoPE 表并冻结。
+
+    新模型把 precompute_freqs_cis 的结果直接存成模块属性（freq_cos/freq_sin），
+    它们因此既是 parameters() 里的 2-D 张量、又会被 model/init.py 的
+    apply_trunc_normal_init 当成普通矩阵重新随机化（skip_init=False 的从零训练
+    路径），还会拿到优化器更新。RoPE 表是由 config 决定的常量：这里按构造期的
+    同一口径重算并 freeze（config 侧的等价修法是把它们移出参数树，旧实现用
+    object.__setattr__）。冻结只影响 trainable_parameters()，权重仍随 checkpoint
+    存盘，strict 加载照旧。
+    """
+    from model.rope import precompute_freqs_cis
+
+    def _fix(m):
+        if not (hasattr(m, "freq_cos") and hasattr(m, "freq_sin")):
+            return
+        # 与 Attention.__init__ 同口径：压缩层用 compress_rope_theta + YaRN，
+        # 纯滑窗层用 rope_theta 且不做 YaRN
+        seq, theta = (
+            (lm_config.original_seq_len, lm_config.compress_rope_theta)
+            if getattr(m, "ratio", 0)
+            else (0, lm_config.rope_theta)
+        )
+        c, s = precompute_freqs_cis(
+            int(m.rope_head_dim),
+            int(lm_config.max_seq_len),
+            int(seq),
+            float(theta),
+            float(lm_config.rope_factor),
+            int(lm_config.beta_fast),
+            int(lm_config.beta_slow),
+        )
+        # 保持 dtype 转换后的口径（convert_model_dtype 已把表转成 bf16/fp16）
+        dtype = m.freq_cos.dtype
+        m.freq_cos, m.freq_sin = c.astype(dtype), s.astype(dtype)
+
+    model.apply_to_modules(lambda name, m: _fix(m))
+    model.freeze(keys=["freq_cos", "freq_sin"])
+    mx.eval(model.parameters())
+
+
+def freeze_backbone_for_dspark(model):
+    """DSpark 独立训练阶段：只留 mtp_modules.* 可训练（V4.1 §2.4.3）。
+
+    先整树 freeze 再解冻草稿层。freeze 只改 trainable_parameters()：checkpoint
+    的保存/加载仍覆盖全部权重。trainer 把 trainable 参数显式喂给被 compile 的
+    loss 函数，冻结后参数叶子变少会自动触发图重建，无需额外处理。
+    """
+    model.freeze()
+    for stage in getattr(model, "mtp_modules", []):
+        stage.unfreeze()
+    return model
+
+
 def build_model_and_tokenizer(
     lm_config,
     args,
@@ -218,62 +278,165 @@ def build_model_and_tokenizer(
 
     convert_model_dtype(model, getattr(args, "dtype", ""))
 
+    # RoPE 表是常量：重算 + 冻结（见 _reset_rope_tables 的说明）
+    _reset_rope_tables(model, lm_config)
+    if getattr(args, "freeze_backbone", False):
+        freeze_backbone_for_dspark(model)
+        n_train = len(tree_flatten(model.trainable_parameters()))
+        Logger(
+            "--freeze_backbone：只训练 mtp_modules.*（论文 §2.4.3 的 DSpark "
+            f"独立训练阶段），可训练张量 {n_train} 个"
+        )
+
     log_parameter_count(model, args)
     return model, tokenizer
 
 
-# 模型结构相关的 CLI 参数：SFT/DPO 中默认值为 None，表示"从基座 checkpoint 的
-# sidecar config 继承"；显式传入时覆盖 sidecar（hidden_size 除外——它还用于
-# 推导默认 checkpoint 文件名，保持固定默认值）。
-_ARCH_ARG_KEYS = (
-    "hidden_size",
-    "num_hidden_layers",
-    "num_attention_heads",
-    "head_dim",
-    "vocab_size",
-    "intermediate_size",
-    "use_attn_gate",
-    "attn_res_register",
-    "attn_res_read_h",
-    "ihc",
-    "ihc_streams",
-    "ihc_typed",
-    "ihc_collapse",
-    "ihc_ngram_stream",
-    "mtp_depth",
-    "mtp_loss_weight",
-    "mtp_steps",
-    "n_routed_experts",
-    "num_experts_per_tok",
-    "n_shared_experts",
-    "moe_intermediate_size",
-    "routed_scaling_factor",
-    "moe_router_logit_norm",
-    "moe_router_logit_temp",
-    "moe_diversity_loss_weight",
-    "z_loss_weight",
-    "moe_latent_dim",
-    "moe_write_spread",
-    "moe_route_scale",
-    "first_k_dense_replace",
-    "dense_intermediate_size",
-    "kda_v_head_ratio",
-    "ngram_table_size",
-    "ngram_layer",
-    "ngram_heads",
-    "ngram_logit_skip",
-    "ngram_conf_gate",
-    "tie_word_embeddings",
-    "use_linear_attn",
-    "kv_lora_rank",
-    "qk_rope_head_dim",
-    "loop_span",
-    "loop_count",
-    "loop_res_scale",
-    "loop_grad_mode",
-    "loop_extrap",
-    "loop_anchor",
+# 模型结构相关的 CLI 参数 → VibyConfig 字段名。唯一真源：trainer/config.py 用
+# 它生成 parser（默认值取 VibyConfig 的 ≈1B 配方），这里用它把 CLI 覆盖写进
+# sidecar config / 组成 VibyConfig 的 kwargs。SFT/DPO 的 parser 把这些参数默认
+# 设为 None：表示"从基座 checkpoint 的 sidecar config 继承"，显式传入才覆盖。
+ARCH_ARG_TO_FIELD = {
+    "hidden_size": "dim",
+    "num_hidden_layers": "n_layers",
+    "num_attention_heads": "n_heads",
+    "head_dim": "head_dim",
+    "rope_head_dim": "rope_head_dim",
+    "q_lora_rank": "q_lora_rank",
+    "o_groups": "o_groups",
+    "o_lora_rank": "o_lora_rank",
+    "window_size": "window_size",
+    "hc_mult": "hc_mult",
+    "hc_sinkhorn_iters": "hc_sinkhorn_iters",
+    "hc_eps": "hc_eps",
+    "compress_ratios": "compress_ratios",
+    "kv_source_layers": "kv_source_layers",
+    "index_source_layers": "index_source_layers",
+    "candidate_source_layer": "candidate_source_layer",
+    "candidate_topk_blocks": "candidate_topk_blocks",
+    "candidate_block_size": "candidate_block_size",
+    "index_n_heads": "index_n_heads",
+    "index_head_dim": "index_head_dim",
+    "index_topk": "index_topk",
+    "rope_theta": "rope_theta",
+    "compress_rope_theta": "compress_rope_theta",
+    "original_seq_len": "original_seq_len",
+    "rope_factor": "rope_factor",
+    "beta_fast": "beta_fast",
+    "beta_slow": "beta_slow",
+    "n_routed_experts": "n_routed_experts",
+    "num_experts_per_tok": "n_activated_experts",
+    "n_shared_experts": "n_shared_experts",
+    "moe_intermediate_size": "moe_inter_dim",
+    "score_func": "score_func",
+    "gate_temp": "gate_temp",
+    "route_scale": "route_scale",
+    "swiglu_limit": "swiglu_limit",
+    "bias_update_rate": "bias_update_rate",
+    "engram_layer_ids": "engram_layer_ids",
+    "engram_max_ngram_size": "engram_max_ngram_size",
+    "engram_vocab_size": "engram_vocab_size",
+    "engram_n_heads": "engram_n_heads",
+    "engram_head_dim": "engram_head_dim",
+    "mtp_depth": "n_mtp_layers",
+    "dspark_block_size": "dspark_block_size",
+    "dspark_noise_token_id": "dspark_noise_token_id",
+    "dspark_target_layer_ids": "dspark_target_layer_ids",
+    "dspark_markov_rank": "dspark_markov_rank",
+    "dspark_n_routed_experts": "dspark_n_routed_experts",
+    "dspark_n_activated_experts": "dspark_n_activated_experts",
+    "mtp_loss_weight": "mtp_loss_weight",
+    "z_loss_weight": "z_loss_weight",
+    "norm_topk_prob": "norm_topk_prob",
+    "tie_word_embeddings": "tie_word_embeddings",
+    "vocab_size": "vocab_size",
+}
+
+# 旧名别名：命令行选项名 → ARCH_ARG_TO_FIELD 里的 dest
+# （--routed_scaling_factor 与 --route_scale 共用一个 dest，这里只用于
+#  --preset 判断"用户是否显式传过"）
+ARCH_ARG_ALIASES = {"routed_scaling_factor": "route_scale"}
+
+# 派生字段 → 生成它们的 CLI 结构参数。sidecar 里的派生字段是按当时的结构算好的；
+# 只要用户显式改了生成它的结构参数（如 --num_hidden_layers / --mtp_depth），
+# 就必须丢掉旧值让 VibyConfig 重算，否则会出现 compress_ratios 长度与新层数
+# 不符、dspark_target_layer_ids 越界这类自相矛盾。
+DERIVED_FIELD_TRIGGERS = {
+    "compress_ratios": ("num_hidden_layers", "mtp_depth"),
+    "kv_source_layers": ("num_hidden_layers", "mtp_depth"),
+    "index_source_layers": ("num_hidden_layers", "mtp_depth"),
+    "candidate_source_layer": ("num_hidden_layers", "mtp_depth"),
+    "dspark_target_layer_ids": ("num_hidden_layers", "mtp_depth"),
+    "engram_layer_ids": ("num_hidden_layers",),
+    "engram_num_embeddings": (
+        "engram_layer_ids",
+        "engram_max_ngram_size",
+        "engram_vocab_size",
+        "engram_n_heads",
+    ),
+}
+
+# 列表类结构参数：命令行/JSON 里是逗号或空格分隔的整数串
+ARCH_LIST_ARGS = (
+    "compress_ratios",
+    "kv_source_layers",
+    "index_source_layers",
+    "engram_layer_ids",
+    "dspark_target_layer_ids",
 )
+
+
+def _as_int_tuple(value):
+    """列表类结构参数统一成 tuple[int]（VibyConfig 接受 list/tuple 两种）。"""
+    if value is None or isinstance(value, tuple):
+        return value
+    if isinstance(value, str):
+        value = value.replace(",", " ").split()
+    return tuple(int(x) for x in value)
+
+
+def build_model_kwargs(args) -> dict:
+    """CLI 结构参数 → VibyConfig kwargs（pretrain 从零建模型的路径）。
+
+    只带显式传入（非 None）的字段与 --preset：其余交给 VibyConfig 的默认值 /
+    preset 预设，CLI 不复制一份配方（避免两处漂移）。
+    """
+    kw = {}
+    preset = getattr(args, "preset", None)
+    if preset:
+        kw["preset"] = preset
+    for arg, field in ARCH_ARG_TO_FIELD.items():
+        value = getattr(args, arg, None)
+        if value is not None:
+            kw[field] = _as_int_tuple(value) if arg in ARCH_LIST_ARGS else value
+    # 序列长度：RoPE 表按 --max_seq_len 建（数据侧用的是同一个参数；
+    # 不放进 ARCH_ARG_TO_FIELD 是为了不让 SFT/DPO 把它抹成 None）
+    seq = getattr(args, "max_seq_len", None)
+    if seq:
+        kw["max_seq_len"] = int(seq)
+    return kw
+
+
+def base_checkpoint_name(args, lm_config, explicit_attr, prefix):
+    """基座 checkpoint 文件名：显式传入优先，否则按 config 的 dim 推导。"""
+    name = getattr(args, explicit_attr, None)
+    if name:
+        return name
+    return f"{prefix}_{int(lm_config.dim)}.safetensors"
+
+
+def sidecar_checkpoint_hint(args, explicit_attr, prefix):
+    """查找 sidecar 用的默认文件名（此刻 lm_config 还不存在）。
+
+    未显式传入 checkpoint 名时，用 --hidden_size（没传就用 VibyConfig 默认
+    dim）推导；换过 hidden_size 的基座用显式 --pretrain_checkpoint/--sft_checkpoint
+    指定即可。
+    """
+    name = getattr(args, explicit_attr, None)
+    if name:
+        return name
+    dim = getattr(args, "hidden_size", None) or VibyConfig().dim
+    return f"{prefix}_{int(dim)}.safetensors"
 
 
 def load_checkpoint_config(save_dir, checkpoint_name):
@@ -297,15 +460,28 @@ def load_checkpoint_config(save_dir, checkpoint_name):
 def build_config_from_sidecar(args, checkpoint_name):
     """以基座 checkpoint 的 sidecar config 为底，CLI 显式参数（非 None）覆盖。
 
-    返回 (config_kwargs, found_sidecar)。无 sidecar 时仅含 CLI 参数，
-    其余字段由 VibyConfig 默认值补齐。
+    返回 (config_kwargs, found_sidecar)。sidecar 的键已经是 VibyConfig 的字段名
+    （to_dict 的输出），CLI 侧经 ARCH_ARG_TO_FIELD 映射；无 sidecar 时只含 CLI
+    结构参数与 --preset，其余字段由 VibyConfig 默认值补齐。
     """
     sidecar = load_checkpoint_config(args.save_dir, checkpoint_name)
     cfg = dict(sidecar) if sidecar else {}
-    for key in _ARCH_ARG_KEYS:
-        value = getattr(args, key, None)
+    given = set()
+    for arg, field in ARCH_ARG_TO_FIELD.items():
+        value = getattr(args, arg, None)
         if value is not None:
-            cfg[key] = value
+            cfg[field] = _as_int_tuple(value) if arg in ARCH_LIST_ARGS else value
+            given.add(arg)
+    if sidecar:
+        # 结构生成参数被显式改动时，sidecar 里的派生字段作废（见
+        # DERIVED_FIELD_TRIGGERS 的说明）；用户显式传了的派生字段保留
+        for field, triggers in DERIVED_FIELD_TRIGGERS.items():
+            if field in cfg and field not in given and any(t in given for t in triggers):
+                cfg.pop(field)
+    else:
+        preset = getattr(args, "preset", None)
+        if preset:
+            cfg["preset"] = preset
     return cfg, sidecar is not None
 
 
@@ -619,7 +795,7 @@ def save_checkpoint(
         "dpo": "dpo",
     }
     prefix = prefixes.get(training_type, training_type)
-    ckp_name = f"{prefix}_{lm_config.hidden_size}"
+    ckp_name = f"{prefix}_{int(lm_config.dim)}"
 
     ckp = os.path.join(args.save_dir, f"{ckp_name}.safetensors")
 

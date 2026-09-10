@@ -2,171 +2,181 @@
 
 基于 Apple MLX 的单设备中文大语言模型训练与推理项目。
 
-架构为 decoder-only Transformer：顺序主干 + Kimi Linear 3:1 混合注意力
-（每 4 层与最后一层为 global：full-causal NoPE GQA，`n_kv_heads=h/4`；
-其余 local 为 KDA——逐通道门控 delta 规则线性注意力，衰减
-`g = −5·σ(e^{A_h} z)`，满秩输出门 `y = W_o[2·σ(W_g x) ⊙ RMSNorm(ō)]`
-（`W_g` 零初始化，初始门 1）；
-全模型无 RoPE / 滑窗；GQA 侧逐 head 无参 RMS qk-norm、XSA、默认开的
-注意力输出门 `2·σ`）+ GQA K-path ShortConv 与 KDA q/k/v 短卷积 +
-AttnRes（score 用 `w·RMSNorm(v_j)`，混合仍用原始 `v_j`）+ RMSNorm
-（GatedNorm 包裹，`2·sigmoid` 门）+ SiLU-GLU / SwiGLU（默认
-`silu(g)·u`；`hidden_act=situ` 可切回 SiTU-GLU `β1=4, β2=25`）。
-FFN 全部为 LatentMoE：路由专家在 `hidden/2` latent 空间计算；
-`n_shared_experts` 个独立共享专家各宽 `moe_intermediate_size`、输出相加；
-QB 分位数快照偏置做负载均衡。logit z-loss 为 `mean(lse²)`（默认 1e-4），
-融合进 CE kernel。MTP（Qwen3.8-Next 口径，预训练默认 depth=1：单层
-full-attn MoE，输入为主干末层 hidden + 下一 token 嵌入，`eh_proj
-(enorm(e)∥hnorm(h))`，teacher-forced 展开 `--mtp_steps` 次默认 2；后训练
-用 `trainer/train_draft.py` 冻结主干做 TTT 草稿微调）。
-2D 矩阵按 `TruncNormal(0, (0.5/√fan_in)²)`、|z|≤2 初始化。
-`lm_head` 默认与 embedding 解绑。
+架构是 **DeepSeek-V4.1 的等比例缩小版**：CED 因果编码器-解码器主干 +
+CSA2 跨层复用稀疏注意力 + Single-Pass mHC 残差流 + sqrt(softplus) 路由的
+细粒度 MoE + Engram n-gram 条件记忆 + DSpark 块式草稿头。旧版（Kimi Linear
+3:1 KDA / iHC / XSA / AttnRes / SiTU / MLA / 短卷积）的实现已全部移除，
+只保留 V4.1 这一条技术路线。
+
+架构语义对照官方实现（`deepseek-ai/DeepSeek-V4.1-Flash` 的 `inference/model.py`，
+已逐行核对）与技术报告 `DeepSeek_V41_Tech_Report`（下称"报告"）。
+
+## 架构
+
+### CED：因果编码器-解码器（报告 §2.2）
+
+主干前 `n_layers/2` 层是**因果编码器**，后一半是**解码器**。解码段的
+全局（压缩）KV 不由解码层各自的 hidden 产生，而是从编码器末层 hidden
+投影而来——实现上就是 `compress_ratios` 在 CED 边界从 `r` 切到 `1`，
+且边界层是 `kv_source`（见下）。滑动窗口 KV 仍逐层从本层 hidden 计算。
+
+### CSA2：压缩稀疏注意力（报告 §2.3）
+
+每个注意力层静态属于三种模式之一（`config.layer_mode`）：
+
+| 模式 | 主 KV | indexer K | Top-K 索引 | 本层计算 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Full** | 自产 | 自产 | 自算 | main Q + SWA KV + indexer Q/K |
+| **Reindex** | 复用上游 | 复用上游 | 自算（只在候选池里打分） | main Q + SWA KV + indexer Q |
+| **Reuse** | 复用上游 | 复用上游 | 复用上游 | main Q + SWA KV |
+
+- 主 KV 与 indexer K 由 `kv_source_layers` 指定的层产生（CED 边界层是
+  解码段的全局源），其后同 ratio 的层共享同一份 cache；`Indexer.owns_k`
+  只在"既是 kv 源又是 indexer 源"的层为真。
+- 每个 query 的可见集合 = 滑动窗口内 `window_size` 个原始 KV ∪ indexer
+  挑出的 `index_topk` 个压缩位置。
+- 压缩：`compress_ratio` 个连续 token 用可学 softmax 门池化成一个 latent
+  （ratio=1 即一次普通投影）；latent 的 RoPE 位置是**组首 token**的位置
+  `j*r`，组 j 只对 `t ≥ (j+1)r−1` 的 query 可见。
+- **分层稀疏索引**（报告 §2.3.2）：`candidate_source_layer`（解码段第一个
+  Full 层）按块最大分为每个 query 选出 `candidate_topk_blocks` 个候选块
+  （每块 `candidate_block_size` 个位置），更深的 indexer 只在这个候选池里
+  打分，把后续 indexer 的每 query 成本从"随上下文线性"降到常数。
+
+### 注意力细节
+
+- **共享 K=V 的多查询注意力**：`wkv` 只产 1 个 head，同一个张量既当 K 又当 V。
+- **部分 RoPE**：只旋转每个 head 尾部 `rope_head_dim` 通道，交错对形式；
+  注意力**输出端用同一旋转按 −i 转回去**，使 cache 只保留一种旋转形式。
+  压缩层用 `compress_rope_theta` + YaRN，纯滑窗层用 `rope_theta` 且不做 YaRN
+  （对应官方实现 `original_seq_len = 0 if compress_ratio == 0`）。
+- **逐 head 可学 attention sink**：进 softmax 分母的额外一项（`2.4` 之外的
+  gpt-oss 式做法，官方同款）。
+- **分组低秩输出投影**：`o_groups` 组 → 组内 block-diagonal 的 `wo_a` →
+  `o_lora_rank` → `wo_b` 回 hidden。
+- **Q 低秩**：`wq_a → q_norm → wq_b`，主注意力与 indexer 共享同一份 q 低秩表示。
+- 无短卷积、无 RoPE 之外的任何位置编码（报告 §2.4.2 明确省掉 Engram 的短卷积）。
+
+### mHC 与 Single-Pass（报告 §2.4.1）
+
+残差流是 `hc_mult` 条并行副本 `[B,T,hc,dim]`。每个子层的读写系数
+`(pre, post, comb)` 由流本身现算：`pre = σ(m·s₀+b₀)+ε`、
+`post = 2σ(m·s₁+b₁)`、`comb` 经 Sinkhorn–Knopp 迭代投影到**双随机矩阵**
+（信号传播非扩张）。Single-Pass 的"系数错位一格"体现为：注意力用的是
+**上一层 FFN 产出**的 pre_mix，FFN 用的是本层注意力产出的 pre_mix。
+
+### MoE（报告 §2.1）
+
+- 亲和度 `sqrt(softplus(x·W)) `（不再是 V3 的 sigmoid），**没有** n_group /
+  topk_group 分组约束；top-k 后按未归一化分数归一化并乘 `route_scale`。
+- **noaux_tc 偏置**：`e_score_correction_bias` 只参与 top-k 选择、不进梯度
+  （`freeze`，但随 checkpoint 保存），训练循环按
+  `b += γ·sign(load_frac − 1/E)` 覆写。
+- **clamped SwiGLU 专家**：`silu(clamp(gate, max=L)) * clamp(up, ±L)`，
+  `L = swiglu_limit`；1 个共享专家每 token 必走。
+- 分发两条路径：小 batch 走稠密广播 matmul，训练/大 prefill 走
+  `mx.gather_mm(sorted_indices=True)` 的免 padding 分段 GEMM。
+
+### Engram（报告 §2.4.2）
+
+挂在若干层入口的 n-gram 条件记忆：token 先过 normalizer 压到小 id 空间
+（" The"/"the"/"THE" 同形），再按 `{2,3,4}`-gram 做多头素数哈希（每
+(层, 阶, 头) 独占一段素数桶），查表得 key/value，用**与残差流的归一化点积**
+做门控写入（带符号平方根 + sigmoid）。无短卷积。表是 fp32 全表 gather
+（官方是 fp8 分片 + RDMA 预取）。
+
+### DSpark / MTP（报告 §2.4.3）
+
+主干后挂草稿层：取主干的 `dspark_target_layer_ids` 层的**注意力输入**（mHC
+流均值）拼起来投影成锚点表示；锚点 t 的草稿序列是 `[x_t, 噪声, …, 噪声]`，
+一次前向算出 `dspark_block_size` 个草稿位置的 base logits，马尔可夫头按
+前一个 token 的嵌入加低秩 logits 偏置，置信度头预测每个位置的接受概率。
+训练用 teacher forcing（槽 j 看 token t+j、预测 t+j+1），**DSpark 目标不回传
+主干**（`stop_gradient`，与报告"只训 DSpark、主干冻结"一致）。
+
+## 缩放配方
+
+| | V4.1-Flash（官方） | Viby 默认（≈1B） | Viby tiny（自测/冒烟） |
+| :--- | :--- | :--- | :--- |
+| dim / 层数 | 5120 / 40（20+20） | 1024 / 12（6+6） | 256 / 4（2+2） |
+| 注意力头 | 64 × 512 | 16 × 128 | 4 × 64 |
+| q_lora / o_groups × o_lora | 1280 / 8 × 1024 | 512 / 4 × 256 | 128 / 2 × 64 |
+| rope_head_dim | 64 | 32 | 16 |
+| MoE 专家 / 激活 / 共享 | 384 / 6 / 1，inter 2304 | 96 / 6 / 1，inter 256 | 16 / 4 / 1，inter 128 |
+| 压缩率（逐层） | [0,0] + [2]×18 + [1]×20 | [0,0] + [2]×4 + [1]×6 | [0,0] + [1]×2 |
+| kv 源 / indexer 源 | 2,8,14,20 / +24,28,32,36 | 2,6 / 2,6,10 | 2 / 2 |
+| 候选池 | 2048 块 × 8 | 64 块 × 8 | 4 块 × 4 |
+| indexer | 32 头 × 128，top-512 | 8 头 × 64，top-64 | 4 头 × 32，top-16 |
+| 滑窗 | 128 | 128 | 32 |
+| hc_mult | 4 | 4 | 4 |
+| Engram | 2 层 × 196B 参数 | 2 层（[1,4]），4 头 × 64 | 2 层，2 头 × 32 |
+| 总参 / 激活 | 552B（+196B Engram）/ 8–16B | **1.02B / 0.13B** | 17M |
+| DSpark | 3 层草稿，5 位置 | 1 层草稿，4 位置 | 1 层，3 位置 |
+
+`VibyConfig(preset="tiny")` 与 `VibyConfig()`（默认 ≈1B）两套预设，
+其余字段都能在构造时覆盖。
 
 ## 组件
 
-- `model/`：模型定义（VibyConfig / VibyForCausalLM）、tokenizer
-- `dataset/`：预训练 / SFT / DPO 数据集
-- `trainer/`：MuonH/AdamH + AdamW 混合优化器（compute 自动缩放超参）、
-  训练循环、检查点管理
-- `model/kernels/`：手写融合 Metal kernel（flash 注意力反向、KDA
-  chunk/scan、conv、SiLU-GLU / SiTU-GLU 融合核（`hidden_act` 二选一，
-  silu 默认）、CE、decode 路径）与训练前预热
-- `experiments/`：性能 probe / bench / sweep / verify / A-B 脚本
-- `eval_model.py`：交互式 / 自动评估脚本
-- `tests/`：全部测试。`test_consistency.py`：架构正确性回归（因果性、
-  prefill/decode、padding、MoE）；`test_align.py`：Marin / K3 公式对齐；
-  `test_kda.py`：KDA 数值；`test_pack_dataset.py` / `test_pack_sft.py`：
-  pretrain/SFT 打包对拍
-- `research/MLX_PERF.md`：**MLX / Apple Silicon 性能优化手册**——硬件
-  roofline 基线、测量口径纪律、mx.compile 与 prewarm 的坑、算子选择
-  清单、手写 Metal kernel 范式、失败方案清单。做性能优化前先读它
-
-## 架构开关
-
-```bash
---use_attn_gate / --no-use_attn_gate   # 默认开：2·σ，零初始化门=1，进 Adam
---use_xsa / --no-use_xsa   # 默认开：MLAy 的 Gated XSA（可学习版 Exclusive
-                          # Self-Attention）。逐 head 学 tanh(α)，α=0 初始化
-                          # ⇒ 恒等；z = y − tanh(α)·(yᵀv/‖v‖²)·v。头 1:1，
-                          # 无需 GQA 的 V-扩展
---xsa_last_n 0            # 应用的最深 N 层；0=自动取最深 ≈1/3 层
-                          # （`max(1, num_hidden_layers // 3)`）；取
-                          # num_hidden_layers 则全层。
---attn_res_register / --no-attn_res_register  # 默认关：替换式 AttnRes。开=加法写、AttnRes 只读
---attn_res_read_h / --no-attn_res_read_h  # 默认关。开=寄存器读 h，不再混合 [h]+写入（需 register）
---ihc / --no-ihc  # 默认关。开=iHC（M 条流、H_res=I）；开时接管残差，AttnRes 开关保留但不走 merge
---ihc_streams 4   # iHC 流数（仅 --ihc 时生效）
---ihc_typed / --no-ihc_typed  # 默认关。开=分型流：n-gram 只进一流、进栈前注入，collapse 默认 identity
---ihc_collapse {mean,identity}  # iHC 出口；typed 且未指定时为 identity
---ihc_ngram_stream 1  # 分型时 n-gram 写入的流（identity 塌缩时不能为 0）
---ngram_logit_skip / --no-ngram_logit_skip  # 默认关。开=n-gram 经 lm_head 残差到 logits
---ngram_conf_gate / --no-ngram_conf_gate  # 默认关。开=n-gram 置信度缩放 attn/mlp 写入
---mtp_depth 1          # MTP 开关（>0 挂 1 层 full-attn，0 关闭）
---mtp_steps 2          # 预训练 teacher-forced 展开步数（Qwen3.8-Next）
---mtp_loss_weight 0.3
-# 草稿微调（冻结主干，只训练 MTP 层，TTT rollout）：
-# python trainer/train_draft.py --draft_ttt_steps 4 --data_path ...
---z_loss_weight 1e-4   # logit z-loss：loss += w · mean(lse²)，0 关闭
---tie_word_embeddings  # 绑定输入/输出 embedding（默认 False：独立 lm_head）
---pack_sequences       # 预训练序列打包（消除 padding 浪费）
---doc_mask             # 打包时屏蔽跨文档注意力与边界 loss（需配合 --pack_sequences）
---no-doc_align         # 关闭文档边界对齐（默认开）：打包时每块首 token 对齐到文档开头
-                       # + 限制 max doc length，丢弃跨块尾部位换取边界更干净、减少跨文档
-                       # 无效 attention（数据侧通用改进；对应 modded-nanogpt record #26）
---max_doc_len N        # 单篇文档最大 token 数（不含 eos），默认=max_seq_len
-# MoE（LatentMoE + QB 路由；默认全层 MoE）：
---first_k_dense_replace 0  # 前 K 层小 dense stem，其后 MoE。0=全层 MoE
---dense_intermediate_size  # 浅层 dense 中间维；未传则与 moe_intermediate_size 同宽
---n_routed_experts 256     # 路由专家数（必须 >0；parser 默认 0 会直接报错）
---num_experts_per_tok 8    # 每 token 激活专家数（1080M 配方；CLI 默认 6）
---n_shared_experts 2       # 独立共享专家数（1080M 配方；CLI 默认 1）
---moe_intermediate_size 384  # 单个路由/共享专家中间维
---routed_scaling_factor 2.5  # sigmoid 归一化后的路由权重缩放
---moe_latent_dim           # 路由专家 latent 维度（默认 hidden//2；0 关闭）
---moe_write_spread / --no-moe_write_spread  # 默认关。专家写出基扩展
---moe_route_scale / --no-moe_route_scale  # 默认关。RMSNorm 后乘未归一化 top-k sigmoid 和
---moe_diversity_loss_weight 0  # router 输入多样性正则（默认关）
-# 学习率（Marin Hero #8435）：线性 warmup（默认本轮 horizon 1%）后立刻
-# 线性收到 --min_lr_ratio（默认 0.05），无 WSD 平台。短跑 --max_steps
-# 会重算衰减斜率，结束时仍落到 0.05×peak；峰值 LR 未传 --token_budget
-# 时也按该 horizon 的 token 数缩放。`--lr_schedule wsd` 才有平台。
-# 预训练 parser 默认 bs=32 / accum=8 / seq=2048，会把 muon_lr 推到 ~0.03，
-# 不要当 1080M 配方。1080M 用下面这条（bs=12, accum=2, seq=1024）。
-# 训练超参（Hyperball / Marin 口径 compute 缩放，默认开启 --lr_scale_auto）：
-# adam_lr = min(0.05, 0.087571·tokens^-0.3461·hidden^-0.3448·√tpb)，
-# muon_lr = min(0.05, 13/3×adam_lr)，beta2/eps 同样按 tokens/tpb 推导；
-# --token_budget 显式给原计划预算（缩短 run 时只改斜率），
-# 显式 --learning_rate 覆盖 adam_lr。--muonh（默认开）：Muon 组加
-# Frobenius 范数球投影；堆叠专家逐专家 NS（每步全量，无降频复用）；
-# Q/K/V per-head NS 默认关（VIBY_MUONH_PER_HEAD=1 打开）；lm_head 走 AdamH；
-# 短卷积、attn_gate、KDA g_proj、GatedNorm.gate_up 走 Adam 标量组（wd=0）；
-# embed / router 仍 wd=0.1。
-```
-
-1080M 常用配方：
-
-```bash
-python trainer/train_pretrain.py --hidden_size 768 --num_hidden_layers 8 \
-  --num_attention_heads 8 --n_routed_experts 256 --num_experts_per_tok 8 \
-  --n_shared_experts 2 --moe_intermediate_size 384 --batch_size 12 \
-  --accumulation_steps 2 --max_seq_len 1024 --pack_sequences --doc_mask \
-  --compile_model --muonh
-```
-
-注：MoE 负载均衡走 QB（Quantile Balancing）：训练期 forward 记录各专家
-margin（原始 sigmoid 分 − per-token 阈值 alpha；K3 Eq.14，旧 bias 只经
-alpha 进入更新），每优化器步取 margin 的
-(1−K/E) 上分位数、零均值化后覆写 frozen 的 expert_bias（无梯度、
-无 EMA rate 超参）。
-
-MoE 按 (token,choice) 对数 `G = B×T×top_k` 分三条路径（形状只随
-`(B,T,E,K)` 变，训练可 `mx.compile`）：
-
-- `G <= 512`（decode / 极小批量）：融合 Metal kernel（router + SiLU-GLU
-  前半 + 加权合并）。不可微，仅推理；`model.train()` 或
-  `router.collect_stats` 时不走。
-- `G <= 4096`（小 prefill）：稠密全专家广播 matmul，按路由权重加权。
-- 更大（训练 / 大 prefill）：`mx.gather_mm(sorted_indices=True)` 免 padding
-  分组 GEMM，每个 (token,choice) 只算真实行，无桶容量、无 host sync。
-
-训练侧：
-
-- BatchedMuon：同形状权重堆叠批量 Newton-Schulz；正交化每步全量重算
-  （NS 降频复用 / Temporal Q 已删，勿重引入）。Q/K/V per-head 切分默认关。
-  `--muon_ns_steps` 默认 5。
-- `--cache_limit_gb`（默认 0=不限）：Metal 空闲块缓存上限（GB）。上限内
-  释放块常驻复用；大 batch 时峰值+缓存不要超物理内存。
-- `--compile_model`：compile 前 `prewarm_all()` 跑完融合 kernel 校验
-  （图内不能 `.item()`）。dropout>0 时自动回退 eager。
+- `model/`：`config.py`（VibyConfig）、`model.py`（VibyModel / VibyForCausalLM /
+  DSpark）、`block.py`、`attention.py`（Compressor / Indexer / Attention）、
+  `hc.py`（mHC）、`moe.py`、`engram.py`、`rope.py`、`norms.py`、
+  `cache.py`（解码状态）、`init.py`、tokenizer
+- `trainer/`：预训练 / SFT / DPO / 训练循环 / 检查点 / MuonH·AdamH 混合优化器
+  （compute 自动缩放超参）
+- `engine/`：进程内连续 batch 推理引擎（新缓存结构）
+- `dataset/`：预训练 / SFT / DPO 数据集（与 MiniMind 格式对齐）
+- `tests/`：架构语义回归（CSA2 三种模式、分层索引、CED、mHC 双随机、MoE
+  sqrtsoftplus/noaux_tc、Engram 哈希、DSpark 梯度隔离、prefill/decode 一致性）
+- `research/`、`research_runs/`、`swanlog/`、`autoresearch-mlx/`：历史资料
+  （优化器研究、训练日志、旧架构时期的实验记录），不是当前架构的一部分
 
 ## 训练
 
 ```bash
-# 预训练：用上面 1080M 配方（须 --n_routed_experts >0；不要依赖 parser 默认 bs/accum/seq）
+# 冒烟（tiny，几分钟）
+python trainer/train_pretrain.py --preset tiny --data_path ../dataset/pretrain_hq.jsonl \
+  --max_seq_len 128 --batch_size 2 --accumulation_steps 1 --max_steps 50
+
+# ≈1B 配方（与 V4.1 结构比例一致）
 python trainer/train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl \
-  --hidden_size 768 --num_hidden_layers 8 --num_attention_heads 8 \
-  --n_routed_experts 256 --num_experts_per_tok 8 --n_shared_experts 2 \
-  --moe_intermediate_size 384 --batch_size 12 --accumulation_steps 2 \
-  --max_seq_len 1024 --pack_sequences --doc_mask
+  --hidden_size 1024 --num_hidden_layers 12 --num_attention_heads 16 \
+  --n_routed_experts 96 --num_experts_per_tok 6 --moe_intermediate_size 256 \
+  --batch_size 12 --accumulation_steps 2 --max_seq_len 1024 \
+  --pack_sequences --doc_mask --compile_model --muonh
 
 # 全量 SFT（需要 pretrain 检查点）
 python trainer/train_full_sft.py --data_path ../dataset/sft_512.jsonl
 
 # DPO（需要 full_sft 检查点）
 python trainer/train_dpo.py --data_path ../dataset/dpo.jsonl
+
+# DSpark 独立阶段：只训草稿层（主干冻结，报告 §2.4.3）
+python trainer/train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl \
+  --resume --freeze_backbone --mtp_loss_weight 1.0
 ```
 
-检查点以 safetensors 保存于 `--out_dir`，并带有同名 `.json` sidecar 与
-`.optimizer.safetensors` 优化器状态。
+要点：
 
-注意：
-
-- SFT / DPO 会自动从基座 checkpoint 的 sidecar JSON 继承模型结构配置，
-  CLI 显式传入的结构参数优先；`save_interval` 会自动对齐到
-  `accumulation_steps` 的整数倍，避免 resume 丢失梯度。
-- 优化器分组变更（MuonH 开关、专家/门控进哪一组）后，旧
-  `.optimizer.safetensors` 不能直接续；加 `--reset_optimizer` 或新开 run。
-  权重仍可加载。
+- 结构参数只走 `VibyConfig`：`--preset`、`--hidden_size`、`--num_hidden_layers`、
+  `--num_attention_heads`、`--head_dim`、`--rope_head_dim`、`--q_lora_rank`、
+  `--o_groups`、`--o_lora_rank`、`--window_size`、`--hc_mult`、
+  `--compress_ratios`、`--kv_source_layers`、`--index_source_layers`、
+  `--index_n_heads`、`--index_head_dim`、`--index_topk`、
+  `--candidate_source_layer`、`--candidate_topk_blocks`、`--candidate_block_size`、
+  `--n_routed_experts`、`--num_experts_per_tok`、`--moe_intermediate_size`、
+  `--score_func`、`--route_scale`、`--swiglu_limit`、`--bias_update_rate`、
+  `--engram_*`、`--mtp_depth`、`--dspark_*`、`--z_loss_weight`、
+  `--tie_word_embeddings`。
+- 检查点：`--out_dir` 下 safetensors + 同名 `.json` sidecar（结构配置）+
+  `.optimizer.safetensors`；SFT/DPO 自动从基座 sidecar 继承结构。
+- **优化器分组**：Muon/AdamH 走核心权重矩阵（含 3D 专家堆叠逐专家 NS）、
+  AdamW 走 embedding/lm_head/router、Engram 检索表独立 Adam（5× lr、wd=0）、
+  其余 1-D（norm gain、attn_sink、mHC scale/base）走标量组 wd=0。
+  分组变更（如切 `--muonh`）后旧优化器状态不能直接续，加 `--reset_optimizer`。
+- `--pack_sequences` / `--doc_mask`：打包与跨文档屏蔽。压缩组按"整组同
+  文档"处理，跨文档的组直接不可见（选择阶段就隔离，不会泄漏）。
+- 预训练默认 `z_loss_weight=1e-4`（`mean(lse²)`，分块融合进 CE）。
 
 ## 数据格式（与 MiniMind 对齐）
 
@@ -204,11 +214,11 @@ SFT（多轮对话，可选 `reasoning_content` / `tools` / `tool_calls` / `tool
 ```
 
 处理方式与 MiniMind 一致：无 system 时以 20% 概率补一条随机 system；
-渲染后以 80% 概率移除空 `<think>\n\n</think>\n\n` 标签；chat template
-负责展开 `<think>` / `<tool_call>` / `<tool_response>` 片段，loss 只监督
-assistant 消息（含其 `reasoning_content` 与 `tool_calls`），不监督
-user / system / tool 回复。超长样本保留头部截断尾部（与 MiniMind 相同），
-截断后无 assistant 可监督时会打印一次警告。
+渲染后以 80% 概率移除空 `<think>\n\n</think>\n\n` 标签；chat template 负责
+展开 `<think>` / `<tool_call>` / `<tool_response>` 片段，loss 只监督 assistant
+消息（含其 `reasoning_content` 与 `tool_calls`），不监督 user / system / tool。
+超长样本保留头部截断尾部（与 MiniMind 相同），截断后无 assistant 可监督时
+会打印一次警告。
 
 DPO：
 
@@ -219,15 +229,61 @@ DPO：
 }
 ```
 
-DPO 同样经过 chat template 渲染与空 `<think>` 清洗，loss mask 只覆盖
-assistant 回复。
+DPO 同样经过 chat template 渲染与空 `<think>` 清洗，loss mask 只覆盖 assistant 回复。
 
-## 评估
+## 评估与推理
 
 ```bash
-python eval_model.py --out_dir out
+python eval_model.py --out_dir out          # 交互式 / 自动评估
 ```
 
-`--model_mode` 支持 `0`（预训练）、`1`（SFT-Chat）和 `2`（DPO）。脚本会自动从
+`--model_mode` 支持 `0`（预训练）、`1`（SFT-Chat）、`2`（DPO）；脚本从
 `latest_checkpoint.txt` 或 `{mode}_*.safetensors` 发现检查点，并优先从
-sidecar JSON 加载模型配置。
+sidecar JSON 加载结构配置。
+
+直接用模型 API：
+
+```python
+from model.config import VibyConfig
+from model.model import VibyForCausalLM
+model = VibyForCausalLM(VibyConfig())
+logits, cache = model.prefill(tokens)          # 整段 prefill
+logits, cache = model.decode_step(next_tok, cache)   # 逐 token（cache 自带 start_pos）
+out = model.generate(tokens, max_new_tokens=64, temperature=0.7, top_k=50)
+```
+
+## 与官方 V4.1 的刻意偏差
+
+缩小规模之外，以下部分没有实现（或用了等价但更简单的做法），用之前请知悉：
+
+1. **多模态**：官方 V4.1-Flash 带 ViT + Aligner，本项目是纯文本。
+2. **量化**：官方 fp8 权重 / fp4 主 KV（QAT）；本项目训练与推理都用 bf16。
+3. **稀疏算力**：训练/prefill 走稠密掩码注意力——可见集合与官方**逐位等价**
+   （已验证），但没有官方融合稀疏 kernel 的省算力效果；解码路径才是 gather 稀疏。
+4. **DSpark**：只挂 1 个草稿 stage（官方 3），5→4 个草稿位置；投机解码的
+   置信度调度采样循环未实现（只有草稿头前向 + 训练损失）。
+5. **Engram**：表规模按比例缩小；表更新用 Adam(5× lr) 近似官方的
+   momentum + Sinkhorn 平衡；不分片、不 fp8。
+6. **SWA Bounded Replay**（官方部署期只重放最近 n_win 个 token 的优化）未实现。
+7. `norm_eps` 用 1e-6（官方 fp8 口径 1e-20），bf16 训练更稳。
+
+## 已知问题
+
+- **MuonH 的 3-D 堆叠专家路径有隐患**：V4.1 架构下 `VIBY_MUONH_EXPERTS=1`（旧行为）
+  会在训练进程内随机产生非有限激活——SFT（128 长度）实测 1/3~2/3 的运行在第 1~3 个
+  微批起 loss=nan，而同一批数据与权重在进程外纯模型跑 40 次全部有限，关掉这条路径后
+  3/3 运行全程有限。表现是"梯度非有限 → NaN 守卫跳过窗口"，参数量值始终正常。
+  因此 **3-D 堆叠专家默认不进 MuonH**（走 AdamW 标量组），2-D 核心权重仍走 MuonH；
+  要复现旧行为显式设 `VIBY_MUONH_EXPERTS=1`。
+- `--use_mtp_speculative` / `num_speculative_tokens` 被接受但被忽略：DSpark 的
+  投机解码采样循环未实现（只有草稿头前向与训练损失）。
+
+## 验证
+
+```bash
+.venv/bin/python -m pytest tests/ -q
+```
+
+已测：整段 prefill vs prefix+逐 token 解码（`max|Δlogit| ≈ 1e-6`，含 ratio=2
+压缩器）、同位置批量解码 vs 单条、packed 文档隔离、mx.compile 前向、
+`nn.value_and_grad` 全参数可微、Engram 哈希与官方 PyTorch 参考逐位一致。

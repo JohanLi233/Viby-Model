@@ -1,416 +1,437 @@
+"""Viby 配置：DeepSeek-V4.1 架构的等比例缩小版。
+
+架构对照（DeepSeek-V4.1-Flash，40 层 / dim 5120 / 384 路由专家）：
+
+- **CED（Causal Encoder-Decoder）**：主干前一半是因果编码器，后一半是
+  解码器；解码器的全局 KV 不由各解码层自己产生，而是从编码器最后一层的
+  hidden 投影而来（`compress_ratios` 在 n_layers//2 处从 r 切到 1，
+  且该层是 kv_source）。
+- **CSA2（Compressed Sparse Attention 2）**：每个注意力层按
+  `compress_ratios` 取三种静态模式之一——Full（自己产压缩 KV 且自己跑
+  indexer）、Reindex（复用上游压缩 KV，自己跑 indexer）、Reuse（压缩 KV
+  与 top-k 索引都复用上游）。压缩 KV 与 indexer 的 K 由
+  `kv_source_layers` 指定层产生，被其后同 ratio 的层共享。
+- **滑动窗口分支**：每层都有 window_size 的 SWA（环状 KV），与压缩分支
+  拼接后一起做注意力。
+- **Lightning Indexer + 分层稀疏索引**：indexer 给每个 query 选
+  `index_topk` 个压缩位置；`candidate_source_layer` 先选
+  `candidate_topk_blocks` 个候选块，更深的 indexer 只在候选池里打分。
+- **mHC（Manifold-Constrained Hyper-Connections）**：残差流是 hc_mult 条
+  并行副本，`comb` 经 Sinkhorn 迭代投影到双随机矩阵。
+- **MoE**：sqrt(softplus(·)) 亲和度 + noaux_tc 的 e_score_correction_bias
+  （只影响选择、不进梯度）；clamped SwiGLU 专家 + 1 个共享专家。
+- **Engram**：n-gram 素数哈希条件记忆，按 token 查表、门控写入残差流。
+- **MTP / DSpark**：主干后追加 draft 层，半自回归块式草稿 + 马尔可夫头 +
+  置信度头。
+
+与本仓库旧实现（Kimi Linear 3:1 KDA / iHC / XSA / AttnRes / SiTU）无关的
+部分已全部移除。
+"""
+
 import json
 import math
 import os
-import warnings
+
+
+# 默认缩放配方（≈1.0B 总参 / ≈110M 激活）：
+#   dim 1024, 12 层（6 编码 + 6 解码）, 96 路由专家 × top-6。
+_DEFAULT_LAYER_PRESET = dict(
+    dim=1024,
+    n_layers=12,
+    n_heads=16,
+    head_dim=128,
+    rope_head_dim=32,
+    q_lora_rank=512,
+    o_groups=4,
+    o_lora_rank=256,
+    moe_inter_dim=256,
+    n_routed_experts=96,
+    n_activated_experts=6,
+    n_shared_experts=1,
+    window_size=128,
+    hc_mult=4,
+    index_n_heads=8,
+    index_head_dim=64,
+    index_topk=64,
+    engram_n_heads=4,
+    engram_head_dim=64,
+)
+
+
+def default_compress_ratios(n_layers: int, n_mtp_layers: int) -> list:
+    """V4.1 的逐层压缩率：浅层纯滑窗、编码器段 r=2、解码器段 r=1、draft 层纯滑窗。
+
+    对照 V4.1-Flash：`[0, 0] + [2]*18 + [1]*20 + [0]*3`。
+    """
+    ratios = [0] * (n_layers + n_mtp_layers)
+    mid = max(2, n_layers // 2)  # CED 边界 = 第一个解码层
+    for i in range(2, mid):
+        ratios[i] = 2
+    for i in range(mid, n_layers):
+        ratios[i] = 1
+    return ratios
+
+
+def default_source_layers(n_layers: int):
+    """(kv_source_layers, index_source_layers, candidate_source_layer)。
+
+    对照 V4.1-Flash：kv=[2, 8, 14, 20]、index=[2, 8, 14, 20, 24, 28, 32, 36]、
+    candidate=20。缩放规则：编码器段固定 2 个 kv 源（第 3 层 + CED 边界层），
+    解码器段每 4 层一个 indexer 源。
+    """
+    mid = max(2, n_layers // 2)
+    kv_sources = [2]
+    if mid > 2:
+        kv_sources.append(mid)
+    else:
+        kv_sources = [mid]
+    index_sources = sorted(set(kv_sources) | set(range(mid, n_layers, 4)))
+    return kv_sources, index_sources, mid
 
 
 class VibyConfig:
+    """DeepSeek-V4.1 缩放版配置。字段名尽量与官方 inference/config.json 对齐。"""
+
     model_type = "viby"
+    arch = "deepseek_v4_1"
 
-    def __init__(
-        self,
-        hidden_size: int = 768,
-        num_hidden_layers: int = 8,
-        **kwargs,
-    ):
-        self.hidden_size = hidden_size
-        self.num_hidden_layers = num_hidden_layers
-        self.dropout = kwargs.get("dropout", 0.0)
-        self.vocab_size = kwargs.get("vocab_size", 6400)
-        self.bos_token_id = kwargs.get("bos_token_id", 1)
-        self.eos_token_id = kwargs.get("eos_token_id", 2)
-        self.flash_attn = kwargs.get("flash_attn", True)
-        self.num_attention_heads = kwargs.get("num_attention_heads", 8)
-        self.head_dim = kwargs.get(
-            "head_dim", self.hidden_size // self.num_attention_heads
+    def __init__(self, **kwargs):
+        kw = dict(kwargs)
+        # ---- 形状别名：CLI/trainer 沿用 HF 风格名字 ----
+        if "hidden_size" in kw:
+            kw.setdefault("dim", kw.pop("hidden_size"))
+        if "num_hidden_layers" in kw:
+            kw.setdefault("n_layers", kw.pop("num_hidden_layers"))
+        if "num_attention_heads" in kw:
+            kw.setdefault("n_heads", kw.pop("num_attention_heads"))
+        if "moe_intermediate_size" in kw:
+            kw.setdefault("moe_inter_dim", kw.pop("moe_intermediate_size"))
+        if "num_experts_per_tok" in kw:
+            kw.setdefault("n_activated_experts", kw.pop("num_experts_per_tok"))
+        if "max_position_embeddings" in kw:
+            kw.setdefault("max_seq_len", kw.pop("max_position_embeddings"))
+        if "mtp_depth" in kw:
+            kw.setdefault("n_mtp_layers", kw.pop("mtp_depth"))
+
+        preset = kw.pop("preset", None)
+        base = dict(_DEFAULT_LAYER_PRESET)
+        if preset == "tiny":
+            base.update(dim=256, n_layers=4, n_heads=4, head_dim=64, rope_head_dim=16,
+                        q_lora_rank=128, o_groups=2, o_lora_rank=64, moe_inter_dim=128,
+                        n_routed_experts=16, n_activated_experts=4, window_size=32,
+                        index_n_heads=4, index_head_dim=32, index_topk=16,
+                        engram_n_heads=2, engram_head_dim=32)
+        for k, v in base.items():
+            kw.setdefault(k, v)
+
+        # ---- 主干 ----
+        self.vocab_size = int(kw.get("vocab_size", 6400))
+        self.dim = int(kw["dim"])
+        self.n_layers = int(kw["n_layers"])
+        self.n_heads = int(kw["n_heads"])
+        self.head_dim = int(kw["head_dim"])
+        self.rope_head_dim = int(kw["rope_head_dim"])
+        self.q_lora_rank = int(kw["q_lora_rank"])
+        self.o_groups = int(kw["o_groups"])
+        self.o_lora_rank = int(kw["o_lora_rank"])
+        self.norm_eps = float(kw.get("norm_eps", 1e-6))
+        self.max_seq_len = int(kw.get("max_seq_len", 4096))
+        self.tie_word_embeddings = bool(kw.get("tie_word_embeddings", False))
+        self.bos_token_id = int(kw.get("bos_token_id", 1))
+        self.eos_token_id = int(kw.get("eos_token_id", 2))
+        self.pad_token_id = int(kw.get("pad_token_id", 0))
+        self.z_loss_weight = float(kw.get("z_loss_weight", 1e-4))
+
+        # ---- 稀疏注意力（CSA2）----
+        self.window_size = int(kw["window_size"])
+        n_mtp = int(kw.get("n_mtp_layers", 1))
+        self.n_mtp_layers = n_mtp
+        ratios = kw.get("compress_ratios")
+        self.compress_ratios = tuple(
+            int(x) for x in (ratios if ratios is not None else default_compress_ratios(self.n_layers, n_mtp))
         )
-        # 注意力后端。默认 MLA（DeepSeek V2/V3 full softmax）：KV 压到
-        # kv_lora_rank，解耦 RoPE（qk_rope_head_dim，跨 head 共享），
-        # 逐 head QK 维 = head_dim + qk_rope_head_dim、V 维 = head_dim。
-        # use_linear_attn=True 才启用 Kimi Linear 3:1（KDA local + NoPE
-        # GQA global + ShortConv），全模型无 RoPE。
-        self.use_linear_attn = bool(kwargs.get("use_linear_attn", False))
-        self.kv_lora_rank = int(kwargs.get("kv_lora_rank", 192))
-        self.qk_rope_head_dim = int(kwargs.get("qk_rope_head_dim", 32))
-        self.rope_theta = float(kwargs.get("rope_theta", 1e6))
-        self.original_max_position_embeddings = int(
-            kwargs.get("original_max_position_embeddings", 2048)
-        )
-        self.rope_scaling = kwargs.get("rope_scaling", None)
-        if self.rope_scaling is None and kwargs.get("inference_rope_scaling", False):
-            self.rope_scaling = {
-                "beta_fast": 32,
-                "beta_slow": 1,
-                "factor": 16,
-                "original_max_position_embeddings": self.original_max_position_embeddings,
-                "attention_factor": 1.0,
-                "type": "yarn",
-            }
-        # linear 模式下 global 层（(layer_idx+1)%4==0 或最后一层）用
-        # full-causal NoPE GQA（n_kv_heads_global，None 时取
-        # num_attention_heads//4）；其余 local 层为 KDA。
-        self.n_kv_heads_global = kwargs.get("n_kv_heads_global", None)
-        # FFN 激活：'silu'（默认，SwiGLU/silu(g)·u）或 'situ'（SiTU-GLU，β1/β2
-        # tanh 软帽）。旧 sidecar 存了旧值会恢复 situ；新 run 无该键走 silu。
-        self.hidden_act = kwargs.get("hidden_act", "silu")
-        self.intermediate_size = kwargs.get(
-            "intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64
-        )
-        self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
-        self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
-        # 默认解绑：lm_head 是独立 nn.Linear（muonh 下走 AdamH 组）。
-        # True 仅保留给显式消融/旧 sidecar 兼容。
-        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", False)
+        auto_kv, auto_idx, auto_cand = default_source_layers(self.n_layers)
+        self.kv_source_layers = tuple(int(x) for x in kw.get("kv_source_layers", auto_kv))
+        self.index_source_layers = tuple(int(x) for x in kw.get("index_source_layers", auto_idx))
+        self.candidate_source_layer = int(kw.get("candidate_source_layer", auto_cand))
+        self.candidate_topk_blocks = int(kw.get("candidate_topk_blocks", 64))
+        self.candidate_block_size = int(kw.get("candidate_block_size", 8))
 
-        # 注意力输出门（Marin）：gate=2·σ(W_g·x)，W_g 零初始化（初始门 1）。
-        self.use_attn_gate = kwargs.get("use_attn_gate", True)
-        # Gated XSA（Exclusive Self-Attention 的可学习版，arXiv:2603.09078 /
-        # modded-nanogpt record #82）：逐 head 学 tanh(α) 扣掉 attention 输出
-        # 中与自身 V 平行的分量 z = y − tanh(α)·(yᵀv/‖v‖²)·v；α=0 初始化 ⇒
-        # 起步恒等（层可自选剂量，故不强制限制层数也能让浅层趋于 0）。
-        # 默认开；xsa_last_n=0 时按配方取最深 ≈1/3 层（参数高尔夫 XSA_LAST_N、
-        # 自注意力偏置随层加深而增大，故收益集中在深层）。
-        self.use_xsa = bool(kwargs.get("use_xsa", True))
-        _xln = int(kwargs.get("xsa_last_n", 0) or 0)
-        if _xln <= 0 and self.use_xsa:
-            _xln = max(1, num_hidden_layers // 3)
-        self.xsa_last_n = max(0, _xln)
-        # AttnRes 混合窗口：只对最近 W 个残差做 softmax 加权。
-        # 全历史是 O(L²) 读 v + 跨步 dv 累加（8 层 ΣN≈157）；窗口把
-        # 每次 merge 的 N 钉死，墙钟从平方降到线性。0=论文全历史。
-        self.attn_res_window = int(kwargs.get("attn_res_window", 4) or 0)
-        # True：残差流做加法写（h ← h + F），AttnRes 只混合 [h]+近 W 个写入
-        # 作为下一子层的读。False（默认）：AttnRes 替换 hidden（论文原式）。
-        # 旧 sidecar 缺键 → False，与 r086 等对照 run 一致。
-        self.attn_res_register = bool(kwargs.get("attn_res_register", False))
-        # True：寄存器模式下子层输入 = h，不再 softmax 混合 [h]+写入。
-        # 旧 sidecar 缺键 → False。需要 attn_res_register。
-        self.attn_res_read_h = bool(kwargs.get("attn_res_read_h", False))
-        # iHC（identity Hyper-Connections，Hy4 / Chimera）：M 条残差流，
-        # 读 x̃=Σ h_pre,m R_m，写 R_m ← R_m + h_post,m Δ，H_res=I（无
-        # Sinkhorn）。开时接管残差读写，AttnRes merge/read 不走；开关本身
-        # 保留。旧 sidecar 缺键 → False。ihc_streams 关时仍存档，默认 4。
-        self.ihc = bool(kwargs.get("ihc", False))
-        self.ihc_streams = int(kwargs.get("ihc_streams", 4) or 0)
-        # True：流 0 恒等、n-gram 只进 ihc_ngram_stream、进栈前注入。
-        # 旧 sidecar 缺键 → False。ihc_collapse 缺省：typed 时 identity，否则 mean。
-        self.ihc_typed = bool(kwargs.get("ihc_typed", False))
-        _col = kwargs.get("ihc_collapse", None)
-        if _col is None:
-            self.ihc_collapse = "identity" if self.ihc_typed else "mean"
-        else:
-            self.ihc_collapse = str(_col)
-        self.ihc_ngram_stream = int(kwargs.get("ihc_ngram_stream", 1) or 0)
-        # MTP（Qwen3.8-Next 口径）：0=关闭；>0 挂 1 个 full-attn MoE 层
-        # （与 Qwen `mtp_num_hidden_layers=1` 对齐，不再堆独立 depth 模块）。
-        # 输入 = 主干末层 hidden（final_norm 前）+ 下一 token 嵌入；
-        # 预训练把同一层 teacher-forced 展开 mtp_steps 次。
-        self.mtp_depth = kwargs.get("mtp_depth", 1)
-        self.mtp_loss_weight = kwargs.get("mtp_loss_weight", 0.3)
-        self.mtp_steps = int(kwargs.get("mtp_steps", 2))
-        # 旧 sidecar 的 EAGLE-3 三路层号只作往返保留，前向不再读取。
-        _fl = kwargs.get("mtp_feature_layers", None)
-        if _fl is None:
-            _fl = (num_hidden_layers,)
-        self.mtp_feature_layers = tuple(int(i) for i in _fl)
-        # logit z-loss（Marin）：loss += z_loss_weight * mean(lse²)，
-        # 主 LM 与 MTP 各 head 同权重，融合进 CE kernel。
-        self.z_loss_weight = float(kwargs.get("z_loss_weight", 1e-4))
-        # 未使用：真正生效的是 apply_trunc_normal_init 的 0.5/√fan_in。
-        # 字段只为旧 sidecar JSON 往返，不要当 GPT-2 式 0.02 初始化读。
-        self.initializer_range = kwargs.get("initializer_range", 0.02)
-        # DeepSeekMoE（V3/V4 风格）：FFN = n_shared_experts 个共享专家 +
-        # E 个细粒度路由专家。first_k_dense_replace>0 时前 K 层改为
-        # 单路 dense SwiGLU（默认与专家同宽），其后仍是 MoE。
-        # 路由：sigmoid 打分，选择分 = sigmoid 分 + expert_bias。
-        # expert_bias 是 frozen 非梯度 buffer，由训练循环按 QB（分位数均衡）
-        # 规则每步快照覆写（见 VibyForCausalLM.update_moe_biases）。top-k 命中后
-        # 用原始 sigmoid 分归一化并乘 routed_scaling_factor。
-        self.n_routed_experts = kwargs.get("n_routed_experts", 0)
-        self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 6)
-        self.n_shared_experts = kwargs.get("n_shared_experts", 1)
-        self.moe_intermediate_size = kwargs.get("moe_intermediate_size", None)
-        self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
-        self.routed_scaling_factor = kwargs.get("routed_scaling_factor", 2.5)
-        # 路由 logits 逐 token 标准化：让 sigmoid 始终工作在敏感区，
-        # 防止 logits 后期被推到 ±5 以上后 bias 失效。
-        self.moe_router_logit_norm = bool(kwargs.get("moe_router_logit_norm", True))
-        self.moe_router_logit_temp = float(kwargs.get("moe_router_logit_temp", 1.0))
-        # router 输入 token 多样性正则：loss = mean(log1p(common²/residual²))。
-        # 直接惩罚训练后期所有 token 收敛到同一方向（res/common 塌缩）。
-        self.moe_diversity_loss_weight = float(
-            kwargs.get("moe_diversity_loss_weight", 0.0)
-        )
-        # Latent MoE：路由专家在 latent 空间（维度 moe_latent_dim）计算——
-        # 共享 lat_down/lat_up 投影包住路由专家，lat_down 后接 learnable
-        # latent_norm（RMSNorm）再 dispatch；聚合输出在 lat_up 前再过
-        # latent_out_norm（K3 Stable LatentMoE §2.3.1：压低路由分支对
-        # 专家选择/路由权重尺度漂移的敏感度）。router 仍在全维 hidden 上
-        # 打分，共享专家保持全宽（抗 dropping 主干）。d=hidden/2 时每个
-        # 路由专家的 FLOPs/参数减半，等预算可把 moe_intermediate_size 翻倍。
-        # 默认 None → hidden_size//2（开启）；显式 0 关闭（消融）。
-        # 只用于新训练：无零初始化等价，函数类从 step 0 改变。
-        _lat = kwargs.get("moe_latent_dim", None)
-        self.moe_latent_dim = self.hidden_size // 2 if _lat is None else int(_lat)
-        # True：路由专家在共享 lat_up 之外，按专家对角缩放 tile(h_k) 写入
-        # 残差补空间（写出基扩展）。s 零初始化 ⇒ 起步与关掉逐位一致。
-        # 旧 sidecar 缺键 → False。需要 moe_latent_dim > 0。
-        self.moe_write_spread = bool(kwargs.get("moe_write_spread", False))
-        # True：路由写出在 latent_out_norm 之后乘未归一化 top-k sigmoid 和。
-        # RMSNorm 对正齐次，关掉时 routed_scaling_factor 写不进残差。
-        # 旧 sidecar 缺键 → False。需要 moe_latent_dim > 0。
-        self.moe_route_scale = bool(kwargs.get("moe_route_scale", False))
-        # 浅层 dense stem：layer_idx < K 用 FeedForward，其后 MoE。
-        # 0（默认）= 全层 MoE，旧 sidecar 缺键保持对照。
-        self.first_k_dense_replace = int(kwargs.get("first_k_dense_replace", 0) or 0)
-        # 浅层 dense 中间维。None 且 K>0 → moe_intermediate_size（小 stem）；
-        # K=0 且未传 → 0（不占宽）。旧 sidecar 缺键同此。
-        _dense_i = kwargs.get("dense_intermediate_size", None)
-        if _dense_i is None:
-            self.dense_intermediate_size = (
-                int(self.moe_intermediate_size or self.intermediate_size)
-                if self.first_k_dense_replace > 0
-                else 0
-            )
-        else:
-            self.dense_intermediate_size = int(_dense_i)
+        # ---- RoPE（滑窗分支用 rope_theta；压缩分支用 compress_rope_theta + YaRN）----
+        self.rope_theta = float(kw.get("rope_theta", 10000.0))
+        self.compress_rope_theta = float(kw.get("compress_rope_theta", 160000.0))
+        self.original_seq_len = int(kw.get("original_seq_len", 65536))
+        self.rope_factor = float(kw.get("rope_factor", 16.0))
+        self.beta_fast = int(kw.get("beta_fast", 32))
+        self.beta_slow = int(kw.get("beta_slow", 1))
 
-        # KDA V 头扩张（Qwen GDN：V 头多于 QK 头，Q/K/门按组重复）。
-        # 默认 2：8 QK 头 → 16 V 头。1=旧正方形。只用于新训练。
-        self.kda_v_head_ratio = int(kwargs.get("kda_v_head_ratio", 2))
-        # 哈希 n-gram 查找表（Engram 口径，arXiv 2601.07372：多头素数哈希 +
-        # 上下文门控 + 膨胀短卷积）。0=关闭。ngram_table_size 是全部
-        # （阶 × 头）子表的总桶数（各头素数取整，实际略小）；记忆维
-        # d_mem = ngram_d_mem（0=取 hidden）；每头维 = d_mem/(阶数×头数)。
-        # 挂在 ngram_layer（1-indexed）入口，W_V/卷积零初始化 ⇒ 起步恒等。
-        self.ngram_table_size = int(kwargs.get("ngram_table_size", 65536))
-        self.ngram_layer = int(kwargs.get("ngram_layer", 2))
-        _ngo = kwargs.get("ngram_orders", (2, 3))
-        self.ngram_orders = tuple(int(i) for i in _ngo)
-        self.ngram_heads = int(kwargs.get("ngram_heads", 8))
-        self.ngram_d_mem = int(kwargs.get("ngram_d_mem", 0) or 0)
-        # True：未过门的 n-gram 向量经 lm_head 加到 logits（标量尺度零初始化）。
-        # 旧 sidecar 缺键 → False。
-        self.ngram_logit_skip = bool(kwargs.get("ngram_logit_skip", False))
-        # True：用 n-gram unembed 的 max-softmax 置信度缩放每层 attn/mlp 写入。
-        # g = 1 − s · stopgrad(max p)；s 零初始化 ⇒ step 0 时 g≡1。
-        # 旧 sidecar 缺键 → False。需要 ngram_table_size > 0。
-        self.ngram_conf_gate = bool(kwargs.get("ngram_conf_gate", False))
-        # SMELT 中间层 loop（arXiv:2609.01343）：居中内部 loop_span 层连续
-        # 执行 loop_count 次（权重共享，参数量不变，effective depth =
-        # L + (r−1)·span）。loop_span>0 且 loop_count>1 才生效，其余组合
-        # 静默退化为无 loop。跨度必须严格在内部（首尾层不参与：SMELT 消融
-        # 结论，也保证 layer 0 cache 长度对齐 token 数、MTP 末层不被 loop）。
-        # loop 内每个 sublayer 的残差写入乘 loop_res_scale（防 weight-tied
-        # 更新吹大残差流）：rsqrt=r**-0.5（默认，SMELT Eq.8/9）、r=1/r、
-        # none=1.0（消融）。loop 跨度 KV 翻倍，预算对齐靠调低 kv_lora_rank。
-        self.loop_span = int(kwargs.get("loop_span", 0) or 0)
-        _lc = kwargs.get("loop_count", 2)
-        self.loop_count = 2 if _lc is None else int(_lc)
-        self.loop_res_scale = str(kwargs.get("loop_res_scale", "rsqrt"))
-        # loop 跨度的反向模式：full（默认，全展开反传）| jfb（单步梯度 /
-        # 0th-order IFT，HRM/TRM 口径）：前 r−1 次 visit 断梯度，只反传
-        # 末次 visit + x_entry 恒等通路。前向数值与 full 逐位一致，仅梯度
-        # 估计不同（丢掉 (I−Jᵀ)⁻¹ 放大）；反向算力/激活内存降到 ~1 次 visit。
-        self.loop_grad_mode = str(kwargs.get("loop_grad_mode", "full"))
-        # Richardson 外推读出（研究探针："visit-2 成本买 visit-3 质量"）：
-        # loop 迭代若一阶收敛，不动点更好估计是 z* ≈ h_r + λ(h_r − h_{r−1})
-        # （h_i = 第 i 次 visit 结束时的 hidden；r>2 取最后两次 visit）。
-        # 固定标量、不加参数 ⇒ 旧 checkpoint 可直接加载做推理探针。
-        # 0（默认）= 关；λ=1 是经典 Richardson。
-        self.loop_extrap = float(kwargs.get("loop_extrap", 0.0) or 0.0)
-        # loop 锚点读出（Huginn/CART 式输入重注入的 AttnRes 原生形态）：
-        # replace 模式下滑窗会把 pre-span 写入（embedding + 浅层输出）与
-        # 跨 visit 的循环历史挤出 merge——span 第一个子层起 embedding 就
-        # 已出局，第 2 遍 visit 与输入完全隔绝（闭环递归，主 loss 卡平台，
-        # 实测 dbg_real_*）。开锚点后 span 区段（含 visit 1）的每次 merge
-        # 常驻 [span 入口 hidden] + [此前各 visit 出口摘要] + 全部 pre-span
-        # 写入，窗口只裁 span 内写入：输入侧与跨 visit 历史永远可选择性
-        # 访问（AttnRes 消融：distant 访问比邻近数量更关键，arXiv:2603.15031
-        # §5；dbg_real_anchor2 实测：只 pin 输入侧不够，跨 visit 摘要补另
-        # 一条轴）。不加参数、不改残差语义，merge 项数封顶在 r + pre_span
-        # _writes + W。默认开；仅 loop 生效 + replace AttnRes（非
-        # register/ihc）时起作用。显式存 False 做消融；旧 loop sidecar
-        # 缺键 → True（要复现旧行为须显式 False）。
-        self.loop_anchor = bool(kwargs.get("loop_anchor", True))
+        # ---- Lightning Indexer ----
+        self.index_n_heads = int(kw["index_n_heads"])
+        self.index_head_dim = int(kw["index_head_dim"])
+        self.index_topk = int(kw["index_topk"])
 
-        if self.n_kv_heads_global is None:
-            self.n_kv_heads_global = max(1, self.num_attention_heads // 4)
+        # ---- mHC ----
+        self.hc_mult = int(kw["hc_mult"])
+        self.hc_sinkhorn_iters = int(kw.get("hc_sinkhorn_iters", 20))
+        self.hc_eps = float(kw.get("hc_eps", 1e-6))
 
-        if self.hidden_size != self.num_attention_heads * self.head_dim:
-            raise ValueError("hidden_size must equal num_attention_heads * head_dim")
-        if self.use_linear_attn:
-            if (
-                self.n_kv_heads_global <= 0
-                or self.num_attention_heads % self.n_kv_heads_global != 0
-            ):
-                raise ValueError("n_kv_heads_global 必须为正且整除 num_attention_heads")
-        else:
-            if self.kv_lora_rank <= 0:
-                raise ValueError("kv_lora_rank 必须大于 0")
-            if self.qk_rope_head_dim <= 0 or self.qk_rope_head_dim % 2 != 0:
-                raise ValueError("qk_rope_head_dim 必须为正偶数")
-            if self.rope_theta <= 0:
-                raise ValueError("rope_theta 必须大于 0")
-        if self.n_routed_experts <= 0:
-            raise ValueError("仅支持 MoE FFN：n_routed_experts 必须大于 0")
-        if self.num_experts_per_tok <= 0:
-            raise ValueError("num_experts_per_tok 必须大于 0")
-        if self.num_experts_per_tok > self.n_routed_experts:
-            raise ValueError(
-                "num_experts_per_tok 不能大于 n_routed_experts，"
-                "否则 top-k 会重复选中同一专家"
-            )
-        if self.n_shared_experts < 0:
-            raise ValueError("n_shared_experts 不能为负数")
-        if self.moe_latent_dim < 0:
-            raise ValueError("moe_latent_dim 不能为负数")
-        if self.moe_latent_dim >= self.hidden_size and self.moe_latent_dim > 0:
-            raise ValueError(
-                "moe_latent_dim 必须小于 hidden_size（压缩才有意义），0 关闭"
-            )
-        if self.moe_write_spread and self.moe_latent_dim <= 0:
-            raise ValueError("moe_write_spread 需要 moe_latent_dim > 0")
-        if self.moe_route_scale and self.moe_latent_dim <= 0:
-            raise ValueError("moe_route_scale 需要 moe_latent_dim > 0")
-        if self.attn_res_read_h and not self.attn_res_register:
-            raise ValueError("attn_res_read_h 需要 attn_res_register")
-        if self.ihc and self.ihc_streams < 2:
-            raise ValueError("ihc_streams 必须 >= 2")
-        if self.ihc_collapse not in ("mean", "identity"):
-            raise ValueError("ihc_collapse 必须是 mean 或 identity")
-        if self.ihc_typed and not self.ihc:
-            raise ValueError("ihc_typed 需要 ihc")
-        if self.ihc:
-            if not (0 <= self.ihc_ngram_stream < max(self.ihc_streams, 1)):
-                raise ValueError("ihc_ngram_stream 必须在 [0, ihc_streams)")
-            if (
-                self.ihc_typed
-                and self.ihc_collapse == "identity"
-                and self.ihc_ngram_stream == 0
-            ):
-                raise ValueError("ihc_ngram_stream 不能为 0（identity 塌缩读流 0）")
-        if self.moe_router_logit_temp <= 0:
-            raise ValueError("moe_router_logit_temp 必须大于 0")
-        if self.moe_diversity_loss_weight < 0:
-            raise ValueError("moe_diversity_loss_weight 不能为负数")
-        if self.z_loss_weight < 0:
-            raise ValueError("z_loss_weight 不能为负数")
-        if self.mtp_depth > 0 and self.mtp_steps < 1:
-            raise ValueError("mtp_steps 必须大于 0")
-        if self.kda_v_head_ratio < 1:
-            raise ValueError("kda_v_head_ratio 必须 >= 1")
-        if self.ngram_table_size < 0:
-            raise ValueError("ngram_table_size 不能为负（0 关闭）")
-        if self.ngram_table_size > 0:
-            if self.ngram_layer < 1:
-                raise ValueError("ngram_layer 是 1-indexed，必须 >= 1")
-            if not self.ngram_orders:
-                raise ValueError("ngram_orders 不能为空")
-            for _o in self.ngram_orders:
-                if _o not in (2, 3):
-                    raise ValueError("ngram_orders 只支持 2（bigram）和 3（trigram）")
-            if self.ngram_heads < 1:
-                raise ValueError("ngram_heads 必须 >= 1")
-            _dmem = self.ngram_d_mem or self.hidden_size
-            _ntab = len(self.ngram_orders) * self.ngram_heads
-            if _dmem % _ntab != 0:
-                raise ValueError(
-                    f"d_mem({_dmem}) 必须被 阶数×头数({_ntab}) 整除"
-                )
-            if (self.ngram_logit_skip or self.ngram_conf_gate) and _dmem != (
-                self.hidden_size
-            ):
-                raise ValueError(
-                    "ngram_logit_skip/ngram_conf_gate 需要 d_mem == hidden_size"
-                )
-        if self.ngram_conf_gate and self.ngram_table_size <= 0:
-            raise ValueError("ngram_conf_gate 需要 ngram_table_size > 0")
-        moe_in = self.moe_intermediate_size or self.intermediate_size
-        if moe_in <= 0:
-            raise ValueError("moe_intermediate_size/intermediate_size 必须大于 0")
-        if self.first_k_dense_replace < 0:
-            raise ValueError("first_k_dense_replace 不能为负")
-        if self.first_k_dense_replace > self.num_hidden_layers:
-            raise ValueError("first_k_dense_replace 不能大于 num_hidden_layers")
-        if self.first_k_dense_replace > 0 and self.dense_intermediate_size <= 0:
-            raise ValueError("first_k_dense_replace>0 需要 dense_intermediate_size>0")
-        if self.loop_span < 0:
-            raise ValueError("loop_span 不能为负（0 关闭）")
-        if self.loop_span > self.num_hidden_layers - 2:
-            raise ValueError(
-                "loop_span 不能大于 num_hidden_layers - 2（首尾层不参与 loop）"
-            )
-        if self.loop_count < 1:
-            raise ValueError("loop_count 必须 >= 1")
-        if self.loop_res_scale not in ("rsqrt", "r", "none"):
-            raise ValueError("loop_res_scale 必须是 rsqrt / r / none")
-        if self.loop_grad_mode not in ("full", "jfb"):
-            raise ValueError("loop_grad_mode 必须是 full / jfb")
-        if not math.isfinite(self.loop_extrap):
-            raise ValueError("loop_extrap 必须是有限值")
-        if self.loop_extrap != 0.0 and self.loop_layer_range() is None:
-            raise ValueError(
-                "loop_extrap 需要 loop 生效（loop_span>0 且 loop_count>=2）"
-            )
-        # 实测（dbg_real_* 对照，L=9 span=4 r=2）：replace 模式 AttnRes 的
-        # merge 窗口若装不下「整个 span 一次 visit 的写入（2·span 个）+ 至少
-        # 一条 pre-span 写入」，第 2 遍 visit 就与 embedding/浅层写入完全
-        # 隔绝，span 退化为闭环递归，主 loss 卡平台而 MTP 正常。loop_anchor
-        # （默认开，锚点常驻读侧）/ register 模式 / 更大窗口（含 0=全历史）
-        # 均可消除。window=0 或锚点开启时不警告。
-        if (
-            self.loop_layer_range() is not None
-            and not self.attn_res_register
-            and not self.loop_anchor
-            and 0 < self.attn_res_window <= 2 * self.loop_span
-        ):
-            warnings.warn(
-                f"loop_span={self.loop_span} 在 replace 模式 AttnRes 下要求 "
-                f"attn_res_window > 2*span（当前 {self.attn_res_window}），否则 "
-                "第 2 遍 visit 读不到 span 之前的写入，训练会卡平台"
-                "（实测 dbg_real_*）。建议保持 --loop_anchor 开启（默认）、"
-                f"--attn_res_window 0（全历史）或 >= {2 * self.loop_span + 1}，"
-                "或改用 --attn_res_register。"
-            )
+        # ---- Engram ----
+        _eids = kw.get("engram_layer_ids")
+        if _eids is None:
+            # 对照 V4.1-Flash 的 [1, 14]（40 层）：第 2 层 + 约 35% 深度处，
+            # 都落在编码器段内；小模型上去重且避开第 0 层。
+            _eids = []
+            for cand in (1, max(2, int(self.n_layers * 0.35))):
+                if cand not in _eids and 0 < cand < self.n_layers:
+                    _eids.append(cand)
+        self.engram_layer_ids = tuple(int(x) for x in _eids)
+        self.engram_max_ngram_size = int(kw.get("engram_max_ngram_size", 4))
+        self.engram_vocab_size = int(kw.get("engram_vocab_size", 8192))
+        self.engram_n_heads = int(kw["engram_n_heads"])
+        self.engram_head_dim = int(kw["engram_head_dim"])
+        self.engram_pad_id = int(kw.get("engram_pad_id", self.pad_token_id))
+        self.engram_compressed_vocab_size = int(kw.get("engram_compressed_vocab_size", 0))
+        _ne = kw.get("engram_num_embeddings")
+        if _ne is None and self.engram_layer_ids:
+            from .engram import compute_num_embeddings
 
-    def loop_layer_range(self):
-        """loop 跨度 (start, end)（end 开区间，居中内部段）；未生效返回 None。"""
-        if self.loop_span <= 0 or self.loop_count <= 1:
-            return None
-        start = (self.num_hidden_layers - self.loop_span) // 2
-        return (start, start + self.loop_span)
+            _ne = compute_num_embeddings(self)
+        self.engram_num_embeddings = tuple(int(x) for x in (_ne or ()))
+
+        # ---- MoE ----
+        self.n_routed_experts = int(kw["n_routed_experts"])
+        self.n_activated_experts = int(kw["n_activated_experts"])
+        self.n_shared_experts = int(kw.get("n_shared_experts", 1))
+        self.moe_inter_dim = int(kw["moe_inter_dim"])
+        self.score_func = str(kw.get("score_func", "sqrtsoftplus"))
+        self.gate_temp = float(kw.get("gate_temp", 1.0))
+        self.norm_topk_prob = bool(kw.get("norm_topk_prob", True))
+        self.route_scale = float(kw.get("route_scale", 1.5))
+        self.swiglu_limit = float(kw.get("swiglu_limit", 10.0))
+        self.bias_update_rate = float(kw.get("bias_update_rate", 1e-3))
+
+        # ---- MTP / DSpark ----
+        self.dspark_block_size = int(kw.get("dspark_block_size", 4))
+        self.dspark_noise_token_id = int(kw.get("dspark_noise_token_id", self.pad_token_id))
+        _tgt = kw.get("dspark_target_layer_ids")
+        if _tgt is None:
+            _tgt = tuple(range(max(0, self.n_layers - 3), self.n_layers)) if self.n_layers >= 3 else (self.n_layers - 1,)
+        self.dspark_target_layer_ids = tuple(int(x) for x in _tgt)
+        self.dspark_markov_rank = int(kw.get("dspark_markov_rank", 64))
+        self.dspark_n_routed_experts = int(kw.get("dspark_n_routed_experts", 32))
+        self.dspark_n_activated_experts = int(kw.get("dspark_n_activated_experts", 3))
+        self.mtp_loss_weight = float(kw.get("mtp_loss_weight", 0.3))
+
+        self._validate()
+
+    # ------------------------------------------------------------------
+    @property
+    def n_encoder_layers(self) -> int:
+        """CED 边界（= 第一个解码层的下标）。"""
+        return max(2, self.n_layers // 2)
 
     @property
-    def num_exec_layers(self) -> int:
-        """实际执行层数（loop 段重复计入）；无 loop 时 = num_hidden_layers。"""
-        span = self.loop_layer_range()
-        if span is None:
-            return self.num_hidden_layers
-        return self.num_hidden_layers + (self.loop_count - 1) * (span[1] - span[0])
+    def n_exec_layers(self) -> int:
+        return self.n_layers
 
-    def is_dense_ffn(self, layer_idx: int) -> bool:
-        return 0 <= int(layer_idx) < self.first_k_dense_replace
+    def layer_mode(self, layer_idx: int) -> str:
+        """CSA2 静态模式：full / reindex / reuse / sliding。"""
+        if self.compress_ratios[layer_idx] == 0:
+            return "sliding"
+        is_kv = layer_idx in self.kv_source_layers
+        is_idx = layer_idx in self.index_source_layers
+        if is_kv and is_idx:
+            return "full"
+        if is_idx:
+            return "reindex"
+        return "reuse"
 
+    def kv_source_of(self, layer_idx: int) -> int:
+        """该层读取的压缩 KV 来自哪一层（自身即源时返回自身）。"""
+        src = None
+        for s in self.kv_source_layers:
+            if s <= layer_idx:
+                src = s
+        return layer_idx if src is None else src
+
+    def index_source_of(self, layer_idx: int) -> int:
+        src = None
+        for s in self.index_source_layers:
+            if s <= layer_idx:
+                src = s
+        return layer_idx if src is None else src
+
+    def moe_of(self, layer_idx: int):
+        """(路由专家数, 激活专家数)：draft 层用 DSpark 的窄 MoE。"""
+        if layer_idx < self.n_layers:
+            return self.n_routed_experts, self.n_activated_experts
+        return (
+            self.dspark_n_routed_experts or self.n_routed_experts,
+            self.dspark_n_activated_experts or self.n_activated_experts,
+        )
+
+    def _validate(self):
+        if self.n_layers < 4:
+            raise ValueError("n_layers 必须 >= 4（CED 至少 2 个编码层 + 2 个解码层）")
+        # V4.1 的 head_dim 与 dim 解耦（官方 64 头 × 512 维，远超 dim/64）：
+        # q 经 q_lora_rank 低秩再升到 n_heads*head_dim，不做 dim == n_heads*head_dim。
+        if self.n_heads % self.o_groups != 0:
+            raise ValueError("n_heads 必须被 o_groups 整除")
+        if self.rope_head_dim <= 0 or self.rope_head_dim % 2 or self.rope_head_dim > self.head_dim:
+            raise ValueError("rope_head_dim 必须是 (0, head_dim] 内的偶数")
+        if self.head_dim % (self.n_heads // self.o_groups) and False:
+            pass
+        if self.hc_mult < 2:
+            raise ValueError("hc_mult 必须 >= 2")
+        if self.hc_sinkhorn_iters < 1:
+            raise ValueError("hc_sinkhorn_iters 必须 >= 1")
+        if self.window_size < 1:
+            raise ValueError("window_size 必须 >= 1")
+        if len(self.compress_ratios) != self.n_layers + self.n_mtp_layers:
+            raise ValueError(
+                f"compress_ratios 长度 {len(self.compress_ratios)} != n_layers + n_mtp_layers"
+                f" = {self.n_layers + self.n_mtp_layers}"
+            )
+        if any(r < 0 for r in self.compress_ratios):
+            raise ValueError("compress_ratios 不能为负")
+        if self.n_routed_experts <= 0:
+            raise ValueError("n_routed_experts 必须 > 0（V4.1 主干全层 MoE）")
+        if not 0 < self.n_activated_experts <= self.n_routed_experts:
+            raise ValueError("n_activated_experts 必须在 (0, n_routed_experts]")
+        if self.n_shared_experts != 1:
+            raise ValueError("V4.1 只有 1 个共享专家")
+        if self.score_func not in ("sqrtsoftplus", "softmax", "sigmoid"):
+            raise ValueError("score_func 必须是 sqrtsoftplus / softmax / sigmoid")
+        if self.moe_inter_dim <= 0:
+            raise ValueError("moe_inter_dim 必须 > 0")
+        if self.index_topk <= 0 or self.index_n_heads <= 0 or self.index_head_dim <= 0:
+            raise ValueError("indexer 的 heads / head_dim / topk 必须 > 0")
+        if self.candidate_source_layer >= 0 and self.candidate_block_size <= 0:
+            raise ValueError("candidate_block_size 必须 > 0")
+        # 压缩层必须有同 ratio 的上游源；源必须有序且第 0 层不做源。
+        for lst, name in (
+            (self.kv_source_layers, "kv_source_layers"),
+            (self.index_source_layers, "index_source_layers"),
+        ):
+            if list(lst) != sorted(set(lst)):
+                raise ValueError(f"{name} 必须严格递增且不重复")
+            if lst and lst[0] <= 0:
+                raise ValueError(f"{name} 不能包含第 0 层")
+            if lst and lst[-1] >= self.n_layers:
+                raise ValueError(f"{name} 的下标必须落在主干层内（< n_layers）")
+        for i in range(self.n_layers):
+            r = self.compress_ratios[i]
+            if r == 0:
+                continue
+            s = self.kv_source_of(i)
+            if s not in self.kv_source_layers:
+                raise ValueError(f"第 {i} 层压缩率 {r} 但没有上游 kv 源")
+            if self.compress_ratios[s] != r:
+                raise ValueError(f"第 {i} 层压缩率 {r} 与其 kv 源第 {s} 层 {self.compress_ratios[s]} 不一致")
+        for e in self.engram_layer_ids:
+            if not 0 <= e < self.n_layers:
+                raise ValueError("engram_layer_ids 必须落在主干层内")
+            if self.compress_ratios[e] == 0 and e == 0:
+                raise ValueError("engram 不能挂在第 0 层")
+        if self.engram_layer_ids and self.engram_max_ngram_size < 2:
+            raise ValueError("engram_max_ngram_size 必须 >= 2")
+        if self.n_mtp_layers > 0 and self.dspark_block_size < 1:
+            raise ValueError("dspark_block_size 必须 >= 1")
+        if self.n_mtp_layers > 0 and not self.dspark_target_layer_ids:
+            raise ValueError("dspark_target_layer_ids 不能为空")
+        for t in self.dspark_target_layer_ids:
+            if not 0 <= t < self.n_layers:
+                raise ValueError("dspark_target_layer_ids 必须落在主干层内")
+
+    # ------------------------------------------------------------------
     def to_dict(self) -> dict:
-        return dict(self.__dict__)
+        d = dict(self.__dict__)
+        d["model_type"] = self.model_type
+        d["arch"] = self.arch
+        for k, v in list(d.items()):
+            if isinstance(v, tuple):
+                d[k] = list(v)
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "VibyConfig":
         data = dict(data)
         data.pop("model_type", None)
-        # 旧 KDA/GQA sidecar 没有 MLA 字段：保持当时的 linear attn 默认，
-        # 否则 strict 加载会把 KDA 权重对到 MLA 上。
-        if "use_linear_attn" not in data and "kv_lora_rank" not in data:
-            data["use_linear_attn"] = True
+        data.pop("arch", None)
         return cls(**data)
 
     def save_pretrained(self, path: str):
         os.makedirs(path, exist_ok=True)
-        with open(os.path.join(path, "config.json"), "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        with open(os.path.join(path, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
 
     @classmethod
     def from_pretrained(cls, path: str) -> "VibyConfig":
-        with open(os.path.join(path, "config.json")) as f:
+        with open(os.path.join(path, "config.json"), encoding="utf-8") as f:
             return cls.from_dict(json.load(f))
+
+    # ------------------------------------------------------------------
+    def num_parameters(self, include_engram: bool = True) -> int:
+        """静态参数计数（只算权重矩阵，不含 norm/bias 等 1D 量）。"""
+        d = self.dim
+        hd, rd = self.head_dim, self.rope_head_dim
+        total = 0
+        total += 2 * self.vocab_size * d if not self.tie_word_embeddings else self.vocab_size * d
+        for i in range(self.n_layers):
+            r = self.compress_ratios[i]
+            mode = self.layer_mode(i)
+            # attention：wq_a / wq_b / wkv / wo_a / wo_b
+            total += d * self.q_lora_rank + self.q_lora_rank * self.n_heads * hd
+            total += d * hd
+            total += (self.n_heads * hd // self.o_groups) * (self.o_groups * self.o_lora_rank)
+            total += self.o_lora_rank * self.o_groups * d
+            if mode == "full":  # 压缩器（+ ratio>1 时的门）
+                total += d * hd * (2 if r > 1 else 1)
+                total += hd * self.index_head_dim + d * self.index_n_heads
+                total += self.q_lora_rank * self.index_n_heads * self.index_head_dim
+            elif mode == "reindex":
+                total += d * self.index_n_heads
+                total += self.q_lora_rank * self.index_n_heads * self.index_head_dim
+            # mHC：attn / ffn 各一个 HyperConnection，混合矩阵 (2+hc)·hc × hc·d
+            total += 2 * (2 + self.hc_mult) * self.hc_mult * self.hc_mult * d
+            # MoE
+            n_exp, _ = self.moe_of(i)
+            total += n_exp * 3 * d * self.moe_inter_dim
+            total += 3 * d * self.moe_inter_dim  # 共享专家
+            # Engram
+            if include_engram and i in self.engram_layer_ids:
+                cols = (self.engram_max_ngram_size - 1) * self.engram_n_heads
+                total += cols * self.engram_head_dim * d * (self.hc_mult + 1)
+                total += 2 * self.hc_mult * d  # q_weight / k_weight 两张 [hc, d]
+                idx = self.engram_layer_ids.index(i)
+                total += self.engram_num_embeddings[idx] * self.engram_head_dim
+        if self.n_mtp_layers > 0:
+            n_exp = self.dspark_n_routed_experts
+            mtp = self.n_mtp_layers * (
+                3 * d * self.moe_inter_dim * (n_exp + 1)
+                + d * self.q_lora_rank
+                + self.q_lora_rank * self.n_heads * hd
+                + d * hd
+                + (self.n_heads * hd // self.o_groups) * (self.o_groups * self.o_lora_rank)
+                + self.o_lora_rank * self.o_groups * d
+                + 2 * (2 + self.hc_mult) * self.hc_mult * self.hc_mult * d  # draft block 的 mHC
+            )
+            mtp += d * len(self.dspark_target_layer_ids) * d  # main_proj（仅第一层）
+            mtp += 2 * self.vocab_size * self.dspark_markov_rank  # 马尔可夫头
+            total += mtp
+        return total
+
+    def num_active_parameters(self) -> int:
+        """每 token 激活的参数量（top-k 专家 + 共享专家 + 注意力）。"""
+        d = self.dim
+        hd = self.head_dim
+        per_layer = self.n_activated_experts * 3 * d * self.moe_inter_dim + 3 * d * self.moe_inter_dim
+        per_layer += d * self.q_lora_rank + self.q_lora_rank * self.n_heads * hd + d * hd
+        per_layer += (self.n_heads * hd // self.o_groups) * (self.o_groups * self.o_lora_rank)
+        per_layer += self.o_lora_rank * self.o_groups * d
+        total = self.n_layers * per_layer + 2 * self.vocab_size * d
+        if self.n_mtp_layers > 0:
+            total += self.n_mtp_layers * (
+                self.dspark_n_activated_experts * 3 * d * self.moe_inter_dim + per_layer
+            )
+        return total

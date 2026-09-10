@@ -14,6 +14,7 @@ from .base_trainer import BaseTrainer
 from .config import get_dpo_parser, setup_training_args
 from .utils import (
     Logger,
+    base_checkpoint_name,
     build_config_from_sidecar,
     build_model_and_tokenizer,
     convert_model_dtype,
@@ -21,6 +22,7 @@ from .utils import (
     init_swanlab,
     load_model_weights,
     log_training_progress,
+    sidecar_checkpoint_hint,
 )
 
 warnings.filterwarnings("ignore")
@@ -78,10 +80,8 @@ def dpo_loss(ref_log_probs, log_probs, mask, beta):
 
 def init_model(lm_config, args):
     """初始化模型和tokenizer，加载SFT权重"""
-    sft_checkpoint_name = (
-        args.sft_checkpoint
-        if getattr(args, "sft_checkpoint", None)
-        else f"full_sft_{lm_config.hidden_size}.safetensors"
+    sft_checkpoint_name = base_checkpoint_name(
+        args, lm_config, "sft_checkpoint", "full_sft"
     )
     model, tokenizer = build_model_and_tokenizer(
         lm_config,
@@ -116,26 +116,19 @@ class DPOTrainer(BaseTrainer):
         super().__init__(args, model, tokenizer, lm_config, "dpo")
         self.ref_model = ref_model
 
-    def _dpo_loss_fn(
-        self, params, moe_biases, x, y, mask, attn_mask, mask_has_pad, ref_log_probs
-    ):
+    def _dpo_loss_fn(self, params, moe_biases, x, y, mask, attn_mask, ref_log_probs):
         """DPO loss 函数（value_and_grad 的目标）。
 
         params 必须显式作为第一个入参：mx.compile 会捕获 Python 闭包里的
         常量，若走 nn.value_and_grad(model, ...) + mx.compile，梯度会永远
         基于 trace 时的初始权重，优化器更新完全无效。
-        expert_bias 同样必须当入参（freeze buffer，不在 params 里）。
-        mask_has_pad 在 eager 侧计算后以 python bool 传入（compile 图内
-        不允许 .item() host sync）。
+        moe bias（e_score_correction_bias）同样必须当入参：它是 freeze
+        buffer，不在 params 里，compile 会把闭包里的值收成 trace 时的快照。
         """
         self.model.update(params)
         if hasattr(self.model, "apply_moe_biases"):
             self.model.apply_moe_biases(moe_biases)
-        res = self.model(
-            input_ids=x,
-            attention_mask=attn_mask,
-            mask_has_pad=mask_has_pad,
-        )
+        res = self.model(input_ids=x, attention_mask=attn_mask)
         log_probs = logits_to_log_probs(res.logits, y)
         log_probs = log_probs * mask
         loss = dpo_loss(ref_log_probs, log_probs, mask, self.beta)
@@ -150,21 +143,6 @@ class DPOTrainer(BaseTrainer):
                 Logger(f"dropout={dropout} 在 mx.compile 下 RNG 被冻结，自动回退 eager")
                 use_compile = False
         if use_compile:
-            try:
-                from mlx.utils import tree_flatten
-
-                from model.kernels import prewarm_all
-
-                dtype = tree_flatten(self.model.parameters())[0][1].dtype
-                prewarm_all(
-                    self.model,
-                    self.lm_config,
-                    dtype,
-                    int(getattr(self.args, "max_seq_len", 0) or 0),
-                    log=Logger,
-                )
-            except Exception as e:
-                Logger(f"融合 kernel 预热跳过（{e}），运行时按需回退 eager")
             Logger("使用 mx.compile 编译 loss 函数")
             fn = mx.compile(fn)
         self._compiled = bool(use_compile)
@@ -223,13 +201,7 @@ class DPOTrainer(BaseTrainer):
 
             # 参考模型前向传播（不走 value_and_grad，不会计算梯度）
             attn_mask = (x != self.tokenizer.pad_token_id).astype(mx.int32)
-            # mx.compile 图内不允许 .item() host sync，在 eager 侧预计算
-            mask_has_pad = bool(mx.any(attn_mask != 1).item())
-            ref_res = self.ref_model(
-                input_ids=x,
-                attention_mask=attn_mask,
-                mask_has_pad=mask_has_pad,
-            )
+            ref_res = self.ref_model(input_ids=x, attention_mask=attn_mask)
             ref_log_probs = logits_to_log_probs(ref_res.logits, y)
             ref_log_probs = ref_log_probs * mask
             mx.eval(ref_log_probs)
@@ -243,7 +215,7 @@ class DPOTrainer(BaseTrainer):
                 else mx.zeros((0,), dtype=mx.float32)
             )
             loss, grads = self._loss_and_grad(
-                params, biases, x, y, mask, attn_mask, mask_has_pad, ref_log_probs
+                params, biases, x, y, mask, attn_mask, ref_log_probs
             )
             if self._compiled:
                 # compiled fn 内部的 model.update 只在 trace 时执行，
@@ -301,15 +273,14 @@ if __name__ == "__main__":
 
     # 优先从 SFT checkpoint 的 sidecar config 继承模型结构，
     # CLI 显式传入的参数优先；无 sidecar 时回退库默认值。
-    checkpoint_name = (
-        args.sft_checkpoint
-        if getattr(args, "sft_checkpoint", None)
-        else f"full_sft_{args.hidden_size}.safetensors"
-    )
+    # 先按 --sft_checkpoint / --hidden_size（缺省即 VibyConfig 默认 dim）猜出
+    # 基座文件名，再读它的 sidecar config 继承结构；CLI 显式参数优先
+    checkpoint_name = sidecar_checkpoint_hint(args, "sft_checkpoint", "full_sft")
     cfg, has_sidecar = build_config_from_sidecar(args, checkpoint_name)
     # DPO 上下文不低于 SFT 的实际上下文
     cfg["max_position_embeddings"] = max(
-        args.max_seq_len, cfg.get("max_position_embeddings", 0)
+        args.max_seq_len,
+        cfg.get("max_seq_len", cfg.get("max_position_embeddings", 0)),
     )
     lm_config = VibyConfig.from_dict(cfg) if has_sidecar else VibyConfig(**cfg)
 

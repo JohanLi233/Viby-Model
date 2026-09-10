@@ -10,10 +10,12 @@ from dataset.lm_dataset import SFTDataset
 from .base_trainer import BaseTrainer
 from .config import get_sft_parser, setup_training_args
 from .utils import (
+    base_checkpoint_name,
     build_config_from_sidecar,
     build_model_and_tokenizer,
     finish_training,
     init_swanlab,
+    sidecar_checkpoint_hint,
 )
 
 warnings.filterwarnings("ignore")
@@ -21,10 +23,8 @@ warnings.filterwarnings("ignore")
 
 def init_model(lm_config, args):
     """初始化模型和tokenizer，加载预训练权重"""
-    checkpoint_name = (
-        args.pretrain_checkpoint
-        if getattr(args, "pretrain_checkpoint", None)
-        else f"pretrain_{lm_config.hidden_size}.safetensors"
+    checkpoint_name = base_checkpoint_name(
+        args, lm_config, "pretrain_checkpoint", "pretrain"
     )
     return build_model_and_tokenizer(
         lm_config,
@@ -43,11 +43,9 @@ if __name__ == "__main__":
     # 优先从 pretrain checkpoint 的 sidecar config 继承模型结构配置，
     # CLI 显式传入的参数优先；无 sidecar 时回退 VibyConfig 库默认值，
     # 避免 pretrain/SFT 结构参数不一致导致 strict 加载失败。
-    checkpoint_name = (
-        args.pretrain_checkpoint
-        if getattr(args, "pretrain_checkpoint", None)
-        else f"pretrain_{args.hidden_size}.safetensors"
-    )
+    # 先按 --pretrain_checkpoint / --hidden_size（缺省即 VibyConfig 默认 dim）
+    # 猜出基座文件名，再读它的 sidecar config 继承结构；CLI 显式参数优先
+    checkpoint_name = sidecar_checkpoint_hint(args, "pretrain_checkpoint", "pretrain")
     cfg, has_sidecar = build_config_from_sidecar(args, checkpoint_name)
     # SFT 的上下文长度由 max_seq_len 决定
     cfg["max_position_embeddings"] = args.max_seq_len

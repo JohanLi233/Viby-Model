@@ -32,10 +32,12 @@ class _FakeOpt:
 
 
 class _FakeCfg:
+    # V4.1 的 VibyConfig 用 dim / n_routed_experts；checkpoint 名取 dim
+    dim = 8
     hidden_size = 8
 
     def to_dict(self):
-        return {"hidden_size": 8, "n_routed_experts": 4}
+        return {"dim": 8, "n_routed_experts": 4}
 
 
 class TestSaveCheckpointSidecar(unittest.TestCase):
