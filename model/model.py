@@ -277,12 +277,14 @@ class VibyForCausalLM(nn.Module):
         seg = self._draft_broadcast(segment_ids, B, T, block)
         pad = self._draft_broadcast(pad_mask, B, T, block)
         cur = self._stage_input(x, draft_ids, self.mtp_modules[0])
-        hc = self.model.hc_mult
+        # Single-Pass mHC：pre_mix 从 identity 起步、逐子层串下去（官方 forward_spec
+        # 的 pre_mix 链），草稿头的 hc_pre 用最后一个 stage 的 FFN 产出的系数，
+        # 而不是重新取 identity——否则头读的流与训练出来的残差流不一致。
+        pre = identity_pre_mix(cur, self.model.hc_mult)
         for stage in self.mtp_modules:
-            pre = identity_pre_mix(cur, hc)
-            cur, _ = stage.layer(cur, 0, pre, SharedAttnState(), None, seg, pad)
+            cur, pre = stage.layer(cur, 0, pre, SharedAttnState(), None, seg, pad)
         last = self.mtp_modules[-1]
-        h = last.norm(hc_pre(cur, identity_pre_mix(cur, hc)))
+        h = last.norm(hc_pre(cur, pre))
         anchors = B * T
         flat_h = h.reshape(anchors, block, cfg.dim)
         flat_ids = draft_ids.reshape(anchors, block)

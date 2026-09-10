@@ -17,11 +17,14 @@ from mlx import nn
 from .norms import rms_unit
 
 
-def hc_split(mixes: mx.array, scale: mx.array, base: mx.array, hc_mult: int):
-    """mixes: [..., (2+hc)·hc] → (pre [...,hc], post [...,hc], comb [...,hc·hc])。"""
+def hc_split(mixes: mx.array, scale: mx.array, base: mx.array, hc_mult: int, eps: float = 1e-6):
+    """mixes: [..., (2+hc)·hc] → (pre [...,hc], post [...,hc], comb [...,hc·hc])。
+
+    eps 用 config.hc_eps：官方 hc_split_sinkhorn 的 pre 分支就是 sigmoid(...) + eps。
+    """
     hc = hc_mult
     m = mixes
-    pre = mx.sigmoid(m[..., :hc] * scale[0] + base[:hc]) + 1e-6
+    pre = mx.sigmoid(m[..., :hc] * scale[0] + base[:hc]) + eps
     post = 2.0 * mx.sigmoid(m[..., hc : 2 * hc] * scale[1] + base[hc : 2 * hc])
     comb = m[..., 2 * hc :] * scale[2] + base[2 * hc :]
     return pre, post, comb
@@ -64,7 +67,7 @@ class HyperConnection(nn.Module):
         """x: [B, T, hc, dim] → (pre, post, comb)，fp32。"""
         flat = x.reshape(*x.shape[:2], -1)
         mixes = self.fn(rms_unit(flat, self.norm_eps).astype(x.dtype)).astype(mx.float32)
-        pre, post, comb = hc_split(mixes, self.scale, self.base, self.hc_mult)
+        pre, post, comb = hc_split(mixes, self.scale, self.base, self.hc_mult, self.eps)
         comb = sinkhorn(
             comb.reshape(*comb.shape[:-1], self.hc_mult, self.hc_mult),
             self.sinkhorn_iters,
