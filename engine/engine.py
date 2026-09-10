@@ -105,7 +105,7 @@ class VibyEngine:
         )
         dtype = model.model.embed_tokens.weight.dtype
         self.pool = PagePool(
-            num_layers=cfg.num_hidden_layers,
+            num_layers=cfg.num_exec_layers,
             n_heads=cfg.num_attention_heads,
             page_size=self.page_size,
             k_dim=cfg.head_dim + cfg.qk_rope_head_dim,
@@ -614,7 +614,7 @@ class VibyEngine:
             seq.kv_caches = (
                 self._load_kv_from_pages(seq)
                 if seq.seqlen > 0
-                else [KVCache() for _ in range(self.model.config.num_hidden_layers)]
+                else [KVCache() for _ in range(self.model.config.num_exec_layers)]
             )
         out = self.model(
             mx.array([q_ids], dtype=mx.int32),

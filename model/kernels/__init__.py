@@ -95,6 +95,23 @@ def prewarm_all(model, config, dtype, seq_len, log=None):
                 if getattr(config, "attn_res_register", False):
                     # 读侧混合 = 寄存器 + 近 W 个写入，N 最大 W+1
                     max_n = min(2 * L + 1, win + 1)
+                elif (
+                    bool(getattr(config, "loop_anchor", True))
+                    and not bool(getattr(config, "ihc", False))
+                    and config.loop_layer_range() is not None
+                ):
+                    # loop 锚点读出（replace 模式）：vs = 常驻寄存器
+                    # （x_entry + ≤r−1 个 visit 摘要）+ pin 份 pre-span
+                    # 写入（embedding + 每浅层 2 份）+ 最近 win 份写入，
+                    # 且 merge 发生在本 sublayer 写入 append 之后。
+                    # N 最大 pin + win + r；窗口填满前的 ramp 会经过
+                    # 其间全部值，range 连续覆盖。漏预热会让这些 N 在
+                    # compile trace 内首次校验（host sync 异常被吞）而
+                    # 整轮训练回退 eager。
+                    start, _ = config.loop_layer_range()
+                    pin = 1 + 2 * start
+                    regs = int(getattr(config, "loop_count", 2) or 2)
+                    max_n = max(max_n, pin + win + regs)
             if getattr(config, "attn_res_read_h", False):
                 # 子层读 h，不走 AttnRes merge
                 note("attn_res_read_h：跳过 AttnRes 合并预热")

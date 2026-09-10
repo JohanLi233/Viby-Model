@@ -306,6 +306,57 @@ def add_common_args(parser):
         default=1,
         help="分型 iHC 下 n-gram 写入的流下标（默认 1）。identity 塌缩时不能为 0",
     )
+    parser.add_argument(
+        "--loop_span",
+        type=int,
+        default=0,
+        help="SMELT 中间层 loop 跨度（arXiv:2609.01343）：居中内部 span 层"
+        "连续执行 --loop_count 次（权重共享，参数量不变，effective depth ="
+        " L + (r−1)·span）。0（默认）=关闭；需 >0 且 loop_count>1 才生效。"
+        "loop 跨度 KV 翻倍，KV 预算对齐可调低 --kv_lora_rank（如 256→192）",
+    )
+    parser.add_argument(
+        "--loop_count",
+        type=int,
+        default=2,
+        help="SMELT loop 次数 r（默认 2，SMELT/Loopie 消融均表明 r=2 最优）。"
+        "仅 --loop_span > 0 时生效",
+    )
+    parser.add_argument(
+        "--loop_res_scale",
+        choices=["rsqrt", "r", "none"],
+        default="rsqrt",
+        help="loop 跨度内 sublayer 残差写入缩放（防 weight-tied 更新吹大"
+        "残差流，SMELT Eq.8/9）：rsqrt=r**-0.5（默认）/ r=1/r / none=不缩放（消融）",
+    )
+    parser.add_argument(
+        "--loop_grad_mode",
+        choices=["full", "jfb"],
+        default="full",
+        help="loop 跨度反向模式：full（默认，全展开反传）/ jfb（单步梯度，"
+        "0th-order IFT，HRM/TRM 口径）：前 r−1 次 visit 断梯度，只反传末次"
+        "visit + x_entry 恒等通路。前向数值与 full 逐位一致；反向算力与"
+        "激活内存降到约 1 次 visit（r=2 时 span 反向减半）",
+    )
+    parser.add_argument(
+        "--loop_extrap",
+        type=float,
+        default=0.0,
+        help="Richardson 外推 λ：末次 visit 后 h += λ(h − h_prev_visit)"
+        "（h_i=第 i 次 visit 结束的 hidden，r>2 取最后两次）。0（默认）=关；"
+        "λ=1 是经典 Richardson（误差随 visit 减半）。固定标量不加参数，"
+        "可对旧 checkpoint 直接做推理探针。需要 --loop_span>0 且 loop_count>=2",
+    )
+    parser.add_argument(
+        "--loop_anchor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="loop 锚点读出（默认开，仅 replace 模式 AttnRes 生效）：span "
+        "区段的 merge 常驻 [span 入口 hidden] + [各 visit 出口摘要] + 全部 "
+        "pre-span 写入，窗口只裁 span 内写入——修复滑窗把输入侧/跨 visit "
+        "历史挤出后 span 闭环递归、主 loss 卡平台的问题。不加参数、不改残差"
+        "语义。--no_loop_anchor 做消融",
+    )
     parser.add_argument("--mtp_depth", type=int, default=1)
     parser.add_argument("--mtp_loss_weight", type=float, default=0.3)
     parser.add_argument(
@@ -593,6 +644,12 @@ def get_sft_parser():
         ihc_typed=None,
         ihc_collapse=None,
         ihc_ngram_stream=None,
+        loop_span=None,
+        loop_count=None,
+        loop_res_scale=None,
+        loop_grad_mode=None,
+        loop_extrap=None,
+        loop_anchor=None,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-Full-SFT")
@@ -663,6 +720,12 @@ def get_draft_parser():
         ihc_typed=None,
         ihc_collapse=None,
         ihc_ngram_stream=None,
+        loop_span=None,
+        loop_count=None,
+        loop_res_scale=None,
+        loop_grad_mode=None,
+        loop_extrap=None,
+        loop_anchor=None,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-Draft")
@@ -741,6 +804,12 @@ def get_dpo_parser():
         ihc_typed=None,
         ihc_collapse=None,
         ihc_ngram_stream=None,
+        loop_span=None,
+        loop_count=None,
+        loop_res_scale=None,
+        loop_grad_mode=None,
+        loop_extrap=None,
+        loop_anchor=None,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-DPO")

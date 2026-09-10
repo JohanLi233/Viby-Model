@@ -29,18 +29,27 @@ def _attn_res_merge(w: mx.array, vs: list, window: int = 0) -> mx.array:
     return attn_res_fused.merge(w, vs)
 
 
-def _attn_res_read(w: mx.array, register: mx.array, writes: list, window: int = 0):
-    """寄存器残差的读侧：softmax 混合 [register] + 最近 W 个写入。
+def _attn_res_read(
+    w: mx.array, register, writes: list, window: int = 0, pin: int = 0
+):
+    """寄存器残差的读侧：softmax 混合 [register(s)] + 常驻前缀 + 最近 W 个写入。
 
-    window 只裁 writes，寄存器永远在混合里（避免滑动窗口把恒等通路裁掉）。
-    尚无写入时读就是寄存器本身，不走 merge。
+    register 可以是单个 (B,T,D) 或它们的列表（loop 场景 = [span 入口锚点,
+    各 visit 出口摘要]）。window 只裁 writes 的非常驻部分，寄存器永远在
+    混合里（避免滑动窗口把恒等通路裁掉）。pin>0 时 writes 的前 pin 份
+    （loop 场景 = pre-span 写入：embedding + 浅层输出）同样常驻，窗口只
+    作用于其后的 span 内写入。尚无写入时：单寄存器直接返回它，多寄存器
+    退化为对寄存器自身的 merge。
     """
+    regs = list(register) if isinstance(register, (list, tuple)) else [register]
     if not writes:
-        return register
-    if window > 0 and len(writes) > window:
-        vs = [register] + writes[-window:]
+        if len(regs) == 1:
+            return regs[0]
+        return _attn_res_merge(w, regs)
+    if window > 0 and len(writes) > pin + window:
+        vs = regs + writes[:pin] + writes[-window:]
     else:
-        vs = [register] + writes
+        vs = regs + writes
     return _attn_res_merge(w, vs, 0)
 
 
@@ -114,6 +123,16 @@ class VibyBlock(nn.Module):
                 config.hidden_size, self.ihc_streams, config.rms_norm_eps
             )
         self.ngram_conf_gate = bool(getattr(config, "ngram_conf_gate", False))
+        # SMELT loop 残差写入缩放：本层落在 loop 跨度内且 loop 生效时
+        # 按 config 取 r**-0.5 / 1/r / 1.0，其余情况 1.0（不乘）。
+        self.loop_res_scale = 1.0
+        loop_range = config.loop_layer_range()
+        if loop_range is not None and loop_range[0] <= layer_idx < loop_range[1]:
+            r = int(config.loop_count)
+            if config.loop_res_scale == "rsqrt":
+                self.loop_res_scale = r ** -0.5
+            elif config.loop_res_scale == "r":
+                self.loop_res_scale = 1.0 / r
 
     def __call__(
         self,
@@ -127,9 +146,14 @@ class VibyBlock(nn.Module):
         segment_ids: Optional[mx.array] = None,
         position_embeddings=None,
         write_gate: Optional[mx.array] = None,
+        loop_anchor: Optional[mx.array] = None,
+        loop_pin: int = 0,
     ):
         # residuals：跨层共享的 sublayer 输出列表。替换式 AttnRes 以
         # 输入 hidden 为 v_0；寄存器模式只收集写入，空列表起步。
+        # loop_anchor（仅 replace 模式、loop 生效时由 VibyStack 传入）：
+        # 常驻锚点列表 [span 入口 hidden, 各 visit 出口摘要]，窗口裁不掉；
+        # loop_pin 为常驻的 pre-span 写入数（窗口只裁 span 内写入）。
         if residuals is None:
             residuals = [] if self.attn_res_register else [hidden_states]
         # 统一在 block 层建 cache：KDA 层与 GQA 层共用同一 KVCache 对象
@@ -148,7 +172,8 @@ class VibyBlock(nn.Module):
                 position_embeddings=position_embeddings,
                 write_gate=write_gate,
             )
-        if use_cache and write_gate is None:
+        if use_cache and write_gate is None and self.loop_res_scale == 1.0 and loop_anchor is None:
+            # 融合 decode kernel 不实现 loop 缩放与锚点读出，回退 eager 路径。
             fused = try_layer_decode(
                 self,
                 hidden_states,
@@ -182,6 +207,8 @@ class VibyBlock(nn.Module):
             segment_ids=segment_ids,
         )
         v_attn = _scale_write(v_attn, write_gate)
+        if self.loop_res_scale != 1.0:
+            v_attn = v_attn * self.loop_res_scale
         residuals.append(v_attn)
         if self.attn_res_register:
             hidden_states = hidden_states + v_attn
@@ -195,9 +222,18 @@ class VibyBlock(nn.Module):
                     self.attn_res_window,
                 )
         else:
-            hidden_states = _attn_res_merge(
-                self.attn_res_q_attn, residuals, self.attn_res_window
-            )
+            if loop_anchor is not None:
+                hidden_states = _attn_res_read(
+                    self.attn_res_q_attn,
+                    loop_anchor,
+                    residuals,
+                    self.attn_res_window,
+                    pin=loop_pin,
+                )
+            else:
+                hidden_states = _attn_res_merge(
+                    self.attn_res_q_attn, residuals, self.attn_res_window
+                )
             mlp_in = hidden_states
         mlp_output = self.mlp(self.post_attention_layernorm(mlp_in))
         # site 3 卷积仅 linear attn（Kimi K3）路径；MLA 默认关掉。
@@ -213,9 +249,19 @@ class VibyBlock(nn.Module):
             else:
                 mlp_output = self.mlp_out_conv(mlp_output, segment_ids=segment_ids)
         mlp_output = _scale_write(mlp_output, write_gate)
+        if self.loop_res_scale != 1.0:
+            mlp_output = mlp_output * self.loop_res_scale
         residuals.append(mlp_output)
         if self.attn_res_register:
             hidden_states = hidden_states + mlp_output
+        elif loop_anchor is not None:
+            hidden_states = _attn_res_read(
+                self.attn_res_q_mlp,
+                loop_anchor,
+                residuals,
+                self.attn_res_window,
+                pin=loop_pin,
+            )
         else:
             hidden_states = _attn_res_merge(
                 self.attn_res_q_mlp, residuals, self.attn_res_window
@@ -250,6 +296,8 @@ class VibyBlock(nn.Module):
             segment_ids=segment_ids,
         )
         v_attn = _scale_write(v_attn, write_gate)
+        if self.loop_res_scale != 1.0:
+            v_attn = v_attn * self.loop_res_scale
         hidden_states = self.ihc_attn.write(hidden_states, v_attn, h_post)
         mlp_in, h_post = self.ihc_mlp.mix(hidden_states)
         mlp_output = self.mlp(self.post_attention_layernorm(mlp_in))
@@ -265,6 +313,8 @@ class VibyBlock(nn.Module):
             else:
                 mlp_output = self.mlp_out_conv(mlp_output, segment_ids=segment_ids)
         mlp_output = _scale_write(mlp_output, write_gate)
+        if self.loop_res_scale != 1.0:
+            mlp_output = mlp_output * self.loop_res_scale
         hidden_states = self.ihc_mlp.write(hidden_states, mlp_output, h_post)
         if own:
             hidden_states = ihc_collapse(hidden_states, mode=self.ihc_collapse)
@@ -272,11 +322,82 @@ class VibyBlock(nn.Module):
 
 
 class VibyStack(nn.Module):
-    """顺序 transformer 主干：N 层 + 尾部 RMSNorm，残差流为 AttnRes。"""
+    """顺序 transformer 主干：N 层 + 尾部 RMSNorm，残差流为 AttnRes。
+
+    SMELT loop（config.loop_span>0 且 loop_count>1）时按 exec_order 展开
+    执行：居中内部 span 连续跑 loop_count 遍（同一 VibyBlock 权重共享），
+    如 L=9 span=4 r=2 → [0,1,2,3,4,5,2,3,4,5,6,7,8]。past_key_values 按
+    执行位置索引（每 visit 一个独立 cache，Huginn 式 per-iteration KV），
+    各 cache 长度均与 token 数对齐，RoPE/mask/generate 语义不变。
+    loop_extrap≠0 时在末次 visit 结束后对 hidden 做 Richardson 外推
+    （h += λ(h − h_prev_visit)），只动流不改 residuals；iHC 4D 流同样支持。
+    loop_anchor（默认开，仅 replace AttnRes）时 span 区段的 merge 常驻
+    [span 入口 hidden] + [各 visit 出口摘要] + 全部 pre-span 写入，
+    窗口只裁 span 内写入，防止滑窗把输入侧/跨 visit 历史挤出后 span
+    退化为闭环递归（主 loss 平台）。
+    """
 
     def __init__(self, config: VibyConfig, n_layers: int):
         super().__init__()
         self.layers = [VibyBlock(config, layer_idx=i) for i in range(n_layers)]
+        # 执行序列表：中间 span 连续重复 loop_count 次；无 loop 时为 0..L-1
+        self.exec_order = list(range(n_layers))
+        loop_range = config.loop_layer_range()
+        if loop_range is not None:
+            start, end = loop_range
+            self.exec_order = (
+                list(range(start))
+                + list(range(start, end)) * int(config.loop_count)
+                + list(range(end, n_layers))
+            )
+        self.n_exec = len(self.exec_order)
+        # JFB（loop_grad_mode="jfb"）用的执行位置边界：span 入口与末次
+        # visit 起点的 exec_pos。无 loop 时为 None（不参与判断）。
+        self._loop_range = loop_range
+        self.loop_grad_mode = str(getattr(config, "loop_grad_mode", "full") or "full")
+        if loop_range is not None:
+            start, end = loop_range
+            self._jfb_entry_pos = start
+            self._jfb_final_pos = start + (int(config.loop_count) - 1) * (end - start)
+        else:
+            self._jfb_entry_pos = None
+            self._jfb_final_pos = None
+        # span 每次 visit 结束的 exec_pos 列表：Richardson 外推
+        # （loop_extrap≠0，末次 visit 后 h += λ(h − h_prev_visit)）与
+        # loop 锚点的 per-visit 摘要都用到。外推只动 hidden 流，不改
+        # residuals/已写入项；iHC 的 4D 流同样逐元素适用。
+        self.loop_extrap = float(getattr(config, "loop_extrap", 0.0) or 0.0)
+        if loop_range is not None:
+            start, end = loop_range
+            span_len = end - start
+            self._visit_ends = [
+                start + (k + 1) * span_len - 1 for k in range(int(config.loop_count))
+            ]
+            self._visit_end_set = frozenset(self._visit_ends)
+        else:
+            self._visit_ends = None
+            self._visit_end_set = None
+        # loop 锚点读出（config.loop_anchor，仅 replace 模式）：span 区段
+        # （含 visit 1）的每次 merge 常驻 [span 入口 hidden] + [此前各 visit
+        # 的出口摘要] + 全部 pre-span 写入（pin=入口时残差列表长度），窗口
+        # 只裁 span 内写入——span 第一个子层起 window 就已挤出 embedding；
+        # visit 摘要恢复跨 visit 的循环历史访问（实测 dbg_real_anchor2：
+        # 只 pin 输入侧不够，被裁的 visit-1 写入是剩余差距）。exec_pos ∈
+        # [start, start+r·span) 的调用收到 loop_anchor=[x_entry, ...摘要]、
+        # loop_pin=res_entry_len（与 JFB 共用记录）。
+        if (
+            loop_range is not None
+            and bool(getattr(config, "loop_anchor", True))
+            and not bool(getattr(config, "attn_res_register", False))
+            and not bool(getattr(config, "ihc", False))
+        ):
+            start, end = loop_range
+            span_len = end - start
+            self._anchor_lo = start
+            self._anchor_hi = start + int(config.loop_count) * span_len
+        else:
+            self._anchor_lo = None
+            self._anchor_hi = None
         self.final_norm = GatedNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn_res_register = bool(getattr(config, "attn_res_register", False))
         self.ihc_streams = (
@@ -335,9 +456,45 @@ class VibyStack(nn.Module):
                     hidden_states, Y, self.ihc_ngram_stream
                 )
             inject = None
-        for layer_idx, layer in enumerate(self.layers):
-            if inject is not None and layer_idx == inject:
-                # Engram：在注入层用当时的 hidden 作 query 门控检索向量
+        visited = set()
+        # JFB / 单步梯度（0th-order IFT，HRM/TRM；Attractor Models
+        # arXiv:2605.12466 在 LLM 规模验证）：前 r−1 次 visit 的图在末次
+        # visit 前被整体断梯度，反向只走 1 次 visit + x_entry 恒等通路。
+        # 前向数值与 full 逐位一致（x_entry − sg(x_entry) 值恰为 0），
+        # 仅梯度估计不同。eval 也无条件应用，无需按 training 分支。
+        jfb = self.loop_grad_mode == "jfb" and self._jfb_entry_pos is not None
+        anchor_on = self._anchor_lo is not None
+        x_entry = None
+        res_entry_len = 0
+        # Richardson 外推：记录每次 visit 结束的 hidden，末次后
+        # h += λ(h − h_prev)。与 JFB 组合时 h_prev 保持其图不特判。
+        extrap_on = self._visit_ends is not None and self.loop_extrap != 0.0
+        prev_visit_hidden = None
+        # per-visit 出口摘要（loop 锚点用）：visit k 的层可读 visit 1..k−1
+        # 的出口 hidden，跨 visit 的循环历史不被滑窗裁掉。
+        visit_summaries = []
+        for exec_pos, layer_idx in enumerate(self.exec_order):
+            layer = self.layers[layer_idx]
+            if (jfb or anchor_on) and exec_pos == self._jfb_entry_pos:
+                # span 入口：记录 hidden（保留图）与残差列表长度。x_entry
+                # 同时服务 JFB 直通与 loop 锚点读出（两者可独立开关）。
+                x_entry = hidden_states
+                res_entry_len = len(residuals)
+            if jfb and exec_pos == self._jfb_final_pos:
+                # 末次 visit 前：值不变的梯度直通（pre-span 层经恒等路
+                # ∂f/∂x 拿梯度——replace 模式下 merge 链是唯一通路，缺了
+                # 它 embedding/layer0 梯度全零）；前序 visit 的 span 写入
+                # 原地断梯度（replace 模式末次 visit 的 merge 会读这份
+                # 列表）。iHC 无共享 residuals，直通本身已覆盖。
+                # delta 必须显式分组先算（元素级恰为 0），否则 (h+x)−x 的
+                # 加法顺序会引入 2^-20 量级舍入，破坏与 full 的逐位一致。
+                delta = x_entry - mx.stop_gradient(x_entry)
+                hidden_states = mx.stop_gradient(hidden_states) + delta
+                for j in range(res_entry_len, len(residuals)):
+                    residuals[j] = mx.stop_gradient(residuals[j])
+            if inject is not None and layer_idx == inject and layer_idx not in visited:
+                # Engram：在注入层用当时的 hidden 作 query 门控检索向量；
+                # loop 下只在注入层的第一次 visit 触发
                 module = ngram_io["module"]
                 Y, tail = module.fuse(
                     hidden_states,
@@ -349,7 +506,11 @@ class VibyStack(nn.Module):
                 hidden_states = hidden_states + Y
                 if hidden_states.ndim == 3 and residuals and not self.attn_res_register:
                     residuals[-1] = residuals[-1] + Y
-            pv = past_key_values[layer_idx] if past_key_values is not None else None
+            visited.add(layer_idx)
+            pv = past_key_values[exec_pos] if past_key_values is not None else None
+            in_anchor_span = (
+                anchor_on and self._anchor_lo <= exec_pos < self._anchor_hi
+            )
             hidden_states, present = layer(
                 hidden_states,
                 past_key_value=pv,
@@ -361,13 +522,32 @@ class VibyStack(nn.Module):
                 segment_ids=segment_ids,
                 position_embeddings=position_embeddings,
                 write_gate=write_gate,
+                loop_anchor=([x_entry] + visit_summaries) if in_anchor_span else None,
+                loop_pin=res_entry_len if in_anchor_span else 0,
             )
             presents.append(present)
+            if anchor_on and exec_pos in self._visit_end_set:
+                # visit 结束：出口 hidden 追加为摘要，后续 visit 常驻可读。
+                # JFB 下断梯度（前序 visit 的图必须整体切掉）；值不变。
+                visit_summaries.append(
+                    mx.stop_gradient(hidden_states) if jfb else hidden_states
+                )
+            # feature_layers 按物理 layer_idx 捕获（末层不在 loop 跨度内，
+            # 只 visit 一次，行为与无 loop 一致）
             if feature_layers is not None and layer_idx in feature_layers:
                 feat = hidden_states
                 if feat.ndim == 4:
                     feat = ihc_collapse(feat, mode=self.ihc_collapse)
                 feat_caps[layer_idx] = feat
+            if extrap_on and exec_pos in self._visit_end_set:
+                # visit 结束。末次 visit 后做 Richardson 外推
+                # z* ≈ h_r + λ(h_r − h_{r−1})；只动 hidden 流，
+                # residuals/past 写入不改。cache 解码（T=1）语义相同。
+                if prev_visit_hidden is not None and exec_pos == self._visit_ends[-1]:
+                    hidden_states = hidden_states + self.loop_extrap * (
+                        hidden_states - prev_visit_hidden
+                    )
+                prev_visit_hidden = hidden_states
         features = (
             [feat_caps[i] for i in feature_layers] if feature_layers is not None else []
         )

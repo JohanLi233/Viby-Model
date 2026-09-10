@@ -140,12 +140,13 @@ class VibyModel(nn.Module):
         **kwargs,
     ) -> tuple[mx.array, list, list]:
         batch_size, seq_length = input_ids.shape
-        n_layers = self.config.num_hidden_layers
+        # loop 生效时 cache 按执行位置计（每 visit 一个独立 cache）
+        n_exec = self.config.num_exec_layers
         if past_key_values is None:
-            past_key_values = [None] * n_layers
-        elif len(past_key_values) != n_layers:
+            past_key_values = [None] * n_exec
+        elif len(past_key_values) != n_exec:
             raise ValueError(
-                f"past_key_values 层数 {len(past_key_values)} 与层数 {n_layers} 不一致"
+                f"past_key_values 层数 {len(past_key_values)} 与执行层数 {n_exec} 不一致"
             )
         first_cache = past_key_values[0]
         start_pos = _seq_len_of_cache(first_cache)
@@ -1175,12 +1176,25 @@ class VibyForCausalLM(nn.Module):
         仅在 router 开启 collect_stats 且训练 forward 执行后有效；返回的
         是图节点，可作为 loss 的额外输出一并物化。        MTP 块同一 gate 会把各展开步的 B·(T−k) 行拼起来，可能长于主干
         B·T；统一裁到最小 N 再 stack。
+        SMELT loop 下被循环的 gate 会把各 visit 的行沿 token 轴拼接
+        （r 遍即 r·B·T 行，按 visit 顺序排列）。头部裁剪会只保留 visit 1
+        的样本，而 expert_bias 是全部 visit 共享的——bias 只按 visit 1 的
+        分布拟合，后续 visit 的路由对 QB 不可见、失衡不被纠正（负载统计
+        又是跨 visit 合并的，表现为循环层 max_load_k 持续漂移上升）。
+        行数 >= 2×n_min 时改为等距抽稀，让各 visit 等比例进入分位数统计；
+        余量不足 2 倍的（如 MTP 的 B·(T−1) vs B·T）保持头部裁剪。
         """
         stats = [g.last_margins for g in self.moe_gates() if g.last_margins is not None]
         if not stats:
             return None
         n_min = min(s.shape[0] for s in stats)
-        stats = [s[:n_min] for s in stats]
+        mixed = []
+        for s in stats:
+            stride = s.shape[0] // n_min
+            if stride > 1:
+                s = s[::stride]
+            mixed.append(s[:n_min])
+        stats = mixed
         return mx.stack(stats) if len(stats) > 1 else stats[0][None]
 
     def moe_bias_stack(self) -> mx.array:

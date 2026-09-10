@@ -85,6 +85,12 @@ if __name__ == "__main__":
         use_linear_attn=args.use_linear_attn,
         kv_lora_rank=args.kv_lora_rank,
         qk_rope_head_dim=args.qk_rope_head_dim,
+        loop_span=getattr(args, "loop_span", 0),
+        loop_count=getattr(args, "loop_count", 2),
+        loop_res_scale=getattr(args, "loop_res_scale", "rsqrt"),
+        loop_grad_mode=getattr(args, "loop_grad_mode", "full"),
+        loop_extrap=getattr(args, "loop_extrap", 0.0),
+        loop_anchor=getattr(args, "loop_anchor", True),
         **({"head_dim": args.head_dim} if args.head_dim is not None else {}),
         **(
             {"intermediate_size": args.intermediate_size}

@@ -52,12 +52,21 @@ def _active_size(path: str, value, top_k: int) -> int:
 
 
 def gemm_active_params(model) -> int:
-    """每 token 参与 GEMM 的激活参数量（MTP 已按展开步数加权）。"""
+    """每 token 参与 GEMM 的激活参数量（MTP 已按展开步数加权）。
+
+    SMELT loop 生效时主干 span 内层权重共享、参数量不变，但每个 token
+    实际跑 loop_count 遍 GEMM：这里把 span 内层的尺寸按 loop_count
+    放大，使 6N 项计入 loop 的真实算力消耗。
+    """
     cfg = model.config
     top_k = int(getattr(cfg, "num_experts_per_tok", 0) or 0)
     tied = bool(getattr(cfg, "tie_word_embeddings", False))
     mtp_on = int(getattr(cfg, "mtp_depth", 0) or 0) > 0
     mtp_steps = int(getattr(cfg, "mtp_steps", 1) or 1) if mtp_on else 0
+    loop_range = (
+        cfg.loop_layer_range() if hasattr(cfg, "loop_layer_range") else None
+    )
+    loop_count = int(getattr(cfg, "loop_count", 1) or 1)
     n = 0
     for path, value in tree_flatten(model.parameters()):
         if _leaf(path) in _SKIP_LEAVES:
@@ -69,12 +78,12 @@ def gemm_active_params(model) -> int:
             size *= mtp_steps
         elif _is_unembedding(path, tied) and mtp_on:
             size *= 1 + mtp_steps
+        elif loop_range is not None and path.startswith("model.stack.layers."):
+            layer_idx = int(path.split(".")[3])
+            if loop_range[0] <= layer_idx < loop_range[1]:
+                size *= loop_count
         n += size
     return n
-
-
-def _n_gqa_layers(n_layers: int) -> int:
-    return sum(1 for i in range(n_layers) if (i + 1) % 4 == 0 or i == n_layers - 1)
 
 
 def attn_fwdbwd_flops_per_token(config, seq_len: int) -> int:
@@ -84,7 +93,8 @@ def attn_fwdbwd_flops_per_token(config, seq_len: int) -> int:
         return 0
     heads = int(config.num_attention_heads)
     head_dim = int(config.head_dim)
-    n_layers = int(config.num_hidden_layers)
+    # SMELT loop 生效时按执行层数计（中间 span 重复跑，FLOPs 计入 MFU）
+    n_layers = int(getattr(config, "num_exec_layers", config.num_hidden_layers))
     mtp_extra = (
         int(config.mtp_steps) if int(getattr(config, "mtp_depth", 0) or 0) > 0 else 0
     )
@@ -92,8 +102,25 @@ def attn_fwdbwd_flops_per_token(config, seq_len: int) -> int:
         qk = head_dim + int(config.qk_rope_head_dim)
         n_softmax = n_layers + mtp_extra
         return n_softmax * 6 * heads * (qk + head_dim) * t
-    n_gqa = _n_gqa_layers(n_layers) + mtp_extra
+    n_gqa = _n_gqa_exec_layers(config) + mtp_extra
     return n_gqa * 6 * heads * (head_dim + head_dim) * t
+
+
+def _n_gqa_exec_layers(config) -> int:
+    """linear attn 下按执行序统计 GQA global 层数（loop span 内 visit 重复计）。"""
+    L = int(config.num_hidden_layers)
+    loop_range = (
+        config.loop_layer_range() if hasattr(config, "loop_layer_range") else None
+    )
+    order = list(range(L))
+    if loop_range is not None:
+        s, e = loop_range
+        order = (
+            list(range(s))
+            + list(range(s, e)) * int(config.loop_count)
+            + list(range(e, L))
+        )
+    return sum(1 for i in order if (i + 1) % 4 == 0 or i == L - 1)
 
 
 def training_flops_per_token(model, seq_len: int) -> int:

@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import warnings
 
 
 class VibyConfig:
@@ -195,6 +196,43 @@ class VibyConfig:
         # g = 1 − s · stopgrad(max p)；s 零初始化 ⇒ step 0 时 g≡1。
         # 旧 sidecar 缺键 → False。需要 ngram_table_size > 0。
         self.ngram_conf_gate = bool(kwargs.get("ngram_conf_gate", False))
+        # SMELT 中间层 loop（arXiv:2609.01343）：居中内部 loop_span 层连续
+        # 执行 loop_count 次（权重共享，参数量不变，effective depth =
+        # L + (r−1)·span）。loop_span>0 且 loop_count>1 才生效，其余组合
+        # 静默退化为无 loop。跨度必须严格在内部（首尾层不参与：SMELT 消融
+        # 结论，也保证 layer 0 cache 长度对齐 token 数、MTP 末层不被 loop）。
+        # loop 内每个 sublayer 的残差写入乘 loop_res_scale（防 weight-tied
+        # 更新吹大残差流）：rsqrt=r**-0.5（默认，SMELT Eq.8/9）、r=1/r、
+        # none=1.0（消融）。loop 跨度 KV 翻倍，预算对齐靠调低 kv_lora_rank。
+        self.loop_span = int(kwargs.get("loop_span", 0) or 0)
+        _lc = kwargs.get("loop_count", 2)
+        self.loop_count = 2 if _lc is None else int(_lc)
+        self.loop_res_scale = str(kwargs.get("loop_res_scale", "rsqrt"))
+        # loop 跨度的反向模式：full（默认，全展开反传）| jfb（单步梯度 /
+        # 0th-order IFT，HRM/TRM 口径）：前 r−1 次 visit 断梯度，只反传
+        # 末次 visit + x_entry 恒等通路。前向数值与 full 逐位一致，仅梯度
+        # 估计不同（丢掉 (I−Jᵀ)⁻¹ 放大）；反向算力/激活内存降到 ~1 次 visit。
+        self.loop_grad_mode = str(kwargs.get("loop_grad_mode", "full"))
+        # Richardson 外推读出（研究探针："visit-2 成本买 visit-3 质量"）：
+        # loop 迭代若一阶收敛，不动点更好估计是 z* ≈ h_r + λ(h_r − h_{r−1})
+        # （h_i = 第 i 次 visit 结束时的 hidden；r>2 取最后两次 visit）。
+        # 固定标量、不加参数 ⇒ 旧 checkpoint 可直接加载做推理探针。
+        # 0（默认）= 关；λ=1 是经典 Richardson。
+        self.loop_extrap = float(kwargs.get("loop_extrap", 0.0) or 0.0)
+        # loop 锚点读出（Huginn/CART 式输入重注入的 AttnRes 原生形态）：
+        # replace 模式下滑窗会把 pre-span 写入（embedding + 浅层输出）与
+        # 跨 visit 的循环历史挤出 merge——span 第一个子层起 embedding 就
+        # 已出局，第 2 遍 visit 与输入完全隔绝（闭环递归，主 loss 卡平台，
+        # 实测 dbg_real_*）。开锚点后 span 区段（含 visit 1）的每次 merge
+        # 常驻 [span 入口 hidden] + [此前各 visit 出口摘要] + 全部 pre-span
+        # 写入，窗口只裁 span 内写入：输入侧与跨 visit 历史永远可选择性
+        # 访问（AttnRes 消融：distant 访问比邻近数量更关键，arXiv:2603.15031
+        # §5；dbg_real_anchor2 实测：只 pin 输入侧不够，跨 visit 摘要补另
+        # 一条轴）。不加参数、不改残差语义，merge 项数封顶在 r + pre_span
+        # _writes + W。默认开；仅 loop 生效 + replace AttnRes（非
+        # register/ihc）时起作用。显式存 False 做消融；旧 loop sidecar
+        # 缺键 → True（要复现旧行为须显式 False）。
+        self.loop_anchor = bool(kwargs.get("loop_anchor", True))
 
         if self.n_kv_heads_global is None:
             self.n_kv_heads_global = max(1, self.num_attention_heads // 4)
@@ -297,6 +335,59 @@ class VibyConfig:
             raise ValueError("first_k_dense_replace 不能大于 num_hidden_layers")
         if self.first_k_dense_replace > 0 and self.dense_intermediate_size <= 0:
             raise ValueError("first_k_dense_replace>0 需要 dense_intermediate_size>0")
+        if self.loop_span < 0:
+            raise ValueError("loop_span 不能为负（0 关闭）")
+        if self.loop_span > self.num_hidden_layers - 2:
+            raise ValueError(
+                "loop_span 不能大于 num_hidden_layers - 2（首尾层不参与 loop）"
+            )
+        if self.loop_count < 1:
+            raise ValueError("loop_count 必须 >= 1")
+        if self.loop_res_scale not in ("rsqrt", "r", "none"):
+            raise ValueError("loop_res_scale 必须是 rsqrt / r / none")
+        if self.loop_grad_mode not in ("full", "jfb"):
+            raise ValueError("loop_grad_mode 必须是 full / jfb")
+        if not math.isfinite(self.loop_extrap):
+            raise ValueError("loop_extrap 必须是有限值")
+        if self.loop_extrap != 0.0 and self.loop_layer_range() is None:
+            raise ValueError(
+                "loop_extrap 需要 loop 生效（loop_span>0 且 loop_count>=2）"
+            )
+        # 实测（dbg_real_* 对照，L=9 span=4 r=2）：replace 模式 AttnRes 的
+        # merge 窗口若装不下「整个 span 一次 visit 的写入（2·span 个）+ 至少
+        # 一条 pre-span 写入」，第 2 遍 visit 就与 embedding/浅层写入完全
+        # 隔绝，span 退化为闭环递归，主 loss 卡平台而 MTP 正常。loop_anchor
+        # （默认开，锚点常驻读侧）/ register 模式 / 更大窗口（含 0=全历史）
+        # 均可消除。window=0 或锚点开启时不警告。
+        if (
+            self.loop_layer_range() is not None
+            and not self.attn_res_register
+            and not self.loop_anchor
+            and 0 < self.attn_res_window <= 2 * self.loop_span
+        ):
+            warnings.warn(
+                f"loop_span={self.loop_span} 在 replace 模式 AttnRes 下要求 "
+                f"attn_res_window > 2*span（当前 {self.attn_res_window}），否则 "
+                "第 2 遍 visit 读不到 span 之前的写入，训练会卡平台"
+                "（实测 dbg_real_*）。建议保持 --loop_anchor 开启（默认）、"
+                f"--attn_res_window 0（全历史）或 >= {2 * self.loop_span + 1}，"
+                "或改用 --attn_res_register。"
+            )
+
+    def loop_layer_range(self):
+        """loop 跨度 (start, end)（end 开区间，居中内部段）；未生效返回 None。"""
+        if self.loop_span <= 0 or self.loop_count <= 1:
+            return None
+        start = (self.num_hidden_layers - self.loop_span) // 2
+        return (start, start + self.loop_span)
+
+    @property
+    def num_exec_layers(self) -> int:
+        """实际执行层数（loop 段重复计入）；无 loop 时 = num_hidden_layers。"""
+        span = self.loop_layer_range()
+        if span is None:
+            return self.num_hidden_layers
+        return self.num_hidden_layers + (self.loop_count - 1) * (span[1] - span[0])
 
     def is_dense_ffn(self, layer_idx: int) -> bool:
         return 0 <= int(layer_idx) < self.first_k_dense_replace

@@ -267,6 +267,12 @@ _ARCH_ARG_KEYS = (
     "use_linear_attn",
     "kv_lora_rank",
     "qk_rope_head_dim",
+    "loop_span",
+    "loop_count",
+    "loop_res_scale",
+    "loop_grad_mode",
+    "loop_extrap",
+    "loop_anchor",
 )
 
 
@@ -750,6 +756,38 @@ def apply_lr_schedule(
             opt.momentum = current_momentum
 
 
+# 实时速率统计（模块级状态）：以上一次日志为窗口计算瞬时 step/s，
+# 再做 EMA 平滑，避免“从训练开始以来的累计平均”掩盖近期速度变化。
+_speed_state = {"last_step": None, "last_time": None, "ema": None}
+_SPEED_EMA_ALPHA = 0.3  # EMA 权重：越大越贴近瞬时值，越小越平滑
+
+
+def _realtime_steps_per_sec(step, cumulative_steps_per_sec):
+    """根据相邻两次日志的步数差/时间差计算实时 step/s（EMA 平滑）。
+
+    首次调用或跨 epoch step 重置时窗口无效，回退到累计平均速率。
+    """
+    now = time.time()
+    last_step = _speed_state["last_step"]
+    last_time = _speed_state["last_time"]
+    if last_step is not None and last_time is not None:
+        d_step = step - last_step
+        d_time = now - last_time
+        if d_step > 0 and d_time > 0:
+            inst = d_step / d_time
+            ema = _speed_state["ema"]
+            ema = (
+                inst
+                if ema is None
+                else _SPEED_EMA_ALPHA * inst + (1 - _SPEED_EMA_ALPHA) * ema
+            )
+            _speed_state["ema"] = ema
+    _speed_state["last_step"] = step
+    _speed_state["last_time"] = now
+    ema = _speed_state["ema"]
+    return ema if ema is not None else cumulative_steps_per_sec
+
+
 def log_training_progress(
     epoch,
     step,
@@ -778,7 +816,11 @@ def log_training_progress(
     spend_time = time.time() - start_time
     # 使用相对步数计算速率，避免 resume 后跳过的步导致速率异常
     effective_steps_done = max(1, (step - base_step_offset + 1))
-    steps_per_sec = effective_steps_done / spend_time if spend_time > 0 else 0.0
+    cumulative_steps_per_sec = (
+        effective_steps_done / spend_time if spend_time > 0 else 0.0
+    )
+    # 实时速率：相邻两次日志窗口的瞬时速率做 EMA，首次/跨 epoch 回退累计平均
+    steps_per_sec = _realtime_steps_per_sec(step, cumulative_steps_per_sec)
     tokens_per_sec = steps_per_sec * args.batch_size * args.max_seq_len
     flops_per_token = float(getattr(args, "flops_per_token", 0) or 0)
     peak_tflops = float(getattr(args, "peak_tflops", None) or DEFAULT_PEAK_TFLOPS)
