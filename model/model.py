@@ -31,7 +31,7 @@ from .config import VibyConfig
 from .engram import Engram, EngramLayout, NgramHashState, build_compressed_token_map
 from .hc import hc_pre, identity_pre_mix
 from .init import apply_trunc_normal_init
-from .moe import MoEGate, update_expert_bias
+from .moe import MoEFeedForward, MoEGate, update_expert_bias
 from .norms import RMSNorm
 
 NEG_INF = -1e30
@@ -46,6 +46,7 @@ class CausalLMOutput:
     diversity_loss: Optional[mx.array] = None
     logits: Optional[mx.array] = None
     moe_loads: Optional[mx.array] = None
+    aux_loss: Optional[mx.array] = None
     hidden_states: Optional[mx.array] = None
 
 
@@ -216,6 +217,7 @@ class VibyForCausalLM(nn.Module):
         self._moe_gates = [m for m in self.modules() if isinstance(m, MoEGate)]
         # 主干 gate 的 E 相同，可以堆成一张 [L, E] 计数表；draft 层 E 不同，单独处理
         self._backbone_gates = [g for g in self._moe_gates if g.layer_idx < config.n_layers]
+        self._moe_layers = [m for m in self.modules() if isinstance(m, MoEFeedForward)]
         if not skip_init:
             apply_trunc_normal_init(self, config.dim)
 
@@ -257,6 +259,10 @@ class VibyForCausalLM(nn.Module):
             out.mtp_loss = mtp_loss
             out.z_loss = out.z_loss + mtp_z
             out.loss = out.loss + self.config.mtp_loss_weight * mtp_loss + z_w * mtp_z
+        if self.training and self._moe_layers and self.config.aux_balance_loss_weight > 0:
+            # 报告 §4.2.2：权重 1e-4 的序列级均衡损失（逐层求和后加权）
+            out.aux_loss = mx.stack([m._last_aux for m in self._moe_layers], axis=0).sum()
+            out.loss = out.loss + self.config.aux_balance_loss_weight * out.aux_loss
         if self.training and self._backbone_gates:
             # 作为图输出返回（compile 下纯侧信道会被剪枝，见 MoEGate.__call__）
             out.moe_loads = mx.stack([g._last_load for g in self._backbone_gates], axis=0)

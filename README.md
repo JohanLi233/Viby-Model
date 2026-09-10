@@ -151,9 +151,12 @@ python trainer/train_full_sft.py --data_path ../dataset/sft_512.jsonl
 # DPO（需要 full_sft 检查点）
 python trainer/train_dpo.py --data_path ../dataset/dpo.jsonl
 
-# DSpark 独立阶段：只训草稿层（主干冻结，报告 §2.4.3）
+# DSpark 独立阶段（报告 §2.4.3）：预训练默认 --mtp_depth 0（§2.1：骨干预训练省略
+# MTP 模块），草稿层在这一阶段才引入并从零初始化；可训练集合变了会自动重置
+# 优化器状态。
 python trainer/train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl \
-  --resume --freeze_backbone --mtp_loss_weight 1.0
+  --resume /path/to/pretrain.safetensors --mtp_depth 1 --freeze_backbone \
+  --mtp_loss_weight 1.0
 ```
 
 要点：
@@ -170,13 +173,20 @@ python trainer/train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl \
   `--tie_word_embeddings`。
 - 检查点：`--out_dir` 下 safetensors + 同名 `.json` sidecar（结构配置）+
   `.optimizer.safetensors`；SFT/DPO 自动从基座 sidecar 继承结构。
-- **优化器分组**：Muon/AdamH 走核心权重矩阵（含 3D 专家堆叠逐专家 NS）、
-  AdamW 走 embedding/lm_head/router、Engram 检索表独立 Adam（5× lr、wd=0）、
-  其余 1-D（norm gain、attn_sink、mHC scale/base）走标量组 wd=0。
-  分组变更（如切 `--muonh`）后旧优化器状态不能直接续，加 `--reset_optimizer`。
+- **优化器分组**（对齐 V4.1 报告 §2.5/§4.2.2）：Muon 走核心权重矩阵，其中 Query
+  权重 `wq_b` **默认逐头 NS**（注意力 `head_dim`、indexer `index_head_dim`；
+  K=V 共享的单头 `wkv` 整矩阵）；token 嵌入 / lm_head / DSpark 马尔可夫头与
+  Engram 检索表走 **Sinkhorn 均衡更新**（动量 0.95、γ=0.18、K=11、τ=1e-3、
+  ε=1e-20、无 wd；Engram 表 5× lr）；RMSNorm 权重走 AdamW 且**受 wd**；
+  偏置/缩放因子（attn_sink、mHC scale/base、Engram q_weight/k_weight）走
+  AdamW wd=0。分组变更（切 `--muonh`、`VIBY_SINKHORN=0`、或
+  `VIBY_MUONH_PER_HEAD=0` 消融）后旧优化器状态不能直接续，加 `--reset_optimizer`。
 - `--pack_sequences` / `--doc_mask`：打包与跨文档屏蔽。压缩组按"整组同
   文档"处理，跨文档的组直接不可见（选择阶段就隔离，不会泄漏）。
-- 预训练默认 `z_loss_weight=1e-4`（`mean(lse²)`，分块融合进 CE）。
+- 损失口径对齐报告 §4.2.2：预训练默认**不算 z-loss**（`--z_loss_weight 0`），
+  改为权重 `1e-4` 的**序列级均衡损失**（`MoEFeedForward.seq_aux_loss`，与 DeepSeek
+  官方 seq-aux 同式，逐序列计算抑制单序列内极端不均衡）；要开 z-loss 显式
+  传 `--z_loss_weight 1e-4`（字段保留，作稳定性消融）。
 
 ## 数据格式（与 MiniMind 对齐）
 
@@ -252,6 +262,26 @@ logits, cache = model.decode_step(next_tok, cache)   # 逐 token（cache 自带 
 out = model.generate(tokens, max_new_tokens=64, temperature=0.7, top_k=50)
 ```
 
+## 与 V4.1 技术报告的逐条对齐
+
+已按报告 §2 / §4.2 对齐的部分（均有数值或测试支撑）：
+
+| 报告条目 | 本项目实现 |
+| :--- | :--- |
+| §2.1 主干 40 层 = 20 编码 + 20 解码；前两层纯 SWA，其余每层 SWA + 全局 | n_encoder_layers = n_layers//2；compress_ratios 前两位为 0 |
+| §2.2 CED：解码段全局 KV 由第 L/2 层隐状态投影而来 | CED 边界层是 kv_source（Full 模式），解码层以 Reuse/Reindex 共享其主 KV |
+| §2.3 CSA2 三模式；主 KV 与 indexer K 跨层共享，Top-K 索引可复用 | config.layer_mode() + kv_source_layers / index_source_layers |
+| §2.3 压缩器去掉重叠与绝对位置编码；indexer K 由主 KV 投影得到 | Compressor 每 r 个 token 池化一次（无重叠、无绝对 PE）；Indexer.index_keys = wk(latent) |
+| §2.3.2 分层稀疏索引：Full 层建候选池，Reindex 只在池内打分 | candidate_source_layer + select_candidate_blocks |
+| §4.2.1 逐层排布（编码器 3x6 组、解码器 5x4 组，组首 Full/Reindex、其余 Reuse） | default_source_layers() 推导出同构排布（缩放后） |
+| §2.4.1 Single-Pass mHC：每个子层消费上一个子层产出的混合系数 | Block.forward 的 pre_mix 链（tests/test_v41_mhc_single_pass.py 逐调用点断言） |
+| §2.4.2 Engram：分词器压缩 + 多头素数哈希 + 上下文门控 + 无短因果卷积；放在第 1/14 层 | model/engram.py（与官方 torch 参考逐位一致）；缩放后放 [1, ~35% 深度] |
+| §2.4.3 DSpark：块式草稿 + Markov 头 + 置信度头；预训练省略 MTP；单独阶段冻结主干；后训练不回传主干 | DSparkStage + --freeze_backbone + stop_gradient；预训练默认 --mtp_depth 0 |
+| §2.5 逐头 Muon（Query 权重按头拆）；Engram/嵌入/预测头用动量 + Sinkhorn 均衡；norm 权重受 wd、偏置与缩放因子不受 | trainer/muon.py：_per_head_dim、SinkhornBalanced、adamw_norm / adamw_nowd 分组 |
+| §4.2.2 超参（Muon m=0.95/wd=0.1；AdamW beta2=0.95/wd=0.1；Sinkhorn gamma=0.18/K=11/tau=1e-3/eps=1e-20；Engram lr x5） | 同（Sinkhorn 与官方 numpy 对拍 max|dW|=8.9e-9） |
+| §4.2.2 无辅助损失负载均衡（bias 更新率 1e-3）+ 权重 1e-4 的序列级均衡损失 | update_expert_bias + MoEFeedForward.seq_aux_loss（与 DeepSeek 官方 seq-aux 同式） |
+| §4.2.2 学习率：预热 -> 平台 -> 余弦衰减 | --lr_schedule wsd --wsd_decay_shape cosine（默认） |
+
 ## 与官方 V4.1 的刻意偏差
 
 缩小规模之外，以下部分没有实现（或用了等价但更简单的做法），用之前请知悉：
@@ -262,19 +292,22 @@ out = model.generate(tokens, max_new_tokens=64, temperature=0.7, top_k=50)
    （已验证），但没有官方融合稀疏 kernel 的省算力效果；解码路径才是 gather 稀疏。
 4. **DSpark**：只挂 1 个草稿 stage（官方 3），5→4 个草稿位置；投机解码的
    置信度调度采样循环未实现（只有草稿头前向 + 训练损失）。
-5. **Engram**：表规模按比例缩小；表更新用 Adam(5× lr) 近似官方的
-   momentum + Sinkhorn 平衡；不分片、不 fp8。
+5. **Engram**：表规模按比例缩小；表更新已按报告实现 momentum + Sinkhorn 均衡
+   （§2.5 算法 1、§4.2.2 超参 K=11/τ=1e-3/ε=1e-20、Engram 5× lr）；不分片、
+   不 fp8。
 6. **SWA Bounded Replay**（官方部署期只重放最近 n_win 个 token 的优化）未实现。
 7. `norm_eps` 用 1e-6（官方 fp8 口径 1e-20），bf16 训练更稳。
+8. **Muon 的更新 RMS 重缩放**（报告 §4.2.2：将每个更新矩阵的 RMS 重缩放至 0.18 以复用 AdamW 学习率）未实现：仓库沿用自校准的 muon_lr = 13/3 x adam_lr + hyperball 范数冻结 + 自研 NS 系数（有独立 probe 校准）。切到报告口径需要重做步长标定，属单独一项工作。
+9. **AdamW 的 eps** 仍走 --adam_eps（compute 缩放公式或 1e-8 兜底），没有默认成报告基线的 1e-20；严格对齐可显式 --adam_eps 1e-20。
+10. **MoE router** 仍是独立小 lr AdamW 组（报告口径的线性权重走 Muon）：正交化步长恒定偏大，实测会把路由打分持续推向失衡。
+11. **DSpark 规模**：只挂 1 个草稿 stage（官方 3）x 4 个草稿位置（官方 5），置信度调度的投机采样循环未实现。
 
 ## 已知问题
 
-- **MuonH 的 3-D 堆叠专家路径有隐患**：V4.1 架构下 `VIBY_MUONH_EXPERTS=1`（旧行为）
-  会在训练进程内随机产生非有限激活——SFT（128 长度）实测 1/3~2/3 的运行在第 1~3 个
-  微批起 loss=nan，而同一批数据与权重在进程外纯模型跑 40 次全部有限，关掉这条路径后
-  3/3 运行全程有限。表现是"梯度非有限 → NaN 守卫跳过窗口"，参数量值始终正常。
-  因此 **3-D 堆叠专家默认不进 MuonH**（走 AdamW 标量组），2-D 核心权重仍走 MuonH；
-  要复现旧行为显式设 `VIBY_MUONH_EXPERTS=1`。
+- **SFT（带 padding 的批次）偶发非有限梯度/前向**：同一命令重复跑，约 1/3~2/3 的运行会在第 1~3 个微批出现 grad_norm=nan（随后该微批 loss=nan），其余运行全程干净；预训练（无 pad）跑 30+ 步未复现。
+  已排查并排除：权重/模块状态/输入**全部有限**（逐张量枚举过 parameters 与私有 buffer）、同一批数据与权重拿到进程外纯模型重复前向+反传 40 次全有限、dump 出的 X/Y/M 逐字节相同、与优化器分组无关（Sinkhorn 新分组与 VIBY_SINKHORN=0 旧分组都会复现，也都能 3/3 干净）、与 --no_muonh / --no_compile 无关。
+  签名（随机、进程相关、同一图重复执行结果不同）指向 MLX/Metal 侧的核间竞态或未初始化读，怀疑点是 mx.fast.scaled_dot_product_attention（bool mask + sinks）或 MoE 的 scatter/gather。
+  缓解：训练循环的 NaN 守卫会跳过该累积窗口（不污染权重）；若同一进程内前向本身开始出 NaN，重启该次运行。下一步建议逐项关掉 sdpa sinks / MoE 稀疏路径做二分定位（尚未做）。
 - `--use_mtp_speculative` / `num_speculative_tokens` 被接受但被忽略：DSpark 的
   投机解码采样循环未实现（只有草稿头前向与训练损失）。
 

@@ -601,6 +601,7 @@ class BaseTrainer:
                 min_lr_ratio=getattr(self.args, "min_lr_ratio", 0.05),
                 schedule=getattr(self.args, "lr_schedule", "linear"),
                 wsd_decay_frac=getattr(self.args, "wsd_decay_frac", 0.2),
+                wsd_decay_shape=getattr(self.args, "wsd_decay_shape", "cosine"),
             )
 
             # 构造 attention_mask，屏蔽 PAD 位置（模型内部按 bool 掩码处理）

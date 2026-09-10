@@ -96,21 +96,23 @@ def test_mtp_block_size_changes_draft_loss(block):
 
 
 def test_total_loss_combines_lm_mtp_and_z():
-    """out.loss = lm_loss + z·z_loss + w·mtp_loss（w = mtp_loss_weight）。"""
+    """out.loss = lm + z·z_loss + w·mtp + a·aux（z 默认 0；a = aux_balance_loss_weight）。"""
     cfg = cfg_tiny(dspark_block_size=2, mtp_loss_weight=0.3, z_loss_weight=1e-4)
     model = build(cfg)
     mx.random.seed(82)
     ids = mx.random.randint(0, cfg.vocab_size, (1, 10))
     out = _forward(model, ids)
     want = float(out.lm_loss) + cfg.z_loss_weight * float(out.z_loss) \
-        + cfg.mtp_loss_weight * float(out.mtp_loss)
+        + cfg.mtp_loss_weight * float(out.mtp_loss) \
+        + cfg.aux_balance_loss_weight * float(out.aux_loss)
     assert float(out.loss) == pytest.approx(want, rel=1e-5, abs=1e-6)
     # use_mtp=False：不算 MTP，也不返回 mtp_loss
     plain = model(ids, labels=ids, use_mtp=False)
     mx.eval(plain.loss, plain.mtp_loss)
     assert plain.mtp_loss is None
     assert float(plain.loss) == pytest.approx(
-        float(plain.lm_loss) + cfg.z_loss_weight * float(plain.z_loss), rel=1e-5, abs=1e-6)
+        float(plain.lm_loss) + cfg.z_loss_weight * float(plain.z_loss)
+        + cfg.aux_balance_loss_weight * float(plain.aux_loss), rel=1e-5, abs=1e-6)
     # 关掉 MTP 后 loss 与开 MTP 不同
     assert abs(float(plain.loss) - float(out.loss)) > 1e-6
 

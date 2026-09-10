@@ -140,7 +140,10 @@ class VibyConfig:
         self.bos_token_id = int(kw.get("bos_token_id", 1))
         self.eos_token_id = int(kw.get("eos_token_id", 2))
         self.pad_token_id = int(kw.get("pad_token_id", 0))
-        self.z_loss_weight = float(kw.get("z_loss_weight", 1e-4))
+        # 报告 §4.2.2 的损失口径只有「无辅助损失负载均衡 + 权重 1e-4 的序列级均衡损失」，
+        # 没有 z-loss：默认关掉（字段保留，作稳定性消融用）。
+        self.z_loss_weight = float(kw.get("z_loss_weight", 0.0))
+        self.aux_balance_loss_weight = float(kw.get("aux_balance_loss_weight", 1e-4))
 
         # ---- 稀疏注意力（CSA2）----
         self.window_size = int(kw["window_size"])

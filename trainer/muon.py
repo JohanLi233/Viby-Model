@@ -1,13 +1,27 @@
 """
 Muon 混合优化器（MLX 单设备版）
 
-基于 mlx.optimizers.Muon / mlx.optimizers.MultiOptimizer 实现混合优化器：
-- Muon/MuonH：ndim >= 2 且非嵌入/输出头/ShortConv/router/零初始化门的
+基于 mlx.optimizers.Muon / mlx.optimizers.MultiOptimizer 实现混合优化器，
+分组对齐 DeepSeek-V4.1 技术报告 §2.5（优化）：
+
+- Muon/MuonH：ndim >= 2 且非嵌入/输出头/Engram 检索表/router/零初始化门的
   核心权重（含 muonh 下 3D 堆叠专家的逐专家 NS），weight_decay=0。
-  正交化每步全量重算（NS 降频复用已删）。Q/K/V per-head NS 默认关。
+  正交化每步全量重算（NS 降频复用已删）。
+  **逐头 Muon（head-wise Muon，报告 §2.5 第一条）默认开启**：Query 权重
+  （attn.wq_b / indexer.wq_b，形状 [n_heads*head_dim, in]）在施加 NS 前
+  reshape 成 (n_heads, head_dim, in) 批量正交化（注意力用 config.head_dim、
+  indexer 用 config.index_head_dim）；Key 侧是共享 K=V 的单头 wkv
+  （head_dim -> dim），拆不出多头，保持整矩阵 NS，见 BatchedMuon._per_head_dim。
+  VIBY_MUONH_PER_HEAD=0 关（消融；旧实现默认关是本仓库历史口径）。
 - 嵌入/输出头、router、其余标量参数（ShortConv、1-D gain、KDA A_log/
   dt_bias、attn_gate / KDA g_proj / GatedNorm.gate_up）使用 AdamW；
-  标量组 wd=0，embed/router wd=0.1（SFT 时 embed wd=0.01）
+- SinkhornBalanced（报告 §2.5 第二/三条 + 算法 1）：Engram 检索表、token 嵌入、
+  预测头（lm_head / DSpark markov_head 的 2D embed/head）用「Nesterov 动量 +
+  Sinkhorn 行/列均衡」更新，有效 lr 缩放 gamma=0.18、**不施加权重衰减**；
+  只留一份动量 state（替代 Adam 的一二阶矩）。
+- AdamW：归一化层权重（各 RMSNorm 的 weight，**受 wd**）、router（受 wd）、
+  其余偏置/缩放因子/3D 专家（**wd=0**）。旧口径「embed 组 wd=0.1 / SFT 0.01、
+  标量组 wd=0」随本次分组调整拆开（Sinkhorn 组按报告无 wd）。
 - pretrain 下 muon/adam 双基础 lr 与 Adam 组 beta2/eps 由
   trainer.utils.resolve_compute_scaled_hparams 按 Hyperball compute 公式写入 args
 """
@@ -26,6 +40,7 @@ _shapeful_adamw_kernels: dict = {}
 _stack_mom_kernels: dict = {}
 _stack_apply_kernels: dict = {}
 _polar_mom_kernels: dict = {}
+_sinkhorn_kernels: dict = {}
 _ns_core_fns: dict = {}
 _fro_norm_kernels: dict = {}
 
@@ -534,6 +549,75 @@ def _polar_mom_kernel(m):
     return fn
 
 
+def _sinkhorn_body(beta, gamma, K, eps, tau, n):
+    """算法 1（DeepSeek-V4.1 技术报告 §2.5）的一步更新（未编译）。
+
+    逐行对照（编号 = 报告算法 1 的行号）：
+      1  M_t ← β·M_{t-1} + (1−β)·G_t
+      2  Ĝ_t ← β·M_t + (1−β)·G_t                ⊳ Nesterov 动量
+      3  ρ_i ← ‖Ĝ_{t,i,:}‖₂，ρ̄ ← (1/m)·Σ_i ρ_i
+      4  U⁽⁰⁾ ← Ĝ_t
+      5  ρ_i ≤ τ·ρ̄ 的行置 0                     ⊳ 掩蔽近零行
+      6-16 for k = 1..K：k 奇数 → 逐行 L2 归一化（行 7-10）；
+           k 偶数 → 逐列 L2 归一化（行 11-14）；分母一律 +ε
+      17 Δ_t ← √n·U⁽ᴷ⁾                          ⊳ 单位行 ℓ₂ 范数 → 单位行 RMS
+      18 η̃_t ← γ·η_t                            ⊳ 匹配 Adam 的更新幅度
+      19 W_{t+1} ← W_t − η̃_t·Δ_t                ⊳ 无权重衰减
+
+    K 必须为奇数：最后一步落在行归一化上，U⁽ᴷ⁾ 的每一行才是单位 ℓ₂ 范数，
+    乘 √n 后才满足式 (7) 的行 RMS≈1（列方向只被交替压到同一尺度）。
+    n 是隐维度（= W 的最后一维，嵌入表/预测头口径下即模型 dim 或
+    markov rank），作为 python 常量烘进图（每形状一个编译体）。
+    范数一律 f32 累加（照 _fro_norm 的数值口径，bf16 参数也不会把
+    归一化推向随机方向），除法在权重 dtype 上做。
+    全程 mx 算子、无 host sync（可 mx.compile）。
+    """
+    sqrt_n = float(n) ** 0.5
+
+    def fn(p, g, m, lr):
+        # 行 1：动量（一阶矩，state 里唯一的 buffer）
+        m = beta * m + (1.0 - beta) * g
+        # 行 2：Nesterov 读出
+        gh = beta * m + (1.0 - beta) * g
+        # 行 3：逐行 ℓ₂ 范数 ρ_i 与均值 ρ̄（f32）
+        g32 = gh.astype(mx.float32)
+        rho = mx.sqrt(mx.sum(g32 * g32, axis=-1, keepdims=True))
+        rho_bar = mx.mean(rho)
+        # 行 4 + 5：U⁽⁰⁾ ← Ĝ_t，并把 ρ_i ≤ τ·ρ̄ 的行掩蔽为 0
+        U = mx.where(rho <= tau * rho_bar, mx.zeros_like(gh), gh)
+        # 行 6-16：K 步交替行/列 L2 归一化（奇数步行、偶数步列）
+        for k in range(1, K + 1):
+            U32 = U.astype(mx.float32)
+            if k % 2 == 1:
+                # 行 7-10：U⁽ᵏ⁾_{i,:} ← U⁽ᵏ⁻¹⁾_{i,:} / (‖U⁽ᵏ⁻¹⁾_{i,:}‖₂ + ε)
+                nrm = mx.sqrt(mx.sum(U32 * U32, axis=-1, keepdims=True))
+            else:
+                # 行 11-14：U⁽ᵏ⁾_{:,j} ← U⁽ᵏ⁻¹⁾_{:,j} / (‖U⁽ᵏ⁻¹⁾_{:,j}‖₂ + ε)
+                nrm = mx.sqrt(mx.sum(U32 * U32, axis=-2, keepdims=True))
+            U = U / (nrm + eps).astype(U.dtype)
+        # 行 17：Δ_t ← √n·U⁽ᴷ⁾（单位行 ℓ₂ → 单位行 RMS）
+        delta = (U * sqrt_n).astype(p.dtype)
+        # 行 18 + 19：W ← W − (γ·η_t)·Δ_t，无权重衰减
+        return p - (gamma * lr) * delta, m
+
+    return fn
+
+
+def _sinkhorn_kernel(beta, gamma, K, eps, tau, n):
+    """按 (β, γ, K, ε, τ, n) 缓存的 mx.compile Sinkhorn 一步更新。
+
+    超参是 python float 而非 traced 输入：与 _adamw_kernel 同样的理由
+    （MLX 弱类型提升下 float×bf16 保持 bf16，换成 f32 数组会抬 dtype）；
+    lr 随 scheduler 每步变，作数组入参。
+    """
+    key = (beta, gamma, K, eps, tau, n)
+    fn = _sinkhorn_kernels.get(key)
+    if fn is None:
+        fn = partial(mx.compile, shapeless=True)(_sinkhorn_body(*key))
+        _sinkhorn_kernels[key] = fn
+    return fn
+
+
 def _normuon_tail(X, v, beta2):
     """NorMuon 行 RMS 尾（arXiv 2510.05491）：神经元粒度的自适应。
     X (…, r, c)，v (…, r) 为逐行二阶矩 EMA（None 时以首个样本播种）。
@@ -765,6 +849,75 @@ class AdamH(FusedAdamW):
         return optim.Optimizer.apply_gradients(self, gradients, parameters)
 
 
+class SinkhornBalanced(optim.Optimizer):
+    """Sinkhorn 均衡更新（报告 §2.5 第二/三条 + 算法 1；超参见 §4.2.2）。
+
+    用于三类 vocab 维大矩阵：Engram 检索表、token 嵌入、预测头（lm_head 与
+    DSpark markov_head 的 2D embed/head）。与 Muon 同流程，只把
+    Newton–Schulz 正交化换成 Sinkhorn 行/列 L2 均衡：
+
+      Δ_t = √n·U⁽ᴷ⁾ = √n·D_r·Ĝ_t·D_c，  η̃_t = γ·η_t，  W ← W − η̃_t·Δ_t
+
+    状态只有一份动量 m（替代 Adam 的 m/v，报告以此为省显存动机），
+    **不施加权重衰减**（报告 §2.5：「Sinkhorn 均衡更新同样使用 Nesterov
+    动量，但不施加权重衰减」）。逐行实现见 _sinkhorn_body 的对照注释。
+
+    超参（报告 §4.2.2）：动量 = Muon 的动量系数（0.95）、lr 校正因子
+    γ = 0.18、K = 11、τ = 10⁻³、ε = 10⁻²⁰；K 必须为奇数（最后一步落在
+    行归一化上，U⁽ᴷ⁾ 才满足式 (7) 的单位行 RMS）。
+
+    lr 语义：η_t 是「本来给这些参数用的 AdamW 学习率」，η̃_t = γ·η_t 由
+    本类内部施加（报告 §2.5：「调整有效学习率以匹配 Adam 的更新幅度」）；
+    训练循环的 lr 日程照常写 opt.learning_rate。
+    """
+
+    def __init__(
+        self,
+        learning_rate,
+        momentum=0.95,
+        gamma=0.18,
+        sinkhorn_steps=11,
+        eps=1e-20,
+        tau=1e-3,
+    ):
+        super().__init__()
+        if int(sinkhorn_steps) % 2 != 1:
+            raise ValueError(f"K 必须是奇数（收尾在行归一化），收到 {sinkhorn_steps}")
+        # 学习率既可给常数也可给 scheduler callable（与 mlx 其它优化器一致）
+        self._maybe_schedule("learning_rate", learning_rate)
+        # 暴露 momentum 属性：trainer.utils.apply_lr_schedule 会按 Muon 的
+        # momentum 日程同步写它（`hasattr(opt, "momentum")`），检查点也随
+        # _optimizer_hparams 存取——与 Muon 组同源，符合 §4.2.2「与 Muon
+        # 相同的动量系数」。
+        self.momentum = float(momentum)
+        self.gamma = float(gamma)
+        self.sinkhorn_steps = int(sinkhorn_steps)
+        self.eps = float(eps)
+        self.tau = float(tau)
+
+    def init_single(self, parameter: mx.array, state: dict):
+        """只初始化一份动量（省掉 Adam 的二阶矩）。"""
+        state["m"] = mx.zeros_like(parameter)
+
+    def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
+        assert parameter.ndim == 2, (
+            f"SinkhornBalanced 只处理 2D 权重矩阵，收到 {parameter.shape}"
+        )
+        lr = self.learning_rate.astype(gradient.dtype)
+        # n = 隐维度 = W 的最后一维（嵌入/预测头口径）；每形状一个编译体。
+        fn = _sinkhorn_kernel(
+            self.momentum,
+            self.gamma,
+            self.sinkhorn_steps,
+            self.eps,
+            self.tau,
+            int(parameter.shape[-1]),
+        )
+        p, m = fn(parameter, gradient, state["m"], lr)
+        state["m"] = m
+        return p
+
+
 class BatchedMuon(optim.Muon):
     """Muon 的批量 Newton-Schulz 版：按形状分组堆叠成 (N, r, c) 一次跑 NS，
     动量更新与 lr 缩放同样在组内批量完成。
@@ -784,6 +937,12 @@ class BatchedMuon(optim.Muon):
     （gauge 自由度），冻结它让优化器带宽全花在方向上，lr 语义也更干净。
     与 r073 bias 零均值投影同一哲学。ndim>2 的堆叠专家以 axis0 为
     batch 逐矩阵 NS（无跨专家耦合），norm 投影同样逐矩阵。
+
+    逐头 Muon（报告 §2.5 第一条，默认开）：Query 权重按行 reshape 成
+    (n_heads, head_dim, in) 后走同一条 stack 路径——每个头独立 NS，
+    hyperball 下每个头的 Frobenius 范数各自冻结（head_dim 由
+    _per_head_dim 按路径解析：注意力 head_dim / indexer index_head_dim）。
+    这就是「为不同头提供不同预条件器」；单头共享的 wkv 不切。
 
     【负面结果，勿重引入】曾实现过 NS 降频复用（每 8 步重算正交化、
     命中步复用旧极因子 D；以及 Temporal 变体：缓存左变换 Q、命中步
@@ -806,6 +965,7 @@ class BatchedMuon(optim.Muon):
         ns_bf16=False,
         stack_ns_steps=None,
         head_dim=0,
+        index_head_dim=0,
         polar_ema=False,
         normuon_beta2=0.0,
         cautious_wd=False,
@@ -846,8 +1006,12 @@ class BatchedMuon(optim.Muon):
         # 堆叠专家组的 NS 迭代步数（None = 与 ns_steps 相同）。仅迭代
         # 次数，不是降频——正交化每步全量重算（降频复用损害见类 docstring）。
         self.stack_ns_steps = stack_ns_steps
-        # K3 Per-Head Muon：Q/K/V 沿 head 切开做 NS。0 关闭。
+        # 逐头 Muon（报告 §2.5 第一条）：Query 权重沿 head 切开做 NS。
+        # head_dim=0 关闭；index_head_dim 是 indexer 的逐头维度（V4.1 的
+        # indexer 头数/头维度与主注意力不同：config.index_n_heads/
+        # index_head_dim，故两条路径各用各的 head_dim，见 _per_head_dim）。
         self.head_dim = int(head_dim or 0)
+        self.index_head_dim = int(index_head_dim or 0)
         # 测量开关（默认关）：VIBY_MUONH_NO_NS=1 时跳过谱均衡，X 改为
         # F-范数匹配 NS 输出的归一化动量——隔离「hyperball 范数冻结」与
         # 「NS 谱均衡」各自的贡献。仅归因测量用，勿用于正式 run。
@@ -903,12 +1067,25 @@ class BatchedMuon(optim.Muon):
         s = float(min(U.shape[-2], U.shape[-1])) ** 0.5
         return U * (s / (nrm + 1e-12)).astype(U.dtype)
 
-    @staticmethod
-    def _is_qkv_path(path: str) -> bool:
-        return any(
-            p in ("q_proj", "k_proj", "v_proj", "kv_proj")
-            for p in path.replace("/", ".").split(".")
-        )
+    def _per_head_dim(self, path: str) -> int:
+        """该参数按头切开时每头的行数；0 = 不做逐头（整矩阵 NS）。
+
+        报告 §2.5 第一条：**Query 与 Key 权重使用逐头 Muon**。本架构里
+        Query 权重是 attn.wq_b（[n_heads*head_dim, q_lora_rank]）与
+        indexer.wq_b（[index_n_heads*index_head_dim, q_lora_rank]），按行
+        reshape 成 (n_heads, head_dim, in) 恰好是逐头切分（行连续）。
+        Key 侧是共享 K=V 的单头 wkv（nn.Linear(dim, head_dim)，形状
+        [head_dim, dim]）：它只有**一个** head，拆不出多个头，因此保持整
+        矩阵 NS（wkv 的行数就是 head_dim 本身，按行拆开等于把每个通道当
+        一个头，语义错误）。旧命名的 q_proj 一并保留以兼容历史 checkpoint；
+        k_proj/v_proj/kv_proj 在本架构不存在，也不做逐头。
+        """
+        parts = path.replace("/", ".").split(".")
+        if "wq_b" not in parts and "q_proj" not in parts:
+            return 0
+        if ".indexer." in path:
+            return self.index_head_dim
+        return self.head_dim
 
     def _ns5(self, X, steps=None):
         """批量 Newton-Schulz：X (N, r, c)，batch 维无耦合（照抄基类规则）。
@@ -974,12 +1151,16 @@ class BatchedMuon(optim.Muon):
                 c = g.size // (b * r)
                 stack_groups.setdefault((b, r, c), []).append((path, orig))
             elif (
-                self.head_dim > 0
-                and self._is_qkv_path(path)
-                and orig[0] % self.head_dim == 0
+                (hd := self._per_head_dim(path)) > 0
+                and orig[0] % hd == 0
             ):
-                nh = orig[0] // self.head_dim
-                stack_groups.setdefault((nh, self.head_dim, orig[1]), []).append(
+                # 逐头 Muon：Query 权重按行拆成 (n_heads, head_dim, in) 后
+                # 进 stack 组（batch 维无耦合，等于每头独立 NS + 逐头
+                # hyperball 范数冻结）。注意力用 config.head_dim、indexer 用
+                # config.index_head_dim——两者头数/头维度不同，key 天然分到
+                # 不同 stack 组（key 含 r=head_dim）。
+                nh = orig[0] // hd
+                stack_groups.setdefault((nh, hd, orig[1]), []).append(
                     (path, orig)
                 )
             else:
@@ -1210,22 +1391,28 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     Adam/AdamH 组的 beta2/eps 同样由 args.adam_beta2 / args.adam_eps 给出
     （兜底旧常数 0.95 / 1e-8），beta1 恒 0.9。
 
-    参数分组（DeepSeek-V4.1 缩放版）：
-    - Muon：ndim >= 2 的核心权重矩阵（注意力 wq/wkv/wo、专家、mHC fn、
-      Engram wkv、MTP 投影），wd=0
-    - AdamH(lm_head)：Adam 方向 + 范数球投影，lr = muon_lr（仅 muonh 下）
-    - AdamW(embed)：token embedding / lm_head / DSpark 马尔可夫头（查表与
-      readout），lr = adam_lr，wd=0.1
-    - Adam(Engram 表)：model.engram_layers.*.embed.weight，lr = adam_lr × 5，
-      wd=0（稀疏 gather 更新不适合 Muon/超球投影；V4.1 §2.5 的 Engram 5× lr）
+    参数分组（DeepSeek-V4.1 缩放版，对齐报告 §2.5 + §4.2.2）：
+    - Muon/MuonH：ndim >= 2 的核心权重矩阵（注意力 wq_a/wq_b/wkv/wo、专家、
+      mHC fn、Engram wkv 投影、MTP 投影），wd=0。其中 Query 权重
+      （attn.wq_b / indexer.wq_b）**默认逐头 NS**（§2.5 第一条；
+      VIBY_MUONH_PER_HEAD=0 关，消融用）；K=V 共享的单头 wkv 保持整矩阵。
+    - SinkhornBalanced（§2.5 第二/三条 + 算法 1，超参 §4.2.2）：Engram
+      检索表（**5× lr**，§4.2.2「Engram 的学习率被放大 5 倍」）、token 嵌入
+      与预测头（lm_head / DSpark markov_head 的 2D embed+head）。
+      动量同 Muon（0.95）、γ=0.18、K=11、τ=1e-3、ε=1e-20，**无 wd**；
+      只存一份动量。
+    - AdamW(norm)：归一化层权重（各 RMSNorm 的 .weight），lr = adam_lr，
+      **wd=adam_wd**（§2.5：「归一化层权重同样受权重衰减影响」）
     - AdamW(router)：router.weight，lr = adam_lr * 0.05（MOE_ROUTER_LR_MULT
-      可调），wd=0.1。router.bias 是 frozen 的 e_score_correction_bias：不在
-      trainable 里，由训练循环按负载覆写（noaux_tc），分组统计不会看到它。
-    - AdamW(scalar)：其余全部（1-D gain/scale/base、attn_sink 零初始化、
-      Engram 的 q_weight/k_weight 乘性门、confidence head），lr = adam_lr，
-      **wd=0**（这些参数要么零初始化、要么有校准过的尺度；wd=0.1 会在
-      1-epoch 内把它们径向缩到 ~10%）
-    （SFT 时 embed/scalar lr 分别乘 0.1/0.3；embed wd=0.01，scalar wd=0）
+      可调），wd=adam_wd。router.bias 是 frozen 的 e_score_correction_bias：
+      不在 trainable 里，由训练循环按负载覆写（noaux_tc），分组统计看不到它。
+    - AdamW(no-wd)：其余全部（偏置/缩放因子：attn_sink 零初始化、mHC
+      scale/base、Engram 的 q_weight/k_weight 乘性门、confidence head，
+      以及默认不入 Muon 的 3D 专家栈），lr = adam_lr，**wd=0**（§2.5：
+      「偏置与缩放因子不受」权重衰减；这些参数要么零初始化、要么有校准过的
+      尺度，wd=0.1 会在 1-epoch 内把它们径向缩到 ~10%）
+    （SFT 时 embed/scalar lr 分别乘 0.1/0.3；norm 组 wd=0.01，no-wd 组 wd=0。
+    VIBY_SINKHORN=0 回退旧分组：lm_head 走 AdamH、embed/Engram 表走 AdamW）
 
     --muonh（MuonH/AdamH/Adam 体系，Marin 口径，默认开启）：
     - Muon 组更新加 Frobenius 范数球投影（方向/范数解耦，hyperball）；
@@ -1283,15 +1470,59 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         return ".engram_layers." in path and path.endswith(".embed.weight")
 
     def _is_adamh(path, arr):
-        # lm_head readout：Adam 方向 + 范数球投影（AdamH 类），仅 muonh 下
+        # 旧分组的 lm_head readout：Adam 方向 + 范数球投影（AdamH 类），仅
+        # muonh 下启用。默认 lm_head 归 Sinkhorn 组（§2.5：预测头用「动量 +
+        # Sinkhorn 均衡」，不再存 Adam 的一二阶矩），只有 VIBY_SINKHORN=0
+        # 的消融回退才走这里。
         return muonh and "lm_head" in path and arr.ndim >= 2
+
+    # ---- Sinkhorn 均衡组（报告 §2.5 算法 1；超参 §4.2.2）----
+    # 默认开：Engram 检索表（5× lr，§4.2.2）/ token 嵌入 / 预测头改走
+    # SinkhornBalanced（Nesterov 动量 + 行/列 L2 均衡，无 wd）。
+    # VIBY_SINKHORN=0 回退旧分组（lm_head→AdamH、embed/Engram 表→AdamW），
+    # 供既有 checkpoint / 消融使用。
+    sinkhorn_on = os.environ.get("VIBY_SINKHORN", "1") == "1"
+    _sink_beta = float(
+        getattr(args, "muon_momentum", None)
+        or os.environ.get("VIBY_SINKHORN_BETA", "0.95")
+    )
+    _sink_gamma = float(os.environ.get("VIBY_SINKHORN_GAMMA", "0.18"))
+    _sink_steps = int(
+        getattr(args, "sinkhorn_steps", None)
+        or os.environ.get("VIBY_SINKHORN_K", "11")
+    )
+    _sink_eps = float(os.environ.get("VIBY_SINKHORN_EPS", "1e-20"))
+    _sink_tau = float(os.environ.get("VIBY_SINKHORN_TAU", "1e-3"))
+    # Engram 检索表 lr 放大倍数（§4.2.2：「Engram 的学习率被放大 5 倍」，
+    # 引 Cheng et al., 2026b）
+    _engram_lr_mult = float(os.environ.get("VIBY_ENGRAM_LR_MULT", "5.0"))
+
+    def _is_ngram_sinkhorn(path, arr):
+        # Engram 检索表（5× lr）：.engram_layers.*.embed.weight，2-D 才收。
+        # 非 2-D（理论不会出现）落 AdamW 无衰减组。
+        return sinkhorn_on and arr.ndim == 2 and _is_ngram_table(path, arr)
+
+    def _is_sinkhorn(path, arr):
+        # token 嵌入 / lm_head / DSpark markov_head（embed 与 head 都是 vocab
+        # 维查表/readout 语义）。2-D 才收：markov 头若退化成别的形状就落
+        # AdamW 无衰减组（不做 Sinkhorn 行/列均衡）。
+        return sinkhorn_on and arr.ndim == 2 and _is_embed(path, arr)
+
+    def _is_norm_weight(path, arr):
+        # 归一化层权重：RMSNorm 的 1-D weight（模块名以 norm 结尾：attn_norm/
+        # ffn_norm/q_norm/kv_norm/k_norm/compressor.norm/main_norm/model.norm）。
+        # 报告 §2.5：这类参数保留 AdamW，且**受权重衰减影响**——与偏置/
+        # 缩放因子（wd=0）分属两组。
+        if arr.ndim != 1 or not path.endswith(".weight"):
+            return False
+        return any(p.endswith("norm") for p in path.split(".")[:-1])
 
     def _is_muon(path, arr):
         # 3D 堆叠专家：muonh 下（默认）由堆叠组逐专家 NS；`--no_muonh` 或
         # VIBY_MUONH_EXPERTS=0 时排除进 AdamW，避免基类 reshape (E,out·in)
         # 跨专家耦合。MoE router 也不走 Muon：正交化更新步长恒定偏大，会把
         # 路由打分持续推向失衡；单独小 lr AdamW 组。
-        # 三类"矩阵形状但不该正交化"的参数落 Adam 标量组：
+        # 三类"矩阵形状但不该正交化"的参数落 AdamW 无衰减组：
         # - Engram 的 q_weight/k_weight（ones 初始化的乘性门，MuonH 的超球
         #   半径=初始范数，正交化会改掉门的尺度语义）；
         # - confidence head（输出维 1，正交化步长语义不适用）；
@@ -1314,45 +1545,127 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     def _is_router(path, arr):
         return ".router." in path
 
+    # 逐头 Muon（报告 §2.5 第一条）：Query 权重默认按头切开做 NS。
+    # 旧实现默认关（VIBY_MUONH_PER_HEAD 未设时 hd=0），且旧 _is_qkv_path
+    # 匹配的是 q_proj/k_proj/v_proj/kv_proj——V4.1 架构里这些名字都不存在
+    # （新名字 wq_b/wkv），逐头实际从未生效；当时的 per-head 负面归因
+    # （r082 probe_p8/p7 −0.14 nat @500）还叠加了 NS 降频复用 + stale 极
+    # 因子（probe_p2 −0.26 nat），不是干净口径。报告口径是**默认用逐头
+    # Muon**，故这里翻默认：VIBY_MUONH_PER_HEAD=0 关闭（保留消融能力）。
+    # 两条 Q 路径 head_dim 不同：主注意力 config.head_dim、indexer
+    # config.index_head_dim；Key 侧是共享 K=V 的单头 wkv（[head_dim, dim]），
+    # 拆不出多头，保持整矩阵 NS（见 BatchedMuon._per_head_dim）。
+    _per_head_on = os.environ.get("VIBY_MUONH_PER_HEAD", "1") == "1"
+    _cfg = getattr(model, "config", None)
+    hd = int(getattr(_cfg, "head_dim", 0) or 0) if _per_head_on else 0
+    hd_index = int(getattr(_cfg, "index_head_dim", 0) or 0) if _per_head_on else 0
+
+    def _head_dim_of(path: str) -> int:
+        parts = path.replace("/", ".").split(".")
+        if "wq_b" not in parts and "q_proj" not in parts:
+            return 0
+        return hd_index if ".indexer." in path else hd
+
+    if training_type == "sft":
+        embed_lr_mult, scalar_lr_mult, adam_wd = 0.1, 0.3, 0.01
+    else:
+        embed_lr_mult, scalar_lr_mult, adam_wd = 1.0, 1.0, 0.1
+
     muon_count = sum(1 for p, a in trainable if _is_muon(p, a))
-    adamh_count = sum(1 for p, a in trainable if _is_adamh(p, a) and not _is_muon(p, a))
+    per_head_count = sum(
+        1 for p, a in trainable if _is_muon(p, a) and _head_dim_of(p) > 0
+    )
+    sinkhorn_engram_count = sum(1 for p, a in trainable if _is_ngram_sinkhorn(p, a))
+    sinkhorn_embed_count = sum(1 for p, a in trainable if _is_sinkhorn(p, a))
+    sinkhorn_engram_params = sum(
+        a.size for p, a in trainable if _is_ngram_sinkhorn(p, a)
+    )
+    sinkhorn_embed_params = sum(a.size for p, a in trainable if _is_sinkhorn(p, a))
+    adamh_count = sum(
+        1
+        for p, a in trainable
+        if not sinkhorn_on and _is_adamh(p, a) and not _is_muon(p, a)
+    )
     embed_count = sum(
         1
         for p, a in trainable
-        if _is_embed(p, a) and not _is_muon(p, a) and not _is_adamh(p, a)
+        if not sinkhorn_on
+        and _is_embed(p, a)
+        and not _is_muon(p, a)
+        and not _is_adamh(p, a)
     )
-    ngram_table_count = sum(1 for p, a in trainable if _is_ngram_table(p, a))
+    ngram_table_count = sum(
+        1 for p, a in trainable if not sinkhorn_on and _is_ngram_table(p, a)
+    )
+    norm_count = sum(
+        1
+        for p, a in trainable
+        if _is_norm_weight(p, a) and not _is_muon(p, a) and not _is_router(p, a)
+    )
     router_count = sum(
         1 for p, a in trainable if _is_router(p, a) and not _is_muon(p, a)
     )
-    scalar_count = sum(
+    # 无衰减组：除 Muon / Sinkhorn / norm / router 以外的全部参数
+    nowd_count = sum(
         1
         for p, a in trainable
         if not _is_muon(p, a)
-        and not _is_adamh(p, a)
-        and not _is_embed(p, a)
-        and not _is_ngram_table(p, a)
+        and not _is_ngram_sinkhorn(p, a)
+        and not _is_sinkhorn(p, a)
+        and not _is_norm_weight(p, a)
+        and not _is_router(p, a)
+    )
+    nowd_params = sum(
+        a.size
+        for p, a in trainable
+        if not _is_muon(p, a)
+        and not _is_ngram_sinkhorn(p, a)
+        and not _is_sinkhorn(p, a)
+        and not _is_norm_weight(p, a)
         and not _is_router(p, a)
     )
 
     Logger("参数分组完成：")
     Logger(
         f"  - {'MuonH(hyperball)' if muonh else 'Muon'} 参数组 (核心权重): "
-        f"{muon_count} 个张量"
+        f"{muon_count} 个张量（逐头 Muon 的 Q 权重 {per_head_count} 个：注意力 "
+        f"head_dim={hd}、indexer head_dim={hd_index}）"
     )
-    if muonh:
-        Logger(f"  - AdamH 参数组 (lm_head): {adamh_count} 个张量")
-    Logger(f"  - 嵌入层参数组: {embed_count} 个张量")
-    if ngram_table_count:
-        Logger(f"  - Engram 检索表参数组 (Adam 5x lr, wd=0): {ngram_table_count} 个张量")
-    Logger(f"  - MoE router 参数组: {router_count} 个张量")
-    Logger(f"  - 标量参数组: {scalar_count} 个张量")
-
-    if training_type == "sft":
-        embed_lr_mult, scalar_lr_mult, adam_wd = 0.1, 0.3, 0.01
+    if sinkhorn_on:
+        Logger(
+            f"  - Sinkhorn 均衡组 (token 嵌入/预测头, lr=adam_lr, "
+            f"γ={_sink_gamma:g}, K={_sink_steps}, τ={_sink_tau:g}, "
+            f"ε={_sink_eps:g}, β={_sink_beta:g}, wd=0): "
+            f"{sinkhorn_embed_count} 个张量 / {sinkhorn_embed_params:,} 参数"
+        )
+        Logger(
+            f"  - Sinkhorn 均衡组 (Engram 检索表, lr={_engram_lr_mult:g}×adam_lr, "
+            f"wd=0): {sinkhorn_engram_count} 个张量 / "
+            f"{sinkhorn_engram_params:,} 参数"
+        )
     else:
-        embed_lr_mult, scalar_lr_mult, adam_wd = 1.0, 1.0, 0.1
-    # router 需要远小于 AdamW 标量组的 lr：AdamW 每坐标步长≈lr，adam base lr
+        Logger("  - Sinkhorn 均衡组: 关闭（VIBY_SINKHORN=0，回退旧分组）")
+        if muonh:
+            Logger(f"  - AdamH 参数组 (lm_head): {adamh_count} 个张量")
+        Logger(f"  - AdamW 嵌入层参数组 (wd={adam_wd:g}): {embed_count} 个张量")
+        if ngram_table_count:
+            Logger(
+                f"  - Engram 检索表参数组 (Adam 5x lr, wd=0): "
+                f"{ngram_table_count} 个张量"
+            )
+    Logger(
+        f"  - AdamW 归一化层权重组 (lr=adam_lr, wd={adam_wd:g}): "
+        f"{norm_count} 个张量"
+    )
+    Logger(
+        f"  - MoE router 参数组 (lr=adam_lr×0.05, wd={adam_wd:g}): "
+        f"{router_count} 个张量"
+    )
+    Logger(
+        f"  - AdamW 无衰减组 (偏置/缩放因子/3D 专家, wd=0): "
+        f"{nowd_count} 个张量 / {nowd_params:,} 参数"
+    )
+    # router 需要远小于 AdamW 组的 lr：AdamW 每坐标步长≈lr，adam base lr
     # 下 ~10 步就把 (32,768) 的 router 权重打乱到 sigmoid
     # 饱和（实测 C 瞬间冲到 14K、吞吐 -45%）；0.05× 让其慢速移动、
     # bias 均衡项压得住负载。可用 MOE_ROUTER_LR_MULT 覆盖。
@@ -1360,13 +1673,6 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         os.environ.get("MOE_ROUTER_LR_MULT", getattr(args, "router_lr_mult", 0.05))
     )
 
-    # per-head NS（Q/K/V 按 head 切分正交化）默认关闭：r082 归因隔离实测
-    # 单独就有害（−0.14 nat @500 步，probe_p8 vs p7），且在 NS 降频 regime
-    # 下与 stale 极因子叠加放大到 −0.26 nat（probe_p2）。
-    # VIBY_MUONH_PER_HEAD=1 可重新打开（消融用）。
-    hd = int(getattr(getattr(model, "config", None), "head_dim", 0) or 0)
-    if os.environ.get("VIBY_MUONH_PER_HEAD", "0") != "1":
-        hd = 0
     # autoresearch-mlx 战役（2026-09-01 结算）验证出的优化器组件。
     # 默认开：NorMuon 行 RMS 尾、cautious weight decay（muon 组与 Adam
     # 组）；默认关：polar-ema（用户决策 2026-09-02：先不上生产默认，
@@ -1418,6 +1724,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
             ns_steps=int(getattr(args, "muon_ns_steps", 5)),
             hyperball=muonh,
             head_dim=hd,
+            index_head_dim=hd_index,
             # muonh 加速旋钮（默认路径 muonh=False 时全部不影响数值）：
             # NS 迭代 bf16（范数仍 fp32）；逐专家 NS 的迭代步数
             ns_bf16=muonh and os.environ.get("VIBY_MUONH_NS_BF16", "1") == "1",
@@ -1450,6 +1757,36 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         weight_decay=0.0,
         bias_correction=True,
     )
+    # Sinkhorn 均衡组（报告 §2.5 算法 1，超参 §4.2.2）：动量同 Muon、
+    # γ=0.18、K=11、τ=1e-3、ε=1e-20、无 wd。两个实例只为 lr 口径分开：
+    # Engram 检索表 5× lr（§4.2.2 引 Cheng et al., 2026b），token 嵌入与
+    # 预测头 1× lr（都是「原来给这些参数的 AdamW lr」，γ 在类内部施加）。
+    sinkhorn_engram = SinkhornBalanced(
+        learning_rate=adam_lr * embed_lr_mult * _engram_lr_mult,
+        momentum=_sink_beta,
+        gamma=_sink_gamma,
+        sinkhorn_steps=_sink_steps,
+        eps=_sink_eps,
+        tau=_sink_tau,
+    )
+    sinkhorn_embed = SinkhornBalanced(
+        learning_rate=adam_lr * embed_lr_mult,
+        momentum=_sink_beta,
+        gamma=_sink_gamma,
+        sinkhorn_steps=_sink_steps,
+        eps=_sink_eps,
+        tau=_sink_tau,
+    )
+    # 归一化层权重：AdamW 且**受 wd**（§2.5：「归一化层权重同样受权重衰减
+    # 影响，而偏置与缩放因子不受」）。lr 沿用旧标量组的 adam_lr 口径。
+    adamw_norm = FusedAdamW(
+        learning_rate=adam_lr * scalar_lr_mult,
+        betas=[0.9, beta2],
+        eps=eps,
+        weight_decay=adam_wd,
+        bias_correction=True,
+        cautious=_adam_cautious,
+    )
     adamw_router = FusedAdamW(
         learning_rate=adam_lr * router_lr_mult,
         betas=[0.9, beta2],
@@ -1458,7 +1795,8 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         bias_correction=True,
         cautious=_adam_cautious,
     )
-    adamw_scalar = FusedAdamW(
+    # 偏置 / 缩放因子 / 默认不入 Muon 的 3D 专家栈：wd=0
+    adamw_nowd = FusedAdamW(
         learning_rate=adam_lr * scalar_lr_mult,
         betas=[0.9, beta2],
         eps=eps,
@@ -1468,44 +1806,42 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
 
     # 为学习率调度器存储初始学习率
     muon_opt.base_lr = muon_lr
-    adamh_head.base_lr = muon_lr
-    adamw_embed.base_lr = adam_lr * embed_lr_mult
-    adamw_ngram_table.base_lr = adam_lr * embed_lr_mult * 5.0
+    sinkhorn_engram.base_lr = adam_lr * embed_lr_mult * _engram_lr_mult
+    sinkhorn_embed.base_lr = adam_lr * embed_lr_mult
+    adamw_norm.base_lr = adam_lr * scalar_lr_mult
     adamw_router.base_lr = adam_lr * router_lr_mult
-    adamw_scalar.base_lr = adam_lr * scalar_lr_mult
+    adamw_nowd.base_lr = adam_lr * scalar_lr_mult
+    if not sinkhorn_on:  # 消融回退组（VIBY_SINKHORN=0）
+        adamh_head.base_lr = muon_lr
+        adamw_embed.base_lr = adam_lr * embed_lr_mult
+        adamw_ngram_table.base_lr = adam_lr * embed_lr_mult * 5.0
 
     # MultiOptimizer: filters 数量 = len(optimizers) - 1，按顺序首个命中生效，
-    # 未命中任何 filter 的参数落到最后一组（AdamW 标量兜底，不限 ndim）。
-    # 空组必须剔除（如 tied embedding 时无 lm_head/AdamH 组）：mlx
-    # MultiOptimizer 对空组会在首次 step 的 state init 抛 IndexError。
-    optimizers = [
-        muon_opt,
-        adamh_head,
-        adamw_embed,
-        adamw_ngram_table,
-        adamw_router,
-        adamw_scalar,
-    ]
-    counts = [
-        muon_count,
-        adamh_count,
-        embed_count,
-        ngram_table_count,
-        router_count,
-        scalar_count,
-    ]
-    filters_all = [
-        _is_muon,
-        _is_adamh,
-        _is_embed,
-        _is_ngram_table,
-        _is_router,
-        None,
-    ]
+    # 未命中任何 filter 的参数落到最后一组（AdamW 无衰减兜底，不限 ndim）。
+    # 空组必须剔除（如 tied embedding 时无 lm_head/AdamH 组、无 Engram 表）：
+    # mlx MultiOptimizer 对空组会在首次 step 的 state init 抛 IndexError。
+    # 默认（sinkhorn_on）：Muon → Sinkhorn(Engram 5×) → Sinkhorn(embed/头) →
+    #                norm(wd) → router(wd) → no-wd 兜底
+    # 回退（VIBY_SINKHORN=0）：Muon → AdamH(lm_head) → AdamW(embed) →
+    #                AdamW(Engram 5×) → norm(wd) → router(wd) → no-wd 兜底
+    optimizers = [muon_opt]
+    counts = [muon_count]
+    filters_all = [_is_muon]
+    if sinkhorn_on:
+        optimizers += [sinkhorn_engram, sinkhorn_embed]
+        counts += [sinkhorn_engram_count, sinkhorn_embed_count]
+        filters_all += [_is_ngram_sinkhorn, _is_sinkhorn]
+    else:
+        optimizers += [adamh_head, adamw_embed, adamw_ngram_table]
+        counts += [adamh_count, embed_count, ngram_table_count]
+        filters_all += [_is_adamh, _is_embed, _is_ngram_table]
+    optimizers += [adamw_norm, adamw_router, adamw_nowd]
+    counts += [norm_count, router_count, nowd_count]
+    filters_all += [_is_norm_weight, _is_router, None]
     keep = [
         i
         for i, (c, f) in enumerate(zip(counts, filters_all))
-        if c > 0 or f is None  # scalar 组作为兜底永远保留
+        if c > 0 or f is None  # 无衰减组作为兜底永远保留
     ]
     return optim.MultiOptimizer(
         [optimizers[i] for i in keep],

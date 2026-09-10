@@ -121,11 +121,15 @@ def load_model_weights(
     checkpoint_path,
     strict=True,
     label="checkpoint",
+    allow_fresh_prefixes=(),
 ):
     """安全地加载模型权重。
 
     - `strict=True` 时，除 `_NON_STRICT_WEIGHT_KEYS` 之外缺少/多余/形状不一致
       的参数都会抛错，避免静默得到随机初始化的部分模型。
+    - `allow_fresh_prefixes`：这些前缀下的参数允许 checkpoint 里没有（从零
+      初始化）。DSpark 独立阶段（报告 §2.4.3）就是用它：基座预训练时不含
+      MTP 模块，草稿层在这一阶段才引入。
     """
     if not checkpoint_path or not os.path.exists(checkpoint_path):
         Logger(f"Warning: {label} {checkpoint_path} not found")
@@ -167,7 +171,9 @@ def load_model_weights(
     missing = [
         key
         for key, shape in model_shapes.items()
-        if key not in loaded and not _is_non_strict_key(key)
+        if key not in loaded
+        and not _is_non_strict_key(key)
+        and not any(key.startswith(pref) for pref in allow_fresh_prefixes)
     ]
     if strict and missing:
         raise ValueError(
@@ -268,6 +274,10 @@ def build_model_and_tokenizer(
             checkpoint_path,
             strict=strict,
             label=checkpoint_label,
+            # DSpark 独立阶段：基座 checkpoint 没有草稿层参数，从零初始化
+            allow_fresh_prefixes=("mtp_modules.",)
+            if getattr(args, "freeze_backbone", False)
+            else (),
         )
         if not loaded:
             raise FileNotFoundError(
@@ -702,6 +712,7 @@ def get_lr_and_momentum(
     min_lr_ratio: float = 0.05,
     schedule: str = "linear",
     wsd_decay_frac: float = 0.2,
+    wsd_decay_shape: str = "linear",
 ) -> Tuple[float, float]:
     """
     计算当前步骤的学习率乘子和动量。
@@ -730,7 +741,13 @@ def get_lr_and_momentum(
             progress = float(step - decay_start) / float(
                 max(1, total_steps - decay_start)
             )
-            lr_multiplier = 1.0 - (1.0 - min_lr_ratio) * progress
+            if wsd_decay_shape == "cosine":
+                # 报告 §4.2.2：平台后用余弦从 peak 衰减到 min_lr_ratio
+                import math as _math
+                cosine = 0.5 * (1.0 + _math.cos(_math.pi * min(progress, 1.0)))
+                lr_multiplier = min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+            else:
+                lr_multiplier = 1.0 - (1.0 - min_lr_ratio) * progress
     else:
         progress = float(step - warmup_steps) / float(
             max(1, total_steps - warmup_steps)
@@ -841,8 +858,18 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
     """统一的检查点加载函数（safetensors 格式）"""
     Logger(f"Loading checkpoint from: {checkpoint_path}")
 
-    # 加载模型权重（严格校验，buffer shape 不匹配时保留当前 config 的版本）
-    if not load_model_weights(model, checkpoint_path, strict=True, label="checkpoint"):
+    # 加载模型权重（严格校验，buffer shape 不匹配时保留当前 config 的版本）。
+    # --freeze_backbone 的 DSpark 独立阶段（报告 §2.4.3）允许基座 checkpoint
+    # 里没有 mtp_modules.*：草稿层在该阶段才引入，从零初始化。
+    if not load_model_weights(
+        model,
+        checkpoint_path,
+        strict=True,
+        label="checkpoint",
+        allow_fresh_prefixes=("mtp_modules.",)
+        if getattr(args, "freeze_backbone", False)
+        else (),
+    ):
         raise FileNotFoundError(f"Checkpoint 不存在: {checkpoint_path}")
 
     # 推导配套文件路径
@@ -857,8 +884,11 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
-    # 加载优化器状态（如未指定重置）
-    if not getattr(args, "reset_optimizer", False):
+    # 加载优化器状态（如未指定重置）。--freeze_backbone 的 DSpark 阶段可训练集合
+    # 与基座训练不同（只有 mtp_modules.*），优化器分组天然不一致，必须重置。
+    if getattr(args, "freeze_backbone", False) and not getattr(args, "reset_optimizer", False):
+        Logger("--freeze_backbone：可训练集合与基座不同，自动跳过优化器状态（等价 --reset_optimizer）")
+    if not getattr(args, "reset_optimizer", False) and not getattr(args, "freeze_backbone", False):
         if os.path.exists(opt_path):
             optimizer.state = tree_unflatten(list(mx.load(opt_path).items()))
             mx.eval(optimizer.state)
@@ -906,10 +936,12 @@ def apply_lr_schedule(
     min_lr_ratio=0.05,
     schedule="linear",
     wsd_decay_frac=0.2,
+    wsd_decay_shape="linear",
 ):
     """应用学习率调度（每微批 step 调用一次）。
 
-    函数默认 schedule=linear（与 CLI / trainer 默认一致）。
+    函数默认 schedule=linear / wsd_decay_shape=linear（保持旧单测语义）；
+    CLI 默认是 wsd + cosine（对齐报告 §4.2.2）。
     """
     lr_multiplier, current_momentum = get_lr_and_momentum(
         global_step,
@@ -918,6 +950,7 @@ def apply_lr_schedule(
         min_lr_ratio=min_lr_ratio,
         schedule=schedule,
         wsd_decay_frac=wsd_decay_frac,
+        wsd_decay_shape=wsd_decay_shape,
     )
 
     for opt in _sub_optimizers(optimizer):

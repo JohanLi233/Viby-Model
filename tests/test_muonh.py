@@ -159,14 +159,19 @@ def test_grouping():
         abs(n_after - n_before) / n_before < 1e-3,
         f"{n_before} -> {n_after}",
     )
+    # 3-D 堆叠专家默认**不进** MuonH（V4.1 架构下该路径有随机 NaN 隐患，见
+    # README「已知问题」），落 AdamW 无衰减组 ⇒ 范数不冻结；这里只要求更新有限、
+    # 且确实动了（不再是恒等）。
     check(
-        "muonh 一步后专家堆叠逐专家范数冻结",
-        abs(ne_after - ne_before) / ne_before < 1e-3,
+        "专家堆叠默认走 AdamW 无衰减组（范数不冻结但更新有限）",
+        ne_after == ne_after and abs(ne_after - ne_before) > 0.0,
         f"{ne_before} -> {ne_after}",
     )
+    # lm_head 按报告 §2.5/§4.2.2 移入 Sinkhorn 均衡组（不再是 AdamH），
+    # 同样不再保范数。
     check(
-        "muonh 一步后 lm_head 范数冻结(AdamH)",
-        abs(nh_after - nh_before) / nh_before < 1e-3,
+        "lm_head 走 Sinkhorn 均衡组（不再保范数，更新有限）",
+        nh_after == nh_after and abs(nh_after - nh_before) > 0.0,
         f"{nh_before} -> {nh_after}",
     )
 

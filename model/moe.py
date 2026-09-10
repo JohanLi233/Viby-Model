@@ -130,6 +130,8 @@ class MoEFeedForward(nn.Module):
         self.moe_in = config.moe_inter_dim
         self.swiglu_limit = config.swiglu_limit
         self.router = MoEGate(config, layer_idx)
+        self.aux_weight = float(getattr(config, "aux_balance_loss_weight", 0.0) or 0.0)
+        self._last_aux = mx.array(0.0)
         self.experts = StackedExperts(n_routed, self.moe_in, config.dim)
         self.shared = Expert(config.dim, self.moe_in, config.swiglu_limit)
 
@@ -172,9 +174,28 @@ class MoEFeedForward(nn.Module):
         out = mx.zeros((M, D), dtype=x.dtype).at[tok_s].add(y * w_s[:, None])
         return out.reshape(B, T, D)
 
+    def seq_aux_loss(self, scores: mx.array, idx: mx.array, B: int, T: int) -> mx.array:
+        """序列级负载均衡损失（报告 §4.2.2：权重 1e-4 的小规模序列级均衡损失）。
+
+        aux = E · mean_b Σ_e f_{b,e}·P_{b,e}：f 是序列 b 内分到专家 e 的 (token,choice)
+        占比（stop_gradient，当负载用），P 是该序列对专家 e 的平均路由概率（带梯度）。
+        逐序列而不是整批，正是为了压住单条序列内部的极端不均衡。
+        """
+        E, k = self.n_routed, self.top_k
+        M = B * T
+        P = mx.mean(scores.reshape(B, T, E), axis=1)  # [B,E]
+        flat = mx.zeros((M, E), dtype=mx.float32)
+        rows = mx.arange(M)
+        for j in range(k):
+            flat = flat.at[rows, idx[:, j]].add(1.0)
+        f = mx.mean(mx.stop_gradient(flat).reshape(B, T, E), axis=1) / k  # [B,E]
+        return mx.mean(mx.sum(f * P, axis=-1)) * E
+
     def __call__(self, x: mx.array) -> mx.array:
         B, T, D = x.shape
-        w, idx, _ = self.router(x.reshape(B * T, D))
+        w, idx, scores = self.router(x.reshape(B * T, D))
+        if self.training and self.aux_weight > 0:
+            self._last_aux = self.seq_aux_loss(scores, idx, B, T)
         if B * T <= self._DENSE_MAX_TOKENS:
             mixed = self._dense_forward(x, idx, w)
         else:

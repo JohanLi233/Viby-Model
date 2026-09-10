@@ -370,17 +370,24 @@ def add_common_args(parser):
     parser.add_argument(
         "--lr_schedule",
         type=str,
-        default="linear",
+        default="wsd",
         choices=["linear", "wsd"],
-        help="学习率日程。linear（默认，Marin Hero #8435）= warmup 1%% 后立刻"
-        "线性收到 min_lr_ratio，无平台；wsd=warmup + 平台 + 末尾衰减。"
-        "数据 80%% 处分相不是 LR 平台，不要用 wsd 去模拟",
+        help="学习率日程。wsd（默认，对齐报告 §4.2.2：线性预热 → 平台 → 末尾"
+        "余弦衰减到 min_lr_ratio）；linear（Marin Hero #8435）= warmup 后立刻线性"
+        "收到 min_lr_ratio，无平台",
     )
     parser.add_argument(
         "--wsd_decay_frac",
         type=float,
         default=0.2,
-        help="WSD 末尾线性衰减占总步数的比例，默认 0.2；仅 --lr_schedule wsd 生效",
+        help="WSD 末尾衰减占总步数的比例，默认 0.2；仅 --lr_schedule wsd 生效",
+    )
+    parser.add_argument(
+        "--wsd_decay_shape",
+        type=str,
+        default="cosine",
+        choices=["cosine", "linear"],
+        help="WSD 末尾衰减形状：cosine（默认，报告 §4.2.2 用余弦）或 linear",
     )
     parser.add_argument(
         "--pack_sequences",
@@ -443,6 +450,15 @@ def add_common_args(parser):
         "但正交化精度下降、训练动力学改变）",
     )
     parser.add_argument(
+        "--sinkhorn_steps",
+        type=int,
+        default=None,
+        help="Sinkhorn 均衡更新的归一化步数 K（报告 §4.2.2 = 11，必须奇数）："
+        "奇数步收尾在行归一化，U^(K) 才是单位行 ℓ₂ 范数、乘 √n 后满足式 (7) "
+        "的行 RMS≈1。不传则读 env VIBY_SINKHORN_K，仍无则 11。"
+        "（Sinkhorn 组 = Engram 检索表 / token 嵌入 / 预测头）",
+    )
+    parser.add_argument(
         "--lr_scale_auto",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -498,6 +514,10 @@ def get_pretrain_parser():
         batch_size=32,
         accumulation_steps=8,
         max_seq_len=2048,
+        # 报告 §2.1：骨干预训练阶段省略 MTP 模块；DSpark 在预训练之后用一个
+        # 专门阶段单独训练（冻结主干），见 §2.4.3。要训练草稿层就显式传
+        # --mtp_depth N（配合 --resume 基座 + --freeze_backbone 即官方口径）。
+        mtp_depth=0,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-Pretrain")
@@ -589,6 +609,17 @@ def _explicit_cli_keys() -> set:
     return seen
 
 
+# 由 (n_layers, n_mtp_layers) 推导、preset 不该固定的结构参数（见 apply_preset）
+_PRESET_DERIVED_ARGS = {
+    "mtp_depth",
+    "compress_ratios",
+    "kv_source_layers",
+    "index_source_layers",
+    "candidate_source_layer",
+    "dspark_target_layer_ids",
+}
+
+
 def apply_preset(args):
     """--preset：把未显式传入的结构参数换成预设值（显式值优先）。
 
@@ -604,7 +635,13 @@ def apply_preset(args):
     explicit |= {
         dest for alias, dest in ARCH_ARG_ALIASES.items() if alias in explicit
     }
+    # 派生字段（压缩率/各源层/候选层/draft 目标层）与 mtp_depth 不由 preset 固定：
+    # 它们由 VibyConfig 从 (n_layers, n_mtp_layers) 推导，而 mtp_depth 决定训练阶段
+    # ——报告 §2.1 要求预训练不带 MTP，DSpark 在之后单独一阶段训练（§2.4.3）。
+    # 显式传参仍然优先。
     for arg, field in ARCH_ARG_TO_FIELD.items():
+        if arg in _PRESET_DERIVED_ARGS and arg not in explicit:
+            continue
         if arg not in explicit:
             setattr(args, arg, getattr(cfg, field))
     return args
