@@ -397,6 +397,15 @@ def _compact_mask(mask):
     )
 
 
+def compact_visible(mask):
+    """把 [B,T,N] 布尔可见性压成 indexed_attention 用的 (indices, lengths)。
+
+    CED 解码段 N=T：源层（Full/Reindex）算完 keep 后压一次，Reuse 层直接
+    拿这份 metadata，不再每层扫一遍 [B,T,T]。
+    """
+    return _compact_mask(mx.stop_gradient(mask))
+
+
 @lru_cache(None)
 def _operation(window_size, softmax_scale, key_tile):
     _, forward, backward = _kernels()

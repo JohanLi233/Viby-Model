@@ -219,6 +219,11 @@ def test_full_layer_owns_compressor_and_indexer():
     _, sh = _layer_outputs(model, 3, x)
     assert sh.compress_kv is not None and sh.compress_kv.shape[0] == 1
     assert sh.index_k is not None and sh.keep_mask is not None
+    if mx.default_device() == mx.gpu:
+        assert sh.sparse_selection is not None
+        ratio, (idx, lens) = sh.sparse_selection
+        assert ratio == 1
+        assert idx.ndim == 2 and lens.ndim == 1
 
 
 def test_reindex_reuses_upstream_kv_but_reselects_topk():

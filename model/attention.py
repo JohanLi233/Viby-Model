@@ -25,6 +25,7 @@ import os
 import mlx.core as mx
 from mlx import nn
 
+from .kernels.indexer_score import indexer_score
 from .norms import RMSNorm
 from .rope import precompute_freqs_cis, rope_partial
 
@@ -140,6 +141,7 @@ class Compressor(nn.Module):
         self.norm = RMSNorm(config.head_dim, config.norm_eps)
         self.wkv = nn.Linear(config.dim, config.head_dim, bias=False)
         self.wgate = nn.Linear(config.dim, config.head_dim, bias=False) if self.ratio > 1 else None
+        self.last_filled = 0
 
     def init_state(self, batch: int, dtype):
         shape = (batch, self.ratio, self.head_dim)
@@ -171,14 +173,18 @@ class Compressor(nn.Module):
         sc_st = mx.where(valid[:, None, None], mx.full_like(sc_st, -mx.inf), sc_st)
         return pooled, valid, (kv_st, sc_st, mx.where(valid, 0, new_filled))
 
-    def __call__(self, x: mx.array, start_pos: int, state=None):
-        """整段/分块 prefill：返回 (latent [B,n,hd] | None, 新 state, 组首位置 | None, first_group)。"""
+    def __call__(self, x: mx.array, start_pos: int, state=None, filled: int = 0):
+        """整段/分块 prefill：返回 (latent [B,n,hd] | None, 新 state, 组首位置 | None, first_group)。
+
+        filled 是 Python int（未成组尾巴长度）。调用方从 LayerCache.filled 传入，
+        避免对 state[2] 做 .item() host sync。
+        """
         B, T, _ = x.shape
         r = self.ratio
         if r == 1:
+            self.last_filled = 0
             return self.norm(self.wkv(x)), None, start_pos + mx.arange(T)[None, :], start_pos
         kv, sc = self.wkv(x), self.wgate(x)
-        filled = 0 if state is None else int(mx.max(state[2]).item())
         if filled:
             kv = mx.concatenate([state[0][:B, :filled], kv], axis=1)
             sc = mx.concatenate([state[1][:B, :filled], sc], axis=1)
@@ -194,6 +200,7 @@ class Compressor(nn.Module):
             tail_kv = mx.concatenate([tail_kv, mx.zeros((B, pad, self.head_dim), dtype=kv.dtype)], axis=1)
             tail_sc = mx.concatenate([tail_sc, mx.full((B, pad, self.head_dim), -mx.inf, dtype=mx.float32)], axis=1)
         new_state = (tail_kv, tail_sc, mx.full((B,), rem, dtype=mx.int32))
+        self.last_filled = rem
         if n == 0:
             return None, new_state, None, base
         kv_g = kv[:, : n * r].reshape(B, n, r, self.head_dim)
@@ -235,25 +242,29 @@ class Indexer(nn.Module):
         c, s = _cos_sin(cos_all, sin_all, pos, False)
         return rope_partial(self.k_norm(self.wk(latent)), c, s, self.rope_head_dim)
 
-    def scores(self, x, qr, index_k, token_pos, reach, cos_all, sin_all):
-        """返回 [B,T,N] 的打分（不可达位置 = -inf，fp32）。"""
+    def scores(self, x, qr, index_k, token_pos, reach, cos_all, sin_all,
+               q_cos=None, q_sin=None):
+        """返回 [B,T,N] 的打分（不可达位置 = -inf，fp32）。
+
+        q_cos/q_sin 若已由主注意力按 token_pos 取过，直接复用，避免 indexer
+        再 gather 一遍 RoPE 表。CED 解码段 N=T 时打分走融合 kernel，不物化
+        [B,T,H,N]。
+        """
         B, T, _ = x.shape
         q = self.wq_b(qr).reshape(B, T, self.n_heads, self.head_dim)
-        c, s = _cos_sin(cos_all, sin_all, token_pos, True)
-        q = rope_partial(q, c, s, self.rope_head_dim)
-        # 打分矩阵保持 bf16（[B,T,8,N] 在 B4/T1024/N1024 下 fp32 单份就是
-        # 134MB，原来 einsum 结果 + relu 结果 + 加权结果各一份），只在最后
-        # 一次加权归约时才升 fp32。
-        sc = mx.einsum("bthd,bnd->bthn", q, index_k)
-        sc = mx.maximum(sc, 0.0)
-        w = self.weights_proj(x).astype(mx.float32) * (self.softmax_scale * self.n_heads ** -0.5)
-        sc = mx.sum(sc.astype(mx.float32) * w[:, :, :, None], axis=2)  # [B,T,N]
-        return mx.where(reach, sc, NEG_INF)
+        if q_cos is None:
+            q_cos, q_sin = _cos_sin(cos_all, sin_all, token_pos, True)
+        q = rope_partial(q, q_cos, q_sin, self.rope_head_dim)
+        w = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        return indexer_score(q, index_k, w, reach)
 
 
 def _group_doc_mask(ratio: int, segment_ids: mx.array):
     """压缩组的文档掩码 [B,T,N]：组内 token 与 query 同文档才可见。"""
     B, T = segment_ids.shape
+    if ratio == 1:
+        # CED 解码段：每组一个 token，就是普通文档注意力掩码
+        return segment_ids[:, None, :] == segment_ids[:, :, None]
     n = T // ratio
     if n == 0:
         return mx.zeros((B, T, 0), dtype=mx.bool_)
@@ -265,6 +276,8 @@ def _group_doc_mask(ratio: int, segment_ids: mx.array):
 def _group_pad_mask(ratio: int, pad_mask: mx.array):
     """压缩组的 pad 掩码 [B,T,N]：组内全是真实 token 才可见。"""
     B, T = pad_mask.shape
+    if ratio == 1:
+        return pad_mask[:, None, :]
     n = T // ratio
     if n == 0:
         return mx.zeros((B, T, 0), dtype=mx.bool_)
@@ -343,20 +356,23 @@ class Attention(nn.Module):
         self.freeze(recurse=False, keys=["freq_cos", "freq_sin"])
 
     # ------------------------------------------------------------------
-    def _q(self, x, token_pos):
+    def _q(self, x, token_pos, cos=None, sin=None):
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).reshape(*x.shape[:2], self.n_heads, self.head_dim)
-        c, s = _cos_sin(self.freq_cos, self.freq_sin, token_pos, True)
-        return qr, rope_partial(q, c, s, self.rope_head_dim)
+        if cos is None:
+            cos, sin = _cos_sin(self.freq_cos, self.freq_sin, token_pos, True)
+        return qr, rope_partial(q, cos, sin, self.rope_head_dim)
 
-    def _window_kv(self, x, token_pos):
+    def _window_kv(self, x, token_pos, cos=None, sin=None):
         kv = self.kv_norm(self.wkv(x))
-        c, s = _cos_sin(self.freq_cos, self.freq_sin, token_pos, False)
-        return rope_partial(kv, c, s, self.rope_head_dim)
+        if cos is None:
+            cos, sin = _cos_sin(self.freq_cos, self.freq_sin, token_pos, False)
+        return rope_partial(kv, cos, sin, self.rope_head_dim)
 
-    def _out_proj(self, o, token_pos):
-        c, s = _cos_sin(self.freq_cos, self.freq_sin, token_pos, True)
-        o = rope_partial(o, c, s, self.rope_head_dim, inverse=True)
+    def _out_proj(self, o, token_pos, cos=None, sin=None):
+        if cos is None:
+            cos, sin = _cos_sin(self.freq_cos, self.freq_sin, token_pos, True)
+        o = rope_partial(o, cos, sin, self.rope_head_dim, inverse=True)
         B, T = o.shape[:2]
         g = self.o_groups
         o = o.reshape(B, T, g, -1)
@@ -365,8 +381,38 @@ class Attention(nn.Module):
         return self.wo_b(o.reshape(B, T, -1))
 
     # ------------------------------------------------------------------
+    def _reuse_compress(self, shared, cache, B, N):
+        """Reuse 层：压缩 KV / keep 都来自上游，不再重建 [B,T,N] 可达掩码。
+
+        CED 解码段 ratio=1 ⇒ N=T，旧路径每层都造一张 [B,T,T] 再和
+        keep AND 一次；keep 在源层已经乘过 reach/doc/pad。
+        """
+        if cache is not None:
+            comp = cache.src_cache.compress_kv[:B, :N] if N else None
+        else:
+            comp = shared.compress_kv
+        return comp, shared.keep_mask
+
+    def _compress_reach(self, token_pos, N, ratio, segment_ids, pad_mask, shared):
+        """同一次前向、同一 N 的后续层（Reindex）复用源层算过的 reach。"""
+        cached = shared.reach
+        if (
+            cached is not None
+            and cached.shape[-1] == N
+            and cached.shape[-2] == token_pos.shape[-1]
+        ):
+            return cached
+        reach = mx.arange(N)[None, None, :] < ((token_pos + 1) // ratio)[..., None]
+        if segment_ids is not None:
+            reach = reach & _group_doc_mask(ratio, segment_ids)
+        if pad_mask is not None:
+            reach = reach & _group_pad_mask(ratio, pad_mask)
+        shared.reach = reach
+        return reach
+
     def _compress_dense(self, x, qr, token_pos, shared, cache, start_pos,
-                        segment_ids=None, pad_mask=None, sparse_selection=False):
+                        segment_ids=None, pad_mask=None, sparse_selection=False,
+                        token_cs=None):
         """压缩分支（prefill / 训练）：产出/复用压缩 KV，并返回可见性掩码。
 
         返回 (comp, cmask)：cmask 是 [B 或 1, T, N] 的 bool，等于
@@ -377,40 +423,48 @@ class Attention(nn.Module):
         B, T, _ = x.shape
         ratio = self.ratio
         N = (start_pos + T) // ratio
+        if not self.is_kv_source and not self.is_index_source and shared.keep_mask is not None:
+            return self._reuse_compress(shared, cache, B, N)
         keep = None
         latent = None
         first_group = start_pos // ratio
         pos = None
         if self.is_kv_source:
-            state = None
-            if cache is not None and cache.kv_state is not None:
-                state = cache.kv_state
-            latent, new_state, pos, first_group = self.compressor(x, start_pos, state)
+            state = cache.kv_state if cache is not None else None
+            filled = cache.filled if cache is not None else 0
+            latent, new_state, pos, first_group = self.compressor(
+                x, start_pos, state, filled
+            )
             if cache is not None and new_state is not None:
                 cache.kv_state = new_state
-                cache.filled = int(mx.max(new_state[2]).item())
+                cache.filled = self.compressor.last_filled
         # 注意轴：token_pos 是 [1,T]，要显式补成 [1,T,1] 才能和 [1,1,N] 按 query 广播
-        reach = mx.arange(N)[None, None, :] < ((token_pos + 1) // ratio)[..., None]
-        # 文档/pad 隔离必须在选择阶段生效：否则候选块与 top-k 会按
-        # 别的文档的内容来挑，packed 序列会跨文档泄漏。
-        if segment_ids is not None:
-            reach = reach & _group_doc_mask(ratio, segment_ids)
-        if pad_mask is not None:
-            reach = reach & _group_pad_mask(ratio, pad_mask)
+        reach = self._compress_reach(token_pos, N, ratio, segment_ids, pad_mask, shared)
         # indexer 需要未旋转的 latent，故先跑 indexer，再写旋转后的压缩 KV
         if self.is_index_source:
             shared.sparse_selection = None
             idxo = self.indexer
             if idxo.owns_k and latent is not None:
-                k = idxo.index_keys(latent, pos, self.freq_cos, self.freq_sin)
+                # CED 解码段 ratio=1：组首 == token_pos，RoPE 表主注意力已经取过
+                if ratio == 1 and token_cs is not None:
+                    c0, s0 = token_cs
+                    k = rope_partial(
+                        idxo.k_norm(idxo.wk(latent)), c0, s0, idxo.rope_head_dim
+                    )
+                else:
+                    k = idxo.index_keys(latent, pos, self.freq_cos, self.freq_sin)
                 if cache is not None:
                     cache.index_k[:B, first_group : first_group + k.shape[1]] = k
                     shared.index_k = cache.index_k[:, :N]
                 else:
                     shared.index_k = k
             if shared.index_k is not None:
+                q_cos = q_sin = None
+                if token_cs is not None:
+                    q_cos, q_sin = token_cs[0][..., None, :], token_cs[1][..., None, :]
                 sc = idxo.scores(
-                    x, qr, shared.index_k, token_pos, reach, self.freq_cos, self.freq_sin
+                    x, qr, shared.index_k, token_pos, reach, self.freq_cos, self.freq_sin,
+                    q_cos=q_cos, q_sin=q_sin,
                 )
                 if idxo.is_candidate_source:
                     shared.candidates = select_candidate_blocks(
@@ -428,13 +482,22 @@ class Attention(nn.Module):
                     shared.sparse_selection = (ratio, selection)
                 else:
                     keep, _ = _topk_masks(sc, reach, idxo.index_topk, 0, need_idx=False)
+                    # 源层压一次 keep：Reuse 层 indexed_attention 不再扫 [B,T,N]
+                    if cache is None and keep.shape[-1] and mx.default_device() == mx.gpu:
+                        from .kernels.sparse_attention import compact_visible
+
+                        shared.sparse_selection = (ratio, compact_visible(keep))
                 shared.keep_mask = keep
         else:
             keep = shared.keep_mask
-        cmask = reach if keep is None else (reach & keep)
+        # keep 已经含 reach（_topk_masks / select_topk），不必再 AND 一张 [B,T,N]
+        cmask = reach if keep is None else keep
         # 压缩 KV 入池：必须是 RoPE 之后的（indexer 用未旋转形式，已在上面用完）
         if self.is_kv_source and latent is not None:
-            c, s = _cos_sin(self.freq_cos, self.freq_sin, pos, False)
+            if ratio == 1 and token_cs is not None:
+                c, s = token_cs
+            else:
+                c, s = _cos_sin(self.freq_cos, self.freq_sin, pos, False)
             lat = rope_partial(latent, c, s, self.rope_head_dim)
             if cache is not None:
                 cache.compress_kv[:B, first_group : first_group + lat.shape[1]] = lat
@@ -489,8 +552,10 @@ class Attention(nn.Module):
         """
         B, T, _ = x.shape
         token_pos = (start_pos + mx.arange(T))[None, :]  # [1,T]，对所有 batch 相同
-        qr, q = self._q(x, token_pos)
-        kv_win = self._window_kv(x, token_pos)
+        c, s = _cos_sin(self.freq_cos, self.freq_sin, token_pos, False)
+        ch, sh = c[..., None, :], s[..., None, :]
+        qr, q = self._q(x, token_pos, ch, sh)
+        kv_win = self._window_kv(x, token_pos, c, s)
         # sdpa 的 mask 用 [B,T] 的绝对位置：[1,T] 广播
         tpos = token_pos[0]
         W = self.window_size
@@ -502,33 +567,53 @@ class Attention(nn.Module):
             and T >= 2 * W
             and T % W == 0
         )
+        token_cs = (c, s)
         if chunked:
-            o = self._attend_chunked(q, kv_win, qr, x, token_pos, shared, segment_ids, pad_mask)
+            o = self._attend_chunked(
+                q, kv_win, qr, x, token_pos, shared, segment_ids, pad_mask, token_cs,
+            )
         else:
             o = self._attend_dense(
                 q, kv_win, qr, x, token_pos, tpos, shared, cache, start_pos,
-                segment_ids, pad_mask,
+                segment_ids, pad_mask, token_cs,
             )
         # Gated XSA 在反向旋转之前、对未投影的 [B,H,T,D] 输出做。v 必须取
         # kv_win（query 自己的滑窗 V），不能用 kv_all[:, -T:]——尾部是压缩 latent。
         if self.xsa_alpha is not None:
             o = self._xsa(o, kv_win)
-        return self._out_proj(o.transpose(0, 2, 1, 3), token_pos)
+        return self._out_proj(o.transpose(0, 2, 1, 3), token_pos, ch, sh)
 
     # ------------------------------------------------------------------
-    def _attend_chunked(self, q, kv_win, qr, x, token_pos, shared, segment_ids, pad_mask):
+    def _attend_chunked(self, q, kv_win, qr, x, token_pos, shared, segment_ids, pad_mask,
+                        token_cs=None):
         """训练路径：query 分块，滑窗 key 只取相邻两块。返回 [B,H,T,D]。"""
         B, T, _ = x.shape
         W = self.window_size
         C = T // W
-        keeps = []
         from .kernels.sparse_attention import enabled_for, indexed_attention, topk_enabled
 
         use_sparse = enabled_for(q, W)
         if self.ratio > 0:
+            sel = shared.sparse_selection
+            # CED Reuse：压缩 KV 和 compact 选择都来自上游，跳过 _compress_dense
+            if (
+                use_sparse
+                and not self.is_kv_source
+                and not self.is_index_source
+                and sel is not None
+                and shared.compress_kv is not None
+                and sel[0] == self.ratio
+                and sel[1][0].shape == (B * T, shared.compress_kv.shape[1])
+            ):
+                return indexed_attention(
+                    q, kv_win, shared.compress_kv, shared.keep_mask,
+                    segment_ids, pad_mask, self.attn_sink,
+                    W, self.softmax_scale, selection=sel[1],
+                )
             comp, cmask = self._compress_dense(
                 x, qr, token_pos, shared, None, 0, segment_ids, pad_mask,
                 sparse_selection=use_sparse and topk_enabled(),
+                token_cs=token_cs,
             )
         else:
             comp, cmask = None, None
@@ -601,7 +686,7 @@ class Attention(nn.Module):
 
     # ------------------------------------------------------------------
     def _attend_dense(self, q, kv_win, qr, x, token_pos, tpos, shared, cache, start_pos,
-                      segment_ids, pad_mask):
+                      segment_ids, pad_mask, token_cs=None):
         """解码 / 分块 prefill / T 不整除：全 T 滑窗 key + 掩码（原路径）。"""
         T = q.shape[1]
         L = 0
@@ -634,7 +719,8 @@ class Attention(nn.Module):
         if self.ratio > 0:
             # cmask 已在 _compress_dense 里算完（基础可达 × doc/pad × top-k）
             comp, cmask = self._compress_dense(
-                x, qr, token_pos, shared, cache, start_pos, segment_ids, pad_mask
+                x, qr, token_pos, shared, cache, start_pos, segment_ids, pad_mask,
+                token_cs=token_cs,
             )
             if comp is not None:
                 kv_all = mx.concatenate([kv_all, comp], axis=1)
@@ -659,33 +745,47 @@ class Attention(nn.Module):
         start_pos 可以是 int，也可以是 [B] 的逐序列位置（连续 batch 里各
         请求长度不同）：窗口按各自槽位写入、按各自绝对位置取用；压缩池与
         index K 池按各自的分组对齐写入，池长取 batch 内最大值并用 reach 掩掉。
+
+        CED 解码段 ratio=1：边界层直接按绝对位置写入共享池，不再走
+        one-hot 缓冲；Reuse 层只 gather，不重建整池拼接。
         """
         B, T, _ = x.shape
         if T != 1:
             raise ValueError("decode 只接受单 token")
+        if shared.pool_tokens is None:
+            if not isinstance(start_pos, mx.array):
+                shared.pool_tokens = int(start_pos) + 1
+            else:
+                shared.pool_tokens = int(mx.max(start_pos).item()) + 1
         if not isinstance(start_pos, mx.array):
             start_pos = mx.full((B,), int(start_pos), dtype=mx.int32)
         start_pos = start_pos.astype(mx.int32)
         token_pos = start_pos[:, None]  # [B,1]
         bidx = mx.arange(B)
-        qr, q = self._q(x, token_pos)
-        kv_new = self._window_kv(x, token_pos)
+        c, s = _cos_sin(self.freq_cos, self.freq_sin, token_pos, False)
+        ch, sh = c[..., None, :], s[..., None, :]
+        qr, q = self._q(x, token_pos, ch, sh)
+        kv_new = self._window_kv(x, token_pos, c, s)
         cache.window[bidx, start_pos % self.window_size] = kv_new[:, 0]
 
-        win_pos = start_pos[:, None] - (self.window_size - 1) + mx.arange(self.window_size)[None, :]
-        win_idx = mx.where(win_pos >= 0, win_pos % self.window_size, -1)[:, None, :].astype(mx.int32)
-        kv_src = cache.window
+        if shared.win_idx is None:
+            win_pos = start_pos[:, None] - (self.window_size - 1) + mx.arange(self.window_size)[None, :]
+            shared.win_idx = mx.where(
+                win_pos >= 0, win_pos % self.window_size, -1
+            )[:, None, :].astype(mx.int32)
+        win_idx = shared.win_idx
         comp_idx = None
 
         if self.ratio > 0:
             offset = self.window_size
-            pool = cache.src_cache
             latent, pos, first_group, valid = None, None, None, None
             if self.is_kv_source:
                 if self.ratio == 1:
+                    # CED 边界：每个 token 自成一组，token_pos 就是组首
                     latent = self.compressor.norm(self.compressor.wkv(x))
-                    first_group = start_pos
-                    valid = mx.ones((B,), dtype=mx.bool_)
+                    pos = token_pos
+                    lat = rope_partial(latent, c, s, self.rope_head_dim)
+                    cache.compress_kv[bidx, start_pos] = lat[:, 0]
                 else:
                     state = cache.kv_state
                     if state is None:
@@ -693,33 +793,36 @@ class Attention(nn.Module):
                     latent, valid, state = self.compressor.step(x, state)
                     cache.kv_state = state
                     first_group = (start_pos + 1 - self.ratio) // self.ratio
-                # cos/sin 按 (*pos.shape, d/2) 取用；解码时位置是 [B,1]，
-                # 与 latent/x 的 [B,1,...] 对齐（[B] 会被广播进 T 轴）
-                pos = (first_group * self.ratio)[:, None]
-                c, s = _cos_sin(self.freq_cos, self.freq_sin, pos, False)
-                lat = rope_partial(latent, c, s, self.rope_head_dim)
-                # 没凑满一组的序列不能写池子（会覆盖上一组的有效条目），
-                # 改写到池尾的丢弃槽里，靠 reach 掩掉。
-                wslot = mx.where(valid, first_group, cache.pool_scratch)
-                cache.compress_kv[bidx, wslot] = mx.where(
-                    valid[:, None], lat[:, 0], mx.zeros_like(lat[:, 0])
-                )
+                    pos = (first_group * self.ratio)[:, None]
+                    c2, s2 = _cos_sin(self.freq_cos, self.freq_sin, pos, False)
+                    lat = rope_partial(latent, c2, s2, self.rope_head_dim)
+                    wslot = mx.where(valid, first_group, cache.pool_scratch)
+                    cache.compress_kv[bidx, wslot] = mx.where(
+                        valid[:, None], lat[:, 0], mx.zeros_like(lat[:, 0])
+                    )
             N = (start_pos + 1) // self.ratio  # [B]
-            n_max = int(mx.max(N).item()) if B else 0
+            n_max = shared.pool_tokens // self.ratio
             if self.is_index_source:
                 idxo = self.indexer
                 if idxo.owns_k and latent is not None:
-                    k = idxo.index_keys(latent, pos, self.freq_cos, self.freq_sin)
-                    wslot = mx.where(valid, first_group, cache.pool_scratch)
-                    cache.index_k[bidx, wslot] = mx.where(
-                        valid[:, None], k[:, 0], mx.zeros_like(k[:, 0])
-                    )
+                    if self.ratio == 1:
+                        k = rope_partial(
+                            idxo.k_norm(idxo.wk(latent)), c, s, idxo.rope_head_dim
+                        )
+                        cache.index_k[bidx, start_pos] = k[:, 0]
+                    else:
+                        k = idxo.index_keys(latent, pos, self.freq_cos, self.freq_sin)
+                        wslot = mx.where(valid, first_group, cache.pool_scratch)
+                        cache.index_k[bidx, wslot] = mx.where(
+                            valid[:, None], k[:, 0], mx.zeros_like(k[:, 0])
+                        )
                 if idxo.owns_k and n_max:
                     shared.index_k = cache.index_k[:, :n_max]
                 if n_max:
                     reach = (mx.arange(n_max)[None, :] < N[:, None])[:, None, :]  # [B,1,N]
                     sc = idxo.scores(
-                        x, qr, shared.index_k, token_pos, reach, self.freq_cos, self.freq_sin
+                        x, qr, shared.index_k, token_pos, reach, self.freq_cos, self.freq_sin,
+                        q_cos=ch, q_sin=sh,
                     )
                     if idxo.is_candidate_source:
                         shared.candidates = select_candidate_blocks(
@@ -734,15 +837,22 @@ class Attention(nn.Module):
                     shared.topk_idx = comp_idx
             else:
                 comp_idx = shared.topk_idx
-            if n_max:
-                kv_src = mx.concatenate([kv_src, pool.compress_kv[:, :n_max]], axis=1)
         if comp_idx is None:
             comp_idx = mx.zeros((B, 1, 0), dtype=mx.int32)
-        idx = mx.concatenate([win_idx, comp_idx], axis=-1)
-        valid_slots = idx >= 0
-        gathered = mx.take_along_axis(
-            kv_src[:, None, :, :], mx.maximum(idx, 0)[..., None], axis=2
+        # 窗口与压缩池分开 gather，避免把随序列增长的整池拼进 [B, W+N, D]
+        win_g = mx.take_along_axis(
+            cache.window[:, None, :, :], mx.maximum(win_idx, 0)[..., None], axis=2
         )
+        if comp_idx.shape[-1]:
+            raw = mx.maximum(comp_idx - self.window_size, 0)
+            comp_g = mx.take_along_axis(
+                cache.src_cache.compress_kv[:, None, :, :], raw[..., None], axis=2
+            )
+            gathered = mx.concatenate([win_g, comp_g], axis=2)
+            valid_slots = mx.concatenate([win_idx >= 0, comp_idx >= 0], axis=-1)
+        else:
+            gathered = win_g
+            valid_slots = win_idx >= 0
         o = mx.fast.scaled_dot_product_attention(
             q.transpose(0, 2, 1, 3),
             gathered,
@@ -754,4 +864,4 @@ class Attention(nn.Module):
         # 与 prefill 同口径：v 用本步窗口 V（kv_new 即刚写入环的自身 token）
         if self.xsa_alpha is not None:
             o = self._xsa(o, kv_new[:, 0][:, None])
-        return self._out_proj(o.transpose(0, 2, 1, 3), token_pos)
+        return self._out_proj(o.transpose(0, 2, 1, 3), token_pos, ch, sh)

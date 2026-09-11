@@ -333,8 +333,10 @@ class VibyEngine:
         """连续 batch 解码一步：各请求位置不同，start_pos 传 [B] int32。"""
         toks = mx.array([[s.token_ids[-1]] for s in seqs], dtype=mx.int32)
         # start_pos = 已处理的 token 数：token_ids 末位尚未过模型，位置是 len-1
-        pos = mx.array([len(s.token_ids) - 1 for s in seqs], dtype=mx.int32)
+        lens = [len(s.token_ids) for s in seqs]
+        pos = mx.array([n - 1 for n in lens], dtype=mx.int32)
         cache = self.pool.cache
+        cache.decode_max_pos = max(lens)
         hidden = self._trunk(toks, start_pos=pos, cache=cache, decode=True)
         logits = self.model.logits(hidden)[:, 0]
         mx.eval(logits)

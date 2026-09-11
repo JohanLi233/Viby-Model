@@ -52,7 +52,10 @@ class SharedAttnState:
     前向之间清理。
     """
 
-    __slots__ = ("compress_kv", "index_k", "keep_mask", "topk_idx", "candidates", "latent_pos", "sparse_selection")
+    __slots__ = (
+        "compress_kv", "index_k", "keep_mask", "topk_idx", "candidates",
+        "latent_pos", "sparse_selection", "reach", "win_idx", "pool_tokens",
+    )
 
     def __init__(self):
         self.compress_kv = None
@@ -62,6 +65,9 @@ class SharedAttnState:
         self.candidates = None  # 分层索引的一级候选块掩码 [B,T,N] bool
         self.latent_pos = None  # 压缩组首的绝对位置 [n]
         self.sparse_selection = None  # (ratio, (indices, lengths)); training only
+        self.reach = None       # 本段前向已算过的压缩可达掩码，同 ratio 的后续层复用
+        self.win_idx = None     # decode：各层共用的滑窗 gather 下标 [B,1,W]
+        self.pool_tokens = None # decode：batch 内最大 token 数（Python int，避免每层 .item()）
 
 
 class VibyCache:
@@ -71,6 +77,7 @@ class VibyCache:
         self.config = config
         self.layers = [LayerCache(config, i, batch_size) for i in range(config.n_layers)]
         self.start_pos = 0
+        self.decode_max_pos = 0  # Python：当前步 batch 内最大绝对位置+1，decode 用来切池
         self.engram_prev = None  # [B, max_ngram-1] 最近 token id（Engram 哈希用）
         self._wire_sources()
 
@@ -92,6 +99,7 @@ class VibyCache:
         压缩池与索引器 K 池按整组回退：只有落在回退区间之外的组保留。
         """
         self.start_pos = max(0, self.start_pos - offset)
+        self.decode_max_pos = self.start_pos
         for c in self.layers:
             c.filled = 0
             c.kv_state = None

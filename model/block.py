@@ -14,6 +14,22 @@ from .hc import HyperConnection, hc_post, hc_pre
 from .moe import MoEFeedForward
 from .norms import RMSNorm
 
+try:
+    from .kernels.hc_pre_norm import enabled_for as _hc_pre_norm_ok
+    from .kernels.hc_pre_norm import hc_pre_norm as _hc_pre_norm
+except Exception:  # noqa: BLE001
+    _hc_pre_norm = None
+
+    def _hc_pre_norm_ok(_x):
+        return False
+
+
+def apply_hc_pre_norm(x, pre_mix, norm):
+    """hc_pre + RMSNorm。hc_mult=4 且 GPU 时走融合核，否则回退两步实现。"""
+    if _hc_pre_norm is not None and _hc_pre_norm_ok(x):
+        return _hc_pre_norm(x, pre_mix, norm.weight, norm.eps)
+    return norm(hc_pre(x, pre_mix))
+
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx: int):
@@ -36,8 +52,7 @@ class Block(nn.Module):
         """x: [B,T,hc,d] → (x, 下一个子层要用的 pre_mix)。"""
         residual = x
         attn_pre, attn_post, attn_comb = self.attn_hc.mixes(x)
-        h = hc_pre(x, pre_mix)
-        h = self.attn_norm(h)
+        h = apply_hc_pre_norm(x, pre_mix, self.attn_norm)
         if decode:
             h = self.attn.decode(h, start_pos, shared, cache)
         else:
@@ -46,8 +61,7 @@ class Block(nn.Module):
 
         residual = x
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc.mixes(x)
-        h = hc_pre(x, attn_pre)
-        h = self.ffn_norm(h)
+        h = apply_hc_pre_norm(x, attn_pre, self.ffn_norm)
         h = self.ffn(h)
         x = hc_post(h, residual, ffn_post, ffn_comb)
         return x, ffn_pre

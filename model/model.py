@@ -25,11 +25,11 @@ import mlx.core as mx
 from mlx import nn
 from mlx.utils import tree_flatten
 
-from .block import Block
+from .block import Block, apply_hc_pre_norm
 from .cache import SharedAttnState, VibyCache
 from .config import VibyConfig
 from .engram import Engram, EngramLayout, NgramHashState, build_compressed_token_map
-from .hc import hc_pre, identity_pre_mix
+from .hc import identity_pre_mix
 from .init import apply_trunc_normal_init
 from .moe import MoEFeedForward, MoEGate, update_expert_bias
 from .norms import RMSNorm
@@ -143,6 +143,12 @@ class VibyModel(nn.Module):
             hashes, new_prev = self.engram_hash(input_ids, prev_tokens, token_mask)
         h = mx.repeat(h[:, :, None, :], self.hc_mult, axis=2)
         shared = SharedAttnState()
+        if decode:
+            hint = getattr(cache, "decode_max_pos", None) if cache is not None else None
+            if hint:
+                shared.pool_tokens = int(hint)
+            elif not isinstance(start_pos, mx.array):
+                shared.pool_tokens = int(start_pos) + 1
         pre_mix = identity_pre_mix(h, self.hc_mult)
         mains = []
         for i, layer in enumerate(self.layers):
@@ -157,8 +163,7 @@ class VibyModel(nn.Module):
             h, pre_mix = layer(
                 h, start_pos, pre_mix, shared, layer_cache, segment_ids, pad_mask, decode
             )
-        h = hc_pre(h, pre_mix)
-        return self.norm(h), mains, new_prev
+        return apply_hc_pre_norm(h, pre_mix, self.norm), mains, new_prev
 
 
 class DSparkMarkovHead(nn.Module):
@@ -226,14 +231,26 @@ class VibyForCausalLM(nn.Module):
         except Exception:  # noqa: BLE001
             pass
         if config.hc_mult == 4:
+            try:
+                from .kernels.hc_pre_norm import prewarm_hc_pre_norm
+
+                prewarm_hc_pre_norm(config.dim, config.norm_eps, mx.bfloat16)
+                prewarm_hc_pre_norm(config.dim, config.norm_eps, mx.float16)
+            except Exception:  # noqa: BLE001
+                pass
+        if config.hc_mult == 4:
             from .kernels.sinkhorn_fused import prewarm_sinkhorn
 
             prewarm_sinkhorn(config.hc_sinkhorn_iters, config.hc_eps)
         from .kernels.moe_dispatch import prewarm_moe, prewarm_route_combine
         from .kernels.sparse_attention import prewarm_sparse_attention, prewarm_topk
+        from .kernels.indexer_score import prewarm_indexer_score
 
         if config.n_heads == 16 and any(config.compress_ratios):
             prewarm_topk(config.max_seq_len)
+        if any(config.compress_ratios):
+            prewarm_indexer_score(config.index_n_heads, config.index_head_dim, mx.bfloat16)
+            prewarm_indexer_score(config.index_n_heads, config.index_head_dim, mx.float16)
 
         for dtype in (mx.bfloat16, mx.float16):
             for dim, width, top_k in {
@@ -317,7 +334,7 @@ class VibyForCausalLM(nn.Module):
         for stage in self.mtp_modules:
             cur, pre = stage.layer(cur, 0, pre, SharedAttnState(), None, seg, pad)
         last = self.mtp_modules[-1]
-        h = last.norm(hc_pre(cur, pre))
+        h = apply_hc_pre_norm(cur, pre, last.norm)
         anchors = B * T
         flat_h = h.reshape(anchors, block, cfg.dim)
         flat_ids = draft_ids.reshape(anchors, block)
@@ -390,6 +407,7 @@ class VibyForCausalLM(nn.Module):
 
     def decode_step(self, token_ids: mx.array, cache: VibyCache):
         """单步解码，返回 (logits [B,V], cache)。"""
+        cache.decode_max_pos = cache.start_pos + 1
         out = self(
             token_ids[:, None],
             start_pos=cache.start_pos,

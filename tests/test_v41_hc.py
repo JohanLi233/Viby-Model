@@ -14,6 +14,7 @@
 import numpy as np
 
 from _v41_common import cfg_tiny, tiny_model
+from model.block import apply_hc_pre_norm
 from model.hc import HyperConnection, hc_post, hc_pre, hc_split, identity_pre_mix, sinkhorn
 
 import mlx.core as mx
@@ -169,16 +170,16 @@ def test_block_single_pass_wiring_matches_manual_replication():
         for layer in model.model.layers:
             residual = h
             attn_pre, attn_post, attn_comb = layer.attn_hc.mixes(h)
-            h = layer.attn_norm(hc_pre(h, pre))
+            h = apply_hc_pre_norm(h, pre, layer.attn_norm)
             h = layer.attn(h, 0, shared, None, None, None)
             h = hc_post(h, residual, attn_post, attn_comb)
             residual = h
             ffn_pre, ffn_post, ffn_comb = layer.ffn_hc.mixes(h)
-            h = layer.ffn_norm(hc_pre(h, attn_pre if single_pass else ffn_pre))
+            h = apply_hc_pre_norm(h, attn_pre if single_pass else ffn_pre, layer.ffn_norm)
             h = layer.ffn(h)
             h = hc_post(h, residual, ffn_post, ffn_comb)
             pre = ffn_pre
-        return model.model.norm(hc_pre(h, pre))
+        return apply_hc_pre_norm(h, pre, model.model.norm)
 
     got = manual(single_pass=True)
     mx.eval(got)

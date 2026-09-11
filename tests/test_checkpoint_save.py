@@ -12,7 +12,7 @@ _sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "
 
 import mlx.core as mx
 
-from trainer.utils import save_checkpoint
+from trainer.utils import finish_training, save_checkpoint
 
 
 class _FakeModel:
@@ -72,6 +72,24 @@ class TestSaveCheckpointSidecar(unittest.TestCase):
             self.assertTrue(_os.path.exists(latest))
             with open(latest, encoding="utf-8") as f:
                 self.assertIn("dpo_8.safetensors", f.read())
+
+
+class TestFinishTraining(unittest.TestCase):
+    def test_skips_swanlab_finish_when_run_already_closed(self):
+        """Ctrl-C 时 SwanLab SIGINT 已经 finish 过，不能再调一次。"""
+        swanlab = SimpleNamespace(
+            finish=lambda: (_ for _ in ()).throw(AssertionError("finish")),
+            has_run=lambda: False,
+        )
+        with patch("trainer.utils.os._exit") as exit_fn:
+            finish_training(swanlab, interrupted=True)
+        exit_fn.assert_called_once_with(0)
+
+    def test_finishes_active_swanlab_run(self):
+        calls = []
+        swanlab = SimpleNamespace(finish=lambda: calls.append("finish"), has_run=lambda: True)
+        finish_training(swanlab, interrupted=False)
+        self.assertEqual(calls, ["finish"])
 
 
 if __name__ == "__main__":

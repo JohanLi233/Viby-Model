@@ -6,7 +6,7 @@ V4 的 mHC：X_{l+1} = B_l X_l + C_l F_l(A_l X_l)——本层系数喂本层输�
 "残差更新与系数预测能合并成一次遍历"的前提（Mega-mHC）。
 
 本文件用两种独立手段钉住语义：
-1) **接线检查**：拦 hc_pre，验证每个调用点拿到的 pre_mix 就是"上一个子层算出的
+1) **接线检查**：拦 apply_hc_pre_norm，验证每个调用点拿到的 pre_mix 就是"上一个子层算出的
    那一个"（不是本层的、也不是重新算的）——用模型自己的 HyperConnection 现算对照；
 2) **扰动检查**：改某子层的系数投影，看哪些子层输入该变、哪些必须不变。
 """
@@ -34,12 +34,12 @@ def _trace(model, ids):
     """按执行顺序抓 (hc_pre 的输入, 每块返回的 ffn_pre)。"""
     calls = []          # [(x, pre_mix)]
     ret = {}            # layer_idx -> ffn_pre
-    orig_pre = block_mod.hc_pre
+    orig_apply = block_mod.apply_hc_pre_norm
     orig_block = block_mod.Block.__call__
 
-    def cap_pre(x, pre_mix):
+    def cap_apply(x, pre_mix, norm):
         calls.append((np.array(x), np.array(pre_mix)))
-        return orig_pre(x, pre_mix)
+        return orig_apply(x, pre_mix, norm)
 
     def cap_block(self, x, start_pos, pre_mix, shared, cache=None,
                   segment_ids=None, pad_mask=None, decode=False):
@@ -48,13 +48,13 @@ def _trace(model, ids):
         ret[self.layer_idx] = np.array(ffn_pre)
         return out, ffn_pre
 
-    block_mod.hc_pre = cap_pre
+    block_mod.apply_hc_pre_norm = cap_apply
     block_mod.Block.__call__ = cap_block
     try:
         out = model(ids, use_mtp=False)
         mx.eval(out.logits)
     finally:
-        block_mod.hc_pre = orig_pre
+        block_mod.apply_hc_pre_norm = orig_apply
         block_mod.Block.__call__ = orig_block
     return calls, ret
 
@@ -70,7 +70,7 @@ def test_each_sublayer_consumes_the_previous_sublayers_coefficients():
     ids = mx.random.randint(0, cfg.vocab_size, (1, 12))
     calls, ffn_pre = _trace(model, ids)
     n = cfg.n_layers
-    assert len(calls) == 2 * n, "hc_pre 调用次数应为 2×层数"
+    assert len(calls) == 2 * n, "apply_hc_pre_norm 调用次数应为 2×层数"
 
     first = calls[0][1]
     assert first.shape[-1] == cfg.hc_mult

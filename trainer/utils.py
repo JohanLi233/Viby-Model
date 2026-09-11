@@ -577,10 +577,18 @@ def finish_training(swanlab=None, interrupted=False):
 
     MLX / SwanLab / 任何漏网的 daemon 线程在 Py_Finalize 阶段再碰 Python
     会 Fatal `PyThreadState_Get`（GIL 已释放）。正常跑完仍走常规退出。
+
+    SwanLab 0.10 在 SIGINT handler 里已经把 run 标成 aborted 并 finish
+    （日志里的 "KeyboardInterrupt by user" / "Upload complete"）。这里再
+    调一次 finish() 会打 `Run has already finished or has not started`。
     """
     if swanlab is not None:
         try:
-            swanlab.finish()
+            has_run = getattr(swanlab, "has_run", None)
+            if callable(has_run) and not has_run():
+                pass
+            else:
+                swanlab.finish()
         except Exception:
             pass
     if interrupted:

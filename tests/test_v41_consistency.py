@@ -181,9 +181,10 @@ def test_pad_mask_keeps_valid_positions_identical():
     lg2 = _logits(model, padded, attention_mask=am2)
     d = max_abs_diff(lg, lg2[:, :8])
     assert d < TOL, d
-    # 非平凡：pad 位置确实被排除（无 mask 时会变）
+    # 非平凡：无 mask 时 pad 自己会进注意力，pad 段 logits 必须变。
+    # 有效前缀是因果的，后面的 pad 本来就看不见，前 8 位不应作为判据。
     lg3 = _logits(model, padded)
-    assert max_abs_diff(lg2[:, :8], lg3[:, :8]) > 1e-6
+    assert max_abs_diff(lg2[:, 8:], lg3[:, 8:]) > 1e-6
 
 
 def test_segment_and_pad_together():

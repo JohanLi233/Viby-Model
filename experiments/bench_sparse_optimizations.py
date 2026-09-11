@@ -44,7 +44,8 @@ def main():
 
     def step():
         out,g=trainer._compute_loss_and_grad(x,y,mask,attn,seg)
-        mx.eval(out,g)
+        mx.eval(*[o for o in out if o is not None])
+        mx.eval(g)
         return out,g
 
     out,g=step()
@@ -52,8 +53,14 @@ def main():
     mx.eval(model.parameters(),trainer.optimizer.state)
     del out,g
     print(json.dumps({'params':model.num_parameters(),'engram_vocab_size':cfg.engram_vocab_size}),flush=True)
-    variants=[('base16',16,False,False),('tile32',32,False,False),
-              ('tile32_topk',32,True,False),('tile32_topk_combine',32,True,True)]
+    variants=[
+        ('base16',16,False,False),
+        ('base16_topk',16,True,False),
+        ('base16_combine',16,False,True),
+        ('tile32',32,False,False),
+        ('tile32_topk',32,True,False),
+        ('tile32_topk_combine',32,True,True),
+    ]
     compiled={}
     for name,tile,topk,combine in variants:
         sa._KEY_TILE=tile; sa._TOPK_ENABLED=topk; moe._COMBINE_ENABLED=combine
