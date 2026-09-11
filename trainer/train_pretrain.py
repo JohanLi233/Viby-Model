@@ -42,10 +42,9 @@ if __name__ == "__main__":
     if lm_config.psr_enabled:
         from .utils import Logger
 
-        Logger(f"PSR 预训练开启：{lm_config.psr_slots} slots × {lm_config.psr_dim}, "
-               f"R={lm_config.psr_rounds}, top-k={lm_config.psr_topk}, "
-               f"bridge gate={lm_config.psr_bridge_init}; "
-               "每行最长文档中点启动，终态未来 token 预测 + 全量读取分布蒸馏选址")
+        Logger(f"Protected PSR: output-only zero head, dense R={lm_config.psr_rounds}, "
+               f"H={lm_config.psr_horizon}, anchors/row={lm_config.psr_train_anchors}; "
+               "direct NTP, detached backbone, independent optimizer")
 
     # 初始化模型
     model, tokenizer = init_model(lm_config, args)

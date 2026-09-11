@@ -1,281 +1,393 @@
-"""PSR semantic gates: prefix isolation, independent cache, learning and budgets."""
+"""Scientific PSR contracts, explicitly checked on MLX rather than toy algebra."""
 
-import numpy as np
+from types import SimpleNamespace
 import pytest
 import mlx.core as mx
-from mlx import nn
-from mlx.utils import tree_flatten
-
+from mlx import nn, optimizers
+from mlx.utils import tree_flatten, tree_map
 from _v41_common import build, max_abs_diff
 from model.config import VibyConfig
-from model.psr import (COMPUTE, EvidenceMemory, IndexReference,
-                       counterfactual_value_targets, exact_topk, index_change_bound)
+from model.model import VibyForCausalLM
+from model.init import apply_trunc_normal_init
+from trainer.psr_pretrain import anchor_plan, compact_anchor_plan, text_psr_inputs
+from trainer.base_trainer import BaseTrainer
+from trainer.psr_optim import ParameterView
 
 
 def config(**kw):
-    args = dict(preset="tiny", dim=64, n_heads=2, o_groups=1, head_dim=32,
-                rope_head_dim=16, q_lora_rank=32, o_lora_rank=32,
-                moe_inter_dim=32, n_routed_experts=4, n_activated_experts=2,
-                engram_layer_ids=(), n_mtp_layers=0, vocab_size=32,
-                max_seq_len=64, window_size=8, psr_enabled=True, psr_dim=32,
-                psr_slots=2, psr_topk=2, psr_rounds=2, psr_bridge_init=0.2)
+    args = dict(
+        preset="tiny",
+        dim=64,
+        n_heads=2,
+        o_groups=1,
+        head_dim=32,
+        rope_head_dim=16,
+        q_lora_rank=32,
+        o_lora_rank=32,
+        moe_inter_dim=32,
+        n_routed_experts=4,
+        n_activated_experts=2,
+        engram_layer_ids=(),
+        n_mtp_layers=0,
+        vocab_size=32,
+        max_seq_len=32,
+        window_size=8,
+        psr_enabled=True,
+        psr_dim=32,
+        psr_slots=2,
+        psr_rounds=1,
+        psr_horizon=4,
+        psr_train_anchors=2,
+    )
     args.update(kw)
     return VibyConfig(**args)
 
 
-def run(model, ids, **kw):
-    return model(ids, use_mtp=False, return_thinking=True, **kw)
-
-
-def test_config_roundtrip_and_invalid_boundary():
-    cfg = config()
-    assert VibyConfig.from_dict(cfg.to_dict()).to_dict() == cfg.to_dict()
-    for kw in ({"psr_topk": 0}, {"psr_rounds": 9}, {"psr_read_cost": -1},
-               {"compress_ratios": (0, 0, 2, 2)}, {"psr_update_scale": 2}):
-        with pytest.raises(ValueError):
-            config(**kw)
-
-
-def test_disabled_path_and_zero_bridge_match_original():
+def pair():
     baseline = build(config(psr_enabled=False))
-    model = build(config(psr_bridge_init=0))
-    model.load_weights(tree_flatten(baseline.parameters()), strict=False)
-    x = mx.array([[1, 2, 3, 4, 5, 6]])
-    original = run(baseline, x).logits
-    disabled = run(model, x, use_thinking=False).logits
-    enabled = run(model, x, thinking_prefix_lengths=4).logits
-    mx.eval(original, disabled, enabled)
-    assert bool(mx.array_equal(original, disabled))
-    assert bool(mx.array_equal(original, enabled))
+    revised = build(config())
+    shared = tree_flatten(baseline.parameters())
+    revised.load_weights(shared, strict=False)
+    for k, v in shared:
+        assert bool(mx.array_equal(v, dict(tree_flatten(revised.parameters()))[k])), k
+    return baseline, revised
 
 
-def test_no_future_answer_leak_and_no_early_prompt_injection():
-    model = build(config())
-    x = mx.array([[1, 2, 3, 4, 5, 6]])
-    changed = mx.array([[1, 2, 3, 4, 20, 21]])
-    a = run(model, x, thinking_prefix_lengths=4)
-    b = run(model, changed, thinking_prefix_lengths=4)
-    off = run(model, x, use_thinking=False)
-    assert max_abs_diff(a.thinking_state.slots, b.thinking_state.slots) < 1e-6
-    assert max_abs_diff(a.logits[:, :3], off.logits[:, :3]) == 0
-    assert max_abs_diff(a.logits[:, 3:], off.logits[:, 3:]) > 1e-5
-    for idx in a.thinking_trace.indices:
-        assert bool(mx.all((idx >= 0) & (idx < 4)))
+def batch():
+    x = mx.array([[1, 2, 3, 4, 5, 6, 7, 8], [2, 3, 4, 5, 6, 7, 8, 9]])
+    y = x + 1
+    mask = mx.ones_like(x)
+    pad = mx.ones_like(x)
+    seg = mx.array([[0, 0, 0, 0, 0, 0, 1, 1], [0, 0, 0, 0, 0, 0, 0, 0]])
+    mask = mask.at[0, 5].add(-1)
+    return x, y, mask, pad, seg
 
 
-def test_observation_kv_precedes_bridge_and_engine_cannot_drop_workspace():
-    from engine.engine import VibyEngine
-    model = build(config())
-    x = mx.array([[1, 2, 3, 4]])
-    _, on = model.prefill(x)
-    _, off = model.prefill(x, use_thinking=False)
-    boundary = model.config.n_encoder_layers
-    assert max_abs_diff(on[boundary].compress_kv, off[boundary].compress_kv) == 0
-    assert max_abs_diff(on[boundary].index_k, off[boundary].index_k) == 0
-    assert on.thinking_state is not None and off.thinking_state is None
-    with pytest.raises(ValueError, match="ThinkingState"):
-        VibyEngine(model)
+def trainer(model, compiled=False, mode="recurrent"):
+    tr = BaseTrainer.__new__(BaseTrainer)
+    tr.model, tr.lm_config, tr.training_type = model, model.config, "pretrain"
+    tr.args = SimpleNamespace(
+        accumulation_steps=1,
+        compile_model=compiled,
+        psr_training_mode=mode,
+        psr_grad_clip=0.2,
+        grad_clip=0.3,
+        seed=123,
+        psr_freeze_base=False,
+    )
+    tr._expl_nest_mu, tr._en_delta, tr._psr_step = 0.0, None, 0
+    tr.optimizer = optimizers.AdamW(learning_rate=1e-3, weight_decay=0.1)
+    tr.psr_optimizer = (
+        optimizers.AdamW(learning_rate=2e-3, weight_decay=0.02)
+        if model.config.psr_enabled
+        else None
+    )
+    tr._loss_and_grad = tr._build_loss_and_grad()
+    return tr
 
 
-def test_per_example_prefix_document_and_padding_masks():
-    model = build(config())
-    x = mx.array([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]])
-    seg = mx.array([[0, 0, 1, 1, 1, 2], [0, 0, 0, 0, 0, 0]])
-    pad = mx.array([[1, 1, 1, 1, 1, 1], [1, 1, 0, 1, 1, 0]])
-    a = run(model, x, thinking_prefix_lengths=mx.array([4, 5]), segment_ids=seg, attention_mask=pad)
-    for idx in a.thinking_trace.indices:
-        assert bool(mx.all((idx[0] == 2) | (idx[0] == 3)))
-        assert bool(mx.all((idx[1] != 2) & (idx[1] < 5)))
-    off = run(model, x, segment_ids=seg, attention_mask=pad, use_thinking=False)
-    assert max_abs_diff(a.logits[:, :2], off.logits[:, :2]) == 0
-    assert max_abs_diff(a.logits[0, 5], off.logits[0, 5]) < 1e-6
+def test_t01_t02_t06_off_shared_weights_and_zero_initialization():
+    base, model = pair()
+    x = batch()[0]
+    off = model(
+        x,
+        psr_mode="off",
+        thinking_targets={"invalid": None},
+        thinking_options={"rounds": 0},
+    )
+    assert bool(mx.array_equal(off.logits, base(x).logits))
+    assert off.thinking_state is None
+    apply_trunc_normal_init(model, model.config.dim)
+    assert bool(mx.all(model.psr.output.weight == 0))
+    enabled = model(x, psr_anchors=mx.array([[1], [1]]))
+    assert bool(mx.array_equal(enabled.logits, model(x, psr_mode="off").logits))
+    # Construction also keeps baseline RNG consumption unchanged, but pairing
+    # always copies/checks shared tensors instead of relying on this convenience.
+    mx.random.seed(99)
+    a = VibyForCausalLM(config(psr_enabled=False))
+    ra = mx.random.uniform(shape=(8,))
+    mx.random.seed(99)
+    b = VibyForCausalLM(config())
+    rb = mx.random.uniform(shape=(8,))
+    assert bool(mx.array_equal(ra, rb))
+    for k, v in tree_flatten(a.parameters()):
+        assert bool(mx.array_equal(v, dict(tree_flatten(b.parameters()))[k]))
 
 
-def test_invalid_array_boundary_fails_closed_without_nan():
-    model = build(config())
-    x = mx.array([[1, 2, 3]])
-    a = run(model, x, thinking_prefix_lengths=mx.array([0]))
-    b = run(model, x, use_thinking=False)
-    assert not bool(a.thinking_state.valid[0])
-    assert bool(mx.all(mx.isfinite(a.thinking_state.slots)))
-    assert max_abs_diff(a.logits, b.logits) == 0
-    assert bool(mx.all(a.thinking_trace.indices[0] == -1))
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("mode", ["off", "recurrent"])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_t03_ten_protected_updates_match_parameters_optimizer_and_moe(
+    compiled, mode, dtype
+):
+    base, model = pair()
+    base.set_dtype(dtype)
+    model.set_dtype(dtype)
+    a, b = trainer(base, compiled), trainer(model, compiled, mode)
+    # Copy optimizer moments explicitly after a shared warmup update.
+    outputs, g = a._compute_loss_and_grad(*batch())
+    a._optimizer_step(g, 1, outputs[2])
+    model.load_weights(tree_flatten(base.parameters()), strict=False)
+    b.optimizer.state = tree_map(lambda v: mx.array(v), a.optimizer.state)
+    for _ in range(10):
+        oa, ga = a._compute_loss_and_grad(*batch())
+        ob, gb = b._compute_loss_and_grad(*batch())
+        a._optimizer_step(ga, 1, oa[2])
+        b._optimizer_step(gb, 1, ob[2])
+        shared = dict(tree_flatten(model.parameters()))
+        for k, v in tree_flatten(base.parameters()):
+            assert max_abs_diff(v, shared[k]) < 2e-6, k
+        sa, sb = (
+            dict(tree_flatten(a.optimizer.state)),
+            dict(tree_flatten(b.optimizer.state)),
+        )
+        assert sa.keys() == sb.keys()
+        for k in sa:
+            assert max_abs_diff(sa[k], sb[k]) < 2e-6, k
+        assert max_abs_diff(base.moe_bias_stack(), model.moe_bias_stack()) < 2e-6
 
 
-def test_prefill_decode_agrees_with_teacher_forcing_and_state_is_constant():
-    model = build(config())
-    model.eval()
-    x = mx.array([[1, 2, 3, 4, 5, 6, 7]])
-    full = run(model, x, thinking_prefix_lengths=4)
-    initial, cache = model.prefill(x[:, :4])
-    slots = cache.thinking_state.slots
-    decoded = [initial]
-    for t in range(4, x.shape[1]):
-        logits, _ = model.decode_step(x[:, t], cache)
-        decoded.append(logits[:, None])
-        assert cache.thinking_state.slots is slots
-    assert cache.start_pos == x.shape[1]
-    assert max_abs_diff(full.logits, mx.concatenate(decoded, axis=1)) < 2e-5
-    assert max_abs_diff(full.thinking_state.slots, slots) < 2e-5
-    cache.rewind(1)
-    with pytest.raises(ValueError, match="boundary"):
-        cache.rewind(cache.start_pos)
-    with pytest.raises(ValueError, match="cannot disable"):
-        model(x[:, :1], cache=cache, use_thinking=False)
+def test_t04_t05_corrected_gradient_isolation_and_two_stage_zero_head():
+    _, model = pair()
+    x, y, mask, pad, seg = batch()
+    anchors = mx.array([[1], [1]])
 
-
-def test_compute_only_ignores_memory_and_fixed_selection_is_an_ablation():
-    model = build(config())
-    r = model.model.reasoner
-    attn = model.model.layers[2].attn
-    initial = mx.random.normal((1, 64))
-    keys = mx.random.normal((1, 6, 32))
-    def memory(scale):
-        return EvidenceMemory(mx.random.normal((1, 6, 32)) * scale, keys * scale,
-                              mx.ones((1, 6), dtype=mx.bool_), mx.array([5]))
-    opts = dict(actions=(COMPUTE, COMPUTE), record_trace=True)
-    a, trace = r(initial, memory(1), None, mx.array([True]), attn.freq_cos, attn.freq_sin, **opts)
-    b, _ = r(initial, memory(100), None, mx.array([True]), attn.freq_cos, attn.freq_sin, **opts)
-    assert max_abs_diff(a.slots, b.slots) == 0
-    assert trace.full_scans == 0 and trace.scores == (None, None)
-    assert a.rounds == 2
-    out = run(model, mx.array([[1, 2, 3, 4]]), thinking_prefix_lengths=4,
-              thinking_options={"selection_mode": "fixed"})
-    assert bool(mx.array_equal(out.thinking_trace.indices[0], out.thinking_trace.indices[1]))
-
-
-def test_exact_topk_ties_mask_and_margin_bound():
-    score = mx.array([[[1.0, 1.0, 1.0 + 5e-7, -2.0]]])
-    idx, _ = exact_topk(score, mx.array([[True, True, True, False]]), 2)
-    assert idx.tolist() == [[[0, 2]]]
-    rng = np.random.default_rng(42)
-    certified = 0
-    for _ in range(24):
-        keys = rng.normal(size=(1, 16, 8)).astype(np.float32)
-        q = rng.normal(size=(1, 2, 3, 8)).astype(np.float32)
-        w = rng.normal(size=(1, 2, 3)).astype(np.float32)
-        q1 = q + rng.normal(scale=1e-4, size=q.shape).astype(np.float32)
-        w1 = w + rng.normal(scale=1e-4, size=w.shape).astype(np.float32)
-        score0 = (np.maximum(q @ keys[:, None].swapaxes(-1, -2), 0) * w[..., None]).sum(-2)
-        score1 = (np.maximum(q1 @ keys[:, None].swapaxes(-1, -2), 0) * w1[..., None]).sum(-2)
-        idx, gap = exact_topk(mx.array(score0), mx.ones((1, 16), mx.bool_), 3)
-        ref = IndexReference(mx.array(q), mx.array(w), idx, gap, mx.array(np.linalg.norm(keys, axis=-1).max(-1)))
-        delta = np.asarray(index_change_bound(ref, mx.array(q1), mx.array(w1)))
-        assert np.all(np.abs(score1 - score0) <= delta[..., None] + 1e-5)
-        if np.all(np.asarray(gap) > 2 * delta):
-            certified += 1
-            new_idx, _ = exact_topk(mx.array(score1), mx.ones((1, 16), mx.bool_), 3)
-            assert bool(mx.array_equal(idx, new_idx))
-    assert certified > 0
-
-
-def targets():
-    return dict(address=mx.array([[[1, 1], [2, 2]]]),
-                tests=mx.array([[[0], [0], [0]]]), results=mx.array([[[1], [2], [3]]]),
-                values=mx.ones((1, 3, 3)))
-
-
-def test_losses_reach_indexer_state_value_and_bridge_without_label_leakage():
-    model = build(config())
-    x = mx.array([[1, 2, 3, 4, 5, 6]])
-    target = targets()
     def loss(m):
-        return run(m, x, labels=x, thinking_prefix_lengths=4, thinking_targets=target).loss
-    value, grads = nn.value_and_grad(model, loss)(model)
-    mx.eval(value, grads)
-    assert np.isfinite(float(value))
+        return m(
+            x,
+            labels=y,
+            loss_mask=mask,
+            attention_mask=pad,
+            segment_ids=seg,
+            psr_anchors=anchors,
+        ).corrected_loss
+
+    _, grads = nn.value_and_grad(model, loss)(model)
     flat = dict(tree_flatten(grads))
-    for path in ("model.reasoner.index_query.weight", "model.reasoner.index_weights.weight",
-                 "model.reasoner.blocks.0.up.weight", "model.reasoner.test_head.weight",
-                 "model.reasoner.value_head.weight", "model.workspace_bridges.0.out.weight"):
-        assert bool(mx.all(mx.isfinite(flat[path]))), path
-        assert float(mx.max(mx.abs(flat[path]))) > 0, path
-    a = run(model, x, thinking_prefix_lengths=4, thinking_targets=target)
-    target["address"] = mx.zeros_like(target["address"])
-    target["results"] = mx.zeros_like(target["results"])
-    b = run(model, x, thinking_prefix_lengths=4, thinking_targets=target)
+    assert float(mx.max(mx.abs(flat["psr.output.weight"]))) > 0
+    for k, v in flat.items():
+        if k != "psr.output.weight":
+            assert float(mx.max(mx.abs(v))) == 0, k
+    opt = optimizers.SGD(learning_rate=0.1)
+    opt.update(ParameterView(model, True), {"psr": grads["psr"]})
+    _, grads = nn.value_and_grad(model, loss)(model)
+    flat = dict(tree_flatten(grads))
+    assert float(mx.max(mx.abs(flat["psr.read_query.weight"]))) > 0
+    assert float(mx.max(mx.abs(flat["psr.blocks.0.up.weight"]))) > 0
+    for k, v in flat.items():
+        if not k.startswith("psr."):
+            assert float(mx.max(mx.abs(v))) == 0, k
+
+
+def test_t07_t08_t09_t15_future_doc_pad_and_nonbridge_isolation():
+    _, model = pair()
+    model.psr.output.weight = mx.random.normal(model.psr.output.weight.shape) * 0.02
+    x, y, mask, pad, seg = batch()
+    anchors = mx.array([[1], [1]])
+    a = model(
+        x,
+        psr_anchors=anchors,
+        segment_ids=seg,
+        attention_mask=pad,
+        return_thinking=True,
+    )
+    changed = mx.where(mx.arange(8)[None, :] > 1, x + 10, x)
+    b = model(
+        changed,
+        psr_anchors=anchors,
+        segment_ids=seg,
+        attention_mask=pad,
+        return_thinking=True,
+    )
     assert max_abs_diff(a.thinking_state.slots, b.thinking_state.slots) == 0
-    assert max_abs_diff(a.logits, b.logits) == 0
-    assert abs(float(a.loss - b.loss)) > 1e-5
+    assert max_abs_diff(a.logits[:, :2], b.logits[:, :2]) == 0
+    off = model(x, psr_mode="off", segment_ids=seg, attention_mask=pad)
+    assert max_abs_diff(a.logits[:, 0], off.logits[:, 0]) == 0
+    assert max_abs_diff(a.logits[:, 5:], off.logits[:, 5:]) == 0
+    assert max_abs_diff(a.logits[:, 1:5], off.logits[:, 1:5]) > 0
+    # The state/correction of document 1 cannot affect document 2.
+    assert max_abs_diff(a.logits[0, 6:], off.logits[0, 6:]) == 0
+    none = model(
+        mx.zeros((1, 3), mx.int32),
+        labels=mx.zeros((1, 3), mx.int32),
+        loss_mask=mx.zeros((1, 3)),
+        attention_mask=mx.zeros((1, 3)),
+        psr_anchors=mx.array([[-1]]),
+    )
+    assert (
+        float(none.lm_loss) == 0
+        and float(none.corrected_loss) == 0
+        and bool(mx.isfinite(none.loss))
+    )
 
 
-def test_fixed_budget_compiles_forward_and_backward():
-    model = build(config())
-    x = mx.array([[1, 2, 3, 4, 5, 6]])
-    def loss(m, ids):
-        return m(ids, labels=ids, thinking_prefix_lengths=4,
-                 thinking_targets=targets(), use_mtp=False).loss
-    vg = nn.value_and_grad(model, loss)
-    fn = mx.compile(lambda ids: vg(model, ids), inputs=model.state, outputs=model.state)
-    eager, _ = nn.value_and_grad(model, loss)(model, x)
-    compiled, grads = fn(x)
-    mx.eval(compiled, grads)
-    assert abs(float(eager - compiled)) < 1e-4
-
-
-def test_adaptive_policy_requires_calibration_and_can_stop_or_compute():
-    model = build(config())
-    x = mx.array([[1, 2, 3, 4]])
-    with pytest.raises(ValueError, match="calibrated"):
-        run(model, x, thinking_prefix_lengths=4, thinking_options={"mode": "adaptive"})
+def test_t10_t11_same_horizon_explicit_modes_and_fresh_cache():
+    _, model = pair()
+    x = batch()[0][:1]
     model.eval()
-    head = model.model.reasoner.value_head
-    head.weight = mx.zeros_like(head.weight)
-    head.bias = mx.array([-100.0, 10.0, 20.0])
-    a = run(model, x, thinking_prefix_lengths=4,
-            thinking_options={"mode": "adaptive", "policy_calibrated": True})
-    assert a.thinking_state.rounds == 0 and a.thinking_trace.full_scans == 0
-    head.bias = mx.array([100.0, -10.0, 20.0])
-    b = run(model, x, thinking_prefix_lengths=4,
-            thinking_options={"mode": "adaptive", "policy_calibrated": True})
-    assert b.thinking_trace.actions == (COMPUTE, COMPUTE)
-    assert b.thinking_trace.full_scans == 0
-    assert b.thinking_state.rounds == 2
+    model.psr.output.weight = mx.random.normal(model.psr.output.weight.shape) * 0.02
+    for rounds in (1, 2, 4):
+        out = model(
+            x,
+            psr_anchors=mx.array([[2]]),
+            thinking_options={"rounds": rounds},
+            return_thinking=True,
+        )
+        assert (
+            out.thinking_state.horizon == 4
+            and out.thinking_state.anchor.tolist() == [[2]]
+        )
+        assert out.thinking_state.rounds == rounds
+    with pytest.raises(ValueError, match="R>=1"):
+        model(x, psr_anchors=mx.array([[2]]), thinking_options={"rounds": 0})
+    state = model(
+        x, psr_anchors=mx.array([[2]]), psr_mode="state_only", return_thinking=True
+    )
+    assert state.thinking_state.rounds == 0
+    assert max_abs_diff(state.logits, model(x, psr_mode="off").logits) > 0
+    _, cache = model.prefill(x[:, :4], psr_mode="state_only")
+    with pytest.raises(ValueError, match="fresh cache"):
+        model(x[:, :1], cache=cache, psr_mode="off")
 
 
-def test_zero_budget_and_one_token_prefix():
-    model = build(config())
-    x = mx.array([[1]])
-    a = run(model, x, thinking_prefix_lengths=1, thinking_options={"rounds": 0})
-    assert a.thinking_trace.states.shape[1] == 1
-    assert a.thinking_state.rounds == 0
-    b = run(model, x, thinking_prefix_lengths=1)
-    assert bool(mx.all(mx.isfinite(b.thinking_state.slots)))
-    assert b.thinking_trace.indices[0].tolist() == [[[0], [0]]]
+def test_t12_t16_t17_dense_sparse_bound_and_true_fixed_scan_count():
+    _, model = pair()
+    x = batch()[0][:1]
+    ids = mx.array([[[[0, 1], [0, 1]]]])
+    audit = model(
+        x,
+        psr_anchors=mx.array([[3]]),
+        thinking_options={
+            "read_mode": "sparse_diagnostic",
+            "fixed_indices": ids,
+            "min_rho": 0.01,
+        },
+        return_thinking=True,
+    )
+    tr = audit.thinking_trace
+    assert tr.full_scans == 1
+    assert bool(mx.all(tr.read_error[0] <= tr.error_bound[0] + 1e-5))
+    assert bool(mx.all((tr.rho[0] >= 0) & (tr.rho[0] <= 1)))
+    fixed = model(
+        x,
+        psr_anchors=mx.array([[3]]),
+        thinking_options={"read_mode": "fixed", "fixed_indices": ids},
+        return_thinking=True,
+    )
+    assert fixed.thinking_trace.full_scans == 0
+    with pytest.raises(ValueError, match="indices"):
+        model(x, psr_anchors=mx.array([[3]]), thinking_options={"read_mode": "fixed"})
 
 
-def test_bellman_targets_value_a_zero_immediate_gain_read():
-    from types import SimpleNamespace
-    class TwoReadTask:
-        config = SimpleNamespace(psr_group_size=1, psr_compute_cost=0.1,
-                                 psr_read_cost=0.1, psr_cost_weight=1.0)
-        def advance(self, slots, memory, cos, sin, action):
-            return slots + (1 if action == 2 else 0), None, None
-    trace = SimpleNamespace(states=mx.array([[[[0.0]], [[1.0]], [[2.0]]]]), memory=None, budget=2)
-    def terminal(slots):
-        return mx.where(slots[:, 0, 0] >= 2, 0.0, 0.5)
-    target = counterfactual_value_targets(TwoReadTask(), trace, None, None, terminal)
-    np.testing.assert_allclose(np.asarray(target[0, 0]), [0.5, 0.5, 0.1], atol=1e-6)
-    assert int(mx.argmin(target[0, 0] + mx.array([0, 0.1, 0.1]))) == 2
-    assert bool(mx.isnan(target[0, -1, 1:]).all())
+def test_t13_t14_t18_cache_invariance_compilation_runtime_gate_and_no_labels():
+    base, model = pair()
+    base.eval()
+    model.eval()
+    model.psr.output.weight = mx.random.normal(model.psr.output.weight.shape) * 0.02
+    x = batch()[0][:1]
+    full = model(x, psr_anchors=mx.array([[3, 7]]))
+    first, cache = model.prefill(x[:, :4])
+    _, base_cache = base.prefill(x[:, :4])
+    outputs = [first]
+    for t in range(4, 8):
+        token, _ = model.decode_step(x[:, t], cache)
+        base.decode_step(x[:, t], base_cache)
+        outputs.append(token[:, None])
+    assert max_abs_diff(full.logits, mx.concatenate(outputs, 1)) < 2e-5
+    for ca, cb in zip(cache.layers, base_cache.layers):
+        for key in ("window", "compress_kv", "index_k"):
+            if getattr(ca, key) is not None:
+                assert max_abs_diff(getattr(ca, key), getattr(cb, key)) < 2e-5
+
+    def forward(params, ids, gate):
+        model.update(params)
+        return model(ids, psr_anchors=mx.array([[3, 7]]), psr_gate=gate).logits
+
+    fn = mx.compile(forward)
+    params = model.trainable_parameters()
+    a = fn(params, x, mx.array(0.0))
+    b = fn(params, x, mx.array(1.0))
+    model.update(params)
+    assert max_abs_diff(a, model(x, psr_mode="off").logits) < 2e-5
+    assert max_abs_diff(a, b) > 0
+    assert max_abs_diff(b, full.logits) < 2e-5
 
 
-def test_synthetic_targets_match_execution_and_bfloat16_backward():
-    from trainer.psr_tasks import pointer_batch
-    batch = pointer_batch(123, 2, 8, 2, 2, 2)
-    ids = np.asarray(batch["input_ids"])
-    for row in range(2):
-        table = ids[row, :8] - 1
-        start = ids[row, -2] - 1
-        assert int(batch["answer"][row]) == int(table[table[start]]) + 1
-    model = build(config())
+def test_layout_sampling_not_content_and_full_coverage():
+    x, y, mask, pad, seg = batch()
+    a, w = anchor_plan(x, pad, seg, 4, count=2, key=mx.array(71, mx.uint32))
+    b, _ = anchor_plan(x + 99, pad, seg, 4, count=2, key=mx.array(71, mx.uint32))
+    assert bool(mx.array_equal(a, b))
+    full = compact_anchor_plan(x, pad, seg, 4)
+    assert full.tolist() == [[0, 4, 6], [0, 4, -1]]
+    assert w.tolist() == [1.5, 1.0]
+    assert "thinking_targets" not in text_psr_inputs(config(), x, y, mask, pad, seg)
+
+
+def test_independent_nan_handling_and_baseline_lr_groups():
+    base, model = pair()
+    a, b = trainer(base), trainer(model)
+    oa, ga = a._compute_loss_and_grad(*batch())
+    ob, gb = b._compute_loss_and_grad(*batch())
+    gb["psr"]["output"]["weight"] = mx.full_like(gb["psr"]["output"]["weight"], mx.nan)
+    a._optimizer_step(ga, 1, oa[2])
+    b._optimizer_step(gb, 1, ob[2])
+    for k, v in tree_flatten(base.parameters()):
+        assert max_abs_diff(v, dict(tree_flatten(model.parameters()))[k]) < 2e-6
+    assert bool(mx.all(model.psr.output.weight == 0))
+
+
+def test_t03_actual_muon_parameter_groups_and_ten_updates():
+    from trainer.muon import create_mixed_optimizer
+    from trainer.config import get_pretrain_parser
+
+    base, model = pair()
+    a, b = trainer(base), trainer(model)
+    args = get_pretrain_parser().parse_args(["--learning_rate", "0.0001"])
+    a.optimizer = create_mixed_optimizer(base, args)
+    b.optimizer = create_mixed_optimizer(ParameterView(model), args)
+    for _ in range(10):
+        oa, ga = a._compute_loss_and_grad(*batch())
+        ob, gb = b._compute_loss_and_grad(*batch())
+        a._optimizer_step(ga, 1, oa[2])
+        b._optimizer_step(gb, 1, ob[2])
+        shared = dict(tree_flatten(model.parameters()))
+        for key, value in tree_flatten(base.parameters()):
+            assert max_abs_diff(value, shared[key]) < 2e-6, key
+        sa, sb = (
+            dict(tree_flatten(a.optimizer.state)),
+            dict(tree_flatten(b.optimizer.state)),
+        )
+        assert sa.keys() == sb.keys()
+        for key in sa:
+            assert max_abs_diff(sa[key], sb[key]) < 2e-6, key
+
+
+def test_t16_generation_block_refresh_matches_full_plan_and_actual_reads():
+    _, model = pair()
+    model.eval()
+    model.psr.output.weight = mx.random.normal(model.psr.output.weight.shape) * 0.02
+    x = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]])
+    full = model(x, psr_anchors=mx.array([[3, 7, 11]]))
+    first, cache = model.prefill(x[:, :4])
+    outputs = [first]
+    for t in range(4, 13):
+        step, _ = model.decode_step(x[:, t], cache)
+        outputs.append(step[:, None])
+    assert cache.psr_phases == 3
+    assert cache.thinking_state.anchor.tolist() == [[11]]
+    assert max_abs_diff(full.logits, mx.concatenate(outputs, 1)) < 2e-5
+
+
+def test_padded_anchor_bfloat16_backward_is_finite():
+    # T<H creates one actual anchor and one padding anchor, as in the CLI probe.
+    model = build(config(psr_horizon=16, vocab_size=6400))
     model.set_dtype(mx.bfloat16)
-    def loss(m):
-        return m(batch["input_ids"], labels=batch["labels"], loss_mask=batch["loss_mask"],
-                 thinking_prefix_lengths=batch["prefix_length"], thinking_targets=batch["targets"],
-                 use_mtp=False).loss
-    value, grad = nn.value_and_grad(model, loss)(model)
-    mx.eval(value, grad)
-    assert bool(mx.isfinite(value))
-    g = dict(tree_flatten(grad))["model.reasoner.index_query.weight"]
-    assert bool(mx.isfinite(g).all()) and float(mx.max(mx.abs(g))) > 0
+    tr = trainer(model, compiled=True)
+    for _ in range(2):
+        out, grads = tr._compute_loss_and_grad(*batch())
+        mx.eval(out, grads)
+        for key, value in tree_flatten(grads):
+            assert bool(mx.all(mx.isfinite(value))), key
+        tr._optimizer_step(grads, 1, out[2])
+    assert float(mx.max(mx.abs(model.psr.output.weight))) > 0

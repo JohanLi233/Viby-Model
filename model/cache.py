@@ -81,6 +81,11 @@ class VibyCache:
         self.decode_max_pos = 0  # Python：当前步 batch 内最大绝对位置+1，decode 用来切池
         self.engram_prev = None  # [B, max_ngram-1] 最近 token id（Engram 哈希用）
         self.thinking_state = None  # independent terminal PSR state; never a token/cache position
+        self.psr_mode = None
+        self.psr_next_anchor = None
+        self.psr_phases = 0
+        self.psr_options = None
+        self.psr_gate = None
         self._wire_sources()
 
     def _wire_sources(self):

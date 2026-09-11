@@ -15,6 +15,7 @@ import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from .muon import create_mixed_optimizer
 from .fast_norm import gradient_square_sum
+from .psr_optim import ParameterView, split_gradients
 from .utils import (
     Logger,
     save_checkpoint,
@@ -95,6 +96,7 @@ class _PrefetchIterator:
         loader = self.loader
         try:
             n = len(loader.dataset)
+            loader.epoch_shuffle_state = np.random.get_state()
             indices = np.random.permutation(n) if loader.shuffle else np.arange(n)
             for start in range(0, n, loader.batch_size):
                 if self._stop.is_set():
@@ -233,18 +235,25 @@ class BaseTrainer:
 
     def _init_training_components(self):
         """初始化训练组件"""
+        protected = getattr(self.lm_config, 'psr_enabled', False)
+        base_view = ParameterView(self.model) if protected else self.model
+        self.psr_optimizer = optim.AdamW(learning_rate=getattr(self.args,'psr_learning_rate',1e-4),
+                                        weight_decay=getattr(self.args,'psr_weight_decay',0.0)) if protected else None
+        self._psr_step = 0
         # 创建优化器
         if getattr(self.args, "optimizer", "muon") == "adamw":
             from .muon import create_adamw_optimizer
 
             self.optimizer = create_adamw_optimizer(
-                self.model, self.args, self.training_type
+                base_view, self.args, self.training_type
             )
         else:
             self.optimizer = create_mixed_optimizer(
-                self.model, self.args, self.training_type
+                base_view, self.args, self.training_type
             )
 
+        # Save/restore the side optimizer separately; never place it in baseline state.
+        self.optimizer.psr_optimizer = self.psr_optimizer
         # noaux_tc 的 e_score_correction_bias 更新：forward 把 [L,E] 的每专家
         # token 计数作为图输出物化（out.moe_loads），_optimizer_step 在窗口
         # 末尾按 b += γ·sign(load_frac − 1/E) 覆写 frozen 的 bias
@@ -267,8 +276,9 @@ class BaseTrainer:
 
         # 处理检查点恢复
         self.start_epoch, self.start_step = self._handle_checkpoint_resume()
+        self._psr_step = int(getattr(self.args,"psr_resumed_microstep", self.start_step))
 
-    def _loss_fn(self, X, Y, loss_mask, attn_mask, seg_ids=None):
+    def _loss_fn(self, X, Y, loss_mask, attn_mask, seg_ids=None, psr_key=0, psr_gate=None):
         """训练 loss 函数（model 走闭包引用）
 
         返回 (加权和 loss / accumulation_steps, mtp 分量 loss, moe_loads,
@@ -280,11 +290,16 @@ class BaseTrainer:
         累加即可（计数可加），窗口末尾交给 model.update_moe_biases 做
         noaux_tc 偏置更新；无 MoE 时用零长占位保持图结构稳定。
         """
-        psr_inputs = {}
+        psr_inputs = dict(psr_mode="off", return_metrics=True)
         if self.training_type == "pretrain" and getattr(self.lm_config, "psr_enabled", False):
             from .psr_pretrain import text_psr_inputs
 
-            psr_inputs = text_psr_inputs(self.lm_config, X, Y, loss_mask, attn_mask, seg_ids)
+            if getattr(self.args, 'psr_training_mode', 'recurrent') == 'off':
+                psr_inputs = dict(psr_mode='off', return_metrics=True)
+            else:
+                psr_inputs = text_psr_inputs(self.lm_config, X, Y, loss_mask, attn_mask, seg_ids, psr_key)
+                psr_inputs['psr_mode'] = getattr(self.args, 'psr_training_mode', 'recurrent')
+            psr_inputs['psr_gate'] = psr_gate
         res = self.model(
             input_ids=X,
             labels=Y,
@@ -299,12 +314,17 @@ class BaseTrainer:
         moe_loads = res.moe_loads
         if moe_loads is None:
             moe_loads = mx.zeros((0,), dtype=mx.float32)
+        loss = res.loss
+        if getattr(self.args, 'psr_freeze_base', False):
+            loss = res.corrected_loss if res.corrected_loss is not None else mx.stop_gradient(res.loss)
+        metrics = res.metrics if res.metrics is not None else mx.zeros((X.shape[0],8,3))
         return (
-            res.loss / self.args.accumulation_steps,
+            loss / self.args.accumulation_steps,
             mtp_loss,
             moe_loads,
             lm_loss / self.args.accumulation_steps,
             z_loss,
+            metrics,
         )
 
     def _loss_and_grad_with_params(
@@ -315,7 +335,7 @@ class BaseTrainer:
         Y,
         loss_mask,
         attn_mask,
-        seg_ids=None,
+        seg_ids=None, psr_key=0, psr_gate=None,
     ):
         """参数与 MoE bias 显式作为入参的 loss 函数（value_and_grad 的目标）。
 
@@ -330,7 +350,7 @@ class BaseTrainer:
         self.model.update(params)
         if hasattr(self.model, "apply_moe_biases"):
             self.model.apply_moe_biases(moe_biases)
-        return self._loss_fn(X, Y, loss_mask, attn_mask, seg_ids)
+        return self._loss_fn(X, Y, loss_mask, attn_mask, seg_ids, psr_key, psr_gate)
 
     def _compute_loss_and_grad(
         self, X, Y, loss_mask, attn_mask, seg_ids=None
@@ -352,9 +372,14 @@ class BaseTrainer:
             if hasattr(self.model, "moe_bias_stack")
             else mx.zeros((0,), dtype=mx.float32)
         )
-        outputs, grads = self._loss_and_grad(
-            eval_params, biases, X, Y, loss_mask, attn_mask, seg_ids
-        )
+        protected = getattr(getattr(self, 'lm_config', None), 'psr_enabled', False)
+        extra = ()
+        if protected:
+            microstep = getattr(self, '_psr_step', 0)
+            extra = (mx.array(microstep + getattr(self.args,'seed',1337),mx.uint32), self.model.psr.calibration_gate)
+            self._psr_step = microstep + 1
+            self.args.psr_microstep = self._psr_step
+        outputs, grads = self._loss_and_grad(eval_params, biases, X, Y, loss_mask, attn_mask, seg_ids, *extra)
         # 无论 eager 还是 compile，f 内部的 model.update / apply_moe_biases 都
         # 只把模块的叶子换成了"trace 期的中间量"（compile 下是无 primitive 的
         # 占位数组，eager 下是 vjp trace 的 tracer）。不恢复的话，下一个微批的
@@ -441,18 +466,37 @@ class BaseTrainer:
 
     def create_data_loader(self, dataset):
         """创建数据加载器"""
-        return MLXDataLoader(
+        self._data_loader = MLXDataLoader(
             dataset,
             batch_size=self.args.batch_size,
             shuffle=True,
             drop_last=True,
         )
+        return self._data_loader
 
     def _optimizer_step(self, accum_grads, accum_count, moe_loads=None):
         """累积窗口结束：梯度裁剪 + 优化器更新 + MoE 路由偏置更新"""
         if accum_count <= 0 or accum_grads is None:
             return 0.0
 
+        protected = getattr(getattr(self, 'lm_config', None), 'psr_enabled', False)
+        if protected:
+            accum_grads, side_grads = split_gradients(accum_grads)
+            if side_grads and getattr(self.args,'psr_training_mode','recurrent') != 'off':
+                clip = getattr(self.args, 'psr_grad_clip', 1.0)
+                if clip:
+                    side_grads, norm = optim.clip_grad_norm(side_grads, clip)
+                else:
+                    norm = mx.sqrt(sum(gradient_square_sum(g) for _,g in tree_flatten(side_grads)))
+                if bool(mx.isfinite(norm)):
+                    self.psr_optimizer.update(ParameterView(self.model,side=True),side_grads)
+                    mx.eval(self.model.psr.parameters(),self.psr_optimizer.state)
+                    if getattr(self.args,"log_interval",10) <= getattr(self.args,"accumulation_steps",1):
+                        Logger(f"PSR optimizer_step={int(self.psr_optimizer.step)} grad_norm={float(norm):.6g}")
+                else:
+                    Logger('PSR gradient non-finite: skip side update only; baseline remains independent')
+            if getattr(self.args,'psr_freeze_base',False):
+                return 0.0
         # 每个微批的 loss 已除以 accumulation_steps，
         # 累加的梯度即窗口平均梯度，无需再除
         # grad_clip=0（默认）表示不裁剪，只算范数用于日志/NaN 防护；
@@ -484,7 +528,7 @@ class BaseTrainer:
             # MLX 参数数组不可变，update 前抓到的引用即更新前的值；
             # update 替换 module 树上的数组后再抓一次，差分即实际更新 δ。
             en_before = dict(tree_flatten(self.model.trainable_parameters()))
-        self.optimizer.update(self.model, grads)
+        self.optimizer.update(ParameterView(self.model) if protected else self.model, grads)
         if self._expl_nest_mu > 0:
             en_after = dict(tree_flatten(self.model.trainable_parameters()))
             self._en_delta = tree_unflatten(
@@ -590,6 +634,9 @@ class BaseTrainer:
                 continue
             self._last_epoch = epoch
             self._last_step = step
+            shuffle_state = getattr(getattr(self, '_data_loader', None), 'epoch_shuffle_state', None)
+            if shuffle_state is not None:
+                self.args.epoch_shuffle_state = (shuffle_state[0], shuffle_state[1].tolist(), *shuffle_state[2:])
             # doc_mask 打包模式下 dataset 多返回一项 segment_ids
             if len(batch) == 4:
                 X, Y, loss_mask, seg_ids = batch
@@ -619,7 +666,7 @@ class BaseTrainer:
             # 路由偏置基于当前快照，而不是 trace 时的常量。
             # mtp_loss 是辅助输出，仅用于日志展示，不参与梯度
             (
-                (loss, mtp_loss, moe_loads, lm_loss, z_loss),
+                (loss, mtp_loss, moe_loads, lm_loss, z_loss, metrics),
                 grads,
             ) = self._compute_loss_and_grad(
                 X, Y, loss_mask, attn_mask, seg_ids
@@ -632,8 +679,15 @@ class BaseTrainer:
             # 时 MLX 的图调度会把前向 tape 滞留与反向临时量同时顶到峰值
             # （r073 配置实测 46GB/4.0s）；拆开后前向先落定（~14.5GB）再跑
             # 反向（峰值 ~16GB），显存省 ~3×、单步快 ~2×，数值不变。
-            mx.eval(loss, mtp_loss, moe_loads, lm_loss, z_loss)
+            mx.eval(loss, mtp_loss, moe_loads, lm_loss, z_loss, metrics)
             mx.eval(grads)
+            if getattr(self.lm_config,'psr_enabled',False) and not getattr(self.args,'no_save',False):
+                record = dict(microstep=global_step+1, optimizer_step=int(self.optimizer.step), phase="pre_update",
+                              consumed_input_tokens=int(mx.sum(attn_mask)),
+                              psr_optimizer_step=int(self.psr_optimizer.step) if self.psr_optimizer is not None else 0,
+                              sums=mx.sum(metrics,axis=0).tolist())
+                with open(os.path.join(self.args.out_dir,'psr_metrics.jsonl'),'a') as file:
+                    file.write(json.dumps(record)+'\n')
             # P-0/P-1 快照（env 门控，默认零开销）：捕获本微批梯度，
             # 供跨 microbatch 方向相关分析（research/OPTIMIZER_RESEARCH §0.5）
             from . import snapshot

@@ -77,7 +77,7 @@ def gemm_active_params(model) -> int:
     for path, value in tree_flatten(model.trainable_parameters()):
         # PSR runs once per prefix, with R shared transitions. Counting its
         # matrices once per token overstates work and omits repeated work.
-        if path.startswith(("model.reasoner.", "model.workspace_bridges.")):
+        if path.startswith(("psr.",)):
             continue
         # 1-D（norm gain / mHC scale·base / attn_sink / router bias）不是 GEMM 权重
         if getattr(value, "ndim", 0) < 2:
@@ -132,29 +132,21 @@ def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int
 
 
 def psr_pretrain_flops_per_token(cfg, seq_len):
-    """Nominal fixed-budget TEXT-pretrain PSR FLOPs, amortized over a row.
+    """Nominal dense protected-side work; no indexer/teacher/value objectives.
 
-    Includes global index scoring, the stop-gradient full-read teacher (forward
-    only), sparse reads, shared blocks, bridges and terminal predictive probes.
-    Excludes sorting, normalization, elementwise work and optimizer FLOPs.
-    This is not a measured latency or a generic adaptive-policy FLOPs estimate.
+    Includes forward-only detached baseline vocabulary logits. Sorting, gather,
+    norm, scalar ops and optimizer are not GEMM FLOPs; profile them separately.
     """
     t = int(seq_len)
     if t <= 0 or not getattr(cfg, "psr_enabled", False):
         return 0
-    d, s, m, r = cfg.dim, cfg.psr_dim, cfg.psr_slots, cfg.psr_rounds
-    hd, hi, di = cfg.head_dim, cfg.index_n_heads, cfg.index_head_dim
-    k, probes = min(cfg.psr_topk, t), min(cfg.psr_num_tests, 4)
-    total = 6 * d * s  # Init(anchor), once
-    total += 6 * r * m * (s * hi * di + s * hi + 2 * s * hd + cfg.psr_blocks * 10 * s * s)
-    total += 6 * r * m * hi * di * t  # index score, fwd+bwd
-    total += r * (2 * m * s * hd + 2 * m * hd * t)  # full-read teacher, fwd only
-    total += 12 * r * m * k * hd  # selected QK + AV
-    total += cfg.psr_blocks * 12 * r * m * m * s
-    bridges = cfg.n_layers - cfg.n_encoder_layers
-    total += bridges * (6 * (2 * t * d * s + 2 * m * s * s) + 12 * t * m * s)
-    total += 6 * probes * s * cfg.psr_test_classes + 12 * probes * m * s
-    return int(total / t)
+    a,m,s,r,d = min(cfg.psr_train_anchors,t),cfg.psr_slots,cfg.psr_dim,cfg.psr_rounds,cfg.dim
+    hd = cfg.head_dim
+    total = 6*a*d*s + 6*a*r*m*(2*s*hd + cfg.psr_blocks*10*s*s)
+    total += 12*a*r*m*t*hd + cfg.psr_blocks*12*a*r*m*m*s
+    total += 6*(t*d*s + 2*a*m*s*s + t*s*cfg.vocab_size) + 12*t*m*s
+    total += 2*t*d*cfg.vocab_size
+    return int(total/t)
 
 
 def model_flops_utilization(

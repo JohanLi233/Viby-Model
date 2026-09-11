@@ -29,7 +29,6 @@
 """
 
 import json
-import math
 import os
 
 
@@ -252,21 +251,12 @@ class VibyConfig:
         self.psr_dim = int(kw.get("psr_dim", 256))
         self.psr_blocks = int(kw.get("psr_blocks", 2))
         self.psr_topk = int(kw.get("psr_topk", 16))
-        self.psr_rounds = int(kw.get("psr_rounds", 4))
+        self.psr_arch = "protected_residual_v1"
+        self.psr_horizon = int(kw.get("psr_horizon", 16))
+        self.psr_train_anchors = int(kw.get("psr_train_anchors", 2))
+        self.psr_rounds = int(kw.get("psr_rounds", 1))
         self.psr_max_rounds = int(kw.get("psr_max_rounds", 8))
-        self.psr_group_size = int(kw.get("psr_group_size", 2))
-        self.psr_num_tests = int(kw.get("psr_num_tests", 4))
-        self.psr_test_classes = int(kw.get("psr_test_classes", self.vocab_size))
-        self.psr_bridge_init = float(kw.get("psr_bridge_init", 0.0))
         self.psr_update_scale = float(kw.get("psr_update_scale", 0.25))
-        self.psr_predictive_weight = float(kw.get("psr_predictive_weight", 1.0))
-        self.psr_address_weight = float(kw.get("psr_address_weight", 1.0))
-        self.psr_value_weight = float(kw.get("psr_value_weight", 1.0))
-        self.psr_cost_weight = float(kw.get("psr_cost_weight", 0.0))
-        # Cost units are supplied/calibrated by the experiment, not called ms.
-        self.psr_read_cost = float(kw.get("psr_read_cost", 1.0))
-        self.psr_compute_cost = float(kw.get("psr_compute_cost", 0.1))
-        self.psr_index_distill_weight = float(kw.get("psr_index_distill_weight", 0.1))
 
         self._validate()
 
@@ -317,23 +307,13 @@ class VibyConfig:
         )
 
     def _validate(self):
-        for name in ("slots", "dim", "blocks", "topk", "max_rounds", "group_size",
-                     "num_tests", "test_classes"):
+        for name in ("slots", "dim", "blocks", "topk", "max_rounds", "horizon", "train_anchors"):
             if getattr(self, "psr_" + name) < 1:
                 raise ValueError(f"psr_{name} must be positive")
-        if not 0 <= self.psr_rounds <= self.psr_max_rounds:
-            raise ValueError("psr_rounds must be within [0, psr_max_rounds]")
+        if not 1 <= self.psr_rounds <= self.psr_max_rounds:
+            raise ValueError("psr_rounds must be within [1, psr_max_rounds]; use explicit off/state_only")
         if not 0 < self.psr_update_scale <= 1:
-            raise ValueError("psr_update_scale must be within (0, 1]")
-        for name in ("predictive_weight", "address_weight", "value_weight", "cost_weight",
-                     "read_cost", "compute_cost", "index_distill_weight"):
-            value = getattr(self, "psr_" + name)
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(f"psr_{name} must be finite and nonnegative")
-        if not math.isfinite(self.psr_bridge_init):
-            raise ValueError("psr_bridge_init must be finite")
-        if self.psr_read_cost < self.psr_compute_cost:
-            raise ValueError("psr_read_cost includes state update and must be >= psr_compute_cost")
+            raise ValueError("psr_update_scale must be within (0,1]")
         if self.psr_enabled:
             mid = self.n_encoder_layers
             if (len(self.compress_ratios) <= mid or self.compress_ratios[mid] != 1
@@ -491,11 +471,8 @@ class VibyConfig:
             total += mtp
         if self.psr_enabled:
             s = self.psr_dim
-            total += s * (self.psr_slots + d + self.index_n_heads * self.index_head_dim
-                          + self.index_n_heads + 2 * hd + 4 + self.psr_num_tests
-                          + self.psr_test_classes)
-            total += self.psr_blocks * 10 * s * s
-            total += (self.n_layers - self.n_encoder_layers) * (2 * d * s + 2 * s * s)
+            total += s * (self.psr_slots + 2*d + 2*hd + self.psr_horizon + self.vocab_size)
+            total += (10*self.psr_blocks + 2)*s*s
         return total
 
     def num_active_parameters(self) -> int:
@@ -511,7 +488,4 @@ class VibyConfig:
             total += self.n_mtp_layers * (
                 self.dspark_n_activated_experts * 3 * d * self.moe_inter_dim + per_layer
             )
-        if self.psr_enabled:
-            s = self.psr_dim
-            total += (self.n_layers - self.n_encoder_layers) * (2 * d * s + 2 * s * s)
         return total

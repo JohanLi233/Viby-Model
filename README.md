@@ -11,11 +11,10 @@ V4.1 这一条技术路线；唯一的保留项是 **Gated XSA**（默认开，�
 架构语义对照官方实现（`deepseek-ai/DeepSeek-V4.1-Flash` 的 `inference/model.py`，
 已逐行核对）与技术报告 `DeepSeek_V41_Tech_Report`（下称"报告"）。
 
-可选 **Viby-PSR** 在 CED 只读前缀记忆上增加独立预测状态工作区，支持精确自适应读址、
-纯计算、预算价值控制和 Decoder 桥接。`train_pretrain.py` **默认开启**（`--no-psr` 关闭），
-自动构造文档内前缀与终态未来 token 监督；模型库直接构造仍需 `psr_enabled=True`。
-实现契约、训练入口与当前限制见
-[VIBY_PSR.md](research/VIBY_PSR.md)。
+**Viby-PSR** 当前采用受保护的输出修正：稠密短循环、零初始化词表头、直接 NTP 监督，
+四处 baseline 输入 detach，独立优化器/裁剪/NaN 处理。普通预训练默认 H=16、R=1，
+`--no-psr` 可关闭；不再使用旧的 Decoder 多层桥接和 future-offset/自蒸馏辅助项。
+[实现契约、验收和未完成实验](research/VIBY_PSR.md)。
 
 ## 架构
 
