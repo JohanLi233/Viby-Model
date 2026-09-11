@@ -19,6 +19,7 @@ from experiments.kernel_bench_utils import (
     abba_blocks, append_jsonl, input_identity, param_identity, restore_train_state, snapshot_train_state,
 )
 from model.kernels import sparse_attention as sa, indexer_select as fs, moe_dispatch as moe, hc_pre_norm as hc
+from model.kernels import moe_counts, moe_decode, moe_gather
 
 
 VARIANTS = {
@@ -31,11 +32,24 @@ VARIANTS = {
 }
 
 
+# Compare against the already-optimized stack, not the pre-CSA2 baseline.
+VARIANTS.update({
+    "dataflow_gather": dict(VARIANTS["fused_combine"], gather_vjp=True),
+    "dataflow_counts": dict(VARIANTS["fused_combine"], compact_aux=True),
+    "dataflow_combined": dict(VARIANTS["fused_combine"], gather_vjp=True, compact_aux=True),
+})
+for variant in VARIANTS.values():
+    variant.setdefault("gather_vjp", False)
+    variant.setdefault("compact_aux", False)
+
+
 def configure(name):
     v = VARIANTS[name]
     fs._ENABLED, fs._BQ_ENABLED = v["fused"], v["bq"]
     sa._TOPK_ENABLED, sa._KEY_OWNED_BWD, sa._SPLIT_BWD = v["radix"], v["key"], v["split"]
     moe._COMBINE_ENABLED, hc._GROUPED_DW = v["combine"], v["grouped"]
+    moe_gather._ENABLED, moe_counts._ENABLED = v["gather_vjp"], v["compact_aux"]
+    moe_decode._ENABLED = False
 
 
 def main():
