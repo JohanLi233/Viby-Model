@@ -77,7 +77,7 @@ def gemm_active_params(model) -> int:
     for path, value in tree_flatten(model.trainable_parameters()):
         # PSR runs once per prefix, with R shared transitions. Counting its
         # matrices once per token overstates work and omits repeated work.
-        if path.startswith(("psr.",)):
+        if path.startswith(("psr.", "ncp.")):
             continue
         # 1-D（norm gain / mHC scale·base / attn_sink / router bias）不是 GEMM 权重
         if getattr(value, "ndim", 0) < 2:
@@ -128,7 +128,18 @@ def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int
     """训练一步（fwd+bwd）每个 token 的近似 FLOPs，不含优化器。"""
     return 6 * gemm_active_params(model) + attn_fwdbwd_flops_per_token(
         model.config, seq_len, attention_lengths
-    ) + psr_pretrain_flops_per_token(model.config, seq_len)
+    ) + psr_pretrain_flops_per_token(model.config, seq_len) + ncp_flops_per_token(model.config, seq_len)
+
+
+def ncp_flops_per_token(cfg, seq_len):
+    """Nominal concept GEMMs at T/k resolution, including VQ distance forward."""
+    if not getattr(cfg,"ncp_enabled",False) or seq_len < cfg.ncp_chunk_size:
+        return 0
+    d,n = cfg.dim,seq_len//cfg.ncp_chunk_size
+    weights=cfg.ncp_layers*(4*d*d+3*d*cfg.ncp_inter_dim)+cfg.ncp_codebooks*d*cfg.ncp_codebook_size
+    # Concept QK/AV are materialized densely; no sparse-gather speed claim.
+    total=6*n*weights+12*cfg.ncp_layers*n*n*d+8*n*cfg.ncp_codebook_size*d
+    return int(total/seq_len)
 
 
 def psr_pretrain_flops_per_token(cfg, seq_len):

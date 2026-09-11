@@ -110,6 +110,8 @@ def evaluate(model, arrays, mode, *, rounds=1, gate=1.0, batch_size=1):
             )
             for doc in np.unique(docids):
                 chosen = (docids == doc) * valid[row]
+                if not np.any(chosen):
+                    continue
                 key = str(int(doc))
                 record = documents.setdefault(
                     key,
@@ -131,10 +133,19 @@ def evaluate(model, arrays, mode, *, rounds=1, gate=1.0, batch_size=1):
                 record["covered_nll_sum"] += float((cn[row] * chosen * cov[row]).sum())
                 record["covered_count"] += float((chosen * cov[row]).sum())
     sums = {
-        k: sum(r[k] for r in documents.values()) for k in next(iter(documents.values()))
+        k: sum(r[k] for r in documents.values())
+        for k in (
+            "base_nll_sum",
+            "nll_sum",
+            "valid_label_count",
+            "covered_base_nll_sum",
+            "covered_nll_sum",
+            "covered_count",
+        )
     }
     count = sums["valid_label_count"]
     return dict(
+        status="ok" if count else "no_valid_labels",
         mode=mode,
         rounds=rounds,
         gate=gate,

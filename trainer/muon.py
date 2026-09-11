@@ -1547,6 +1547,9 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
                 and path.endswith(("q_weight", "k_weight"))
             )
             and "confidence_head" not in path
+            # Product-VQ centroids are embedding tables, not matrices whose
+            # original radius should be preserved by MuonH.
+            and not path.startswith("ncp.codebooks")
             and not path.endswith(("freq_cos", "freq_sin"))
         )
 

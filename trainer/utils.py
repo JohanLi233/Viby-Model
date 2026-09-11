@@ -218,6 +218,9 @@ def _reset_rope_tables(model, lm_config):
     def _fix(m):
         if not (hasattr(m, "freq_cos") and hasattr(m, "freq_sin")):
             return
+        if hasattr(m, "reset_concept_rope"):
+            m.reset_concept_rope()
+            return
         # 与 Attention.__init__ 同口径：压缩层用 compress_rope_theta + YaRN，
         # 纯滑窗层用 rope_theta 且不做 YaRN
         seq, theta = (
@@ -316,6 +319,9 @@ def build_model_and_tokenizer(
 # sidecar config / 组成 VibyConfig 的 kwargs。SFT/DPO 的 parser 把这些参数默认
 # 设为 None：表示"从基座 checkpoint 的 sidecar config 继承"，显式传入才覆盖。
 ARCH_ARG_TO_FIELD = {
+    **{name: name for name in ("ncp_enabled", "ncp_chunk_size", "ncp_layers", "ncp_heads",
+                               "ncp_codebooks", "ncp_codebook_size", "ncp_inter_dim", "ncp_merge",
+                               "ncp_loss_reduction", "ncp_loss_weight", "ncp_vq_loss_weight", "ncp_fusion_init")},
     **{name: name for name in ("psr_enabled", "psr_slots", "psr_dim", "psr_blocks", "psr_topk",
                                 "psr_rounds", "psr_max_rounds", "psr_horizon", "psr_train_anchors")},
     "hidden_size": "dim",
@@ -379,7 +385,8 @@ ARCH_ARG_TO_FIELD = {
 # （--routed_scaling_factor 与 --route_scale 共用一个 dest，这里只用于
 #  --preset 判断"用户是否显式传过"）
 ARCH_ARG_ALIASES = {"routed_scaling_factor": "route_scale", "psr": "psr_enabled",
-                    "no_psr": "psr_enabled", "no_psr_enabled": "psr_enabled"}
+                    "no_psr": "psr_enabled", "no_psr_enabled": "psr_enabled",
+                    "ncp": "ncp_enabled", "no_ncp": "ncp_enabled", "no_ncp_enabled": "ncp_enabled"}
 
 # 派生字段 → 生成它们的 CLI 结构参数。sidecar 里的派生字段是按当时的结构算好的；
 # 只要用户显式改了生成它的结构参数（如 --num_hidden_layers / --mtp_depth），
@@ -796,6 +803,18 @@ def _sub_optimizers(optimizer):
     return getattr(optimizer, "optimizers", [optimizer])
 
 
+def get_optimizer_steps(optimizer):
+    """Read leaf clocks; MultiOptimizer has states[], not a top-level step.
+
+    Keep all group clocks in logs instead of assuming they must be identical.
+    This also works before the first update and after state restoration.
+    """
+    children = getattr(optimizer, "optimizers", None)
+    if children is not None:
+        return [step for child in children for step in get_optimizer_steps(child)]
+    return [int(optimizer.step)]
+
+
 def get_current_lr(optimizer):
     """从优化器读取当前主学习率（MultiOptimizer 时取第一个，即 Muon 组）。"""
     opt = _sub_optimizers(optimizer)[0]
@@ -832,7 +851,7 @@ def _artifact_sha256(path, common_only=False):
             size = struct.unpack("<Q",file.read(8))[0]
             header = json.loads(file.read(size))
             for name, entry in sorted(header.items()):
-                if name == "__metadata__" or name.startswith("psr."):
+                if name == "__metadata__" or name.startswith(("psr.", "ncp.")):
                     continue
                 digest.update(json.dumps([name,entry["dtype"],entry["shape"]]).encode())
                 start,end = entry["data_offsets"]
@@ -903,7 +922,7 @@ def save_checkpoint(
         "psr_optimizer": _optimizer_hparams(optimizer.psr_optimizer) if getattr(optimizer,"psr_optimizer",None) is not None else None,
         "psr_microstep": getattr(args,"psr_microstep",step+1),
     }
-    if getattr(lm_config, 'psr_enabled', False):
+    if getattr(lm_config, 'psr_enabled', False) or getattr(lm_config, 'ncp_enabled', False):
         meta['code_sha'] = subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
         meta['dirty_diff_sha256'] = hashlib.sha256(subprocess.check_output(['git','diff'])).hexdigest()
         root=Path(__file__).resolve().parents[1]
@@ -914,13 +933,14 @@ def save_checkpoint(
         meta['rng'] = {'mlx_key': list(mx.random.state)[0].tolist(), 'python': random.getstate(),
                        'numpy_epoch_start': getattr(args,'epoch_shuffle_state',None)}
         filters = getattr(optimizer,'filters',[lambda *_: True])
-        meta['baseline_parameter_groups'] = [[] for _ in filters]
+        group_key = 'optimizer_parameter_groups' if getattr(lm_config,'ncp_enabled',False) else 'baseline_parameter_groups'
+        meta[group_key] = [[] for _ in filters]
         for key,value in tree_flatten(model.trainable_parameters()):
             if key.startswith('psr.'):
                 continue
             for i,fn in enumerate(filters):
                 if fn(key,value):
-                    meta['baseline_parameter_groups'][i].append(key)
+                    meta[group_key][i].append(key)
                     break
     meta_path = os.path.join(args.save_dir, f"{ckp_name}.json")
     with open(meta_path, "w") as f:
@@ -935,9 +955,9 @@ def save_checkpoint(
     side = getattr(optimizer, 'psr_optimizer', None)
     if side is not None:
         mx.save_safetensors(os.path.join(args.save_dir, f"{ckp_name}.psr_optimizer.safetensors"), dict(tree_flatten(side.state)))
-    if getattr(lm_config,'psr_enabled',False):
+    if getattr(lm_config,'psr_enabled',False) or getattr(lm_config,'ncp_enabled',False):
         meta['common_weights_sha256'] = _artifact_sha256(ckp,common_only=True)
-        meta['baseline_optimizer_sha256'] = _artifact_sha256(opt_path)
+        meta['optimizer_sha256' if getattr(lm_config,'ncp_enabled',False) else 'baseline_optimizer_sha256'] = _artifact_sha256(opt_path)
         with open(meta_path,'w') as file:
             json.dump(meta,file,indent=2,default=str)
     Logger(f"Checkpoint saved: {ckp}")
@@ -955,6 +975,11 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
     fresh_psr = (getattr(model.config, "psr_enabled", False)
                  and not any(k.startswith(psr_prefixes) for k in weights))
     fresh_prefixes = ("mtp_modules.",) if getattr(args, "freeze_backbone", False) else ()
+    fresh_ncp = getattr(model.config, "ncp_enabled", False) and not any(k.startswith("ncp.") for k in weights)
+    if fresh_ncp:
+        if not getattr(args,"reset_optimizer",False):
+            raise ValueError("NCP changes architecture/optimizer groups: use a fresh output directory or explicit --reset_optimizer for a baseline warm start")
+        fresh_prefixes += ("ncp.",)
     if fresh_psr:
         fresh_prefixes += psr_prefixes
 

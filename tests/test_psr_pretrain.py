@@ -30,7 +30,7 @@ def test_cli_default_is_dense_short_local_protected_not_old_aux(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_pretrain.py", *argv])
     args = setup_training_args(get_pretrain_parser().parse_args(argv))
     cfg = VibyConfig(**build_model_kwargs(args))
-    assert cfg.psr_enabled and cfg.psr_rounds == 1 and cfg.psr_horizon == 16
+    assert cfg.ncp_enabled and not cfg.psr_enabled and cfg.psr_rounds == 1 and cfg.psr_horizon == 16
     assert cfg.psr_train_anchors == 2 and args.psr_learning_rate == 1e-4
     assert not hasattr(cfg, "psr_predictive_weight")
     assert not args.use_swanlab and not args.auto_resume
@@ -102,6 +102,10 @@ def test_statistics_sum_tokens_and_document_pair_bootstrap():
     assert results["bridge_coverage"] == 1.0
     assert results["nll_sum"] == pytest.approx(results["base_nll_sum"], abs=1e-5)
     assert results["resampling_unit"] == "document"
+    empty = evaluate(
+        model, {**arrays, "loss_mask": np.zeros_like(arrays["loss_mask"])}, "off"
+    )
+    assert empty["status"] == "no_valid_labels" and empty["valid_label_count"] == 0
 
 
 def test_gate_calibration_can_reject_and_is_separate_from_inference():

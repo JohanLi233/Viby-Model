@@ -29,6 +29,7 @@
 """
 
 import json
+import math
 import os
 
 
@@ -258,6 +259,20 @@ class VibyConfig:
         self.psr_max_rounds = int(kw.get("psr_max_rounds", 8))
         self.psr_update_scale = float(kw.get("psr_update_scale", 0.25))
 
+        self.ncp_enabled = bool(kw.get("ncp_enabled", False))
+        self.ncp_chunk_size = int(kw.get("ncp_chunk_size", 4))
+        self.ncp_layers = int(kw.get("ncp_layers", max(1, self.n_encoder_layers // 2)))
+        self.ncp_heads = int(kw.get("ncp_heads", max(1, self.dim // 128)))
+        self.ncp_codebooks = int(kw.get("ncp_codebooks", max(1, self.dim // 128)))
+        self.ncp_codebook_size = int(kw.get("ncp_codebook_size", 128))
+        self.ncp_inter_dim = int(kw.get("ncp_inter_dim", ((self.dim * 43 // 16 + 63) // 64) * 64))
+        self.ncp_rope_theta = float(kw.get("ncp_rope_theta", 500000.0))
+        self.ncp_fusion_init = float(kw.get("ncp_fusion_init", 0.1))
+        self.ncp_merge = str(kw.get("ncp_merge", "softmax"))
+        self.ncp_loss_reduction = str(kw.get("ncp_loss_reduction", "mean"))
+        self.ncp_loss_weight = float(kw.get("ncp_loss_weight", 1.0))
+        self.ncp_vq_loss_weight = float(kw.get("ncp_vq_loss_weight", 1.0))
+
         self._validate()
 
     # ------------------------------------------------------------------
@@ -307,6 +322,20 @@ class VibyConfig:
         )
 
     def _validate(self):
+        if self.ncp_enabled:
+            if self.psr_enabled:
+                raise ValueError("NCP and PSR are separate experiments; disable PSR for NCP")
+            if any(getattr(self, "ncp_" + k) < 1 for k in
+                   ("chunk_size", "layers", "heads", "codebooks", "codebook_size", "inter_dim")):
+                raise ValueError("NCP dimensions must be positive")
+            if self.dim % self.ncp_codebooks or self.dim % self.ncp_heads or (self.dim // self.ncp_heads) % 2:
+                raise ValueError("NCP requires divisible codebooks/heads and an even head dimension")
+            if self.ncp_merge not in ("softmax", "raw_logits") or self.ncp_loss_reduction not in ("mean", "l2"):
+                raise ValueError("invalid NCP merge or loss reduction")
+            if not all(math.isfinite(x) for x in (self.ncp_fusion_init,self.ncp_rope_theta,self.ncp_loss_weight,self.ncp_vq_loss_weight)) or self.ncp_rope_theta <= 0:
+                raise ValueError("NCP scales must be finite and RoPE theta positive")
+            if not (self.ncp_loss_weight >= 0 and self.ncp_vq_loss_weight >= 0):
+                raise ValueError("NCP loss weights must be nonnegative")
         for name in ("slots", "dim", "blocks", "topk", "max_rounds", "horizon", "train_anchors"):
             if getattr(self, "psr_" + name) < 1:
                 raise ValueError(f"psr_{name} must be positive")
@@ -473,6 +502,9 @@ class VibyConfig:
             s = self.psr_dim
             total += s * (self.psr_slots + 2*d + 2*hd + self.psr_horizon + self.vocab_size)
             total += (10*self.psr_blocks + 2)*s*s
+        if self.ncp_enabled:
+            total += self.ncp_layers*(4*d*d+3*d*self.ncp_inter_dim)
+            total += self.ncp_codebooks*d*self.ncp_codebook_size + self.ncp_codebook_size*d
         return total
 
     def num_active_parameters(self) -> int:
@@ -488,4 +520,7 @@ class VibyConfig:
             total += self.n_mtp_layers * (
                 self.dspark_n_activated_experts * 3 * d * self.moe_inter_dim + per_layer
             )
+        if self.ncp_enabled:
+            total += (self.ncp_layers*(4*d*d+3*d*self.ncp_inter_dim)
+                      + self.ncp_codebooks*d*self.ncp_codebook_size)//self.ncp_chunk_size
         return total

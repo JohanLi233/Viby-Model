@@ -26,6 +26,7 @@ from .utils import (
     resolve_warmup_iters,
     resolve_lr_horizon,
     set_ddp_flag,
+    get_optimizer_steps,
 )
 
 _SENTINEL = object()
@@ -290,7 +291,7 @@ class BaseTrainer:
         累加即可（计数可加），窗口末尾交给 model.update_moe_biases 做
         noaux_tc 偏置更新；无 MoE 时用零长占位保持图结构稳定。
         """
-        psr_inputs = dict(psr_mode="off", return_metrics=True)
+        psr_inputs = dict(psr_mode="off", return_metrics=getattr(self.lm_config, "psr_enabled", False))
         if self.training_type == "pretrain" and getattr(self.lm_config, "psr_enabled", False):
             from .psr_pretrain import text_psr_inputs
 
@@ -318,6 +319,8 @@ class BaseTrainer:
         if getattr(self.args, 'psr_freeze_base', False):
             loss = res.corrected_loss if res.corrected_loss is not None else mx.stop_gradient(res.loss)
         metrics = res.metrics if res.metrics is not None else mx.zeros((X.shape[0],8,3))
+        if res.ncp_metrics is not None:
+            metrics = res.ncp_metrics
         return (
             loss / self.args.accumulation_steps,
             mtp_loss,
@@ -682,12 +685,24 @@ class BaseTrainer:
             mx.eval(loss, mtp_loss, moe_loads, lm_loss, z_loss, metrics)
             mx.eval(grads)
             if getattr(self.lm_config,'psr_enabled',False) and not getattr(self.args,'no_save',False):
-                record = dict(microstep=global_step+1, optimizer_step=int(self.optimizer.step), phase="pre_update",
+                group_steps = get_optimizer_steps(self.optimizer)
+                record = dict(microstep=global_step+1, optimizer_step=max(group_steps, default=0),
+                              optimizer_group_steps=group_steps, phase="pre_update",
                               consumed_input_tokens=int(mx.sum(attn_mask)),
                               psr_optimizer_step=int(self.psr_optimizer.step) if self.psr_optimizer is not None else 0,
                               sums=mx.sum(metrics,axis=0).tolist())
                 with open(os.path.join(self.args.out_dir,'psr_metrics.jsonl'),'a') as file:
                     file.write(json.dumps(record)+'\n')
+            if getattr(self.lm_config, "ncp_enabled", False) and not getattr(self.args, "no_save", False):
+                values = metrics.tolist()
+                record = dict(microstep=global_step+1, optimizer_group_steps=get_optimizer_steps(self.optimizer),
+                              ntp_loss=float(lm_loss)*self.args.accumulation_steps,
+                              valid_label_count=int(mx.sum(loss_mask)),
+                              ncp_loss=values[0], vq_loss=values[1], feedback_coverage=values[2],
+                              valid_concepts=values[3], valid_pairs=values[4], codebook_usage=values[5],
+                              target_mean_square=values[6], predicted_mean_square=values[7])
+                with open(os.path.join(self.args.out_dir,"ncp_metrics.jsonl"),"a") as file:
+                    file.write(json.dumps(record)+"\n")
             # P-0/P-1 快照（env 门控，默认零开销）：捕获本微批梯度，
             # 供跨 microbatch 方向相关分析（research/OPTIMIZER_RESEARCH §0.5）
             from . import snapshot
@@ -812,6 +827,13 @@ class BaseTrainer:
                             f"gate_maxK={'/'.join(f'{v / 2**10:.1f}' for v in gate_max)}"
                         )
 
+                if getattr(self.lm_config, "ncp_enabled", False):
+                    extra = dict(extra or {})
+                    for index, name in enumerate(("loss", "vq_loss", "feedback_coverage", "valid_concepts",
+                                                   "valid_pairs", "codebook_usage", "target_ms", "predicted_ms")):
+                        extra["ncp/"+name] = float(metrics[index])
+                    Logger(f"NCP loss={float(metrics[0]):.5f} VQ={float(metrics[1]):.5f} "
+                           f"coverage={float(metrics[2]):.3f} usage={float(metrics[5]):.3f}")
                 log_training_progress(
                     epoch,
                     step,

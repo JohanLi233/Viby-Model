@@ -71,6 +71,8 @@ class VibyEngine:
         **kwargs,
     ):
         cfg = model.config
+        if getattr(cfg, "ncp_enabled", False):
+            raise ValueError("NCP core currently uses model.generate with full-prefix recomputation; continuous-batch NCP cache is not implemented")
         if getattr(cfg, "psr_enabled", False):
             raise ValueError("PSR currently uses model.prefill/decode_step/generate; the continuous-batch engine does not yet transport ThinkingState")
         model.eval()

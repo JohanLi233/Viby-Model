@@ -11,10 +11,10 @@ V4.1 这一条技术路线；唯一的保留项是 **Gated XSA**（默认开，�
 架构语义对照官方实现（`deepseek-ai/DeepSeek-V4.1-Flash` 的 `inference/model.py`，
 已逐行核对）与技术报告 `DeepSeek_V41_Tech_Report`（下称"报告"）。
 
-**Viby-PSR** 当前采用受保护的输出修正：稠密短循环、零初始化词表头、直接 NTP 监督，
-四处 baseline 输入 detach，独立优化器/裁剪/NaN 处理。普通预训练默认 H=16、R=1，
-`--no-psr` 可关闭；不再使用旧的 Decoder 多层桥接和 future-offset/自蒸馏辅助项。
-[实现契约、验收和未完成实验](research/VIBY_PSR.md)。
+预训练当前默认试验 **NCP-Core**：四 token 池化、因果 Concept Module、PQ codebook、下一 concept
+预测和 Decoder 融合，联合训练 NTP + NCP + VQ，**不叠加 PSR**。仅移植核心机制，保留 Viby 主干。
+[实现口径与运行说明](research/NCP_CORE.md)。`--no-ncp` 选择 token baseline；PSR 独立实验使用
+`--no-ncp --psr`，详见 [PSR 契约](research/VIBY_PSR.md)。
 
 ## 架构
 

@@ -1,6 +1,10 @@
 # Viby-PSR 科学修订：受保护的输出修正器
 
-日期：2026-09-11。修订基点为 `52d17a67f3012af1052c99ff48f4eccade6dcd7e`。
+日期：2026-09-11。
+
+当前预训练默认已切换为独立 [NCP-Core](NCP_CORE.md) 试验；PSR 需显式 `--no-ncp --psr`。
+下文记录受保护 PSR 的机制及历史验收，不表示它仍是默认实验。
+修订基点为 `52d17a67f3012af1052c99ff48f4eccade6dcd7e`。
 本文描述当前实现及验收边界，不是验证集收益或效率优势声明。旧 PSR 实现、旧配方和实验历史
 保留在该 commit；已有 checkpoint 未被覆盖。旧的 Decoder 多层注入与辅助分类/自蒸馏/value
 训练路径已从当前主线移除。
@@ -48,7 +52,7 @@ MoE bias 更新保持原规则。侧路使用独立 optimizer state、LR、裁�
 - `state_only`：构造 S0，不执行循环，但读出与词表修正仍存在。
 - `recurrent`：明确执行 R≥1。R=0 报错，不再兼任开关。
 
-模型库仍显式使用 `VibyConfig(psr_enabled=True)`；`train_pretrain.py` 默认开启受保护路径，
+模型库仍显式使用 `VibyConfig(psr_enabled=True)`；`train_pretrain.py --no-ncp --psr` 开启受保护路径，
 `--no-psr` 关闭。默认 **H=16、R=1、8 槽、dim=256、2 个共享 dense block**。
 每个文档从文档首位置开始划分长度 H 的块；anchor b 只能看 `x<=b`，只修正 `[b,b+H)`，
 并继续受同文档/PAD 限制。对应 logits 始终预测 `x[t+1]`，读出 query 来自合法的实际 `h0_t`。
@@ -87,7 +91,7 @@ out = model(
 多文档 packed 数据支持无缓存训练/评估；多文档 cached 生成明确拒绝。连续 batch engine 和
 DSpark speculative 生成尚未搬运该工作区，仍拒绝 PSR 配置；MTP 的原主干训练目标可以保留。
 
-普通预训练命令可以继续使用，默认配方已改为受保护 R=1；可选参数包括：
+PSR 独立预训练使用 `--no-ncp --psr`，配方为受保护 R=1；可选参数包括：
 
 ```text
 --psr_horizon 16 --psr_rounds 1 --psr_train_anchors 2

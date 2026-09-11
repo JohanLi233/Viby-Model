@@ -29,10 +29,11 @@ from .block import Block, apply_hc_pre_norm
 from .cache import SharedAttnState, VibyCache
 from .config import VibyConfig
 from .engram import Engram, EngramLayout, NgramHashState, build_compressed_token_map
-from .hc import identity_pre_mix
+from .hc import hc_pre, identity_pre_mix
 from .init import apply_trunc_normal_init
 from .moe import MoEFeedForward, MoEGate, update_expert_bias
 from .norms import RMSNorm
+from .ncp import NextConceptModule, NCPRecomputeCache
 from .psr import EvidenceMemory, ProtectedPSR, ReasoningTrace, ThinkingState, residual_statistics
 
 NEG_INF = -1e30
@@ -58,6 +59,10 @@ class CausalLMOutput:
     base_token_nll: Optional[mx.array] = None
     corrected_token_nll: Optional[mx.array] = None
     bridge_mask: Optional[mx.array] = None
+    ncp_loss: Optional[mx.array] = None
+    vq_loss: Optional[mx.array] = None
+    ncp_metrics: Optional[mx.array] = None
+    ncp_result: object = None
 
 
 def lm_head_ce(hidden: mx.array, weight: mx.array, labels: mx.array, loss_mask=None,
@@ -144,7 +149,9 @@ class VibyModel(nn.Module):
 
     def __call__(self, input_ids: mx.array, start_pos: int = 0, cache: Optional[VibyCache] = None,
                  segment_ids=None, pad_mask=None, decode: bool = False, prev_tokens=None,
-                 collect_main: bool = True, return_memory=False):
+                 collect_main: bool = True, return_memory=False, ncp=None, ncp_loss=False):
+        if ncp is not None and (cache is not None or decode or start_pos != 0):
+            raise ValueError("NCP uses full-prefix reference inference; token KV cache support is not enabled")
         h = self.embed(input_ids)
         B, T = input_ids.shape
         positions = (start_pos + mx.arange(T))[None, :] if not isinstance(start_pos, mx.array) else start_pos[:, None] + mx.arange(T)
@@ -165,11 +172,20 @@ class VibyModel(nn.Module):
                 shared.pool_tokens = int(start_pos) + 1
         pre_mix = identity_pre_mix(h, self.hc_mult)
         mains = []
+        ncp_result = None
         for i, layer in enumerate(self.layers):
             if hashes is not None and i in self._engram_slot:
                 h = self.engram_layers[self._engram_slot[i]](
                     h, hashes[:, :, self._engram_slot[i], :]
                 )
+            if ncp is not None and i == self.config.n_encoder_layers:
+                encoder_hidden = hc_pre(h, pre_mix)
+                ncp_result = ncp(encoder_hidden, segment_ids, pad_mask, compute_loss=ncp_loss)
+                # Lift a single-stream concept residual into mHC without replacing
+                # its streams. Their weighted read receives precisely this signal.
+                mass = mx.sum(pre_mix.astype(h.dtype).astype(mx.float32), axis=-1, keepdims=True)
+                delta = ncp_result.signal.astype(mx.float32) / mx.maximum(mass, self.config.hc_eps)
+                h = h + delta.astype(h.dtype)[:, :, None, :]
             if collect_main and i in self.target_layer_ids:
                 # MTP 读的是目标层的"注意力输入"（mHC 均值），不是层输出
                 mains.append(mx.mean(h, axis=2))
@@ -183,7 +199,9 @@ class VibyModel(nn.Module):
                 values = shared.compress_kv if cache is None else cache[i].compress_kv[:, :start_pos + T]
                 memory = EvidenceMemory(values, boundary_input, positions, pad_mask, segment_ids)
         result = (apply_hc_pre_norm(h, pre_mix, self.norm), mains, new_prev)
-        return (*result, memory) if return_memory else result
+        if return_memory:
+            result = (*result, memory)
+        return (*result, ncp_result) if ncp is not None else result
 
 
 class DSparkMarkovHead(nn.Module):
@@ -296,6 +314,15 @@ class VibyForCausalLM(nn.Module):
             high, low = rng[0].tolist()
             mx.random.seed((int(high) << 32) | int(low))
 
+        self.ncp = None
+        if config.ncp_enabled:
+            rng = list(mx.random.state)
+            self.ncp = NextConceptModule(config)
+            if not skip_init:
+                apply_trunc_normal_init(self.ncp, config.dim)
+            high, low = rng[0].tolist()
+            mx.random.seed((int(high) << 32) | int(low))
+
 
     # ------------------------------------------------------------------
     def _head_weight(self) -> mx.array:
@@ -309,7 +336,8 @@ class VibyForCausalLM(nn.Module):
                  start_pos=0, cache=None, decode=False, prev_tokens=None, use_mtp=True,
                  thinking_prefix_lengths=None, thinking_state=None, thinking_options=None,
                  thinking_targets=None, use_thinking=True, return_thinking=False,
-                 psr_mode=None, psr_anchors=None, psr_gate=None, psr_sample_weights=None, return_metrics=False, **kwargs):
+                 psr_mode=None, psr_anchors=None, psr_gate=None, psr_sample_weights=None, return_metrics=False,
+                 use_ncp=True, **kwargs):
         mode = psr_mode or ('recurrent' if self.config.psr_enabled and use_thinking else 'off')
         if not use_thinking:
             mode = 'off'
@@ -344,7 +372,8 @@ class VibyForCausalLM(nn.Module):
         want_main = bool(use_mtp and self.mtp_modules and labels is not None)
         result = self.model(input_ids, start_pos=start_pos, cache=cache, segment_ids=segment_ids,
                             pad_mask=pad, decode=decode, prev_tokens=prev_tokens,
-                            collect_main=want_main, return_memory=requested)
+                            collect_main=want_main, return_memory=requested,
+                            ncp=self.ncp if use_ncp else None, ncp_loss=labels is not None)
         hidden, mains, _ = result[:3]
         state, trace = thinking_state, None
         if requested:
@@ -358,6 +387,11 @@ class VibyForCausalLM(nn.Module):
         if state is not None and state.mode != mode:
             raise ValueError("state mode mismatch; create a fresh condition")
         out = CausalLMOutput(thinking_state=state, thinking_trace=trace)
+        if self.ncp is not None and use_ncp:
+            out.ncp_result = result[-1]
+            out.ncp_loss = out.ncp_result.ncp_loss
+            out.vq_loss = out.ncp_result.vq_loss
+            out.ncp_metrics = out.ncp_result.metrics
         b,t,_ = hidden.shape
         positions = (start_pos + mx.arange(t))[None] if not isinstance(start_pos, mx.array) else start_pos[:,None] + mx.arange(t)
         positions = mx.broadcast_to(positions,(b,t))
@@ -372,6 +406,8 @@ class VibyForCausalLM(nn.Module):
         z_w = float(self.config.z_loss_weight)
         ce, z = lm_head_ce(hidden, self._head_weight(), labels, loss_mask, z_w)
         out.lm_loss, out.z_loss, out.loss = ce, z, ce + z_w * z
+        if out.ncp_loss is not None:
+            out.loss = out.loss + self.config.ncp_loss_weight*out.ncp_loss + self.config.ncp_vq_loss_weight*out.vq_loss
         valid = mx.ones((b,t),mx.float32) if loss_mask is None else loss_mask.astype(mx.float32)
         if vector is not None or return_metrics:
             base_losses, corrected_losses, returned_logits = [], [], []
@@ -524,6 +560,9 @@ class VibyForCausalLM(nn.Module):
     def prefill(self, input_ids: mx.array, segment_ids=None, *, use_thinking=True,
                 thinking_options=None, psr_mode=None, psr_gate=None):
         """整段 prefill，返回 (logits [B,T,V], cache)。"""
+        if self.ncp is not None:
+            out = self(input_ids, segment_ids=segment_ids, use_mtp=False)
+            return out.logits, NCPRecomputeCache(input_ids, segment_ids, input_ids.shape[1])
         if self.config.psr_enabled and use_thinking and psr_mode != "off" and segment_ids is not None:
             if bool(mx.any(segment_ids != segment_ids[:,:1])):
                 raise ValueError("multi-document cached PSR generation is unsupported; use uncached packed evaluation")
@@ -545,6 +584,13 @@ class VibyForCausalLM(nn.Module):
 
     def decode_step(self, token_ids: mx.array, cache: VibyCache, *, psr_gate=None):
         """单步解码，返回 (logits [B,V], cache)。"""
+        if isinstance(cache, NCPRecomputeCache):
+            cache.input_ids = mx.concatenate([cache.input_ids, token_ids[:,None]], axis=1)
+            if cache.segment_ids is not None:
+                cache.segment_ids = mx.concatenate([cache.segment_ids, cache.segment_ids[:,-1:]], axis=1)
+            cache.start_pos += 1
+            out = self(cache.input_ids, segment_ids=cache.segment_ids, use_mtp=False)
+            return out.logits[:,-1], cache
         cache.decode_max_pos = cache.start_pos + 1
         if psr_gate is None:
             psr_gate = cache.psr_gate
