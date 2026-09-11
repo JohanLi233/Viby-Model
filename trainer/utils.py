@@ -316,6 +316,8 @@ ARCH_ARG_TO_FIELD = {
     "o_groups": "o_groups",
     "o_lora_rank": "o_lora_rank",
     "window_size": "window_size",
+    "use_xsa": "use_xsa",
+    "xsa_last_n": "xsa_last_n",
     "hc_mult": "hc_mult",
     "hc_sinkhorn_iters": "hc_sinkhorn_iters",
     "hc_eps": "hc_eps",
@@ -378,6 +380,7 @@ DERIVED_FIELD_TRIGGERS = {
     "candidate_source_layer": ("num_hidden_layers", "mtp_depth"),
     "dspark_target_layer_ids": ("num_hidden_layers", "mtp_depth"),
     "engram_layer_ids": ("num_hidden_layers",),
+    "xsa_last_n": ("num_hidden_layers",),
     "engram_num_embeddings": (
         "engram_layer_ids",
         "engram_max_ngram_size",

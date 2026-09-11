@@ -218,6 +218,33 @@ class VibyForCausalLM(nn.Module):
         # 主干 gate 的 E 相同，可以堆成一张 [L, E] 计数表；draft 层 E 不同，单独处理
         self._backbone_gates = [g for g in self._moe_gates if g.layer_idx < config.n_layers]
         self._moe_layers = [m for m in self.modules() if isinstance(m, MoEFeedForward)]
+        # 融合 kernel 预热（必须在 mx.compile trace 之前、eager 上下文里做）
+        try:
+            from .kernels.hc_fused import prewarm_hc_post
+
+            prewarm_hc_post(config.hc_mult)
+        except Exception:  # noqa: BLE001
+            pass
+        if config.hc_mult == 4:
+            from .kernels.sinkhorn_fused import prewarm_sinkhorn
+
+            prewarm_sinkhorn(config.hc_sinkhorn_iters, config.hc_eps)
+        from .kernels.moe_dispatch import prewarm_moe, prewarm_route_combine
+        from .kernels.sparse_attention import prewarm_sparse_attention, prewarm_topk
+
+        if config.n_heads == 16 and any(config.compress_ratios):
+            prewarm_topk(config.max_seq_len)
+
+        for dtype in (mx.bfloat16, mx.float16):
+            for dim, width, top_k in {
+                (m.dim, 2 * m.moe_in, m.top_k) for m in self._moe_layers
+            }:
+                prewarm_moe(dim, width, top_k, dtype)
+                prewarm_route_combine(dim, top_k, dtype)
+            if config.n_heads == 16 and any(config.compress_ratios):
+                prewarm_sparse_attention(
+                    config.head_dim, config.window_size, config.head_dim ** -0.5, dtype
+                )
         if not skip_init:
             apply_trunc_normal_init(self, config.dim)
 

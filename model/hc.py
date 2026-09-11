@@ -14,6 +14,11 @@ Sinkhorn–Knopp 迭代把 comb 投影到双随机矩阵，保证跨层信号传
 import mlx.core as mx
 from mlx import nn
 
+try:  # 融合 Metal kernel；不可用时自动回退下面的纯 MLX 实现
+    from .kernels.hc_fused import hc_post_fused as _hc_post_fused
+except Exception:  # noqa: BLE001
+    _hc_post_fused = None
+
 from .norms import rms_unit
 
 
@@ -32,15 +37,9 @@ def hc_split(mixes: mx.array, scale: mx.array, base: mx.array, hc_mult: int, eps
 
 def sinkhorn(comb: mx.array, iters: int, eps: float) -> mx.array:
     """comb: [..., hc, hc] → 双随机矩阵（softmax 起手，再交替行列归一化）。"""
-    m = mx.max(comb, axis=-1, keepdims=True)
-    c = mx.exp(comb - m)
-    c = c / (mx.sum(c, axis=-1, keepdims=True) + eps)
-    # 列归一化放在前面："comb / (comb.sum(-2) + eps)" 首步
-    c = c / (mx.sum(c, axis=-2, keepdims=True) + eps)
-    for _ in range(iters - 1):
-        c = c / (mx.sum(c, axis=-1, keepdims=True) + eps)
-        c = c / (mx.sum(c, axis=-2, keepdims=True) + eps)
-    return c
+    from .kernels.sinkhorn_fused import sinkhorn_fused
+
+    return sinkhorn_fused(comb, iters, eps)
 
 
 class HyperConnection(nn.Module):
@@ -77,9 +76,14 @@ class HyperConnection(nn.Module):
 
 
 def hc_pre(x: mx.array, pre_mix: mx.array) -> mx.array:
-    """把 hc 条流按 pre_mix 收敛成一条：[B,T,hc,d] × [B,T,hc] → [B,T,d]。"""
-    y = mx.sum(pre_mix[..., None] * x, axis=-2)
-    return y.astype(x.dtype)
+    """把 hc 条流按 pre_mix 收敛成一条：[B,T,hc,d] × [B,T,hc] → [B,T,d]。
+
+    pre_mix 先降到 x.dtype 再乘：fp32 混合系数会把 [B,T,hc,d] 的乘积
+    提升成 fp32（B4/T1024/hc4/d1024 下 67MB/次、每层 2 次），而输出本来
+    就要回到 x.dtype；模型其余路径都是 bf16，这里保持同一精度口径。
+    """
+    y = mx.sum(pre_mix.astype(x.dtype)[..., None] * x, axis=-2)
+    return y
 
 
 def hc_post(x: mx.array, residual: mx.array, post: mx.array, comb: mx.array) -> mx.array:
@@ -87,11 +91,19 @@ def hc_post(x: mx.array, residual: mx.array, post: mx.array, comb: mx.array) -> 
 
     x:[B,T,d] residual:[B,T,hc,d] post:[B,T,hc] comb:[B,T,hc,hc]
         out[m] = post[m]·x + Σ_j comb[m, j]·residual[j]
+
+    Σ_j 用 [B,T,hc,hc] @ [B,T,hc,d] 的批量 matmul 算：原先的
+    `comb[..., None] * residual[..., None, :, :]` 会先广播出
+    [B,T,hc,hc,d]（B4/T1024/hc4/d1024 fp32 = 268MB/次，每层 2 次，
+    反向还要再来一遍），matmul 在 bf16 下是同一数学且无中间量。
     """
-    y = post[..., None] * x[..., None, :] + mx.sum(
-        comb[..., None] * residual[..., None, :, :], axis=-2
+    if _hc_post_fused is not None:
+        return _hc_post_fused(x, residual, post, comb)
+    dt = x.dtype
+    y = post.astype(dt)[..., None] * x[..., None, :] + mx.matmul(
+        comb.astype(dt), residual
     )
-    return y.astype(x.dtype)
+    return y.astype(dt)
 
 
 def identity_pre_mix(x: mx.array, hc_mult: int) -> mx.array:

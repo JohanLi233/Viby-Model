@@ -24,8 +24,8 @@
 - **MTP / DSpark**：主干后追加 draft 层，半自回归块式草稿 + 马尔可夫头 +
   置信度头。
 
-与本仓库旧实现（Kimi Linear 3:1 KDA / iHC / XSA / AttnRes / SiTU）无关的
-部分已全部移除。
+与本仓库旧实现（Kimi Linear 3:1 KDA / iHC / AttnRes / SiTU）无关的
+部分已全部移除；**Gated XSA 作为可选后处理保留**（见「注意力细节」）。
 """
 
 import json
@@ -120,7 +120,9 @@ class VibyConfig:
                         q_lora_rank=128, o_groups=2, o_lora_rank=64, moe_inter_dim=128,
                         n_routed_experts=16, n_activated_experts=4, window_size=32,
                         index_n_heads=4, index_head_dim=32, index_topk=16,
-                        engram_n_heads=2, engram_head_dim=32)
+                        engram_n_heads=2, engram_head_dim=32,
+                        # tiny 预设要显式压回小表，否则会继承 ≈1B 配方的大 Engram
+                        engram_vocab_size=8192)
         for k, v in base.items():
             kw.setdefault(k, v)
 
@@ -160,6 +162,20 @@ class VibyConfig:
         self.candidate_topk_blocks = int(kw.get("candidate_topk_blocks", 64))
         self.candidate_block_size = int(kw.get("candidate_block_size", 8))
 
+        # ---- Gated XSA（Exclusive Self-Attention 的可学习版）----
+        # 逐 head 学 tanh(α) 扣掉 attention 输出中与自身 V 平行的分量
+        #     z = y − tanh(α)·(yᵀv/‖v‖²)·v
+        # α=0 初始化 ⇒ 起步恒等（层可自选剂量，故不强制限制层数也能让浅层趋于 0）。
+        # 与 CSA2 正交：只对注意力输出做一次逐 head 后处理，不碰 KV cache、
+        # 不碰 indexer/候选池，故 prefill/decode/prefix cache/连续 batch 口径一致。
+        # 默认开；xsa_last_n=0 时按配方取最深 ≈1/3 层（参数高尔夫 XSA_LAST_N、
+        # 自注意力偏置随层加深而增大，故收益集中在深层）。
+        self.use_xsa = bool(kw.get("use_xsa", True))
+        _xln = int(kw.get("xsa_last_n", 0) or 0)
+        if _xln <= 0 and self.use_xsa:
+            _xln = max(1, self.n_layers // 3)
+        self.xsa_last_n = max(0, _xln)
+
         # ---- RoPE（滑窗分支用 rope_theta；压缩分支用 compress_rope_theta + YaRN）----
         self.rope_theta = float(kw.get("rope_theta", 10000.0))
         self.compress_rope_theta = float(kw.get("compress_rope_theta", 160000.0))
@@ -189,7 +205,12 @@ class VibyConfig:
                     _eids.append(cand)
         self.engram_layer_ids = tuple(int(x) for x in _eids)
         self.engram_max_ngram_size = int(kw.get("engram_max_ngram_size", 4))
-        self.engram_vocab_size = int(kw.get("engram_vocab_size", 8192))
+        # 163840 = 20 × 8192：官方 V4.1-Flash 的 Engram 检索表占**总参 26%**
+        # （196B / (552B+196B)），而旧的 8192 在 ≈1B 配方下只有 1.28%（12.7M），
+        # 比例差了 20 倍——Engram 是"条件记忆"，靠极稀疏的大容量查表存知识，
+        # 表太小等于把它降级成一个普通特征模块。表参数量 ≈ 1536 × V
+        # （2 层 × 3 阶 × 4 头 × head_dim 64），V=163840 → ≈252M，占比 ~20%。
+        self.engram_vocab_size = int(kw.get("engram_vocab_size", 163840))
         self.engram_n_heads = int(kw["engram_n_heads"])
         self.engram_head_dim = int(kw["engram_head_dim"])
         self.engram_pad_id = int(kw.get("engram_pad_id", self.pad_token_id))

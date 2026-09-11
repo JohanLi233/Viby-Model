@@ -69,6 +69,18 @@ def add_common_args(parser):
         help="滑窗分支窗口（V4.1-Flash 为 128）",
     )
     parser.add_argument(
+        "--use_xsa",
+        action=argparse.BooleanOptionalAction,
+        default=_DEFAULT_CFG.use_xsa,
+        help="Gated XSA（可学习 Exclusive Self-Attention，arXiv:2603.09078 / modded-nanogpt record #82）：逐 head 学 tanh(α) 扣掉注意力输出中与自身 V 平行的分量 z = y − tanh(α)·(yᵀv/‖v‖²)·v，α=0 初始化 ⇒ 起步恒等。作用在最深 --xsa_last_n 层（本模型是共享 K=V 的 MQA，v 对所有 head 相同，无需 GQA 的 V-扩展）。默认开",
+    )
+    parser.add_argument(
+        "--xsa_last_n",
+        type=int,
+        default=0,
+        help="启用 gated XSA 的最深 N 层；0=自动按配方取最深 ≈1/3 层（max(1, n_layers // 3)）。取 n_layers 则全主干层应用（DSpark 草稿层始终不挂）。仅 --use_xsa 时生效",
+    )
+    parser.add_argument(
         "--hc_mult",
         type=int,
         default=_DEFAULT_CFG.hc_mult,
@@ -612,6 +624,7 @@ def _explicit_cli_keys() -> set:
 # 由 (n_layers, n_mtp_layers) 推导、preset 不该固定的结构参数（见 apply_preset）
 _PRESET_DERIVED_ARGS = {
     "mtp_depth",
+    "xsa_last_n",
     "compress_ratios",
     "kv_source_layers",
     "index_source_layers",

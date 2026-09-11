@@ -426,3 +426,41 @@ def test_rope_tables_are_not_randomized_by_init():
     assert not any("freq_cos" in k or "freq_sin" in k for k in trainable)
     params = {k for k, _ in tree_flatten(model.parameters())}
     assert any("freq_cos" in k for k in params)
+
+
+# ------------------------------------------------------- 训练路径分块 ≡ 稠密
+
+def test_chunked_window_matches_dense_path(monkeypatch):
+    """分块滑窗路径必须与"全 T + 掩码"的稠密路径逐位一致（同输入同权重）。
+
+    分块只是把不可见的 key 从 sdpa 的 S 维里拿掉（窗口 W 内的 key 必然落在
+    相邻两块里），可见集完全相同，所以两条路径的输出应当相等。
+    """
+    import model.attention as attn_mod
+    from model.attention import Attention
+
+    W, T = 8, 32
+    R = 4
+    cfg = cfg_tiny(
+        compress_ratios=(0, 0, R, R, 0),
+        kv_source_layers=(2,),
+        index_source_layers=(2, 3),
+        candidate_source_layer=2,
+        window_size=W,
+        index_topk=8,
+    )
+    mx.random.seed(21)
+    attn = Attention(cfg, 3)
+    mx.random.seed(22)
+    x = mx.random.normal((2, T, cfg.dim))
+    seg = mx.repeat(mx.arange(T)[None, :] // (T // 2), 2, axis=0).astype(mx.int32)
+    pad = mx.ones((2, T), dtype=mx.bool_)
+
+    monkeypatch.setattr(attn_mod, "_CHUNK_ENABLED", True)
+    a = attn(x, 0, SharedAttnState(), None, seg, pad)
+    mx.eval(a)
+    monkeypatch.setattr(attn_mod, "_CHUNK_ENABLED", False)
+    b = attn(x, 0, SharedAttnState(), None, seg, pad)
+    mx.eval(b)
+    assert a.shape == b.shape
+    assert mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32))).item() < 1e-5

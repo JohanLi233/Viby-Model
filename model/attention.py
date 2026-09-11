@@ -21,6 +21,7 @@ cache——这正是 CED 的实现方式：解码层的全局 KV 来自编码器
 各请求长度不同"的逐步解码。
 """
 
+import os
 import mlx.core as mx
 from mlx import nn
 
@@ -28,6 +29,11 @@ from .norms import RMSNorm
 from .rope import precompute_freqs_cis, rope_partial
 
 NEG_INF = -1e30
+
+
+# 训练路径的滑窗分块开关（export VIBY_ATTN_CHUNK=0 回退全 T 稠密掩码路径，
+# 用于数值对拍与排障；两条路径数学等价，见 tests/test_v41_attention.py）
+_CHUNK_ENABLED = os.environ.get("VIBY_ATTN_CHUNK", "1") != "0"
 
 
 def _cos_sin(cos_all, sin_all, pos, head_axis: bool):
@@ -82,12 +88,16 @@ def select_candidate_blocks(logits: mx.array, compress_lens, topk_blocks: int, b
     return keep[..., :width]
 
 
-def _topk_masks(score: mx.array, reach: mx.array, k: int, offset: int):
+def _topk_masks(score: mx.array, reach: mx.array, k: int, offset: int,
+                need_idx: bool = True):
     """从打分矩阵里取出每 query 的 k 个压缩位置。
 
     返回 (keep_mask [B,T,N] bool, topk_idx [B,T,k'] int32)：
     - keep_mask："被选中且可达"的布尔掩码（稠密/prefill 路径用）；
     - topk_idx：按位置排序、加 offset、不可达为 -1 的下标（解码 gather 用）。
+
+    need_idx=False 时跳过 argpartition/sort/gather 这一支（稠密训练路径只用
+    keep_mask，idx 只有 decode 会读），省掉 [B,T,N] 上的两次选择。
 
     索引一律 stop_gradient：MLX 不允许对 gather/scatter 的索引求 VJP。
     """
@@ -103,9 +113,11 @@ def _topk_masks(score: mx.array, reach: mx.array, k: int, offset: int):
     # 不可达位置一样当成硬屏蔽：可达候选中不足 k 个时，阈值为 -inf 会让这些
     # 位置靠 tiebreak 混进 keep，候选池就不再是更深 indexer 的搜索域上界。
     selectable = sg > NEG_INF
-    # keep：第 k 大分数当阈值（可达位置少于 k 时阈值为 -inf，恰好等价"全取可达"）
+    # keep：第 k 大分数当阈值（可达位置少于 k 个时阈值为 -inf，恰好等价"全取可达"）
     thr = mx.partition(sel_score, kth=N - k_eff, axis=-1)[..., N - k_eff]
     keep = (sel_score >= thr[..., None]) & reach & selectable
+    if not need_idx:
+        return keep, None
     sel = mx.argpartition(-sel_score, kth=k_eff - 1, axis=-1)[..., :k_eff].astype(mx.int32)
     idx = mx.sort(sel, axis=-1)
     valid = mx.take_along_axis(reach, idx, axis=-1) & mx.take_along_axis(selectable, idx, axis=-1)
@@ -229,10 +241,13 @@ class Indexer(nn.Module):
         q = self.wq_b(qr).reshape(B, T, self.n_heads, self.head_dim)
         c, s = _cos_sin(cos_all, sin_all, token_pos, True)
         q = rope_partial(q, c, s, self.rope_head_dim)
-        sc = mx.einsum("bthd,bnd->bthn", q, index_k).astype(mx.float32)
+        # 打分矩阵保持 bf16（[B,T,8,N] 在 B4/T1024/N1024 下 fp32 单份就是
+        # 134MB，原来 einsum 结果 + relu 结果 + 加权结果各一份），只在最后
+        # 一次加权归约时才升 fp32。
+        sc = mx.einsum("bthd,bnd->bthn", q, index_k)
         sc = mx.maximum(sc, 0.0)
         w = self.weights_proj(x).astype(mx.float32) * (self.softmax_scale * self.n_heads ** -0.5)
-        sc = mx.sum(sc * w[:, :, :, None], axis=2)  # [B,T,N]
+        sc = mx.sum(sc.astype(mx.float32) * w[:, :, :, None], axis=2)  # [B,T,N]
         return mx.where(reach, sc, NEG_INF)
 
 
@@ -254,7 +269,9 @@ def _group_pad_mask(ratio: int, pad_mask: mx.array):
     if n == 0:
         return mx.zeros((B, T, 0), dtype=mx.bool_)
     g = pad_mask[:, : n * ratio].reshape(B, n, ratio)
-    return mx.all(g, axis=-1)[:, None, :] & mx.ones((1, T, 1), dtype=mx.bool_)
+    # 只留 [B,1,N]：原来的 `& mx.ones((1,T,1))` 先把整张 [B,T,N] 物化出来，
+    # 而调用方 (reach & ...) 本来就会广播，等于白算一份 4MB 的布尔张量。
+    return mx.all(g, axis=-1)[:, None, :]
 
 
 class Attention(nn.Module):
@@ -278,6 +295,19 @@ class Attention(nn.Module):
         self.softmax_scale = self.head_dim ** -0.5
 
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
+        # Gated XSA：只在主干最深 xsa_last_n 层挂逐 head 可学习 tanh(α)。
+        # 零初始化 ⇒ tanh(0)=0 ⇒ step-0 严格恒等，不扰动已有权重。
+        # DSpark 草稿层（layer_idx >= n_layers）不挂，与旧实现口径一致。
+        _xsa_layer = (
+            0 <= layer_idx < config.n_layers
+            and config.xsa_last_n > 0
+            and layer_idx >= config.n_layers - config.xsa_last_n
+        )
+        self.xsa_alpha = (
+            mx.zeros((self.n_heads,), dtype=mx.float32)
+            if (config.use_xsa and _xsa_layer)
+            else None
+        )
         self.wq_a = nn.Linear(config.dim, config.q_lora_rank, bias=False)
         self.q_norm = RMSNorm(config.q_lora_rank, self.eps)
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
@@ -336,8 +366,14 @@ class Attention(nn.Module):
 
     # ------------------------------------------------------------------
     def _compress_dense(self, x, qr, token_pos, shared, cache, start_pos,
-                        segment_ids=None, pad_mask=None):
-        """压缩分支（prefill / 训练）：产出/复用压缩 KV 并算出 top-k 掩码。"""
+                        segment_ids=None, pad_mask=None, sparse_selection=False):
+        """压缩分支（prefill / 训练）：产出/复用压缩 KV，并返回可见性掩码。
+
+        返回 (comp, cmask)：cmask 是 [B 或 1, T, N] 的 bool，等于
+        「基础可达性 × 文档/pad 隔离 × indexer top-k」。原来这张掩码在
+        __call__ 里又用 _group_doc_mask/_group_pad_mask 重建了一遍（每层
+        重复两次 [B,T,N] 的构造与比较），这里一次算完后直接复用。
+        """
         B, T, _ = x.shape
         ratio = self.ratio
         N = (start_pos + T) // ratio
@@ -353,8 +389,17 @@ class Attention(nn.Module):
             if cache is not None and new_state is not None:
                 cache.kv_state = new_state
                 cache.filled = int(mx.max(new_state[2]).item())
+        # 注意轴：token_pos 是 [1,T]，要显式补成 [1,T,1] 才能和 [1,1,N] 按 query 广播
+        reach = mx.arange(N)[None, None, :] < ((token_pos + 1) // ratio)[..., None]
+        # 文档/pad 隔离必须在选择阶段生效：否则候选块与 top-k 会按
+        # 别的文档的内容来挑，packed 序列会跨文档泄漏。
+        if segment_ids is not None:
+            reach = reach & _group_doc_mask(ratio, segment_ids)
+        if pad_mask is not None:
+            reach = reach & _group_pad_mask(ratio, pad_mask)
         # indexer 需要未旋转的 latent，故先跑 indexer，再写旋转后的压缩 KV
         if self.is_index_source:
+            shared.sparse_selection = None
             idxo = self.indexer
             if idxo.owns_k and latent is not None:
                 k = idxo.index_keys(latent, pos, self.freq_cos, self.freq_sin)
@@ -364,14 +409,6 @@ class Attention(nn.Module):
                 else:
                     shared.index_k = k
             if shared.index_k is not None:
-                # 注意轴：token_pos 是 [1,T]，要显式补成 [1,T,1] 才能和 [1,1,N] 按 query 广播
-                reach = mx.arange(N)[None, None, :] < ((token_pos + 1) // ratio)[..., None]
-                # 文档/pad 隔离必须在选择阶段生效：否则候选块与 top-k 会按
-                # 别的文档的内容来挑，packed 序列会跨文档泄漏。
-                if segment_ids is not None:
-                    reach = reach & _group_doc_mask(ratio, segment_ids)
-                if pad_mask is not None:
-                    reach = reach & _group_pad_mask(ratio, pad_mask)
                 sc = idxo.scores(
                     x, qr, shared.index_k, token_pos, reach, self.freq_cos, self.freq_sin
                 )
@@ -384,10 +421,17 @@ class Attention(nn.Module):
                     )
                 elif idxo.uses_candidates and shared.candidates is not None:
                     sc = mx.where(shared.candidates, sc, NEG_INF)
-                keep, topk = _topk_masks(sc, reach, idxo.index_topk, 0)
-                shared.keep_mask, shared.topk_idx = keep, topk
+                if sparse_selection:
+                    from .kernels.sparse_attention import select_topk
+
+                    keep, selection = select_topk(sc, reach, idxo.index_topk)
+                    shared.sparse_selection = (ratio, selection)
+                else:
+                    keep, _ = _topk_masks(sc, reach, idxo.index_topk, 0, need_idx=False)
+                shared.keep_mask = keep
         else:
             keep = shared.keep_mask
+        cmask = reach if keep is None else (reach & keep)
         # 压缩 KV 入池：必须是 RoPE 之后的（indexer 用未旋转形式，已在上面用完）
         if self.is_kv_source and latent is not None:
             c, s = _cos_sin(self.freq_cos, self.freq_sin, pos, False)
@@ -400,18 +444,166 @@ class Attention(nn.Module):
             comp = cache.src_cache.compress_kv[:B, :N] if N else None
         else:
             comp = shared.compress_kv
-        return comp, keep
+        return comp, cmask
+
+    # ------------------------------------------------------------------
+    def _xsa(self, o, kv_win):
+        """Gated XSA：逐 head 扣掉注意力输出中与自身 V 平行的分量。
+
+        z = y − tanh(α)·(yᵀv/‖v‖²)·v
+
+        o:      [B, H, T, D]（sdpa 输出的原生布局，仍在 RoPE 旋转坐标系里）
+        kv_win: [B, T, D] 本层滑窗分支的 K=V（**已旋转**，与 o 同坐标系）
+
+        必须在本层 _out_proj 的反向旋转之前调用，内积才在同一坐标系里；
+        扣的是「query 直接复制自己那个 token 的 value」这一分量，压缩 latent
+        不属于任何一个 query 自身，故不参与（与旧 MLA 实现口径一致）。
+
+        本模型是共享 K=V 的 MQA：wkv 只产 1 个 head 广播给所有 query head，
+        所以 v 对所有 head 相同，系数在 head_dim 上归约即可（旧 MLA 是
+        1:1 头、GQA 靠 mx.repeat，这里不需要扩展 V）。
+        """
+        of = o.astype(mx.float32)
+        vf = kv_win.astype(mx.float32)
+        vv = mx.maximum(mx.sum(vf * vf, axis=-1, keepdims=True), mx.array(1e-12))
+        # [B,T,1] → [B,1,T,1]，对 H 轴广播
+        coef = mx.einsum("bhtd,btd->bht", of, vf)[..., None] / vv[:, None]
+        alpha = mx.tanh(self.xsa_alpha).astype(mx.float32).reshape(
+            1, self.n_heads, 1, 1
+        )
+        return (of - alpha * coef * vf[:, None]).astype(o.dtype)
 
     # ------------------------------------------------------------------
     def __call__(self, x, start_pos: int, shared, cache=None, segment_ids=None, pad_mask=None):
-        """prefill / 训练路径：窗口与压缩两组掩码拼在一次 sdpa 里做稠密计算。"""
+        """prefill / 训练路径：窗口与压缩两组掩码拼在一次 sdpa 里做注意力。
+
+        两条路径（数学等价，只是可见集的表示方式不同）：
+
+        - **分块路径**（训练/整段 prefill，`cache is None`、`T` 是窗口整数倍）：
+          query 按 `window_size` 切块，每块只对 [前一块, 本块] 共 2W 个滑窗 key
+          做注意力 —— 窗口 W 内的 key 必然落在这两块里，所以可见集完全一致，
+          但 sdpa 的 S 从 `T + N` 降到 `2W + N`（B4/T1024/W128 下 ratio=1 层
+          2048 → 1280，纯滑窗层 1024 → 256）。
+        - **稠密路径**（解码 / 分块 prefill / T 不整除）：历史窗口 + 全 T 的
+          滑窗 key 用掩码遮挡，保持原有语义与 cache 写入。
+        """
         B, T, _ = x.shape
         token_pos = (start_pos + mx.arange(T))[None, :]  # [1,T]，对所有 batch 相同
         qr, q = self._q(x, token_pos)
         kv_win = self._window_kv(x, token_pos)
         # sdpa 的 mask 用 [B,T] 的绝对位置：[1,T] 广播
         tpos = token_pos[0]
+        W = self.window_size
+        chunked = (
+            _CHUNK_ENABLED
+            and cache is None
+            and start_pos == 0
+            and W > 0
+            and T >= 2 * W
+            and T % W == 0
+        )
+        if chunked:
+            o = self._attend_chunked(q, kv_win, qr, x, token_pos, shared, segment_ids, pad_mask)
+        else:
+            o = self._attend_dense(
+                q, kv_win, qr, x, token_pos, tpos, shared, cache, start_pos,
+                segment_ids, pad_mask,
+            )
+        # Gated XSA 在反向旋转之前、对未投影的 [B,H,T,D] 输出做。v 必须取
+        # kv_win（query 自己的滑窗 V），不能用 kv_all[:, -T:]——尾部是压缩 latent。
+        if self.xsa_alpha is not None:
+            o = self._xsa(o, kv_win)
+        return self._out_proj(o.transpose(0, 2, 1, 3), token_pos)
 
+    # ------------------------------------------------------------------
+    def _attend_chunked(self, q, kv_win, qr, x, token_pos, shared, segment_ids, pad_mask):
+        """训练路径：query 分块，滑窗 key 只取相邻两块。返回 [B,H,T,D]。"""
+        B, T, _ = x.shape
+        W = self.window_size
+        C = T // W
+        keeps = []
+        from .kernels.sparse_attention import enabled_for, indexed_attention, topk_enabled
+
+        use_sparse = enabled_for(q, W)
+        if self.ratio > 0:
+            comp, cmask = self._compress_dense(
+                x, qr, token_pos, shared, None, 0, segment_ids, pad_mask,
+                sparse_selection=use_sparse and topk_enabled(),
+            )
+        else:
+            comp, cmask = None, None
+
+        if comp is not None and comp.shape[1] > 0 and use_sparse:
+            selection = None
+            if shared.sparse_selection is not None:
+                ratio, metadata = shared.sparse_selection
+                if ratio == self.ratio and metadata[0].shape == (B * T, comp.shape[1]):
+                    selection = metadata
+            return indexed_attention(
+                q, kv_win, comp, cmask, segment_ids, pad_mask, self.attn_sink,
+                W, self.softmax_scale, selection=selection,
+            )
+
+        kc = kv_win.reshape(B, C, W, kv_win.shape[-1])
+        zero = mx.zeros((B, 1, W, kv_win.shape[-1]), dtype=kv_win.dtype)
+        prev = mx.concatenate([zero, kc[:, :-1]], axis=1)
+        k_win = mx.concatenate([prev, kc], axis=2)  # [B,C,2W,D]
+
+        # 窗口掩码 [W,2W]：前 W 列是上一块（相对位置 -W..-1），后 W 列是本块（0..W-1）
+        j = mx.arange(W)[:, None]
+        kk = mx.arange(2 * W)[None, :]
+        kpos = kk - W  # 前 W 列 = 上一块（-W..-1），后 W 列 = 本块（0..W-1）
+        win = (kpos <= j) & (kpos > j - W)
+        # 第 0 块没有"上一块"，那半边的 key 是 padding，必须整块屏蔽
+        win = win[None] & ((kk >= W)[None] | (mx.arange(C) > 0)[:, None, None])
+        if segment_ids is not None:
+            seg_c = segment_ids.reshape(B, C, W)
+            seg_prev = mx.concatenate(
+                [mx.zeros((B, 1, W), dtype=seg_c.dtype), seg_c[:, :-1]], axis=1
+            )
+            seg_key = mx.concatenate([seg_prev, seg_c], axis=2)  # [B,C,2W]
+            win = win & (seg_key[:, :, None, :] == seg_c[:, :, :, None])
+        if pad_mask is not None:
+            pad_c = pad_mask.reshape(B, C, W)
+            pad_prev = mx.concatenate(
+                [mx.zeros((B, 1, W), dtype=mx.bool_), pad_c[:, :-1]], axis=1
+            )
+            pad_key = mx.concatenate([pad_prev, pad_c], axis=2)
+            win = win & pad_key[:, :, None, :]
+
+        if win.ndim == 3:  # 无 doc/pad 掩码时补上 batch 维（sdpa 按 B*C 分批）
+            win = mx.broadcast_to(win[None], (B,) + win.shape)
+        if comp is not None:
+            N = comp.shape[1]
+            k_all = mx.concatenate(
+                [k_win, mx.broadcast_to(comp[:, None, None], (B, C, 1, N, comp.shape[-1])).reshape(B, C, N, comp.shape[-1])],
+                axis=2,
+            )
+            win = mx.concatenate([win, cmask.reshape(B, C, W, N)], axis=-1)
+        else:
+            k_all = k_win
+
+        S = k_all.shape[2]
+        o = mx.fast.scaled_dot_product_attention(
+            q.reshape(B * C, W, self.n_heads, self.head_dim).transpose(0, 2, 1, 3),
+            k_all.reshape(B * C, 1, S, k_all.shape[-1]),
+            k_all.reshape(B * C, 1, S, k_all.shape[-1]),
+            scale=self.softmax_scale,
+            mask=win.reshape(B * C, 1, W, S),
+            sinks=self.attn_sink,
+        )
+        # 与稠密路径同布局：[B,H,T,D]（__call__ 再 transpose 成 [B,T,H,D] 给 _out_proj）
+        return (
+            o.reshape(B, C, self.n_heads, W, self.head_dim)
+            .transpose(0, 2, 1, 3, 4)
+            .reshape(B, self.n_heads, T, self.head_dim)
+        )
+
+    # ------------------------------------------------------------------
+    def _attend_dense(self, q, kv_win, qr, x, token_pos, tpos, shared, cache, start_pos,
+                      segment_ids, pad_mask):
+        """解码 / 分块 prefill / T 不整除：全 T 滑窗 key + 掩码（原路径）。"""
+        T = q.shape[1]
         L = 0
         kv_hist = None
         if cache is not None and start_pos > 0:
@@ -440,34 +632,25 @@ class Attention(nn.Module):
         mask = visible[None, None, :, :] if visible.ndim == 2 else visible[:, None, :, :]
 
         if self.ratio > 0:
-            comp, keep = self._compress_dense(
+            # cmask 已在 _compress_dense 里算完（基础可达 × doc/pad × top-k）
+            comp, cmask = self._compress_dense(
                 x, qr, token_pos, shared, cache, start_pos, segment_ids, pad_mask
             )
             if comp is not None:
                 kv_all = mx.concatenate([kv_all, comp], axis=1)
-                cmask = mx.arange(comp.shape[1])[None, None, :] < (
-                    (tpos + 1) // self.ratio
-                )[None, :, None]
-                if keep is not None:
-                    cmask = cmask & keep
-                if segment_ids is not None:
-                    cmask = cmask & _group_doc_mask(self.ratio, segment_ids)
-                if pad_mask is not None:
-                    cmask = cmask & _group_pad_mask(self.ratio, pad_mask)
                 cm = cmask[None, None, :, :] if cmask.ndim == 2 else cmask[:, None, :, :]
                 if mask.shape[0] != cm.shape[0]:
                     mask = mx.broadcast_to(mask, (cm.shape[0],) + mask.shape[1:])
                 mask = mx.concatenate([mask, cm], axis=-1)
 
-        o = mx.fast.scaled_dot_product_attention(
+        return mx.fast.scaled_dot_product_attention(
             q.transpose(0, 2, 1, 3),
             kv_all[:, None, :, :],
             kv_all[:, None, :, :],
             scale=self.softmax_scale,
             mask=mask,
             sinks=self.attn_sink,
-        ).transpose(0, 2, 1, 3)
-        return self._out_proj(o, token_pos)
+        )
 
     # ------------------------------------------------------------------
     def decode(self, x, start_pos, shared, cache):
@@ -567,5 +750,8 @@ class Attention(nn.Module):
             scale=self.softmax_scale,
             mask=valid_slots[:, None, :, :],
             sinks=self.attn_sink,
-        ).transpose(0, 2, 1, 3)
-        return self._out_proj(o, token_pos)
+        )
+        # 与 prefill 同口径：v 用本步窗口 V（kv_new 即刚写入环的自身 token）
+        if self.xsa_alpha is not None:
+            o = self._xsa(o, kv_new[:, 0][:, None])
+        return self._out_proj(o.transpose(0, 2, 1, 3), token_pos)

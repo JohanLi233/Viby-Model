@@ -5,8 +5,8 @@
 架构是 **DeepSeek-V4.1 的等比例缩小版**：CED 因果编码器-解码器主干 +
 CSA2 跨层复用稀疏注意力 + Single-Pass mHC 残差流 + sqrt(softplus) 路由的
 细粒度 MoE + Engram n-gram 条件记忆 + DSpark 块式草稿头。旧版（Kimi Linear
-3:1 KDA / iHC / XSA / AttnRes / SiTU / MLA / 短卷积）的实现已全部移除，
-只保留 V4.1 这一条技术路线。
+3:1 KDA / iHC / AttnRes / SiTU / MLA / 短卷积）的实现已全部移除，只保留
+V4.1 这一条技术路线；唯一的保留项是 **Gated XSA**（默认开，见下）。
 
 架构语义对照官方实现（`deepseek-ai/DeepSeek-V4.1-Flash` 的 `inference/model.py`，
 已逐行核对）与技术报告 `DeepSeek_V41_Tech_Report`（下称"报告"）。
@@ -55,6 +55,14 @@ CSA2 跨层复用稀疏注意力 + Single-Pass mHC 残差流 + sqrt(softplus) �
 - **分组低秩输出投影**：`o_groups` 组 → 组内 block-diagonal 的 `wo_a` →
   `o_lora_rank` → `wo_b` 回 hidden。
 - **Q 低秩**：`wq_a → q_norm → wq_b`，主注意力与 indexer 共享同一份 q 低秩表示。
+- **Gated XSA**（默认开；非官方 V4.1 组件，本仓库额外挂的后处理）：对注意力输出做逐 head
+  后处理，扣掉与自身 V 平行的分量
+  `z = y − tanh(α)·(yᵀv/‖v‖²)·v`，α 逐 head 可学、零初始化 ⇒ **起步严格恒等**。
+  作用在最深 `xsa_last_n` 层（默认 `max(1, n_layers//3)`），DSpark 草稿层不挂。
+  与 CSA2 正交：只读、不改 KV cache / indexer / 候选池，故 prefill、逐 token
+  解码、prefix cache、连续 batch 口径天然一致；`v` 只取本层滑窗分支
+  （压缩 latent 不属于任何 query 自身，不参与）。
+  这是**刻意偏离**官方实现的一处——加它是为了消融，`--no-use_xsa` 可完全关闭。
 - 无短卷积、无 RoPE 之外的任何位置编码（报告 §2.4.2 明确省掉 Engram 的短卷积）。
 
 ### mHC 与 Single-Pass（报告 §2.4.1）
@@ -301,6 +309,9 @@ out = model.generate(tokens, max_new_tokens=64, temperature=0.7, top_k=50)
 9. **AdamW 的 eps** 仍走 --adam_eps（compute 缩放公式或 1e-8 兜底），没有默认成报告基线的 1e-20；严格对齐可显式 --adam_eps 1e-20。
 10. **MoE router** 仍是独立小 lr AdamW 组（报告口径的线性权重走 Muon）：正交化步长恒定偏大，实测会把路由打分持续推向失衡。
 11. **DSpark 规模**：只挂 1 个草稿 stage（官方 3）x 4 个草稿位置（官方 5），置信度调度的投机采样循环未实现。
+12. **Gated XSA 默认开**：XSA 不是官方 V4.1 组件，是本仓库额外挂的注意力后处理
+    （arXiv:2603.09078 / modded-nanogpt record #82）。默认 `use_xsa=True` 且作用于
+    最深 `max(1, n_layers//3)` 层。要严格对齐官方口径请加 `--no-use_xsa`。
 
 ## 已知问题
 

@@ -76,10 +76,14 @@ class MoEGate(nn.Module):
         self._last_load = mx.zeros((n_routed,), dtype=mx.float32)
 
     def scores(self, x: mx.array) -> mx.array:
-        """x: [M, D]（任意 dtype）→ [M, E] fp32 亲和度分数。"""
-        xf = x.astype(mx.float32)
-        wf = self.weight.astype(mx.float32)
-        s = (xf @ wf.T) / self.gate_temp
+        """x: [M, D]（任意 dtype）→ [M, E] fp32 亲和度分数。
+
+        矩阵乘留在计算 dtype（bf16 的 GEMM 在 MLX 上按 fp32 累加，权重本来
+        就是 bf16，结果与"两边都升 fp32 再乘"一致），只在 [M,E] 的小结果上
+        进 fp32——原来把 [M,D] 的激活和 [E,D] 的路由矩阵都升 fp32，等于让
+        每层的路由 GEMM 跑在 fp32 上，还多两次 [M,D] 量级的转换。
+        """
+        s = (x @ self.weight.T).astype(mx.float32) / self.gate_temp
         if self.score_func == "softmax":
             return mx.softmax(s, axis=-1)
         if self.score_func == "sigmoid":
@@ -160,8 +164,24 @@ class MoEFeedForward(nn.Module):
         flat = idx.reshape(G)
         order = mx.argsort(mx.stop_gradient(flat))
         exps_s = flat[order].astype(mx.int32)
+        from .kernels.moe_dispatch import (
+            combine_enabled_for, combine_routes, down_project_routes,
+            enabled_for, gather_gate_up, route_inverse, route_metadata,
+        )
+
+        if enabled_for(x, self.n_routed, 2 * self.moe_in):
+            metadata = route_metadata(order, exps_s, self.n_routed)
+            h = gather_gate_up(
+                x.reshape(M, D), self.experts.gate_up_w.astype(x.dtype),
+                order, exps_s, metadata, K,
+            )
+            gate, up = mx.split(h, 2, axis=-1)
+            act = expert_act(gate, up, self.swiglu_limit)
+            return down_project_routes(
+                act, self.experts.down_w.astype(x.dtype), w.reshape(G),
+                order, metadata, K,
+            ).reshape(B, T, D)
         tok_s = (order // K).astype(mx.int32)
-        w_s = w.reshape(G)[order].astype(x.dtype)
         xs = x.reshape(M, D)[tok_s]
         gu_t = self.experts.gate_up_w.swapaxes(-1, -2)
         dw_t = self.experts.down_w.swapaxes(-1, -2)
@@ -171,7 +191,16 @@ class MoEFeedForward(nn.Module):
         gate, up = mx.split(h, 2, axis=-1)
         act = expert_act(gate, up, self.swiglu_limit)
         y = mx.gather_mm(act, dw_t, rhs_indices=exps_s, sorted_indices=True)[:, 0, :]
-        out = mx.zeros((M, D), dtype=x.dtype).at[tok_s].add(y * w_s[:, None])
+        if combine_enabled_for(x, K):
+            # ``y`` is sorted by expert, while route weights are stored in the
+            # original token-major flattening.  The fused combine handles the
+            # weighting and K-way token reduction in one pass.  Its inverse is
+            # the only metadata needed for this native gather_mm path.
+            inverse = route_inverse(order)
+            out = combine_routes(y, w.reshape(G), order, inverse, K)
+        else:
+            w_s = w.reshape(G)[order].astype(x.dtype)
+            out = mx.zeros((M, D), dtype=x.dtype).at[tok_s].add(y * w_s[:, None])
         return out.reshape(B, T, D)
 
     def seq_aux_loss(self, scores: mx.array, idx: mx.array, B: int, T: int) -> mx.array:

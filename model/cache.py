@@ -52,7 +52,7 @@ class SharedAttnState:
     前向之间清理。
     """
 
-    __slots__ = ("compress_kv", "index_k", "keep_mask", "topk_idx", "candidates", "latent_pos")
+    __slots__ = ("compress_kv", "index_k", "keep_mask", "topk_idx", "candidates", "latent_pos", "sparse_selection")
 
     def __init__(self):
         self.compress_kv = None
@@ -61,6 +61,7 @@ class SharedAttnState:
         self.topk_idx = None    # 解码路径：选中的压缩位置（含窗口 offset，-1 = 无效）
         self.candidates = None  # 分层索引的一级候选块掩码 [B,T,N] bool
         self.latent_pos = None  # 压缩组首的绝对位置 [n]
+        self.sparse_selection = None  # (ratio, (indices, lengths)); training only
 
 
 class VibyCache:
