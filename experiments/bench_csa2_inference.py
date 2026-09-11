@@ -13,14 +13,17 @@ from model.config import VibyConfig
 from model.model import VibyForCausalLM
 from model import moe
 from model.kernels import decode_metadata as dm, indexer_select as fs, moe_dispatch
+from model.kernels import moe_decode
 from trainer.config import get_pretrain_parser, setup_training_args
 from trainer.utils import build_model_kwargs, convert_model_dtype
 
 
 def configure(name):
-    dm._ENABLED = name in ("metadata", "combined")
-    moe._DECODE_GATHER = name in ("experts", "combined")
-    dm._PREFILL_SELECT = fs._ENABLED = fs._BQ_ENABLED = name == "combined"
+    combined = name in ("combined", "compiled_moe")
+    dm._ENABLED = name == "metadata" or combined
+    moe._DECODE_GATHER = name == "experts" or combined
+    dm._PREFILL_SELECT = fs._ENABLED = fs._BQ_ENABLED = combined
+    moe_decode._ENABLED = name == "compiled_moe"
     # Use the validated deterministic combine in both arms; this prevents
     # unrelated native bf16 scatter arrival-order noise in prefix activations.
     moe_dispatch._COMBINE_ENABLED = True
@@ -70,8 +73,8 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--block-iters", type=int, default=5)
     ap.add_argument("--blocks", type=int, default=3)
-    ap.add_argument("--reference", choices=["reference", "experts"], default="reference")
-    ap.add_argument("--variants", nargs="+", choices=["metadata", "experts", "combined"], default=["metadata", "experts", "combined"])
+    ap.add_argument("--reference", choices=["reference", "experts", "combined"], default="reference")
+    ap.add_argument("--variants", nargs="+", choices=["metadata", "experts", "combined", "compiled_moe"], default=["metadata", "experts", "combined"])
     args = ap.parse_args()
     mx.set_default_device(mx.gpu)
     mx.set_cache_limit(8 * 1024**3)
@@ -92,7 +95,8 @@ def main():
     path = Path(args.run_dir) / "results.jsonl"
     protocol = dict(kind="protocol", args=vars(args), params=param_identity(model), mlx=mx.__version__,
                     input_hash=input_identity(tokens), dtype="bfloat16", execution="eager public prefill/decode APIs",
-                    native_expert_gemm=True, deterministic_prefill_combine_both_arms=True)
+                    native_expert_gemm=True, deterministic_prefill_combine_both_arms=True,
+                    compiled_moe_variants=[n for n in args.variants if n == "compiled_moe"])
     append_jsonl(path, protocol)
     print(json.dumps(protocol), flush=True)
 
@@ -141,6 +145,8 @@ def main():
                           relative_l2=float(mx.sqrt(mx.sum(delta*delta) / mx.sum(reference.astype(mx.float32)**2))))
             append_jsonl(path, record)
             print(json.dumps(record), flush=True)
+            if name == "compiled_moe" and record["max_abs"] != 0.0:
+                raise RuntimeError("compiled MoE changed decode logits; refusing a speedup measurement")
             print("ABBA decode", name, flush=True)
             result = abba_blocks(lambda: decode(args.reference), lambda: decode(name),
                                  args.warmup, args.block_iters, args.blocks,

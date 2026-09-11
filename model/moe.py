@@ -15,6 +15,7 @@ import mlx.core as mx
 from mlx import nn
 
 from .init import trunc_normal
+from .kernels import moe_counts, moe_decode, moe_gather
 
 _DECODE_GATHER = os.environ.get("VIBY_MOE_DECODE_GATHER", "1") != "0"
 
@@ -199,7 +200,14 @@ class MoEFeedForward(nn.Module):
                 order, metadata, K,
             ).reshape(B, T, D)
         tok_s = (order // K).astype(mx.int32)
-        xs = x.reshape(M, D)[tok_s]
+        use_gather_vjp = self.training and moe_gather.enabled_for(x, K)
+        use_combine = combine_enabled_for(x, K)
+        # One permutation serves both input-gradient reduction and combine.
+        inverse = route_inverse(order) if use_gather_vjp else None
+        if use_gather_vjp:
+            xs = moe_gather.gather_routes(x.reshape(M, D), order, inverse, K)
+        else:
+            xs = x.reshape(M, D)[tok_s]
         gu_t = self.experts.gate_up_w.swapaxes(-1, -2)
         dw_t = self.experts.down_w.swapaxes(-1, -2)
         if gu_t.dtype != x.dtype:
@@ -208,19 +216,21 @@ class MoEFeedForward(nn.Module):
         gate, up = mx.split(h, 2, axis=-1)
         act = expert_act(gate, up, self.swiglu_limit)
         y = mx.gather_mm(act, dw_t, rhs_indices=exps_s, sorted_indices=True)[:, 0, :]
-        if combine_enabled_for(x, K):
+        if use_combine:
             # ``y`` is sorted by expert, while route weights are stored in the
             # original token-major flattening.  The fused combine handles the
             # weighting and K-way token reduction in one pass.  Its inverse is
             # the only metadata needed for this native gather_mm path.
-            inverse = route_inverse(order)
+            if inverse is None:
+                inverse = route_inverse(order)
             out = combine_routes(y, w.reshape(G), order, inverse, K)
         else:
             w_s = w.reshape(G)[order].astype(x.dtype)
             out = mx.zeros((M, D), dtype=x.dtype).at[tok_s].add(y * w_s[:, None])
         return out.reshape(B, T, D)
 
-    def seq_aux_loss(self, scores: mx.array, idx: mx.array, B: int, T: int) -> mx.array:
+    def seq_aux_loss(self, scores: mx.array, idx: mx.array, B: int, T: int,
+                     counts=None) -> mx.array:
         """序列级负载均衡损失（报告 §4.2.2：权重 1e-4 的小规模序列级均衡损失）。
 
         aux = E · mean_b Σ_e f_{b,e}·P_{b,e}：f 是序列 b 内分到专家 e 的 (token,choice)
@@ -230,18 +240,41 @@ class MoEFeedForward(nn.Module):
         E, k = self.n_routed, self.top_k
         M = B * T
         P = mx.mean(scores.reshape(B, T, E), axis=1)  # [B,E]
-        flat = mx.zeros((M, E), dtype=mx.float32)
-        rows = mx.arange(M)
-        for j in range(k):
-            flat = flat.at[rows, idx[:, j]].add(1.0)
-        f = mx.mean(mx.stop_gradient(flat).reshape(B, T, E), axis=1) / k  # [B,E]
+        if counts is None and moe_counts.enabled_for(idx):
+            counts = moe_counts.sequence_route_counts(idx, B, T, E)
+        if counts is not None:
+            # Same sequence-level objective and /T then /K normalization.
+            f = (mx.stop_gradient(counts) / T) / k
+        else:
+            flat = mx.zeros((M, E), dtype=mx.float32)
+            rows = mx.arange(M)
+            for j in range(k):
+                flat = flat.at[rows, idx[:, j]].add(1.0)
+            f = mx.mean(mx.stop_gradient(flat).reshape(B, T, E), axis=1) / k
         return mx.mean(mx.sum(f * P, axis=-1)) * E
 
     def __call__(self, x: mx.array) -> mx.array:
         B, T, D = x.shape
         w, idx, scores = self.router(x.reshape(B * T, D))
         if self.training and self.aux_weight > 0:
-            self._last_aux = self.seq_aux_loss(scores, idx, B, T)
+            counts = None
+            if moe_counts.enabled_for(idx):
+                counts = moe_counts.sequence_route_counts(idx, B, T, self.n_routed)
+                # Supersede the router's lazy global scatter with the exact
+                # same occurrence counts. This remains a forward side channel.
+                self.router._last_load = mx.sum(counts, axis=0)
+            self._last_aux = self.seq_aux_loss(scores, idx, B, T, counts=counts)
+        if moe_decode._ENABLED and not self.training and B * T <= self._DENSE_MAX_TOKENS:
+            decode_weights = (
+                self.experts.gate_up_w, self.experts.down_w,
+                self.shared.w1.weight, self.shared.w2.weight, self.shared.w3.weight,
+            )
+            if moe_decode.enabled_for(x, self.training, _DECODE_GATHER,
+                                      self._DENSE_MAX_TOKENS, decode_weights):
+                return moe_decode.compiled_decode(
+                    x, idx, w, *decode_weights,
+                    self.n_routed, self.top_k, self.swiglu_limit, self.shared.swiglu_limit,
+                )
         if B * T <= self._DENSE_MAX_TOKENS:
             mixed = self._dense_forward(x, idx, w)
         else:
