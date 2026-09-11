@@ -205,6 +205,7 @@ def _sampling_params(args, tokenizer, max_new: int) -> SamplingParams:
         eos_token_id=tokenizer.eos_token_id,
         use_mtp_speculative=bool(args.use_mtp_speculative),
         num_speculative_tokens=args.num_speculative_tokens,
+        mtp_confidence_threshold=args.mtp_confidence_threshold,
     )
 
 
@@ -265,15 +266,16 @@ def main():
     parser.add_argument(
         "--use_mtp_speculative",
         action="store_true",
-        help="使用 MTP 投机解码加速（需模型带 MTP 模块，batch=1）",
+        help="启用 DSpark 草稿验证与拒绝采样（检查点必须带已训练的 MTP 模块）",
     )
     parser.add_argument(
         "--num_speculative_tokens",
         default=1,
         type=int,
-        help="MTP 投机解码每轮草稿 token 数（默认 1。本模型 MTP 是整层，"
-        "草稿多于 1 通常更慢；需配合 --use_mtp_speculative）",
+        help="每轮草稿上限（默认 1，实际不超过 dspark_block_size-1 和剩余长度）",
     )
+    parser.add_argument("--mtp_confidence_threshold", type=float, default=0.0,
+                        help="DSpark 置信度低于此值时停止本轮草稿；0 关闭此调度，范围 [0,1]")
     parser.add_argument(
         "--model_mode",
         "--mode",
@@ -296,6 +298,8 @@ def main():
     if args.num_speculative_tokens <= 0:
         print("错误：num_speculative_tokens 必须大于 0")
         exit(1)
+    if not 0 <= args.mtp_confidence_threshold <= 1:
+        parser.error("mtp_confidence_threshold 必须在 [0,1] 范围内")
     if args.max_seq_len <= 0:
         print("错误：max_seq_len 必须大于 0")
         exit(1)
@@ -313,7 +317,12 @@ def main():
     engine = VibyEngine(model, tokenizer, max_num_seqs=1)
     print("[engine] VibyEngine（window / compress_kv / index_k 三类池，连续 batch + 前缀复用）")
     if args.use_mtp_speculative:
-        print("[engine] 注意：新引擎暂未实现 DSpark 投机解码，--use_mtp_speculative 被忽略")
+        try:
+            engine._validate_speculative(_sampling_params(args, tokenizer, 1))
+        except ValueError as exc:
+            parser.error(str(exc))
+        limit = min(args.num_speculative_tokens, model.config.dspark_block_size - 1)
+        print(f"[engine] DSpark 投机解码已启用：每轮最多 {limit} 个草稿，主干验证 + 拒绝修正采样")
 
     prompts = get_prompt_datas(args)
     test_mode = int(input("[0] 自动测试\n[1] 手动输入\n"))
@@ -360,7 +369,7 @@ def main():
             print(
                 f"\n[MTP speculative] 草稿接受率: {acc:.1%} "
                 f"({stats['mtp_accepted']}/{stats['mtp_drafted']}，"
-                f"每轮草稿 {args.num_speculative_tokens})"
+                f"每轮草稿上限 {min(args.num_speculative_tokens, model.config.dspark_block_size - 1)})"
             )
 
         gen_len = generated_ids.shape[1] - slice_start

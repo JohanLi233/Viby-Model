@@ -11,6 +11,12 @@ V4.1 这一条技术路线；唯一的保留项是 **Gated XSA**（默认开，�
 架构语义对照官方实现（`deepseek-ai/DeepSeek-V4.1-Flash` 的 `inference/model.py`，
 已逐行核对）与技术报告 `DeepSeek_V41_Tech_Report`（下称"报告"）。
 
+可选 **Viby-PSR** 在 CED 只读前缀记忆上增加独立预测状态工作区，支持精确自适应读址、
+纯计算、预算价值控制和 Decoder 桥接。`train_pretrain.py` **默认开启**（`--no-psr` 关闭），
+自动构造文档内前缀与终态未来 token 监督；模型库直接构造仍需 `psr_enabled=True`。
+实现契约、训练入口与当前限制见
+[VIBY_PSR.md](research/VIBY_PSR.md)。
+
 ## 架构
 
 ### CED：因果编码器-解码器（报告 §2.2）
@@ -308,7 +314,7 @@ out = model.generate(tokens, max_new_tokens=64, temperature=0.7, top_k=50)
 8. **Muon 的更新 RMS 重缩放**（报告 §4.2.2：将每个更新矩阵的 RMS 重缩放至 0.18 以复用 AdamW 学习率）未实现：仓库沿用自校准的 muon_lr = 13/3 x adam_lr + hyperball 范数冻结 + 自研 NS 系数（有独立 probe 校准）。切到报告口径需要重做步长标定，属单独一项工作。
 9. **AdamW 的 eps** 仍走 --adam_eps（compute 缩放公式或 1e-8 兜底），没有默认成报告基线的 1e-20；严格对齐可显式 --adam_eps 1e-20。
 10. **MoE router** 仍是独立小 lr AdamW 组（报告口径的线性权重走 Muon）：正交化步长恒定偏大，实测会把路由打分持续推向失衡。
-11. **DSpark 规模**：只挂 1 个草稿 stage（官方 3）x 4 个草稿位置（官方 5），置信度调度的投机采样循环未实现。
+11. **DSpark 规模**：默认 1 个草稿 stage（官方 3）x 4 个草稿位置（官方 5）。引擎已支持草稿、主干验证、拒绝修正采样和可选置信度调度，详见 [DSpark 引擎说明](research/DSPARK_ENGINE.md)。
 12. **Gated XSA 默认开**：XSA 不是官方 V4.1 组件，是本仓库额外挂的注意力后处理
     （arXiv:2603.09078 / modded-nanogpt record #82）。默认 `use_xsa=True` 且作用于
     最深 `max(1, n_layers//3)` 层。要严格对齐官方口径请加 `--no-use_xsa`。
@@ -319,8 +325,9 @@ out = model.generate(tokens, max_new_tokens=64, temperature=0.7, top_k=50)
   已排查并排除：权重/模块状态/输入**全部有限**（逐张量枚举过 parameters 与私有 buffer）、同一批数据与权重拿到进程外纯模型重复前向+反传 40 次全有限、dump 出的 X/Y/M 逐字节相同、与优化器分组无关（Sinkhorn 新分组与 VIBY_SINKHORN=0 旧分组都会复现，也都能 3/3 干净）、与 --no_muonh / --no_compile 无关。
   签名（随机、进程相关、同一图重复执行结果不同）指向 MLX/Metal 侧的核间竞态或未初始化读，怀疑点是 mx.fast.scaled_dot_product_attention（bool mask + sinks）或 MoE 的 scatter/gather。
   缓解：训练循环的 NaN 守卫会跳过该累积窗口（不污染权重）；若同一进程内前向本身开始出 NaN，重启该次运行。下一步建议逐项关掉 sdpa sinks / MoE 稀疏路径做二分定位（尚未做）。
-- `--use_mtp_speculative` / `num_speculative_tokens` 被接受但被忽略：DSpark 的
-  投机解码采样循环未实现（只有草稿头前向与训练损失）。
+- DSpark 投机解码需要带已训练 MTP 模块的检查点。`--use_mtp_speculative`
+  已生效；缺少模块会明确报错。当前验证复用逐 token decode 图，尚未实现主干
+  多 token 并行验证，不保证比普通解码快。
 
 ## 验证
 

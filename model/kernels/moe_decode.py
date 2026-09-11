@@ -15,7 +15,9 @@ _ENABLED = os.environ.get("VIBY_MOE_DECODE_COMPILE", "0") != "0"
 def enabled_for(x, training, decode_gather, max_tokens, weights):
     return (_ENABLED and decode_gather and not training
             and mx.default_device() == mx.gpu and mx.metal.is_available() and x.ndim == 3
-            and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
+            # FP32 fusion can contract arithmetic and change output bits.
+            # Keep the exact-parity contract by retaining eager FP32 decode.
+            and x.dtype in (mx.bfloat16, mx.float16)
             and 0 < x.shape[0] * x.shape[1] <= max_tokens
             and all(w.dtype == x.dtype for w in weights))
 

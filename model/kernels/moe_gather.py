@@ -82,6 +82,10 @@ def gather_routes(x, order, inverse, routes):
     if order.dtype not in (mx.int32, mx.uint32) or inverse.dtype not in (mx.int32, mx.uint32):
         raise ValueError("route permutations must contain int32 or uint32 indices")
     order, inverse = mx.stop_gradient(order), mx.stop_gradient(inverse)
+    if x.size == 0:
+        # Native empty take has a broken scatter adjoint in MLX 0.32.2.
+        # A reshape has the same empty value and a valid empty adjoint.
+        return x.reshape(order.size, x.shape[1])
     if not enabled_for(x, routes):
         return x[(order // routes).astype(mx.int32)]
     return _op(routes)(x, order, inverse)

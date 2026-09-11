@@ -26,7 +26,7 @@ from model.cache import VibyCache
 
 from .memory import StatePool, capture_state, copy_state_row, restore_state
 from .prefix import RadixPrefixCache
-from .sampling import find_stop_length, log_softmax, sample_one, transform_logits
+from .sampling import find_stop_length, log_softmax, sample_one, speculative_correction, transform_logits
 from .types import CompletionOutput, RequestOutput, SamplingParams
 
 
@@ -45,6 +45,7 @@ class Sequence:
     finish_reason: Optional[str] = None
     logprobs: list = field(default_factory=list)
     streamer: object = None
+    draft_mains: Optional[tuple] = None
 
     @property
     def n_generated(self) -> int:
@@ -70,6 +71,8 @@ class VibyEngine:
         **kwargs,
     ):
         cfg = model.config
+        if getattr(cfg, "psr_enabled", False):
+            raise ValueError("PSR currently uses model.prefill/decode_step/generate; the continuous-batch engine does not yet transport ThinkingState")
         model.eval()
         self.model = model
         self.config = cfg
@@ -144,6 +147,7 @@ class VibyEngine:
         streamer 只在 n==1 时生效（与旧引擎一致）。
         """
         params = params or SamplingParams()
+        self._validate_speculative(params)
         if params.stop and self.tokenizer is None:
             raise ValueError("stop 字符串需要 tokenizer")
         ids = self._encode(prompt)
@@ -186,9 +190,20 @@ class VibyEngine:
             self._admit(seq)
             mark(seq)
 
+        # Admission can finish immediately (EOS or a one-token limit).
+        self._compact()
         if self._running:
-            logits = self._decode(self._running)
-            self._append_step(self._running, logits)
+            if any(s.params.use_mtp_speculative for s in self._running):
+                # Isolated scratch rows allow different draft lengths and
+                # rejection positions without corrupting other running rows.
+                for seq in self._running:
+                    if seq.params.use_mtp_speculative:
+                        self._speculative_step(seq)
+                    else:
+                        self._decode_one(seq)
+            else:
+                logits = self._decode(self._running)
+                self._append_step(self._running, logits)
             for seq in self._running:
                 mark(seq)
             self._compact()
@@ -242,6 +257,18 @@ class VibyEngine:
     # ------------------------------------------------------------------
     # 调度
     # ------------------------------------------------------------------
+    def _validate_speculative(self, params):
+        if not params.use_mtp_speculative:
+            return
+        if not getattr(self.model, "mtp_modules", None) or not callable(getattr(self.model, "dspark_draft", None)):
+            raise ValueError("--use_mtp_speculative requires a checkpoint with trained DSpark/MTP modules")
+        if self.config.dspark_block_size < 2:
+            raise ValueError("DSpark speculative decoding requires dspark_block_size >= 2")
+        if params.num_speculative_tokens is not None and params.num_speculative_tokens <= 0:
+            raise ValueError("num_speculative_tokens must be positive")
+        if not 0 <= params.mtp_confidence_threshold <= 1:
+            raise ValueError("mtp_confidence_threshold must be between 0 and 1")
+
     def _admit(self, seq: Sequence) -> None:
         """prefill 一条新序列（含前缀复用），把状态搬进池子并采样第一个 token。"""
         prompt = seq.prompt_ids
@@ -255,13 +282,20 @@ class VibyEngine:
             if state is not None and state.hidden is None and n_hit >= len(prompt):
                 # 快照缺末位 hidden 时无法产出首个 logits，退回整段 prefill
                 n_hit, state = 0, None
+            if (state is not None and seq.params.use_mtp_speculative
+                    and state.draft_mains is None and n_hit >= len(prompt)):
+                # An ordinary full-prefix hit has no DSpark anchor. Recompute
+                # it instead of silently disabling speculation or guessing it.
+                n_hit, state = 0, None
         scratch = VibyCache(self.config, 1)
         start = restore_state(scratch, 0, state) if state is not None else 0
         end = len(prompt)
         hidden = None
+        draft_mains = None
         if start >= end:
             # 整段命中：用快照里的末位 hidden 重算 logits（省一次前向）
             hidden = state.hidden[None]
+            draft_mains = state.draft_mains
         else:
             # 稠密续跑剩余 prompt；开前缀缓存时按 stride 分块，块尾插复用点
             stride = self.prefix_stride if self.prefix is not None else end
@@ -279,13 +313,23 @@ class VibyEngine:
                     hidden = None
                     for p in range(pos, end):
                         one = mx.array([[prompt[p]]], dtype=mx.int32)
-                        hidden = self._trunk(one, start_pos=p, cache=scratch, decode=True)[:, -1]
+                        result = self._trunk(one, start_pos=p, cache=scratch, decode=True,
+                                             collect_main=seq.params.use_mtp_speculative)
+                        if seq.params.use_mtp_speculative:
+                            result, mains = result
+                            draft_mains = tuple(mx.array(m[0, -1]) for m in mains)
+                        hidden = result[:, -1]
                         self._update_engram_decode(scratch, one)
                         mx.eval(hidden)
                     pos = end
                 else:
                     ids = mx.array([prompt[pos:nxt]], dtype=mx.int32)
-                    hidden = self._trunk(ids, start_pos=pos, cache=scratch, decode=False)[:, -1]
+                    result = self._trunk(ids, start_pos=pos, cache=scratch, decode=False,
+                                         collect_main=seq.params.use_mtp_speculative)
+                    if seq.params.use_mtp_speculative:
+                        result, mains = result
+                        draft_mains = tuple(mx.array(m[0, -1]) for m in mains)
+                    hidden = result[:, -1]
                     self._update_engram_prefill(scratch, ids)
                     pos = nxt
                     mx.eval(hidden)
@@ -294,7 +338,7 @@ class VibyEngine:
                 if self.prefix is not None and (self.prefix.has_room() or pos >= end):
                     self.prefix.insert(
                         prompt[:pos],
-                        capture_state(scratch, 0, pos, hidden=mx.array(hidden[0])),
+                        capture_state(scratch, 0, pos, hidden=mx.array(hidden[0]), draft_mains=draft_mains),
                     )
         logits = self.model.logits(hidden)[0]
         mx.eval(logits)
@@ -303,6 +347,7 @@ class VibyEngine:
         self.pool.ensure(row + 1, [len(s.token_ids) for s in self._running])
         copy_state_row(self.pool.cache, row, scratch, 0, end)
         seq.row = row
+        seq.draft_mains = draft_mains
         # 3) 统计 + 采样首 token
         self.stats["prefill_tokens"] += len(prompt) - start
         if n_hit:
@@ -354,13 +399,122 @@ class VibyEngine:
             params = seq.params
             row = logits[i]
             tok = sample_one(transform_logits(row, seq.token_ids, params), params)
-            if params.logprobs:
-                seq.logprobs.append(float(log_softmax(row)[tok].item()))
-            seq.token_ids.append(tok)
-            if seq.streamer is not None:
-                seq.streamer.put([[tok]])
-            self.stats["generated_tokens"] += 1
-            self._check_finish(seq)
+            self._append_token(seq, tok, row)
+
+    def _append_token(self, seq, tok, target_logits):
+        """Only verified/corrected tokens reach the public stream or logprobs."""
+        if seq.params.logprobs:
+            seq.logprobs.append(float(log_softmax(target_logits)[tok].item()))
+        seq.token_ids.append(tok)
+        if seq.streamer is not None:
+            seq.streamer.put([[tok]])
+        self.stats["generated_tokens"] += 1
+        self._check_finish(seq)
+
+    def _scratch_for(self, seq):
+        scratch = VibyCache(self.config, 1)
+        copy_state_row(scratch, 0, self.pool.cache, seq.row, len(seq.token_ids) - 1)
+        return scratch
+
+    def _verify_token(self, scratch, token, position, collect_main=True):
+        scratch.decode_max_pos = position + 1
+        ids = mx.array([[token]], mx.int32)
+        result = self._trunk(ids, start_pos=mx.array([position], mx.int32), cache=scratch,
+                             decode=True, collect_main=collect_main)
+        if collect_main:
+            hidden, mains = result
+            mains = tuple(mx.array(m[0, -1]) for m in mains)
+        else:
+            hidden, mains = result, None
+        self._update_engram_decode(scratch, ids)
+        return self.model.logits(hidden)[0, 0], mains
+
+    def _decode_one(self, seq):
+        scratch = self._scratch_for(seq)
+        logits, mains = self._verify_token(scratch, seq.token_ids[-1], len(seq.token_ids) - 1,
+                                           collect_main=seq.params.use_mtp_speculative)
+        mx.eval(logits)
+        copy_state_row(self.pool.cache, seq.row, scratch, 0, len(seq.token_ids))
+        seq.draft_mains = mains
+        self.stats["decode_tokens"] += 1
+        self.stats["batch_steps"] += 1
+        self.stats["max_batch"] = max(self.stats["max_batch"], 1)
+        self._append_step([seq], logits[None])
+
+    def _draft_tokens(self, seq, count):
+        mains = [m[None, None, :] for m in seq.draft_mains]
+        # Slot 0 is the processed anchor. Slot 1 is the already emitted,
+        # pending target token; its DSpark output proposes the next token.
+        known = list(seq.token_ids[-2:])
+        proposals = []
+        history = list(seq.token_ids)
+        for _ in range(count):
+            logits, confidence = self.model.dspark_draft(mains, mx.array([known], mx.int32), last_only=True)
+            if seq.params.mtp_confidence_threshold > 0:
+                if float(mx.sigmoid(confidence[0, -1]).item()) < seq.params.mtp_confidence_threshold:
+                    self.stats["mtp_confidence_stops"] += 1
+                    break
+            transformed = transform_logits(logits[0, -1], history, seq.params)
+            token = sample_one(transformed, seq.params)
+            proposal = mx.softmax(transformed)
+            mx.eval(proposal)
+            proposals.append((token, proposal))
+            known.append(token)
+            history.append(token)
+            stops = set(seq.params.stop_token_ids or [])
+            if seq.params.eos_token_id is not None:
+                stops.add(seq.params.eos_token_id)
+            if token in stops:
+                break
+        return proposals
+
+    def _speculative_step(self, seq):
+        remaining = seq.max_new - seq.n_generated
+        count = min(seq.params.num_speculative_tokens or 1, self.config.dspark_block_size - 1, remaining - 1)
+        if count <= 0:
+            self._decode_one(seq)
+            return
+        if seq.draft_mains is None:
+            raise RuntimeError("missing DSpark anchor state for speculative request")
+        proposals = self._draft_tokens(seq, count)
+        if not proposals:
+            self._decode_one(seq)
+            return
+        self.stats["mtp_rounds"] += 1
+        self.stats["mtp_drafted"] += len(proposals)
+        scratch = self._scratch_for(seq)
+        start = len(seq.token_ids) - 1
+        logits, states = [], []
+        # Build one lazy verification graph using the actual decode path.
+        # Dense prefill verification would change fixed-k ties and compressor
+        # boundaries. Real snapshots also restore overwritten window-ring slots.
+        for i, token in enumerate([seq.token_ids[-1], *[p[0] for p in proposals]]):
+            row, mains = self._verify_token(scratch, token, start + i)
+            logits.append(row)
+            states.append(capture_state(scratch, 0, start + i + 1, draft_mains=mains))
+        mx.eval(logits)
+        self.stats["decode_tokens"] += len(logits)
+        self.stats["batch_steps"] += len(logits)
+        self.stats["max_batch"] = max(self.stats["max_batch"], 1)
+        chosen = states[0]
+        for i, (draft, proposal) in enumerate(proposals):
+            target = transform_logits(logits[i], seq.token_ids, seq.params)
+            token, accepted = speculative_correction(target, proposal, draft, seq.params)
+            if accepted:
+                self.stats["mtp_accepted"] += 1
+            else:
+                self.stats["mtp_rejected"] += 1
+            chosen = states[i]
+            self._append_token(seq, token, logits[i])
+            if not accepted or seq.finished:
+                break
+        else:
+            chosen = states[-1]
+            target = transform_logits(logits[-1], seq.token_ids, seq.params)
+            self._append_token(seq, sample_one(target, seq.params), logits[-1])
+        restore_state(self.pool.cache, seq.row, chosen)
+        seq.draft_mains = chosen.draft_mains
+        mx.eval(seq.draft_mains)
 
     def _compact(self) -> None:
         """把结束的序列移出 running，并把状态行压实到 0..B-1。"""
@@ -381,21 +535,21 @@ class VibyEngine:
     # ------------------------------------------------------------------
     # 前向 / Engram 记账
     # ------------------------------------------------------------------
-    def _trunk(self, ids: mx.array, start_pos, cache: VibyCache, decode: bool) -> mx.array:
+    def _trunk(self, ids: mx.array, start_pos, cache: VibyCache, decode: bool, collect_main=False):
         """主干前向，返回末层 hidden [B,T,D]（等价于 VibyForCausalLM 的 hidden）。
 
         直接走 `VibyModel.__call__`：它同时支持标量 / [B] 的 start_pos，并且会
         把 per-row 的位置一路传到 `Attention.decode`。
         """
-        hidden, _, _ = self.model.model(
+        hidden, mains, _ = self.model.model(
             ids,
             start_pos=start_pos,
             cache=cache,
             decode=decode,
             prev_tokens=cache.engram_prev,
-            collect_main=False,
+            collect_main=collect_main,
         )
-        return hidden
+        return (hidden, mains) if collect_main else hidden
 
     def _update_engram_prefill(self, cache: VibyCache, ids: mx.array) -> None:
         """稠密 prefill 后的 engram 历史推进（与 model.prefill 的取值口径一致）。"""
@@ -437,6 +591,8 @@ class VibyEngine:
             keep = find_stop_length(self.tokenizer, gen, params.stop)
             if keep is not None:
                 del seq.token_ids[base + keep :]
+                if params.logprobs:
+                    del seq.logprobs[keep:]
                 self._finish(seq, "stop")
                 return
         if len(gen) >= seq.max_new:
@@ -488,8 +644,11 @@ class VibyEngine:
             "generated_tokens": 0,
             "batch_steps": 0,
             "max_batch": 0,
-            "mtp_accepted": 0,  # DSpark 投机解码 TODO，占位保持旧字段
+            "mtp_accepted": 0,
             "mtp_drafted": 0,
+            "mtp_rejected": 0,
+            "mtp_rounds": 0,
+            "mtp_confidence_stops": 0,
         }
 
     @property

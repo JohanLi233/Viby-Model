@@ -1,5 +1,11 @@
 # CSA2 / CED kernel implementation and acceptance
 
+**2026-09-11 follow-up:** the historical restored-window timings below used a
+snapshot utility that aliased mutable optimizer-state dictionaries on restore.
+Those window measurements do not establish same-state A/B performance. The
+snapshot repair and fresh measurements are recorded in
+[MOE_TRAINING_REPAIR.md](MOE_TRAINING_REPAIR.md); original records remain intact.
+
 2026-09-11. Apple M4 Max (48 GiB), MLX 0.32.2. This records the completed
 implementation and measured defaults after the seven-section algorithm audit.
 The baseline for performance includes correctness repairs; the broken

@@ -133,6 +133,7 @@ def main():
     jsonl = run_dir / "benchmarks.jsonl"
 
     mx.set_default_device(mx.gpu)
+    mx.random.seed(args.seed)
     targs, cfg, model, trainer = build_trainer(args)
     cfg_dump = {
         "dim": cfg.dim,
@@ -195,7 +196,7 @@ def main():
         def arm():
             run_fb(trainer, fb_batch)
 
-        result = abba_blocks(arm, arm, args.warmup, args.block_iters, args.blocks, "A", "A")
+        result = abba_blocks(arm, arm, args.warmup, args.block_iters, args.blocks)
         med = result["A"]["median_s"]
         rec = {
             **base_rec,
@@ -221,7 +222,7 @@ def main():
             restore_train_state(model, trainer.optimizer, snap)
 
         result = abba_blocks(
-            arm, arm, args.warmup, args.block_iters, args.blocks, "A", "A",
+            arm, arm, args.warmup, args.block_iters, args.blocks,
             before_a=reset, before_b=reset,
         )
         med = result["A"]["median_s"]

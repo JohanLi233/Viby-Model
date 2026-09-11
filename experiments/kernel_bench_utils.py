@@ -34,6 +34,7 @@ DEFAULT_VIBY_FLAGS = {
     "VIBY_HC_KERNEL": "1",
     "VIBY_HC_PRE_NORM_KERNEL": "1",
     "VIBY_SINKHORN_KERNEL": "1",
+    "VIBY_OPT_SINKHORN_FAST_NORM": "1",
 }
 
 
@@ -116,7 +117,9 @@ def snapshot_train_state(model, optimizer):
 
 def restore_train_state(model, optimizer, snap):
     model.update(snap["params"])
-    optimizer.state = snap["optimizer"]
+    # Optimizers mutate state dictionaries in place, even though array leaves
+    # are immutable. Hand back fresh containers on EVERY restore.
+    optimizer.state = clone_tree(snap["optimizer"])
     if snap["biases"] is not None and hasattr(model, "apply_moe_biases"):
         model.apply_moe_biases(snap["biases"])
     mx.eval(model.parameters(), optimizer.state)
@@ -140,6 +143,10 @@ def abba_blocks(
     before_a=None, before_b=None,
 ):
     """预热两臂后按 A,B,B,A 测。fn 自己负责 mx.eval；before_* 在计时外调用。"""
+    if label_a == label_b:
+        raise ValueError("ABBA slot labels must differ, including A/A comparisons")
+    if warmup < 0 or block_iters <= 0 or n_blocks <= 0:
+        raise ValueError("expected warmup >= 0 and positive block_iters/n_blocks")
 
     def _prep(name):
         fn = before_a if name == label_a else before_b

@@ -219,7 +219,7 @@ def test_train_benchmark_independent_switches():
                 isinstance(node, ast.For) and text.startswith("for variant in VARIANTS.values():")) or (
                 isinstance(node, ast.FunctionDef) and node.name == "configure"):
             nodes.append(node)
-    ns = {k: types.SimpleNamespace() for k in ("sa", "fs", "moe", "hc", "moe_counts", "moe_decode", "moe_gather")}
+    ns = {k: types.SimpleNamespace() for k in ("sa", "fs", "moe", "hc", "moe_counts", "moe_decode", "moe_gather", "optimizer_impl")}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "bench-config", "exec"), ns)
     for name, expected in [("fused_combine", (False, False)), ("dataflow_gather", (True, False)),
                            ("dataflow_counts", (False, True)), ("dataflow_combined", (True, True))]:
@@ -244,13 +244,15 @@ def test_decode_benchmark_is_incremental_not_all_experts_baseline():
 def test_decode_guard_rejects_training_large_batches_and_mixed_dtype(load):
     mod, mx = load("moe_decode")
     mod._ENABLED, mx.device = True, mx.gpu
-    x = array(np.zeros((1, 1, 64)), np.float32)
+    x = array(np.zeros((1, 1, 64)), np.float16)
     weights = (x,) * 5
     assert mod.enabled_for(x, False, True, 8, weights)
     assert not mod.enabled_for(x, True, True, 8, weights)
     assert not mod.enabled_for(x, False, False, 8, weights)
     assert not mod.enabled_for(array(np.zeros((9, 1, 64)), np.float32), False, True, 8, weights)
-    assert not mod.enabled_for(x, False, True, 8, (x.astype(np.float16),) + weights[1:])
+    assert not mod.enabled_for(x, False, True, 8, (x.astype(np.float32),) + weights[1:])
+    xf = x.astype(np.float32)
+    assert not mod.enabled_for(xf, False, True, 8, (xf,) * 5)
     mx.device = mx.cpu
     assert not mod.enabled_for(x, False, True, 8, weights)
 

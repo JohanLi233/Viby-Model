@@ -17,9 +17,10 @@ class SamplingParams:
     eos_token_id: Optional[int] = 2
     n: int = 1
     logprobs: bool = False
-    # DSpark 投机解码尚未在新引擎里实现（TODO）：保留字段以兼容老调用方。
+    # A round proposes up to dspark_block_size-1 new tokens, then a target bonus.
     use_mtp_speculative: bool = False
     num_speculative_tokens: Optional[int] = None
+    mtp_confidence_threshold: float = 0.0  # 0 disables confidence-based early exit
     # ---- 新增：停止条件 ----
     stop: Optional[list] = None  # 停止字符串（需要 tokenizer），命中即截断
     stop_token_ids: Optional[list] = None  # 命中即停的 token id

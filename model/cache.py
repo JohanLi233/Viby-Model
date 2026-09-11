@@ -80,6 +80,7 @@ class VibyCache:
         self.start_pos = 0
         self.decode_max_pos = 0  # Python：当前步 batch 内最大绝对位置+1，decode 用来切池
         self.engram_prev = None  # [B, max_ngram-1] 最近 token id（Engram 哈希用）
+        self.thinking_state = None  # independent terminal PSR state; never a token/cache position
         self._wire_sources()
 
     def _wire_sources(self):
@@ -99,6 +100,14 @@ class VibyCache:
 
         压缩池与索引器 K 池按整组回退：只有落在回退区间之外的组保留。
         """
+        if offset < 0:
+            raise ValueError("rewind offset must be nonnegative")
+        if self.thinking_state is not None and offset > 0:
+            # Reusing a workspace before its full question is observed leaks
+            # future input; require a fresh prefill rather than silently lose it.
+            new_pos = max(0, self.start_pos - offset)
+            if bool(mx.any(new_pos <= self.thinking_state.anchor).item()):
+                raise ValueError("rewind crosses the PSR question boundary; use a fresh prefill")
         self.start_pos = max(0, self.start_pos - offset)
         self.decode_max_pos = self.start_pos
         for c in self.layers:

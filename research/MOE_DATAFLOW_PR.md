@@ -1,5 +1,11 @@
 # MoE dataflow optimizations (experimental)
 
+Follow-up on Apple hardware: see [MOE_TRAINING_REPAIR.md](MOE_TRAINING_REPAIR.md)
+for corrected Metal tests, empty-gather VJP repair, FP32 decode fallback,
+optimizer snapshot repair and new timings. The original implementation-host
+results below are historical. Compiled decode now accepts bf16/fp16 only;
+FP32 uses eager execution to preserve the exact-parity contract.
+
 Base: `b7c5019537f570de12cef555f987633c9d0ba95c`, 2026-09-11.
 This change implements three independently switchable paths. It does **not**
 claim 80% MFU or a measured training/decode speedup. The existing accepted

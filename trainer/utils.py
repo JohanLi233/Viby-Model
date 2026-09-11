@@ -79,8 +79,10 @@ def log_parameter_count(model, args=None):
     flops = training_flops_per_token(model, seq) if seq > 0 else 0
     args.flops_per_token = flops
     Logger(
-        f"训练 FLOPs/token：{flops / 1e9:.3f}G（6×激活 GEMM + CSA2 注意力，"
-        f"MTP 草稿前向已折算），peak {peak:.1f} TFLOPS"
+        f"训练 FLOPs/token 估算：{flops / 1e9:.3f}G（6×激活 GEMM + 名义 sparse top-k，"
+        f"未实测文档掩码/阈值并列；DSpark 按槽数折算"
+        f"{'；含 PSR 固定预算文本预训练摊销' if getattr(model.config, 'psr_enabled', False) else ''}），"
+        f"peak {peak:.1f} TFLOPS"
     )
 
 
@@ -122,6 +124,7 @@ def load_model_weights(
     strict=True,
     label="checkpoint",
     allow_fresh_prefixes=(),
+    weights=None,
 ):
     """安全地加载模型权重。
 
@@ -135,7 +138,7 @@ def load_model_weights(
         Logger(f"Warning: {label} {checkpoint_path} not found")
         return False
 
-    weights = dict(mx.load(checkpoint_path).items())
+    weights = dict(mx.load(checkpoint_path).items()) if weights is None else weights
     model_shapes = {k: v.shape for k, v in tree_flatten(model.parameters())}
 
     loaded = {}
@@ -307,6 +310,11 @@ def build_model_and_tokenizer(
 # sidecar config / 组成 VibyConfig 的 kwargs。SFT/DPO 的 parser 把这些参数默认
 # 设为 None：表示"从基座 checkpoint 的 sidecar config 继承"，显式传入才覆盖。
 ARCH_ARG_TO_FIELD = {
+    **{name: name for name in (
+        "psr_enabled", "psr_slots", "psr_dim", "psr_blocks", "psr_topk", "psr_rounds",
+        "psr_max_rounds", "psr_group_size", "psr_num_tests", "psr_test_classes",
+        "psr_bridge_init", "psr_predictive_weight", "psr_index_distill_weight",
+    )},
     "hidden_size": "dim",
     "num_hidden_layers": "n_layers",
     "num_attention_heads": "n_heads",
@@ -367,7 +375,8 @@ ARCH_ARG_TO_FIELD = {
 # 旧名别名：命令行选项名 → ARCH_ARG_TO_FIELD 里的 dest
 # （--routed_scaling_factor 与 --route_scale 共用一个 dest，这里只用于
 #  --preset 判断"用户是否显式传过"）
-ARCH_ARG_ALIASES = {"routed_scaling_factor": "route_scale"}
+ARCH_ARG_ALIASES = {"routed_scaling_factor": "route_scale", "psr": "psr_enabled",
+                    "no_psr": "psr_enabled", "no_psr_enabled": "psr_enabled"}
 
 # 派生字段 → 生成它们的 CLI 结构参数。sidecar 里的派生字段是按当时的结构算好的；
 # 只要用户显式改了生成它的结构参数（如 --num_hidden_layers / --mtp_depth），
@@ -868,6 +877,13 @@ def save_checkpoint(
 def load_checkpoint(checkpoint_path, model, optimizer, args):
     """统一的检查点加载函数（safetensors 格式）"""
     Logger(f"Loading checkpoint from: {checkpoint_path}")
+    weights = dict(mx.load(checkpoint_path).items())
+    psr_prefixes = ("model.reasoner.", "model.workspace_bridges.")
+    fresh_psr = (getattr(model.config, "psr_enabled", False)
+                 and not any(k.startswith(psr_prefixes) for k in weights))
+    fresh_prefixes = ("mtp_modules.",) if getattr(args, "freeze_backbone", False) else ()
+    if fresh_psr:
+        fresh_prefixes += psr_prefixes
 
     # 加载模型权重（严格校验，buffer shape 不匹配时保留当前 config 的版本）。
     # --freeze_backbone 的 DSpark 独立阶段（报告 §2.4.3）允许基座 checkpoint
@@ -877,9 +893,8 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
         checkpoint_path,
         strict=True,
         label="checkpoint",
-        allow_fresh_prefixes=("mtp_modules.",)
-        if getattr(args, "freeze_backbone", False)
-        else (),
+        allow_fresh_prefixes=fresh_prefixes,
+        weights=weights,
     ):
         raise FileNotFoundError(f"Checkpoint 不存在: {checkpoint_path}")
 
@@ -899,7 +914,9 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
     # 与基座训练不同（只有 mtp_modules.*），优化器分组天然不一致，必须重置。
     if getattr(args, "freeze_backbone", False) and not getattr(args, "reset_optimizer", False):
         Logger("--freeze_backbone：可训练集合与基座不同，自动跳过优化器状态（等价 --reset_optimizer）")
-    if not getattr(args, "reset_optimizer", False) and not getattr(args, "freeze_backbone", False):
+    if fresh_psr:
+        Logger("PSR 架构升级：已严格载入原主干，新工作区保持初始化；重置 optimizer / epoch / step")
+    if not fresh_psr and not getattr(args, "reset_optimizer", False) and not getattr(args, "freeze_backbone", False):
         if os.path.exists(opt_path):
             optimizer.state = tree_unflatten(list(mx.load(opt_path).items()))
             mx.eval(optimizer.state)
@@ -919,7 +936,9 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
     start_step = int(last_finished_step) + 1
 
     # 如要求重置优化器，则从step 0开始
-    if getattr(args, "reset_optimizer", False):
+    if fresh_psr:
+        start_epoch, start_step = 0, 0
+    elif getattr(args, "reset_optimizer", False):
         start_step = 0
         Logger(
             "reset_optimizer set: optimizer states not loaded; start_step reset to 0"

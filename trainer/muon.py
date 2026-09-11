@@ -43,6 +43,7 @@ _polar_mom_kernels: dict = {}
 _sinkhorn_kernels: dict = {}
 _ns_core_fns: dict = {}
 _fro_norm_kernels: dict = {}
+_SINKHORN_FAST_NORM = os.environ.get("VIBY_OPT_SINKHORN_FAST_NORM", "1") == "1"
 
 # shapeful AdamW 缓存上限（按形状+超参），超出回退 shapeless
 _SHAPEFUL_CACHE_MAX = 128
@@ -549,7 +550,7 @@ def _polar_mom_kernel(m):
     return fn
 
 
-def _sinkhorn_body(beta, gamma, K, eps, tau, n):
+def _sinkhorn_body(beta, gamma, K, eps, tau, n, fast_norm=False):
     """算法 1（DeepSeek-V4.1 技术报告 §2.5）的一步更新（未编译）。
 
     逐行对照（编号 = 报告算法 1 的行号）：
@@ -580,18 +581,25 @@ def _sinkhorn_body(beta, gamma, K, eps, tau, n):
         # 行 2：Nesterov 读出
         gh = beta * m + (1.0 - beta) * g
         # 行 3：逐行 ℓ₂ 范数 ρ_i 与均值 ρ̄（f32）
-        g32 = gh.astype(mx.float32)
-        rho = mx.sqrt(mx.sum(g32 * g32, axis=-1, keepdims=True))
+        if fast_norm:
+            from .fast_norm import square_sum
+            rho = mx.sqrt(square_sum(gh, 1))
+        else:
+            g32 = gh.astype(mx.float32)
+            rho = mx.sqrt(mx.sum(g32 * g32, axis=-1, keepdims=True))
         rho_bar = mx.mean(rho)
         # 行 4 + 5：U⁽⁰⁾ ← Ĝ_t，并把 ρ_i ≤ τ·ρ̄ 的行掩蔽为 0
         U = mx.where(rho <= tau * rho_bar, mx.zeros_like(gh), gh)
         # 行 6-16：K 步交替行/列 L2 归一化（奇数步行、偶数步列）
         for k in range(1, K + 1):
-            U32 = U.astype(mx.float32)
-            if k % 2 == 1:
+            if fast_norm:
+                nrm = mx.sqrt(square_sum(U, 1 if k % 2 else 0))
+            elif k % 2 == 1:
+                U32 = U.astype(mx.float32)
                 # 行 7-10：U⁽ᵏ⁾_{i,:} ← U⁽ᵏ⁻¹⁾_{i,:} / (‖U⁽ᵏ⁻¹⁾_{i,:}‖₂ + ε)
                 nrm = mx.sqrt(mx.sum(U32 * U32, axis=-1, keepdims=True))
             else:
+                U32 = U.astype(mx.float32)
                 # 行 11-14：U⁽ᵏ⁾_{:,j} ← U⁽ᵏ⁻¹⁾_{:,j} / (‖U⁽ᵏ⁻¹⁾_{:,j}‖₂ + ε)
                 nrm = mx.sqrt(mx.sum(U32 * U32, axis=-2, keepdims=True))
             U = U / (nrm + eps).astype(U.dtype)
@@ -610,10 +618,10 @@ def _sinkhorn_kernel(beta, gamma, K, eps, tau, n):
     （MLX 弱类型提升下 float×bf16 保持 bf16，换成 f32 数组会抬 dtype）；
     lr 随 scheduler 每步变，作数组入参。
     """
-    key = (beta, gamma, K, eps, tau, n)
+    key = (beta, gamma, K, eps, tau, n, _SINKHORN_FAST_NORM)
     fn = _sinkhorn_kernels.get(key)
     if fn is None:
-        fn = partial(mx.compile, shapeless=True)(_sinkhorn_body(*key))
+        fn = partial(mx.compile, shapeless=not _SINKHORN_FAST_NORM)(_sinkhorn_body(*key))
         _sinkhorn_kernels[key] = fn
     return fn
 

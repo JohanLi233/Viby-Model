@@ -6,15 +6,18 @@ MFU = (tokens/s × 每 token 训练 FLOPs) / 硬件峰值。
 
 - **6N**：fwd 2N + bwd 4N。N 只数每 token 真正参与 GEMM 的权重：
   路由专家按 top-k/E 折算；token embedding 与 Engram n-gram 检索表是纯
-  寻址（稀疏 gather），不计；MTP/DSpark 草稿层每 token 只多走一遍前向
-  （block 内各槽共享同一次前向），lm_head 则会被草稿 logits 再用一次。
+  寻址（稀疏 gather），不计；DSpark 在每个 anchor 展开 block 个草稿槽，
+  草稿层与输出头按实际槽数折算。
 - **注意力**：QKᵀ + AV 没有对应权重，按每层实际参与打分的长度 L 计
   6 · n_heads · (head_dim + head_dim) · L（fwd+bwd；K=V 共享 MQA，
-  d_qk = d_v = head_dim）。训练走稠密路径：压缩分支全量计算、top-k 掩码
-  只改可见性，故 L = min(T, window_size) + T/ratio（ratio=0 的纯滑窗层
-  只有窗口）。indexer 的 [B,T,N] 小打分矩阵与压缩器池化不计入（占比 <1%）。
+  d_qk = d_v = head_dim）。默认按 sparse top-k 的名义长度估算。
+  真实长度依赖文档掩码、候选池、阈值并列；验收需传入实测逐层平均长度。
+  这是 6N 近似口径，不是精确算子 FLOPs；不计 Indexer 打分、池化、逐元素
+  算子与重算，也不将稠密 fallback 的无效 mask 位置充作 useful FLOPs。
 - 不含优化器（Muon Newton-Schulz）FLOPs；墙钟含优化器，因此 MFU 会低于
   纯 GEMM 利用率。这是训练 MFU 的标准口径。
+- PSR 启用时，单独按固定预算文本预训练的一次前缀思考摊销到 token，
+  包含全量索引/读取教师、循环与桥接；不能把循环权重当成每 token 一次 GEMM。
 
 默认峰值 13.5 TFLOPS：M4 Max bf16 稠密 GEMM 实测中位
 （research/MLX_PERF.md §0：12.9~14）。换机用 --peak_tflops。
@@ -33,6 +36,8 @@ def _is_lookup_table(path: str, tied: bool) -> bool:
     （在 _is_unembedding 里处理），此处不再跳过。
     """
     if "engram_layers" in path and path.endswith(".embed.weight"):
+        return True
+    if ".markov_head.embed.weight" in path:
         return True
     if path.endswith("model.embed.weight") or path == "embed.weight":
         return not tied
@@ -60,26 +65,35 @@ def _active_size(path: str, value, cfg) -> int:
 
 
 def gemm_active_params(model) -> int:
-    """每 token 参与 GEMM 的激活参数量（MTP/lm_head 的重复前向已折算）。"""
+    """6N 的可训练权重近似（不含 frozen buffers，DSpark 按槽数折算）。
+
+    面向全参数训练；冻结主干/LoRA 的前向成本需要另行逐算子审计。
+    """
     cfg = model.config
     tied = bool(getattr(cfg, "tie_word_embeddings", False))
     mtp_on = int(getattr(cfg, "n_mtp_layers", 0) or 0) > 0
     n = 0
-    for path, value in tree_flatten(model.parameters()):
+    block = int(getattr(cfg, "dspark_block_size", 1)) if mtp_on else 0
+    for path, value in tree_flatten(model.trainable_parameters()):
+        # PSR runs once per prefix, with R shared transitions. Counting its
+        # matrices once per token overstates work and omits repeated work.
+        if path.startswith(("model.reasoner.", "model.workspace_bridges.")):
+            continue
         # 1-D（norm gain / mHC scale·base / attn_sink / router bias）不是 GEMM 权重
         if getattr(value, "ndim", 0) < 2:
             continue
         if _is_lookup_table(path, tied):
             continue
         size = _active_size(path, value, cfg)
+        if path.startswith("mtp_modules") and ".main_proj." not in path:
+            size *= block
         if _is_unembedding(path, tied) and mtp_on:
-            # 主干 CE 一次 + DSpark 草稿 logits 一次（block 各槽共享同一次前向）
-            size *= 2
+            size *= 1 + block
         n += size
     return n
 
 
-def attn_fwdbwd_flops_per_token(config, seq_len: int) -> int:
+def attn_fwdbwd_flops_per_token(config, seq_len: int, attention_lengths=None) -> int:
     """CSA2 注意力的 QKᵀ + AV fwd+bwd FLOPs / token（不含投影 GEMM）。"""
     t = int(seq_len)
     if t <= 0:
@@ -88,22 +102,59 @@ def attn_fwdbwd_flops_per_token(config, seq_len: int) -> int:
     head_dim = int(config.head_dim)
     window = int(config.window_size)
     ratios = tuple(config.compress_ratios)
-    total = 0
-    for i in range(int(config.n_layers) + int(config.n_mtp_layers)):
+    layers = int(config.n_layers) + int(config.n_mtp_layers)
+    if attention_lengths is not None and len(attention_lengths) != layers:
+        raise ValueError("attention_lengths must contain one mean per backbone/draft layer")
+    total = 0.0
+    for i in range(layers):
+        draft = i >= int(config.n_layers)
+        multiplier = int(config.dspark_block_size) if draft else 1
+        length_t = multiplier if draft else t
         r = ratios[i] if i < len(ratios) else 0
-        length = min(t, window)
-        if r > 0:
-            # 训练是稠密 prefill：压缩分支的 N = T/ratio 全部算、top-k 只裁可见性
-            length = min(t, window + (t + r - 1) // r)
-        total += 6 * heads * (head_dim + head_dim) * length
-    return total
+        w = min(length_t, window)
+        # Average causal window length, before document/padding masks.
+        length = w - w * (w - 1) / (2 * length_t)
+        if attention_lengths is not None:
+            length = float(attention_lengths[i])
+            if length < 0:
+                raise ValueError("attention lengths must be nonnegative")
+        elif r > 0:
+            length += min(int(config.index_topk), (length_t + r - 1) // r)
+        total += multiplier * 6 * heads * (head_dim + head_dim) * length
+    return int(total)
 
 
-def training_flops_per_token(model, seq_len: int) -> int:
+def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int:
     """训练一步（fwd+bwd）每个 token 的近似 FLOPs，不含优化器。"""
     return 6 * gemm_active_params(model) + attn_fwdbwd_flops_per_token(
-        model.config, seq_len
-    )
+        model.config, seq_len, attention_lengths
+    ) + psr_pretrain_flops_per_token(model.config, seq_len)
+
+
+def psr_pretrain_flops_per_token(cfg, seq_len):
+    """Nominal fixed-budget TEXT-pretrain PSR FLOPs, amortized over a row.
+
+    Includes global index scoring, the stop-gradient full-read teacher (forward
+    only), sparse reads, shared blocks, bridges and terminal predictive probes.
+    Excludes sorting, normalization, elementwise work and optimizer FLOPs.
+    This is not a measured latency or a generic adaptive-policy FLOPs estimate.
+    """
+    t = int(seq_len)
+    if t <= 0 or not getattr(cfg, "psr_enabled", False):
+        return 0
+    d, s, m, r = cfg.dim, cfg.psr_dim, cfg.psr_slots, cfg.psr_rounds
+    hd, hi, di = cfg.head_dim, cfg.index_n_heads, cfg.index_head_dim
+    k, probes = min(cfg.psr_topk, t), min(cfg.psr_num_tests, 4)
+    total = 6 * d * s  # Init(anchor), once
+    total += 6 * r * m * (s * hi * di + s * hi + 2 * s * hd + cfg.psr_blocks * 10 * s * s)
+    total += 6 * r * m * hi * di * t  # index score, fwd+bwd
+    total += r * (2 * m * s * hd + 2 * m * hd * t)  # full-read teacher, fwd only
+    total += 12 * r * m * k * hd  # selected QK + AV
+    total += cfg.psr_blocks * 12 * r * m * m * s
+    bridges = cfg.n_layers - cfg.n_encoder_layers
+    total += bridges * (6 * (2 * t * d * s + 2 * m * s * s) + 12 * t * m * s)
+    total += 6 * probes * s * cfg.psr_test_classes + 12 * probes * m * s
+    return int(total / t)
 
 
 def model_flops_utilization(

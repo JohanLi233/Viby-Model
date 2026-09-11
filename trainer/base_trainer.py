@@ -14,6 +14,7 @@ import mlx.optimizers as optim
 import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from .muon import create_mixed_optimizer
+from .fast_norm import gradient_square_sum
 from .utils import (
     Logger,
     save_checkpoint,
@@ -279,12 +280,18 @@ class BaseTrainer:
         累加即可（计数可加），窗口末尾交给 model.update_moe_biases 做
         noaux_tc 偏置更新；无 MoE 时用零长占位保持图结构稳定。
         """
+        psr_inputs = {}
+        if self.training_type == "pretrain" and getattr(self.lm_config, "psr_enabled", False):
+            from .psr_pretrain import text_psr_inputs
+
+            psr_inputs = text_psr_inputs(self.lm_config, X, Y, loss_mask, attn_mask, seg_ids)
         res = self.model(
             input_ids=X,
             labels=Y,
             loss_mask=loss_mask,
             attention_mask=attn_mask,
             segment_ids=seg_ids,
+            **psr_inputs,
         )
         mtp_loss = res.mtp_loss if res.mtp_loss is not None else mx.array(0.0)
         lm_loss = res.lm_loss if res.lm_loss is not None else res.loss
@@ -454,12 +461,11 @@ class BaseTrainer:
             grads, grad_norm = optim.clip_grad_norm(accum_grads, self.args.grad_clip)
         else:
             grads = accum_grads
-            # 仅用于日志与 NaN 防护（不裁剪）：bf16 直接 square-sum，
-            # 省掉每个张量两份全量 f32 物化（~1B 参数下每窗口 ~20GB→~7GB
-            # 流量）；bf16 与 f32 同指数域，平方不溢出，NaN 照常传播
-            grad_norm = mx.sqrt(
-                sum(mx.sum(mx.square(g)) for _, g in tree_flatten(grads))
-            )
+            # FP32 register accumulation avoids low-precision square underflow,
+            # FP16 overflow and a rounded bf16 sum across the parameter tree.
+            # Large gradients are read once without full-size FP32 temporaries.
+            sums = [gradient_square_sum(g) for _, g in tree_flatten(grads)]
+            grad_norm = mx.sqrt(mx.sum(mx.stack(sums))) if sums else mx.array(0.0)
 
         # NaN/Inf 防护：梯度范数非有限时跳过本窗口更新。单个坏微批前向 NaN
         # 会把窗口累积梯度污染成 NaN，若照常应用，norm=nan 使缩放因子变 nan，
@@ -490,7 +496,7 @@ class BaseTrainer:
             )
 
         # noaux_tc 偏置更新：窗口内各微批的 [L,E] 计数已累加（计数可加），
-        # 这里按 b += γ·sign(load_frac − 1/E) 覆写每个 gate 的
+        # 这里按 b -= γ·sign(load_frac − 1/E) 覆写每个 gate 的
         # e_score_correction_bias。必须在 compile 图外调用：它写的是冻结的
         # buffer，下一次前向作为显式入参进图。
         if moe_loads is not None and getattr(moe_loads, "size", 0) > 0:

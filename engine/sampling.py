@@ -76,6 +76,30 @@ def sample_one(row: mx.array, params: SamplingParams) -> int:
     return int(mx.random.categorical(row[None])[0].item())
 
 
+def speculative_correction(target, proposal, token, params, *, uniform=None):
+    """Accept a proposal with min(1,p/q), otherwise sample normalized (p-q)+.
+
+    target is the target's already transformed logit row; proposal is the
+    normalized distribution that actually produced token (same filters/history).
+    Greedy uses exact target argmax matching and never probabilistic acceptance.
+    """
+    if not params.do_sample or params.temperature <= 0:
+        expected = int(mx.argmax(target).item())
+        return expected, expected == token
+    p = mx.softmax(target.astype(mx.float32))
+    pt, qt = float(p[token].item()), float(proposal[token].item())
+    alpha = min(1.0, pt / qt) if qt > 0 else 0.0
+    u = float(mx.random.uniform().item()) if uniform is None else float(uniform)
+    if u < alpha:
+        return token, True
+    residual = mx.maximum(p - proposal, 0)
+    mass = mx.sum(residual)
+    # A rounding-degenerate residual must still produce a valid target draw.
+    residual = mx.where(mass > 0, residual / mx.maximum(mass, 1e-30), p)
+    corrected = int(mx.random.categorical(mx.log(residual)[None])[0].item())
+    return corrected, False
+
+
 def find_stop_length(tokenizer, gen_ids: list, stops: Optional[list]) -> Optional[int]:
     """停止字符串命中时返回应保留的 token 数（其余截掉），未命中返回 None。
 

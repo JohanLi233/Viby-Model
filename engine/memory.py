@@ -39,6 +39,7 @@ class PrefixState:
     kv_state: dict = field(default_factory=dict)  # ratio>1 源层 → (kv[r,hd], score[r,hd], filled[])
     engram_prev: Optional[mx.array] = None  # [w] 最近 token（末位最近）
     hidden: Optional[mx.array] = None  # [D] 末位 hidden（全命中时重算 logits）
+    draft_mains: Optional[tuple] = None  # target-layer inputs [D] at this prefix's last token
 
 
 def _batch_of(cache: VibyCache) -> int:
@@ -104,9 +105,11 @@ def copy_state_row(dst: VibyCache, drow: int, src: VibyCache, srow: int = 0,
 
 
 def capture_state(cache: VibyCache, row: int, n: int,
-                  hidden: Optional[mx.array] = None) -> PrefixState:
+                  hidden: Optional[mx.array] = None, draft_mains=None) -> PrefixState:
     """从 cache 的第 row 行取长度 n 的状态快照（显式拷贝，之后 cache 再被写也不影响）。"""
     state = PrefixState(n=int(n), hidden=hidden)
+    if draft_mains is not None:
+        state.draft_mains = tuple(mx.array(m) for m in draft_mains)
     for i, lc in enumerate(cache.layers):
         ratio = max(lc.ratio, 1)
         k = n // ratio
@@ -126,6 +129,9 @@ def restore_state(dst: VibyCache, drow: int, state: PrefixState) -> int:
     """把快照写回 dst 的第 drow 行，返回快照长度 n。"""
     batch = _batch_of(dst)
     for i, dl in enumerate(dst.layers):
+        # Dense prefix continuation uses a Python filled count; the decode
+        # compressor also carries a per-row GPU count in kv_state.
+        dl.filled = state.n % dl.ratio if dl.ratio > 1 else 0
         dl.window[drow] = state.window[i]
         if dl.compress_kv is not None:
             arr = state.compress.get(i)
@@ -171,6 +177,8 @@ def state_bytes(state: PrefixState) -> int:
         total += sum(_array_bytes(s) for s in tup)
     total += _array_bytes(state.engram_prev)
     total += _array_bytes(state.hidden)
+    if state.draft_mains is not None:
+        total += sum(_array_bytes(m) for m in state.draft_mains)
     return total
 
 

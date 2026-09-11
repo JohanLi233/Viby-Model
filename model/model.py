@@ -29,10 +29,12 @@ from .block import Block, apply_hc_pre_norm
 from .cache import SharedAttnState, VibyCache
 from .config import VibyConfig
 from .engram import Engram, EngramLayout, NgramHashState, build_compressed_token_map
-from .hc import identity_pre_mix
+from .hc import hc_pre, identity_pre_mix
 from .init import apply_trunc_normal_init
 from .moe import MoEFeedForward, MoEGate, update_expert_bias
 from .norms import RMSNorm
+from .psr import (EvidenceMemory, PredictiveStateReasoner, ReasoningTrace,
+                  ThinkingState, WorkspaceBridge, psr_losses)
 
 NEG_INF = -1e30
 
@@ -48,6 +50,9 @@ class CausalLMOutput:
     moe_loads: Optional[mx.array] = None
     aux_loss: Optional[mx.array] = None
     hidden_states: Optional[mx.array] = None
+    thinking_state: Optional[ThinkingState] = None
+    thinking_trace: Optional[ReasoningTrace] = None
+    psr_losses: Optional[dict] = None
 
 
 def lm_head_ce(hidden: mx.array, weight: mx.array, labels: mx.array, loss_mask=None,
@@ -113,6 +118,9 @@ class VibyModel(nn.Module):
         self.embed = nn.Embedding(config.vocab_size, config.dim)
         self.layers = [Block(config, i) for i in range(config.n_layers)]
         self.norm = RMSNorm(config.dim, config.norm_eps)
+        self.reasoner = PredictiveStateReasoner(config) if config.psr_enabled else None
+        self.workspace_bridges = ([WorkspaceBridge(config) for _ in range(config.n_layers - config.n_encoder_layers)]
+                                  if config.psr_enabled else [])
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
         self.engram_layout = EngramLayout.from_config(config) if config.engram_layer_ids else None
         # 用 list 而不是 dict 存 Engram：参数树的整型键会被 tree_unflatten 还原成
@@ -134,9 +142,49 @@ class VibyModel(nn.Module):
 
     def __call__(self, input_ids: mx.array, start_pos: int = 0, cache: Optional[VibyCache] = None,
                  segment_ids=None, pad_mask=None, decode: bool = False, prev_tokens=None,
-                 collect_main: bool = True):
+                 collect_main: bool = True, thinking_prefix_lengths=None,
+                 thinking_state=None, thinking_options=None, use_thinking=True,
+                 return_thinking=False, record_thinking=False):
         """返回 (末层 hidden [B,T,D], 目标层 hidden 列表, 新的 engram prev_tokens)。"""
+        state = thinking_state
+        if state is None and cache is not None:
+            state = cache.thinking_state
+        if not use_thinking and state is not None:
+            raise ValueError("cannot disable PSR in a cache already conditioned on a workspace; prefill a fresh cache")
+        requested = thinking_prefix_lengths is not None and use_thinking
+        if (requested or state is not None) and self.reasoner is None:
+            raise ValueError("PSR requires psr_enabled=True")
+        if requested and (decode or isinstance(start_pos, mx.array) or start_pos != 0 or state is not None):
+            raise ValueError("start PSR once, in a full question prefill at start_pos=0")
+        if (requested or state is not None) and collect_main:
+            raise ValueError("PSR requires collect_main=False / use_mtp=False (draft targets can cross the question boundary)")
+        if thinking_options and not requested:
+            raise ValueError("thinking_options require a new question boundary")
+        trace = None
         h = self.embed(input_ids)
+        B, T = input_ids.shape
+        if state is not None and state.slots.shape != (B, self.config.psr_slots, self.config.psr_dim):
+            raise ValueError("workspace shape does not match the current batch/config")
+        boundary_input = None
+        if requested:
+            lengths = thinking_prefix_lengths
+            if isinstance(lengths, int):
+                if not 1 <= lengths <= T:
+                    raise ValueError("thinking_prefix_lengths must be in [1,T]")
+                lengths = mx.full((B,), lengths, dtype=mx.int32)
+            if lengths.shape != (B,) or not mx.issubdtype(lengths.dtype, mx.integer):
+                raise ValueError("thinking_prefix_lengths must be an integer or an integer array [B]")
+            valid = (lengths >= 1) & (lengths <= T)
+            anchor = mx.clip(lengths - 1, 0, T - 1).astype(mx.int32)
+            row = mx.arange(B)
+            if pad_mask is not None:
+                valid = valid & pad_mask[row, anchor]
+            segment = None if segment_ids is None else segment_ids[row, anchor]
+            visible = (mx.arange(T)[None, :] <= anchor[:, None]) & valid[:, None]
+            if pad_mask is not None:
+                visible = visible & pad_mask
+            if segment is not None:
+                visible = visible & (segment_ids == segment[:, None])
         hashes, new_prev = (None, None)
         if self.engram_hash is not None:
             token_mask = None if pad_mask is None else pad_mask
@@ -160,10 +208,30 @@ class VibyModel(nn.Module):
                 # MTP 读的是目标层的"注意力输入"（mHC 均值），不是层输出
                 mains.append(mx.mean(h, axis=2))
             layer_cache = None if cache is None else cache[i]
+            if requested and i == self.config.n_encoder_layers:
+                boundary_input = apply_hc_pre_norm(h, pre_mix, layer.attn_norm)
             h, pre_mix = layer(
                 h, start_pos, pre_mix, shared, layer_cache, segment_ids, pad_mask, decode
             )
-        return apply_hc_pre_norm(h, pre_mix, self.norm), mains, new_prev
+            if requested and i == self.config.n_encoder_layers:
+                # This layer has just built the original observation KV using
+                # exactly boundary_input. No workspace injection has happened.
+                memory = EvidenceMemory(shared.compress_kv, shared.index_k, visible, anchor)
+                state, trace = self.reasoner(
+                    boundary_input[mx.arange(B), anchor], memory, segment, valid,
+                    layer.attn.freq_cos, layer.attn.freq_sin,
+                    record_trace=record_thinking, **(thinking_options or {}),
+                )
+                if cache is not None:
+                    cache.thinking_state = state.for_decode()
+            if state is not None and i >= self.config.n_encoder_layers:
+                positions = start_pos + mx.arange(T) if not isinstance(start_pos, mx.array) else start_pos[:, None] + mx.arange(T)
+                delta = self.workspace_bridges[i - self.config.n_encoder_layers](
+                    hc_pre(h, pre_mix), state, positions, segment_ids, pad_mask,
+                )
+                h = h + delta[:, :, None, :]
+        result = (apply_hc_pre_norm(h, pre_mix, self.norm), mains, new_prev)
+        return (*result, state, trace) if return_thinking else result
 
 
 class DSparkMarkovHead(nn.Module):
@@ -276,10 +344,14 @@ class VibyForCausalLM(nn.Module):
                  loss_mask: Optional[mx.array] = None, attention_mask: Optional[mx.array] = None,
                  segment_ids: Optional[mx.array] = None, need_logits: bool = False,
                  start_pos: int = 0, cache: Optional[VibyCache] = None,
-                 decode: bool = False, prev_tokens=None, use_mtp: bool = True, **kwargs):
+                 decode: bool = False, prev_tokens=None, use_mtp: bool = True,
+                 thinking_prefix_lengths=None, thinking_state=None, thinking_options=None,
+                 thinking_targets=None, use_thinking=True, return_thinking=False, **kwargs):
         pad_mask = None if attention_mask is None else attention_mask.astype(mx.bool_)
         want_main = bool(use_mtp and self.mtp_modules and labels is not None)
-        hidden, mains, new_prev = self.model(
+        if thinking_targets is not None and (thinking_prefix_lengths is None or not use_thinking):
+            raise ValueError("thinking_targets require an active PSR question boundary")
+        hidden, mains, new_prev, state, trace = self.model(
             input_ids,
             start_pos=start_pos,
             cache=cache,
@@ -288,16 +360,30 @@ class VibyForCausalLM(nn.Module):
             decode=decode,
             prev_tokens=prev_tokens,
             collect_main=want_main,
+            thinking_prefix_lengths=thinking_prefix_lengths,
+            thinking_state=thinking_state,
+            thinking_options=thinking_options,
+            use_thinking=use_thinking,
+            return_thinking=True,
+            record_thinking=return_thinking or thinking_targets is not None,
         )
         out = CausalLMOutput()
+        out.thinking_state = state
+        out.thinking_trace = trace
+        if thinking_targets is not None:
+            out.psr_losses = psr_losses(self.model.reasoner, trace, thinking_targets)
         if labels is None:
             out.logits = self.logits(hidden)
+            if out.psr_losses is not None:
+                out.loss = out.psr_losses["total"]
             return out
         z_w = float(self.config.z_loss_weight)
         ce, z = lm_head_ce(hidden, self._head_weight(), labels, loss_mask, z_w)
         out.lm_loss = ce
         out.z_loss = z
         out.loss = ce + z_w * z
+        if out.psr_losses is not None:
+            out.loss = out.loss + out.psr_losses["total"]
         if want_main and mains:
             mtp_loss, mtp_z = self._mtp_loss(mains, input_ids, labels, loss_mask, pad_mask, segment_ids)
             out.mtp_loss = mtp_loss
@@ -315,6 +401,35 @@ class VibyForCausalLM(nn.Module):
         return out
 
     # ------------------------------------------------------------------
+    def dspark_draft(self, mains, known_ids, *, last_only=False):
+        """DSpark logits/confidence for a known draft prefix [B,L], L<=block.
+
+        mains are the backbone target-layer inputs at the processed anchor,
+        each [B,1,D]. known_ids starts with that anchor token. Causal draft
+        stages allow computing just the known prefix: future noise slots
+        cannot affect these outputs. Preserve training's Markov alignment
+        exactly: previous ids are [anchor, known_ids[:-1]].
+        """
+        if not self.mtp_modules:
+            raise ValueError("DSpark speculative decoding requires a checkpoint with MTP modules")
+        if len(mains) != len(self.config.dspark_target_layer_ids):
+            raise ValueError("DSpark requires all configured backbone target-layer inputs")
+        b, length = known_ids.shape
+        if not 1 <= length <= self.config.dspark_block_size:
+            raise ValueError("DSpark prefix length exceeds dspark_block_size")
+        x = mx.concatenate(mains, axis=-1) if len(mains) > 1 else mains[0]
+        cur = self._stage_input(x, known_ids[:, None, :], self.mtp_modules[0])
+        pre = identity_pre_mix(cur, self.model.hc_mult)
+        for stage in self.mtp_modules:
+            cur, pre = stage.layer(cur, 0, pre, SharedAttnState())
+        last = self.mtp_modules[-1]
+        h = apply_hc_pre_norm(cur, pre, last.norm).reshape(b, length, self.config.dim)
+        previous = mx.concatenate([known_ids[:, :1], known_ids[:, :-1]], axis=1)
+        if last_only:
+            h, previous = h[:, -1:], previous[:, -1:]
+        bias, markov = last.markov_head(previous)
+        return self.logits(h) + bias, last.confidence_head(h, markov)
+
     def _mtp_loss(self, mains, input_ids, labels, loss_mask, pad_mask, segment_ids):
         """DSpark teacher-forced 草稿损失（各槽 CE 均值 + 置信度头 BCE）。"""
         cfg = self.config
@@ -393,10 +508,13 @@ class VibyForCausalLM(nn.Module):
         return mx.repeat(m.reshape(B * T)[:, None], block, axis=1)
 
     # ------------------------------------------------------------------
-    def prefill(self, input_ids: mx.array, segment_ids=None):
+    def prefill(self, input_ids: mx.array, segment_ids=None, *, use_thinking=True,
+                thinking_options=None):
         """整段 prefill，返回 (logits [B,T,V], cache)。"""
         cache = VibyCache(self.config, input_ids.shape[0])
-        out = self(input_ids, start_pos=0, cache=cache, segment_ids=segment_ids, use_mtp=False)
+        out = self(input_ids, start_pos=0, cache=cache, segment_ids=segment_ids, use_mtp=False,
+                   use_thinking=use_thinking, thinking_options=thinking_options,
+                   thinking_prefix_lengths=input_ids.shape[1] if self.config.psr_enabled and use_thinking else None)
         cache.start_pos = input_ids.shape[1]
         if self.model.engram_hash is not None:
             w = max(self.config.engram_max_ngram_size - 1, 0)
@@ -428,11 +546,12 @@ class VibyForCausalLM(nn.Module):
         return out.logits[:, -1], cache
 
     def generate(self, input_ids: mx.array, max_new_tokens: int = 64, temperature: float = 0.7,
-                 top_k: int = 0, eos_token_id: Optional[int] = None):
+                 top_k: int = 0, eos_token_id: Optional[int] = None, *,
+                 use_thinking=True, thinking_options=None):
         """自回归解码（prefill 一次 + 逐 token decode）。"""
         cfg = self.config
         B = input_ids.shape[0]
-        logits, cache = self.prefill(input_ids)
+        logits, cache = self.prefill(input_ids, use_thinking=use_thinking, thinking_options=thinking_options)
         logits = logits[:, -1]
         eos = cfg.eos_token_id if eos_token_id is None else eos_token_id
         finished = mx.zeros((B,), dtype=mx.bool_)

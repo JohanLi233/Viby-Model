@@ -6,6 +6,7 @@ never used as a performance baseline. Outputs include all raw timed samples.
 """
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -20,6 +21,9 @@ from experiments.kernel_bench_utils import (
 )
 from model.kernels import sparse_attention as sa, indexer_select as fs, moe_dispatch as moe, hc_pre_norm as hc
 from model.kernels import moe_counts, moe_decode, moe_gather
+from trainer import muon as optimizer_impl
+from trainer.flops import DEFAULT_PEAK_TFLOPS
+from experiments.audit_training_flops import audit_training_flops
 
 
 VARIANTS = {
@@ -37,10 +41,13 @@ VARIANTS.update({
     "dataflow_gather": dict(VARIANTS["fused_combine"], gather_vjp=True),
     "dataflow_counts": dict(VARIANTS["fused_combine"], compact_aux=True),
     "dataflow_combined": dict(VARIANTS["fused_combine"], gather_vjp=True, compact_aux=True),
+    "optimizer_norm": dict(VARIANTS["fused_combine"], fast_opt_norm=True),
+    "dataflow_optimizer": dict(VARIANTS["fused_combine"], gather_vjp=True, compact_aux=True, fast_opt_norm=True),
 })
 for variant in VARIANTS.values():
     variant.setdefault("gather_vjp", False)
     variant.setdefault("compact_aux", False)
+    variant.setdefault("fast_opt_norm", False)
 
 
 def configure(name):
@@ -50,6 +57,7 @@ def configure(name):
     moe._COMBINE_ENABLED, hc._GROUPED_DW = v["combine"], v["grouped"]
     moe_gather._ENABLED, moe_counts._ENABLED = v["gather_vjp"], v["compact_aux"]
     moe_decode._ENABLED = False
+    optimizer_impl._SINKHORN_FAST_NORM = v["fast_opt_norm"]
 
 
 def main():
@@ -67,7 +75,12 @@ def main():
     ap.add_argument("--reference", choices=VARIANTS, default="corrected")
     ap.add_argument("--variants", nargs="+", choices=VARIANTS, default=["fused_indexer", "fused_combine", "key_owned"])
     ap.add_argument("--mode", choices=["fb", "window"], default="fb")
+    ap.add_argument("--peak-tflops", type=float, default=DEFAULT_PEAK_TFLOPS)
     args = ap.parse_args()
+    if not math.isfinite(args.peak_tflops) or args.peak_tflops <= 0:
+        ap.error("--peak-tflops must be finite and positive")
+    if min(args.batch, args.seq, args.accum, args.block_iters, args.blocks) <= 0 or args.warmup < 0:
+        ap.error("shape/count arguments must be positive; warmup must be nonnegative")
     mx.set_default_device(mx.gpu)
     mx.random.seed(1234)
     configure(args.reference)
@@ -81,19 +94,28 @@ def main():
     del grads
     snap = snapshot_train_state(model, trainer.optimizer)
     en_delta = trainer._en_delta
+    audits = [audit_training_flops(model, batch) for batch in
+              (batches if args.mode == "window" else batches[:1])]
+    fpt = sum(a["flops_per_token"] for a in audits) / len(audits)
+    tokens = args.batch * args.seq * (args.accum if args.mode == "window" else 1)
     names = list(dict.fromkeys([args.reference, *args.variants]))
     graphs = {}
     path = Path(args.run_dir) / "results.jsonl"
     meta = dict(kind="protocol", args=vars(args), params=param_identity(model),
                 mlx=mx.__version__, flags={n: VARIANTS[n] for n in names},
                 input_hash=input_identity(*[v for batch in batches for v in batch if v is not None]),
+                flops_audit=audits, peak_tflops=args.peak_tflops,
+                target_70pct_seconds=tokens * fpt / (0.70 * args.peak_tflops * 1e12),
                 model=dict(dim=cfg.dim, layers=cfg.n_layers, heads=cfg.n_heads, head_dim=cfg.head_dim,
                            window=cfg.window_size, index_heads=cfg.index_n_heads, index_dim=cfg.index_head_dim,
                            candidate_block_size=cfg.candidate_block_size, candidate_topk_blocks=cfg.candidate_topk_blocks,
                            ratios=list(cfg.compress_ratios)))
     append_jsonl(path, meta)
     print(json.dumps(meta), flush=True)
+    reference_updated = None
     for name in names:
+        restore_train_state(model, trainer.optimizer, snap)
+        trainer._en_delta = en_delta
         configure(name)
         trainer._loss_and_grad = trainer._build_loss_and_grad()
         print("compile/warmup", name, flush=True)
@@ -105,6 +127,31 @@ def main():
         append_jsonl(path, record)
         print(json.dumps(record), flush=True)
         del outputs, gradients
+        if args.mode == "window":
+            run_window(trainer, batches)
+            updated = dict(tree_flatten(model.trainable_parameters()))
+            biases = model.moe_bias_stack()
+            if reference_updated is None:
+                reference_updated = (updated, biases)
+            checks = []
+            for key, value in updated.items():
+                delta = value.astype(mx.float32) - reference_updated[0][key].astype(mx.float32)
+                checks.append(mx.stack([mx.max(mx.abs(delta)), mx.sum(delta * delta),
+                                        mx.sum(mx.square(reference_updated[0][key].astype(mx.float32)))]))
+            metrics = mx.stack(checks)
+            max_abs = float(mx.max(metrics[:, 0]))
+            relative_l2 = float(mx.sqrt(mx.sum(metrics[:, 1]) / mx.maximum(mx.sum(metrics[:, 2]), 1e-30)))
+            bias_max_abs = float(mx.max(mx.abs(biases - reference_updated[1])))
+            record = dict(kind="window_numerical", variant=name, parameter_max_abs=max_abs,
+                          parameter_relative_l2=relative_l2, router_bias_max_abs=bias_max_abs)
+            append_jsonl(path, record)
+            print(json.dumps(record), flush=True)
+            if not math.isfinite(max_abs) or not math.isfinite(relative_l2) or bias_max_abs != 0:
+                raise RuntimeError("nonfinite updated parameters or changed router bias update")
+            del updated, biases, checks, metrics, value, delta
+    del reference_updated
+    restore_train_state(model, trainer.optimizer, snap)
+    trainer._en_delta = en_delta
 
     def arm(name):
         def run():
@@ -126,9 +173,13 @@ def main():
                              before_a=reset if args.mode == "window" else None,
                              before_b=reset if args.mode == "window" else None)
         record = dict(kind="timing", reference=args.reference, variant=name, mode=args.mode, **result)
+        record["tokens_per_second"] = {arm: tokens / result[arm]["median_s"] for arm in ("A", "B")}
+        record["mfu_estimate"] = {arm: rate * fpt / (args.peak_tflops * 1e12)
+                                  for arm, rate in record["tokens_per_second"].items()}
         append_jsonl(path, record)
         print(json.dumps({k: record[k] for k in ("variant", "mode", "paired_block_median_B_over_A",
-                                               "aa_end_over_start_abs_rel", "inconclusive_aa_drift")}), flush=True)
+                                               "aa_end_over_start_abs_rel", "inconclusive_aa_drift",
+                                               "tokens_per_second", "mfu_estimate")}), flush=True)
     reset()
 
 

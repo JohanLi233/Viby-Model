@@ -129,6 +129,16 @@ def add_common_args(parser):
     parser.add_argument("--index_n_heads", type=int, default=_DEFAULT_CFG.index_n_heads)
     parser.add_argument("--index_head_dim", type=int, default=_DEFAULT_CFG.index_head_dim)
     parser.add_argument("--index_topk", type=int, default=_DEFAULT_CFG.index_topk)
+    parser.add_argument("--psr", "--psr_enabled", dest="psr_enabled",
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help="启用预测状态工作区；普通预训练默认开启，--no-psr 关闭")
+    for name in ("psr_slots", "psr_dim", "psr_blocks", "psr_topk", "psr_rounds",
+                 "psr_max_rounds", "psr_group_size", "psr_num_tests"):
+        parser.add_argument("--" + name, type=int, default=getattr(_DEFAULT_CFG, name))
+    parser.add_argument("--psr_test_classes", type=int, default=None,
+                        help="行为预测类别数；默认跟随当前 vocab_size")
+    for name in ("psr_bridge_init", "psr_predictive_weight", "psr_index_distill_weight"):
+        parser.add_argument("--" + name, type=float, default=getattr(_DEFAULT_CFG, name))
     parser.add_argument(
         "--rope_theta",
         type=float,
@@ -530,6 +540,9 @@ def get_pretrain_parser():
         # 专门阶段单独训练（冻结主干），见 §2.4.3。要训练草稿层就显式传
         # --mtp_depth N（配合 --resume 基座 + --freeze_backbone 即官方口径）。
         mtp_depth=0,
+        psr_enabled=True,
+        psr_bridge_init=0.05,
+        psr_predictive_weight=0.1,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-Pretrain")
@@ -623,6 +636,7 @@ def _explicit_cli_keys() -> set:
 
 # 由 (n_layers, n_mtp_layers) 推导、preset 不该固定的结构参数（见 apply_preset）
 _PRESET_DERIVED_ARGS = {
+    "psr_enabled", "psr_bridge_init", "psr_predictive_weight", "psr_test_classes",
     "mtp_depth",
     "xsa_last_n",
     "compress_ratios",
@@ -684,6 +698,10 @@ def setup_training_args(args, training_type="pretrain"):
     # SFT/DPO 的结构参数默认 None，交给 sidecar 继承逻辑）
     if training_type == "pretrain":
         apply_preset(args)
+        if args.psr_enabled and args.mtp_depth:
+            raise ValueError("PSR 预训练使用 mtp_depth=0；DSpark 独立训练请传 --no-psr")
+        if args.psr_enabled and args.psr_test_classes not in (None, args.vocab_size):
+            raise ValueError("PSR 文本预训练的 psr_test_classes 必须等于 vocab_size")
 
     # checkpoint 保存点必须落在梯度累积窗口边界上：窗口中间保存的 checkpoint
     # 不含已累加但未更新的梯度，resume 时这部分梯度会永久丢失

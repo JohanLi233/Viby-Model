@@ -36,7 +36,7 @@ def test_gather_forward_and_exact_binary_vjp(dtype, m, d, k):
     x = mx.random.normal((m, d)).astype(dtype)
     # Binary fractions keep the six-way reference sum exactly representable.
     g = (mx.random.randint(-8, 9, (m*k, d)).astype(mx.float32) / 8).astype(dtype)
-    got, grads = mx.vjp(lambda a: gather.gather_routes(a, order, inv, k), [x], [g])
+    (got,), grads = mx.vjp(lambda a: gather.gather_routes(a, order, inv, k), [x], [g])
     expected = x[(order // k).astype(mx.int32)]
     dx = mx.sum(g[inv].reshape(m, k, d).astype(mx.float32), axis=1).astype(dtype)
     mx.eval(got, grads, expected, dx)
@@ -219,7 +219,7 @@ def test_native_sorted_moe_complete_vjp(monkeypatch, dtype):
     results = []
     for enabled in (False, True):
         monkeypatch.setattr(gather, "_ENABLED", enabled)
-        out, grad = mx.vjp(forward, [x, gu, dw, w], [cot])
+        (out,), grad = mx.vjp(forward, [x, gu, dw, w], [cot])
         mx.eval(out, grad)
         results.append((f32(out), [f32(g) for g in grad]))
     tol = {mx.float32: (1e-4, 1e-5), mx.float16: (5e-3, 3e-3), mx.bfloat16: (3e-2, 2e-2)}[dtype]

@@ -177,7 +177,7 @@ def main():
         )
     )
     print(
-        "      逐层模式 %s  参数量 %.1fM/%.1fM  FLOPs/token %.3fG  构建 %.1fs"
+        "      逐层模式 %s  参数量 %.1fM/%.1fM  名义 sparse FLOPs/token 估算 %.3fG  构建 %.1fs"
         % (
             modes, model.num_parameters() / 1e6,
             cfg.num_active_parameters() / 1e6, fpt / 1e9, build_s,
@@ -234,7 +234,7 @@ def main():
     peak_fb = mx.get_peak_memory() / 1e9
     tps = B * T / fb_min
     print(
-        "fwd+bwd  min %.3fs (med %.3fs)  %6.0f tok/s  MFU %5.1f%%  峰值 %.2f GB"
+        "fwd+bwd  min %.3fs (med %.3fs)  %6.0f tok/s  MFU估算 %5.1f%%（不含优化器时间） 峰值 %.2f GB"
         % (fb_min, fb_med, tps, tps * fpt / peak_tflops / 1e12 * 100, peak_fb),
         flush=True,
     )
@@ -250,7 +250,7 @@ def main():
         opt_min, _ = bench(run_opt, args.iters, 1)
         window = fb_min * args.accum + opt_min
         print(
-            "optimizer min %.3fs  → accum=%d 窗口 %.2fs  %6.0f tok/s  opt 占比 %.1f%%  峰值 %.2f GB"
+            "optimizer min %.3fs  → accum=%d 拼接窗口估计 %.2fs  %6.0f tok/s  opt 占比 %.1f%%  峰值 %.2f GB"
             % (
                 opt_min, args.accum, window, args.accum * B * T / window,
                 100 * opt_min / window, mx.get_peak_memory() / 1e9,
@@ -258,8 +258,8 @@ def main():
             flush=True,
         )
     print(
-        "注：MFU 口径不含优化器 FLOPs（trainer/flops.py），墙钟含；"
-        "旧实现 1551M 配方在 bs12×1024 上的历史基线见 research/MLX_PERF.md §9。"
+        "注：上方 MFU 只计 fwd+bwd 墙钟；拼接窗口不含梯度累加/范数/bias 更新。"
+        "真实训练窗口与实测稀疏长度请用 experiments/bench_csa2_plan.py --mode window。"
     )
 
 
