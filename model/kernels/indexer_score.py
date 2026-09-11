@@ -64,6 +64,16 @@ _FWD = r"""
     device float* ob = out + (size_t)query * N;
 
     for (uint base = tile * BK; base < N; base += ntiles * BK) {
+        // 整块都不可达：省掉 K 读取与 MMA，只协作写一遍哨兵。判定用的是与
+        // 逐元素完全相同的谓词 `reach[q,n]`，有效集合不变。
+        // Scheduling splits do not change the physical per-key-tile stride.
+        bool tile_ok = tile_valid[(size_t)query * ((N+BK-1)/BK) + base/BK];
+        if (!tile_ok) {
+            for (uint i = tid; i < BK; i += NT)
+                if (base + i < N) ob[base + i] = -1e30f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            continue;
+        }
         for (uint i = tid; i < BK * ID; i += NT) {
             uint row = i / ID, d = i % ID;
             uint n = base + row;
@@ -155,6 +165,8 @@ _BWD = r"""
     const device bool* rb = reach + (size_t)query * N;
 
     for (uint base = tile * BK; base < N; base += ntiles * BK) {
+        // 整块不可达：反向同样跳过 K 读取 / MMA / dK atomic。
+        if (!tile_valid[(size_t)query * ((N+BK-1)/BK) + base/BK]) continue;
         for (uint i = tid; i < BK * ID; i += NT) {
             uint row = i / ID, d = i % ID;
             uint n = base + row;
@@ -244,14 +256,14 @@ _BWD = r"""
 def _kernels():
     fwd = mx.fast.metal_kernel(
         name="indexer_score_fwd_mma",
-        input_names=["q", "k", "w", "reach", "dims"],
+        input_names=["q", "k", "w", "reach", "tile_valid", "dims"],
         output_names=["out"],
         source=_FWD,
         header=_HEADER,
     )
     bwd = mx.fast.metal_kernel(
         name="indexer_score_bwd_mma",
-        input_names=["q", "k", "w", "reach", "g", "dims"],
+        input_names=["q", "k", "w", "reach", "tile_valid", "g", "dims"],
         output_names=["dq", "dk", "dw"],
         source=_BWD,
         header=_HEADER,
@@ -288,11 +300,22 @@ def _n_tiles(batch, seq, keys):
     queries = batch * seq
     if keys == 0 or queries >= 256:
         return 1
-    return min((keys + _BK - 1) // _BK, max(1, 256 // max(queries, 1)))
+    return min((keys + _BK - 1) // _BK, max(1, (256 + queries - 1) // max(queries, 1)))
 
 
 def _dims(batch, seq, keys, tiles):
     return mx.array([seq, keys, batch, tiles], mx.uint32)
+
+
+def _tile_valid(reach, tiles, block):
+    """One flag per actual BK key tile, independent of dispatch split count."""
+    b, t, n = reach.shape
+    nt = -(-n // block)
+    pad = nt * block - n
+    if pad:
+        reach = mx.concatenate(
+            [reach, mx.zeros((b, t, pad), mx.bool_)], axis=-1)
+    return mx.any(reach.reshape(b * t, nt, block), axis=-1)
 
 
 @lru_cache(None)
@@ -303,10 +326,14 @@ def _operation():
     def op(q, k, w, reach):
         b, t, h, d = q.shape
         n = k.shape[1]
+        from . import indexer_select as fused
+        if fused._BQ_ENABLED and t > 1 and fused.supported(q, k):
+            return fused.score_bq(q, k, w, reach)
         tiles = _n_tiles(b, t, n)
         nt = 32 * (d // 32)
+        tv = _tile_valid(reach, tiles, _BK)
         (out,) = forward(
-            inputs=[q, k, w, reach, _dims(b, t, n, tiles)],
+            inputs=[q, k, w, reach, tv, _dims(b, t, n, tiles)],
             template=[("T", q.dtype), ("IH", h), ("ID", d)],
             grid=(nt, b * t, tiles),
             threadgroup=(nt, 1, 1),
@@ -323,8 +350,9 @@ def _operation():
         n = k.shape[1]
         tiles = _n_tiles(b, t, n)
         nt = 32 * (d // 32)
+        tv = _tile_valid(reach, tiles, _BK)
         dq, dk, dw = backward(
-            inputs=[q, k, w, reach, g.astype(q.dtype), _dims(b, t, n, tiles)],
+            inputs=[q, k, w, reach, tv, g.astype(q.dtype), _dims(b, t, n, tiles)],
             template=[("T", q.dtype), ("IH", h), ("ID", d), ("SHARDS", _SHARDS)],
             grid=(nt, b * t, tiles),
             threadgroup=(nt, 1, 1),
@@ -363,7 +391,10 @@ def indexer_score(q, k, w, reach):
 
 
 def prewarm_indexer_score(n_heads: int, head_dim: int, dtype=mx.bfloat16, seq: int = 32):
-    """eager 上下文里编译 fwd/bwd，覆盖训练（T 大）和 decode（T=1、N 切开）两条 grid。"""
+    """Eager callable/JIT creation for training and key-split decode grids."""
+    from .indexer_select import _kernel, _selection_mask_kernel
+    _kernel()  # create callable before mx.compile traces a fused selection
+    _selection_mask_kernel()
     if not _ENABLED or mx.default_device() != mx.gpu:
         return False
     if n_heads not in (4, 8) or head_dim not in (32, 64):

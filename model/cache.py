@@ -54,7 +54,7 @@ class SharedAttnState:
 
     __slots__ = (
         "compress_kv", "index_k", "keep_mask", "topk_idx", "candidates",
-        "latent_pos", "sparse_selection", "reach", "win_idx", "pool_tokens",
+        "latent_pos", "sparse_selection", "reach", "win_idx", "pool_tokens", "candidate_blocks",
     )
 
     def __init__(self):
@@ -63,6 +63,7 @@ class SharedAttnState:
         self.keep_mask = None   # 稠密路径：被 indexer 选中的压缩位置 [B,T,N] bool
         self.topk_idx = None    # 解码路径：选中的压缩位置（含窗口 offset，-1 = 无效）
         self.candidates = None  # 分层索引的一级候选块掩码 [B,T,N] bool
+        self.candidate_blocks = None  # (sorted block ids, GPU lengths), fused training
         self.latent_pos = None  # 压缩组首的绝对位置 [n]
         self.sparse_selection = None  # (ratio, (indices, lengths)); training only
         self.reach = None       # 本段前向已算过的压缩可达掩码，同 ratio 的后续层复用

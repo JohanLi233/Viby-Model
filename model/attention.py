@@ -69,6 +69,9 @@ def select_candidate_blocks(logits: mx.array, compress_lens, topk_blocks: int, b
     # 原实现用 last[..., None]，在 decode（T=1、B>1）下会与 [B,T,num_blocks]
     # 广播成 [B,B,num_blocks]，候选池掩码凭空多出一个 batch 维。
     last = (compress_lens - 1) // block_size
+    # MLX integer division truncates toward zero: -1 // CB can be 0.
+    # Empty rows have no latest block, regardless of that division result.
+    last = mx.where(mx.array(compress_lens) > 0, last, -1)
     if not isinstance(last, mx.array):
         last = mx.array(last)
     if last.ndim == 0:
@@ -250,13 +253,17 @@ class Indexer(nn.Module):
         再 gather 一遍 RoPE 表。CED 解码段 N=T 时打分走融合 kernel，不物化
         [B,T,H,N]。
         """
+        q, w = self._query_weights(x, qr, token_pos, cos_all, sin_all, q_cos, q_sin)
+        return indexer_score(q, index_k, w, reach)
+
+    def _query_weights(self, x, qr, token_pos, cos_all, sin_all, q_cos=None, q_sin=None):
         B, T, _ = x.shape
         q = self.wq_b(qr).reshape(B, T, self.n_heads, self.head_dim)
         if q_cos is None:
             q_cos, q_sin = _cos_sin(cos_all, sin_all, token_pos, True)
         q = rope_partial(q, q_cos, q_sin, self.rope_head_dim)
         w = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
-        return indexer_score(q, index_k, w, reach)
+        return q, w
 
 
 def _group_doc_mask(ratio: int, segment_ids: mx.array):
@@ -412,7 +419,7 @@ class Attention(nn.Module):
 
     def _compress_dense(self, x, qr, token_pos, shared, cache, start_pos,
                         segment_ids=None, pad_mask=None, sparse_selection=False,
-                        token_cs=None):
+                        token_cs=None, materialize_keep=False):
         """压缩分支（prefill / 训练）：产出/复用压缩 KV，并返回可见性掩码。
 
         返回 (comp, cmask)：cmask 是 [B 或 1, T, N] 的 bool，等于
@@ -459,38 +466,45 @@ class Attention(nn.Module):
                 else:
                     shared.index_k = k
             if shared.index_k is not None:
+                from .kernels import indexer_select as fused_index
+
                 q_cos = q_sin = None
                 if token_cs is not None:
                     q_cos, q_sin = token_cs[0][..., None, :], token_cs[1][..., None, :]
-                sc = idxo.scores(
-                    x, qr, shared.index_k, token_pos, reach, self.freq_cos, self.freq_sin,
-                    q_cos=q_cos, q_sin=q_sin,
-                )
-                if idxo.is_candidate_source:
-                    shared.candidates = select_candidate_blocks(
-                        sc,
-                        (token_pos + 1) // ratio,
-                        idxo.candidate_topk_blocks,
-                        idxo.candidate_block_size,
-                    )
-                elif idxo.uses_candidates and shared.candidates is not None:
-                    sc = mx.where(shared.candidates, sc, NEG_INF)
-                if sparse_selection:
-                    from .kernels.sparse_attention import select_topk
-
-                    keep, selection = select_topk(sc, reach, idxo.index_topk)
-                    shared.sparse_selection = (ratio, selection)
-                else:
-                    keep, _ = _topk_masks(sc, reach, idxo.index_topk, 0, need_idx=False)
-                    # 源层压一次 keep：Reuse 层 indexed_attention 不再扫 [B,T,N]
-                    if cache is None and keep.shape[-1] and mx.default_device() == mx.gpu:
+                # 候选池先并进 reach：indexer 只在候选域内打分/打分块，
+                # 而 reach 的语义保持“原始可达 + 候选”不变。
+                can_fuse = (sparse_selection and fused_index._ENABLED and (cache is None or start_pos == 0)
+                            and T > 1 and 0 < N <= 1024 and idxo.n_heads in (4, 8)
+                            and idxo.head_dim in (32, 64) and x.dtype in (mx.float16, mx.bfloat16))
+                if can_fuse:
+                    iq, iw = idxo._query_weights(x, qr, token_pos, self.freq_cos, self.freq_sin, q_cos, q_sin)
+                    candidates = shared.candidate_blocks if idxo.uses_candidates else None
+                    if idxo.uses_candidates and candidates is None and shared.candidates is not None:
                         from .kernels.sparse_attention import compact_visible
-
-                        shared.sparse_selection = (ratio, compact_visible(keep))
-                shared.keep_mask = keep
+                        candidates = compact_visible(shared.candidates[..., ::idxo.candidate_block_size])
+                    selection, blocks = fused_index.fused_select(
+                        iq, shared.index_k, iw, reach, idxo.index_topk,
+                        candidates=candidates, candidate_source=idxo.is_candidate_source,
+                        latest=(token_pos + 1) // ratio, block_size=idxo.candidate_block_size,
+                        block_topk=idxo.candidate_topk_blocks)
+                    shared.sparse_selection = (ratio, selection)
+                    shared.keep_mask = None
+                    if materialize_keep:
+                        keep = fused_index.selection_mask(selection, B, T, N)
+                        shared.keep_mask = keep
+                    if idxo.is_candidate_source:
+                        shared.candidate_blocks = blocks
+                        shared.candidates = None
+                else:
+                    if idxo.uses_candidates and shared.candidates is None and shared.candidate_blocks is not None:
+                        shared.candidates = fused_index.candidate_mask(
+                            shared.candidate_blocks, B, T, N, idxo.candidate_block_size)
+                    keep = self._indexer_dense_selection(
+                        idxo, x, qr, shared, token_pos, reach, ratio, sparse_selection, q_cos, q_sin)
+                    shared.keep_mask = keep
         else:
             keep = shared.keep_mask
-        # keep 已经含 reach（_topk_masks / select_topk），不必再 AND 一张 [B,T,N]
+        # Fused consumers use sparse_selection directly; no dense keep is made.
         cmask = reach if keep is None else keep
         # 压缩 KV 入池：必须是 RoPE 之后的（indexer 用未旋转形式，已在上面用完）
         if self.is_kv_source and latent is not None:
@@ -498,16 +512,36 @@ class Attention(nn.Module):
                 c, s = token_cs
             else:
                 c, s = _cos_sin(self.freq_cos, self.freq_sin, pos, False)
-            lat = rope_partial(latent, c, s, self.rope_head_dim)
+            kv = rope_partial(latent, c, s, self.rope_head_dim)
             if cache is not None:
-                cache.compress_kv[:B, first_group : first_group + lat.shape[1]] = lat
-            shared.compress_kv = lat
-        if cache is not None:
-            # 解码/分块 prefill：池子在源层的 LayerCache 上，直接读全量前缀
-            comp = cache.src_cache.compress_kv[:B, :N] if N else None
-        else:
-            comp = shared.compress_kv
+                cache.compress_kv[:B, first_group : first_group + kv.shape[1]] = kv
+            shared.compress_kv = kv
+        comp = (cache.src_cache.compress_kv[:B, :N] if N else None) if cache is not None else shared.compress_kv
         return comp, cmask
+
+    def _indexer_dense_selection(self, idxo, x, qr, shared, token_pos, reach, ratio,
+                                 sparse_selection, q_cos, q_sin):
+        reach_eff = reach
+        if idxo.uses_candidates and shared.candidates is not None:
+            reach_eff = reach & shared.candidates
+        sc = idxo.scores(x, qr, shared.index_k, token_pos, reach_eff, self.freq_cos, self.freq_sin,
+                         q_cos=q_cos, q_sin=q_sin)
+        if idxo.is_candidate_source:
+            shared.candidates = select_candidate_blocks(
+                sc, (token_pos + 1) // ratio, idxo.candidate_topk_blocks, idxo.candidate_block_size)
+            shared.candidate_blocks = None
+        elif idxo.uses_candidates and shared.candidates is not None:
+            sc = mx.where(shared.candidates, sc, NEG_INF)
+        if sparse_selection:
+            from .kernels.sparse_attention import select_topk
+            keep, selection = select_topk(sc, reach, idxo.index_topk)
+            shared.sparse_selection = (ratio, selection)
+        else:
+            keep, _ = _topk_masks(sc, reach, idxo.index_topk, 0, need_idx=False)
+            if keep.shape[-1] and mx.default_device() == mx.gpu:
+                from .kernels.sparse_attention import compact_visible
+                shared.sparse_selection = (ratio, compact_visible(keep))
+        return keep
 
     # ------------------------------------------------------------------
     def _xsa(self, o, kv_win):
@@ -591,6 +625,7 @@ class Attention(nn.Module):
         W = self.window_size
         C = T // W
         from .kernels.sparse_attention import enabled_for, indexed_attention, topk_enabled
+        from .kernels import indexer_select as fused_index
 
         use_sparse = enabled_for(q, W)
         if self.ratio > 0:
@@ -612,7 +647,7 @@ class Attention(nn.Module):
                 )
             comp, cmask = self._compress_dense(
                 x, qr, token_pos, shared, None, 0, segment_ids, pad_mask,
-                sparse_selection=use_sparse and topk_enabled(),
+                sparse_selection=use_sparse and (topk_enabled() or fused_index._ENABLED),
                 token_cs=token_cs,
             )
         else:
@@ -688,6 +723,9 @@ class Attention(nn.Module):
     def _attend_dense(self, q, kv_win, qr, x, token_pos, tpos, shared, cache, start_pos,
                       segment_ids, pad_mask, token_cs=None):
         """解码 / 分块 prefill / T 不整除：全 T 滑窗 key + 掩码（原路径）。"""
+        from .kernels import decode_metadata as decode_kernels, indexer_select as fused_index
+        fused_prefill = (decode_kernels._PREFILL_SELECT and cache is not None and start_pos == 0
+                         and mx.default_device() == mx.gpu)
         T = q.shape[1]
         L = 0
         kv_hist = None
@@ -720,7 +758,8 @@ class Attention(nn.Module):
             # cmask 已在 _compress_dense 里算完（基础可达 × doc/pad × top-k）
             comp, cmask = self._compress_dense(
                 x, qr, token_pos, shared, cache, start_pos, segment_ids, pad_mask,
-                token_cs=token_cs,
+                sparse_selection=fused_prefill and fused_index._ENABLED,
+                token_cs=token_cs, materialize_keep=fused_prefill,
             )
             if comp is not None:
                 kv_all = mx.concatenate([kv_all, comp], axis=1)
@@ -728,6 +767,7 @@ class Attention(nn.Module):
                 if mask.shape[0] != cm.shape[0]:
                     mask = mx.broadcast_to(mask, (cm.shape[0],) + mask.shape[1:])
                 mask = mx.concatenate([mask, cm], axis=-1)
+
 
         return mx.fast.scaled_dot_product_attention(
             q.transpose(0, 2, 1, 3),
@@ -750,6 +790,7 @@ class Attention(nn.Module):
         one-hot 缓冲；Reuse 层只 gather，不重建整池拼接。
         """
         B, T, _ = x.shape
+        from .kernels import decode_metadata as decode_kernels
         if T != 1:
             raise ValueError("decode 只接受单 token")
         if shared.pool_tokens is None:
@@ -820,8 +861,11 @@ class Attention(nn.Module):
                     shared.index_k = cache.index_k[:, :n_max]
                 if n_max:
                     reach = (mx.arange(n_max)[None, :] < N[:, None])[:, None, :]  # [B,1,N]
+                    reach_eff = reach
+                    if idxo.uses_candidates and shared.candidates is not None:
+                        reach_eff = reach & shared.candidates
                     sc = idxo.scores(
-                        x, qr, shared.index_k, token_pos, reach, self.freq_cos, self.freq_sin,
+                        x, qr, shared.index_k, token_pos, reach_eff, self.freq_cos, self.freq_sin,
                         q_cos=ch, q_sin=sh,
                     )
                     if idxo.is_candidate_source:
@@ -830,7 +874,10 @@ class Attention(nn.Module):
                         )
                     elif idxo.uses_candidates and shared.candidates is not None:
                         sc = mx.where(shared.candidates, sc, NEG_INF)
-                    _, comp_idx = _topk_masks(sc, reach, idxo.index_topk, offset)
+                    if decode_kernels._ENABLED and mx.default_device() == mx.gpu:
+                        comp_idx = decode_kernels.topk_indices(sc, reach, idxo.index_topk, offset)
+                    else:
+                        _, comp_idx = _topk_masks(sc, reach, idxo.index_topk, offset)
                     shared.topk_idx = comp_idx
                 else:
                     comp_idx = mx.zeros((B, 1, 0), dtype=mx.int32)
@@ -839,6 +886,15 @@ class Attention(nn.Module):
                 comp_idx = shared.topk_idx
         if comp_idx is None:
             comp_idx = mx.zeros((B, 1, 0), dtype=mx.int32)
+        if decode_kernels._ENABLED and mx.default_device() == mx.gpu:
+            gathered, valid_slots = decode_kernels.gather_pools(
+                cache.window, cache.src_cache.compress_kv, win_idx, comp_idx)
+            o = mx.fast.scaled_dot_product_attention(
+                q.transpose(0, 2, 1, 3), gathered, gathered, scale=self.softmax_scale,
+                mask=valid_slots[:, None, :, :], sinks=self.attn_sink)
+            if self.xsa_alpha is not None:
+                o = self._xsa(o, kv_new[:, 0][:, None])
+            return self._out_proj(o.transpose(0, 2, 1, 3), token_pos, ch, sh)
         # 窗口与压缩池分开 gather，避免把随序列增长的整池拼进 [B, W+N, D]
         win_g = mx.take_along_axis(
             cache.window[:, None, :, :], mx.maximum(win_idx, 0)[..., None], axis=2

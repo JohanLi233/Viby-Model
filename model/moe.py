@@ -9,10 +9,14 @@
   1 个共享专家（普通 SwiGLU）每 token 必走。
 """
 
+import os
+
 import mlx.core as mx
 from mlx import nn
 
 from .init import trunc_normal
+
+_DECODE_GATHER = os.environ.get("VIBY_MOE_DECODE_GATHER", "1") != "0"
 
 
 def softplus(x: mx.array) -> mx.array:
@@ -143,6 +147,19 @@ class MoEFeedForward(nn.Module):
     def _dense_forward(self, x: mx.array, idx: mx.array, w: mx.array) -> mx.array:
         B, T, D = x.shape
         M, K = B * T, self.top_k
+        if (_DECODE_GATHER and not self.training and mx.default_device() == mx.gpu
+                and self.experts.gate_up_w.dtype == x.dtype and self.experts.down_w.dtype == x.dtype):
+            # Small-batch inference: native gather_mm reads only selected
+            # experts; routing, weights and the expert GEMMs are unchanged.
+            exps = idx.reshape(M * K).astype(mx.int32)
+            tokens = (mx.arange(M * K) // K).astype(mx.int32)
+            h = mx.gather_mm(x.reshape(M, 1, D), self.experts.gate_up_w.swapaxes(-1, -2).astype(x.dtype),
+                             lhs_indices=tokens, rhs_indices=exps)
+            gate, up = mx.split(h, 2, axis=-1)
+            act = expert_act(gate, up, self.swiglu_limit)
+            y = mx.gather_mm(act, self.experts.down_w.swapaxes(-1, -2).astype(x.dtype), rhs_indices=exps)
+            from .kernels.decode_metadata import combine_selected_experts
+            return combine_selected_experts(y, w.reshape(-1), exps, self.n_routed, K).reshape(B, T, D)
         S = (
             mx.zeros((M, self.n_routed), dtype=x.dtype)
             .at[mx.arange(M)[:, None], idx.reshape(M, K)]

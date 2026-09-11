@@ -11,6 +11,10 @@ from functools import lru_cache
 import mlx.core as mx
 
 _ENABLED = os.environ.get("VIBY_HC_PRE_NORM_KERNEL", "1") != "0"
+# §7：权梯度 partial 的分组 + 两级非 atomic 归约。M>=1024 时每 TG 顺序处理
+# 4 个 token（RT=4），partial 行数从 M 降到 ceil(M/4)；小 M 用 RT=1，避免白减
+# 并行 TG 数。`VIBY_HC_GROUPED_DW=0` 回到原来的单级 `mx.sum(dw, axis=0)`。
+_GROUPED_DW = os.environ.get("VIBY_HC_GROUPED_DW", "1") != "0"
 
 _FWD = r"""
     uint tid=thread_position_in_grid.x, row=thread_position_in_grid.y;
@@ -71,6 +75,33 @@ _BWD = r"""
     if (tid<4) dpre[row*4+tid]=float(T((coeff[tid*4]+coeff[tid*4+1])+(coeff[tid*4+2]+coeff[tid*4+3])));
 """
 
+_BWD_GROUPED = r"""
+    uint tid=thread_position_in_grid.x, group=thread_position_in_grid.y;
+    threadgroup float partial[4];
+    threadgroup float coeff[4*4];
+    float dw_acc[(D+127)/128];
+    for (uint r=0;r<(D+127)/128;++r) dw_acc[r]=0.0f;
+    for (uint local=0;local<RT;++local) {
+        uint row=group*RT+local;
+        if (row>=dims[0]) break;
+        /*TOKEN_BACKWARD*/
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint d=tid;d<D;d+=128) dweight[(size_t)group*D+d]=dw_acc[d/128];
+""".replace("/*TOKEN_BACKWARD*/", _BWD[_BWD.index("    float dr="):].replace(
+    "dweight[pos]=T(g[pos]*T(h[pos]*T(r)));",
+    "dw_acc[d/128]+=float(T(g[pos]*T(h[pos]*T(r))));",
+))
+
+
+@lru_cache(None)
+def _grouped_backward():
+    return mx.fast.metal_kernel(
+        name="hc_pre_rms_bwd_grouped",
+        input_names=["x", "pre", "weight", "g", "h", "rstd", "dims"],
+        output_names=["dx", "dpre", "dweight"], source=_BWD_GROUPED,
+    )
+
 
 @lru_cache(None)
 def _kernels():
@@ -89,8 +120,41 @@ def enabled_for(x):
 
 
 @lru_cache(None)
+def _reduce_kernels():
+    """§7.3 两级非 atomic 权梯度归约。"""
+    stage1 = mx.fast.metal_kernel(
+        name="hc_pre_dw_stage1", input_names=["partial", "dims"],
+        output_names=["second"],
+        source=r"""
+    uint tid=thread_position_in_grid.x;
+    uint g=thread_position_in_grid.y;
+    uint G=dims[0], D=dims[1];
+    uint dd=tid;
+    if (dd>=D || g*64>=G) return;
+    float acc=0.0f;
+    for (uint r=0;r<64 && g*64+r<G;++r) acc+=partial[(size_t)(g*64+r)*D+dd];
+    second[(size_t)g*D+dd]=acc;
+""",
+    )
+    stage2 = mx.fast.metal_kernel(
+        name="hc_pre_dw_stage2", input_names=["second", "dims"],
+        output_names=["dweight"],
+        source=r"""
+    uint dd=thread_position_in_grid.x;
+    uint G2=dims[0], D=dims[1];
+    if (dd>=D) return;
+    float acc=0.0f;
+    for (uint g=0;g<G2;++g) acc+=second[(size_t)g*D+dd];
+    dweight[dd]=acc;
+""",
+    )
+    return stage1, stage2
+
+
+@lru_cache(None)
 def _operation(eps):
     forward, backward = _kernels()
+    stage1, stage2 = _reduce_kernels()
 
     @mx.custom_function
     def op(x, pre, weight):
@@ -108,6 +172,28 @@ def _operation(eps):
         g, _, _ = cotangent
         _, h, r = output
         n, _, d = x.shape
+        if _GROUPED_DW:
+            rt = 4 if n >= 1024 else 1
+            groups = (n + rt - 1) // rt
+            dx, dp, dw = _grouped_backward()(
+                inputs=[x, pre, weight, g, h, r, mx.array([n], mx.uint32)],
+                template=[("T", x.dtype), ("D", d), ("RT", rt)],
+                grid=(128, groups, 1), threadgroup=(128, 1, 1),
+                output_shapes=[x.shape, pre.shape, (groups, d)],
+                output_dtypes=[x.dtype, mx.float32, mx.float32],
+            )
+            rows = max(1, (groups + 63) // 64)
+            second = stage1(
+                inputs=[dw, mx.array([groups, d], mx.uint32)],
+                grid=(d, rows, 1), threadgroup=(128, 1, 1),
+                output_shapes=[(rows, d)], output_dtypes=[mx.float32],
+            )[0]
+            dweight = stage2(
+                inputs=[second, mx.array([rows, d], mx.uint32)],
+                grid=(d, 1, 1), threadgroup=(128, 1, 1),
+                output_shapes=[(d,)], output_dtypes=[mx.float32],
+            )[0]
+            return dx, dp.astype(pre.dtype), dweight.astype(weight.dtype)
         dx, dp, dw = backward(
             inputs=[x, pre, weight, g, h, r], template=[("T", x.dtype), ("D", d)],
             grid=(128, n, 1), threadgroup=(128, 1, 1),

@@ -24,12 +24,12 @@ import mlx.core as mx
 # Keep the hand-written gather/down GEMMs independently opt-in.  Route
 # combine is a separate P2 experiment because native ``mx.gather_mm`` remains
 # the production GEMM path.
-# 2026-09-11 回滚：route-combine 默认值退回改动前（关闭），代码保留——
-# VIBY_MOE_COMBINE_KERNEL=1 可原样重开。
+# Token-owned FP32 combine is enabled after paired whole-step acceptance.
+# The experimental expert GEMM remains disabled; native gather_mm is retained.
 _ENABLED = os.environ.get("VIBY_MOE_KERNEL", "0") != "0"
 _COMBINE_ENABLED = os.environ.get(
     "VIBY_MOE_COMBINE_KERNEL",
-    os.environ.get("VIBY_MOE_COMBINE", "0"),
+    os.environ.get("VIBY_MOE_COMBINE", "1"),
 ) != "0"
 _HEADER = "#include <metal_simdgroup_matrix>\nusing namespace metal;\n"
 
@@ -174,37 +174,44 @@ _REDUCE_SOURCE = r"""
 """
 
 _COMBINE_SOURCE = r"""
-    uint gid=thread_position_in_grid.x;
-    uint M=inverse_shape[0]/K;
-    if (gid>=M*D) return;
-    uint t=gid/D,d=gid%D;
-    // Match native BF16 scatter_add's per-update rounding.  The fixed choice
-    // order is still different from the original atomic CAS arrival order.
-    T v=T(0);
-    for (uint k=0;k<K;++k) {
-        uint route=t*K+k;
-        T product=T(y[(size_t)inverse[route]*D+d]*T(weights[route]));
-        v=T(v+product);
+    uint tid=thread_position_in_grid.x, token=thread_position_in_grid.y;
+    threadgroup int pos[K];
+    threadgroup float ws[K];
+    for (uint k=tid;k<K;k+=128) {
+        pos[k]=inverse[token*K+k]; ws[k]=float(weights[token*K+k]);
     }
-    out[gid]=v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint d=tid;d<D;d+=128) {
+        float acc=0.0f;
+        for (uint k=0;k<K;++k) acc+=ws[k]*float(y[(size_t)pos[k]*D+d]);
+        out[(size_t)token*D+d]=T(acc);
+    }
 """
 
 _COMBINE_VJP_SOURCE = r"""
-    uint tid=thread_position_in_grid.x;
-    uint s=thread_position_in_grid.y;
-    uint route=order[s],t=route/K;
-    T w=T(weights[route]);
-    float acc=0.0f;
-    for (uint d=tid;d<D;d+=128) {
-        T v=g[(size_t)t*D+d];
-        dy[(size_t)s*D+d]=T(v*w);
-        acc+=float(T(v*y[(size_t)s*D+d]));
+    uint tid=thread_position_in_grid.x, token=thread_position_in_grid.y;
+    threadgroup int pos[K];
+    threadgroup float ws[K], sums[4*K];
+    for (uint k=tid;k<K;k+=128) {
+        pos[k]=inverse[token*K+k]; ws[k]=float(weights[token*K+k]);
     }
-    acc=simd_sum(acc);
-    threadgroup float sums[4];
-    if (tid%32==0) sums[tid/32]=acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid==0) dw[route]=float(T((sums[0]+sums[1])+(sums[2]+sums[3])));
+    float acc[K];
+    for (uint k=0;k<K;++k) acc[k]=0.0f;
+    for (uint d=tid;d<D;d+=128) {
+        float v=float(g[(size_t)token*D+d]);
+        for (uint k=0;k<K;++k) {
+            dy[(size_t)pos[k]*D+d]=T(v*ws[k]);
+            acc[k]+=v*float(y[(size_t)pos[k]*D+d]);
+        }
+    }
+    for (uint k=0;k<K;++k) {
+        float sum=simd_sum(acc[k]);
+        if (tid%32==0) sums[(tid/32)*K+k]=sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k=tid;k<K;k+=128)
+        dw[token*K+k]=sums[k]+sums[K+k]+sums[2*K+k]+sums[3*K+k];
 """
 
 # The down projection reads already sorted activations. Weighting and token
@@ -278,7 +285,7 @@ def _kernels():
              ["dw"], _DW_SOURCE, True),
         make("moe_inverse_reduce", ["g", "inverse"], ["out"], _REDUCE_SOURCE),
         make("moe_route_combine", ["y", "weights", "inverse"], ["out"], _COMBINE_SOURCE),
-        make("moe_route_combine_vjp", ["y", "weights", "order", "g"],
+        make("moe_route_combine_vjp", ["y", "weights", "inverse", "g"],
              ["dy", "dw"], _COMBINE_VJP_SOURCE),
         make("moe_down_write", ["x", "weight", "order", "offsets", "tile_offsets", "weights"],
              ["out"], _DOWN_SOURCE, True, True),
@@ -323,10 +330,12 @@ def route_metadata(order, experts, n_experts):
 
 def route_inverse(order):
     """Return original-route -> sorted-row permutation for native gather_mm."""
+    if order.size == 0:
+        return mx.zeros(order.shape, mx.int32)
     return _kernels()[-1](
         inputs=[order],
-        grid=(((order.size + 127) // 128) * 128, 1, 1),
-        threadgroup=(128, 1, 1),
+        grid=(((order.size + 255) // 256) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
         output_shapes=[order.shape], output_dtypes=[mx.int32],
     )[0]
 
@@ -389,7 +398,7 @@ def _combine_op(k):
         d, m = y.shape[-1], order.size//k
         return forward(
             inputs=[y, weights, inverse], template=[("T", y.dtype), ("D", d), ("K", k)],
-            grid=(m*d, 1, 1), threadgroup=(256, 1, 1),
+            grid=(128, m, 1), threadgroup=(128, 1, 1),
             output_shapes=[(m, d)], output_dtypes=[y.dtype],
         )[0]
 
@@ -397,9 +406,9 @@ def _combine_op(k):
     def vjp(primals, cotangent, output):
         y, weights, order, inverse = primals
         dy, dw = backward(
-            inputs=[y, weights, order, cotangent],
+            inputs=[y, weights, inverse, cotangent],
             template=[("T", y.dtype), ("D", y.shape[-1]), ("K", k)],
-            grid=(128, order.size, 1), threadgroup=(128, 1, 1),
+            grid=(128, order.size//k, 1), threadgroup=(128, 1, 1),
             output_shapes=[y.shape, weights.shape], output_dtypes=[y.dtype, mx.float32],
         )
         # Keep placeholders for integer metadata; a None before a trainable
@@ -413,6 +422,8 @@ def _combine_op(k):
 
 
 def combine_routes(y, weights, order, inverse, k):
+    if order.size == 0:
+        return mx.zeros((0, y.shape[-1]), y.dtype) + mx.sum(y) * 0 + mx.sum(weights) * 0
     return _combine_op(k)(y, weights, order, inverse)
 
 

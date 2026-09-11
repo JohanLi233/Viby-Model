@@ -152,3 +152,74 @@ def test_indexed_attention_independent_window_and_compressed_lengths():
     mx.eval(out)
     assert tuple(out.shape) == (2, 16, 16, dim)
     assert np.isfinite(np.asarray(out.astype(mx.float32))).all()
+
+
+def _run_vjp(fn, q, wkv, ckv, sinks, vis, seg, pad, W, scale, cot):
+    def wrapped(a, w, c, s):
+        return fn(a, w, c, vis, seg, pad, s, W, scale)
+    out, grads = mx.vjp(wrapped, [q, wkv, ckv, sinks], [cot])
+    return out[0] if isinstance(out, list) else out, list(grads)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="need GPU MMA")
+@pytest.mark.parametrize("batch,seq,keys,dim,window", [
+    (2, 32, 16, 64, 16),
+    (2, 17, 7, 64, 8),
+    (3, 48, 24, 128, 16),
+    (2, 64, 0, 64, 16),
+])
+def test_indexed_attention_split_backward_matches_eager(batch, seq, keys, dim, window):
+    """`VIBY_SPARSE_ATTN_BWD_SPLIT=1`：query-owned dQ/dSink + 片上归约 dKV 路径。"""
+    from model.kernels import sparse_attention as sa
+
+    _require_gpu_kernel(dim, window)
+    q, wkv, ckv, vis, seg, pad, sinks, W, scale = _inputs(
+        batch, seq, keys, dim, window, seed=11)
+    mx.random.seed(3)
+    cot = mx.random.normal((batch, 16, seq, dim)).astype(mx.bfloat16)
+
+    prev = sa._SPLIT_BWD
+    sa._SPLIT_BWD = True
+    sa._operation.cache_clear()
+    try:
+        y0, g0 = _run_vjp(sa.indexed_attention, q, wkv, ckv, sinks, vis, seg, pad, W, scale, cot)
+        y1, g1 = _run_vjp(eager_indexed_attention, q, wkv, ckv, sinks, vis, seg, pad, W, scale, cot)
+        mx.eval(y0, y1, g0, g1)
+        assert np.isfinite(np.asarray(y0.astype(mx.float32))).all()
+        names = ("dQ", "dWindow", "dCompressed", "dSinks")
+        _finite_close(y0, y1, rtol=5e-2, atol=2e-1)
+        for name, a, b in zip(names, g0, g1):
+            arr = np.asarray(a.astype(mx.float32))
+            assert np.isfinite(arr).all(), f"{name} produced non-finite values"
+            _finite_close(a, b, rtol=8e-2, atol=2e-1)
+    finally:
+        sa._SPLIT_BWD = prev
+        sa._operation.cache_clear()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="need GPU")
+def test_select_topk_packed_matches_row_major_compact():
+    """§5.4 packed 输出：行内保序的一维紧凑 + exclusive row_offsets。"""
+    from model.kernels.sparse_attention import select_topk, select_topk_packed
+
+    mx.set_default_device(mx.gpu)
+    mx.random.seed(0)
+    # 用全可达的行，保证走的是 §5.1 的 Indexer 快路径（阈值只在有效域内取）。
+    scores = mx.array([[[3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0],
+                        [1.0, 5.0, 1.0, 5.0, 1.0, 5.0, 1.0, 5.0],
+                        [9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0]]], mx.float32)
+    reach = mx.ones((1, 3, 8), mx.bool_)
+    keep, (indices, lengths) = select_topk(scores, reach, 2)
+    row_offsets, keep2, (flat, lengths2) = select_topk_packed(scores, reach, 2)
+    mx.eval(keep, indices, lengths, row_offsets, keep2, flat, lengths2)
+
+    assert np.array_equal(np.asarray(keep), np.asarray(keep2))
+    assert np.array_equal(np.asarray(lengths), np.asarray(lengths2))
+    counts = np.asarray(lengths)
+    assert np.array_equal(np.asarray(row_offsets),
+                          np.concatenate([[0], np.cumsum(counts)]))
+    idx = np.asarray(indices)
+    got = np.asarray(flat)
+    expected = np.concatenate([idx[r, :int(counts[r])] for r in range(len(counts))])
+    assert got.size == indices.size  # static arena, not a host-sized allocation
+    assert np.array_equal(got[:expected.size], expected)
