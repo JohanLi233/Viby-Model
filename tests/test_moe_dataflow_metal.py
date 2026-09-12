@@ -2,6 +2,7 @@
 
 This module must run on Apple hardware. A Linux skip is not GPU validation.
 """
+
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,7 +10,11 @@ import pytest
 
 mx = pytest.importorskip("mlx.core", reason="MLX is required; Metal tests not executed")
 from model import moe as model_moe
-from model.kernels import moe_counts as counts, moe_decode as decode, moe_gather as gather
+from model.kernels import (
+    moe_counts as counts,
+    moe_decode as decode,
+    moe_gather as gather,
+)
 from model.kernels.moe_dispatch import route_inverse
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="need Apple Metal")
@@ -29,13 +34,15 @@ def f32(x):
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("m,d,k", [(0, 65, 6), (1, 1, 1), (9, 127, 6), (33, 1031, 1), (7, 0, 6)])
+@pytest.mark.parametrize(
+    "m,d,k", [(0, 65, 6), (1, 1, 1), (9, 127, 6), (33, 1031, 1), (7, 0, 6)]
+)
 def test_gather_forward_and_exact_binary_vjp(dtype, m, d, k):
     order = mx.array(np.random.default_rng(3).permutation(m * k), mx.int32)
     inv = route_inverse(order)
     x = mx.random.normal((m, d)).astype(dtype)
     # Binary fractions keep the six-way reference sum exactly representable.
-    g = (mx.random.randint(-8, 9, (m*k, d)).astype(mx.float32) / 8).astype(dtype)
+    g = (mx.random.randint(-8, 9, (m * k, d)).astype(mx.float32) / 8).astype(dtype)
     (got,), grads = mx.vjp(lambda a: gather.gather_routes(a, order, inv, k), [x], [g])
     expected = x[(order // k).astype(mx.int32)]
     dx = mx.sum(g[inv].reshape(m, k, d).astype(mx.float32), axis=1).astype(dtype)
@@ -47,10 +54,10 @@ def test_gather_forward_and_exact_binary_vjp(dtype, m, d, k):
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 def test_compiled_gather_vjp_and_later_trainable_input(dtype):
     m, d, k = 19, 129, 6
-    order = mx.array(np.random.default_rng(9).permutation(m*k), mx.int32)
+    order = mx.array(np.random.default_rng(9).permutation(m * k), mx.int32)
     inv = route_inverse(order)
     x = mx.random.normal((m, d)).astype(dtype)
-    scale = mx.random.normal((m*k, d)).astype(dtype)
+    scale = mx.random.normal((m * k, d)).astype(dtype)
 
     def loss(a, b):
         y = gather.gather_routes(a, order, inv, k)
@@ -69,33 +76,48 @@ def test_compiled_gather_vjp_and_later_trainable_input(dtype):
     np.testing.assert_array_equal(f32(g1[1]), f32(expected_scale_grad))
 
 
-@pytest.mark.parametrize("b,t,e,k", [(0, 3, 8, 1), (2, 0, 8, 6), (1, 1, 8, 1),
-                                    (3, 43, 96, 6), (4, 1024, 96, 6), (2, 5, 513, 6)])
+@pytest.mark.parametrize(
+    "b,t,e,k",
+    [
+        (0, 3, 8, 1),
+        (2, 0, 8, 6),
+        (1, 1, 8, 1),
+        (3, 43, 96, 6),
+        (4, 1024, 96, 6),
+        (2, 5, 513, 6),
+    ],
+)
 @pytest.mark.parametrize("hot", [False, True])
 def test_route_counts_are_occurrences_and_batch_local(b, t, e, k, hot):
-    ids_np = np.zeros((b*t, k), np.int32) if hot else np.random.default_rng(5).integers(e, size=(b*t, k), dtype=np.int32)
+    ids_np = (
+        np.zeros((b * t, k), np.int32)
+        if hot
+        else np.random.default_rng(5).integers(e, size=(b * t, k), dtype=np.int32)
+    )
     ids = mx.array(ids_np)
     got = counts.sequence_route_counts(ids, b, t, e)
-    expected = np.zeros((b*t, e), np.float32)
+    expected = np.zeros((b * t, e), np.float32)
     for j in range(k):
-        np.add.at(expected, (np.arange(b*t), ids_np[:, j]), 1)
+        np.add.at(expected, (np.arange(b * t), ids_np[:, j]), 1)
     expected = expected.reshape(b, t, e).sum(axis=1)
     mx.eval(got)
     assert got.dtype == mx.float32
     np.testing.assert_array_equal(f32(got), expected)
-    assert float(mx.sum(got)) == b*t*k
+    assert float(mx.sum(got)) == b * t * k
 
 
 @pytest.mark.parametrize("b,t,k", [(1, 1, 1), (3, 43, 6), (4, 1024, 6)])
 def test_aux_loss_value_and_score_gradient(monkeypatch, b, t, k):
     e = 96
     owner = SimpleNamespace(n_routed=e, top_k=k)
-    ids = mx.random.randint(0, e, (b*t, k)).astype(mx.int32)
-    scores = mx.random.uniform(shape=(b*t, e))
+    ids = mx.random.randint(0, e, (b * t, k)).astype(mx.int32)
+    scores = mx.random.uniform(shape=(b * t, e))
     results = []
     for enabled in (False, True):
         monkeypatch.setattr(counts, "_ENABLED", enabled)
-        fn = mx.value_and_grad(lambda s: model_moe.MoEFeedForward.seq_aux_loss(owner, s, ids, b, t))
+        fn = mx.value_and_grad(
+            lambda s: model_moe.MoEFeedForward.seq_aux_loss(owner, s, ids, b, t)
+        )
         value, grad = fn(scores)
         mx.eval(value, grad)
         results.append((f32(value), f32(grad)))
@@ -104,10 +126,17 @@ def test_aux_loss_value_and_score_gradient(monkeypatch, b, t, k):
 
 
 def make_layer(e, k, dtype):
-    cfg = SimpleNamespace(dim=64, moe_inter_dim=32, swiglu_limit=10.0,
-                          score_func="sqrtsoftplus", gate_temp=1.0, norm_topk_prob=True,
-                          route_scale=1.0, aux_balance_loss_weight=1e-4,
-                          moe_of=lambda layer: (e, k))
+    cfg = SimpleNamespace(
+        dim=64,
+        moe_inter_dim=32,
+        swiglu_limit=10.0,
+        score_func="sqrtsoftplus",
+        gate_temp=1.0,
+        norm_topk_prob=True,
+        route_scale=1.0,
+        aux_balance_loss_weight=1e-4,
+        moe_of=lambda layer: (e, k),
+    )
     layer = model_moe.MoEFeedForward(cfg)
     layer.router.weight = layer.router.weight.astype(dtype)
     layer.experts.gate_up_w = layer.experts.gate_up_w.astype(dtype)
@@ -174,8 +203,16 @@ def test_full_model_prefill_and_eight_decode_steps(monkeypatch, batch):
 
     monkeypatch.setattr(moe_dispatch, "_COMBINE_ENABLED", True)
     monkeypatch.setattr(model_moe, "_DECODE_GATHER", True)
-    cfg = cfg_mix(n_heads=16, head_dim=64, window_size=8, index_n_heads=4, index_head_dim=32,
-                  candidate_block_size=7, candidate_topk_blocks=2, index_topk=5)
+    cfg = cfg_mix(
+        n_heads=16,
+        head_dim=64,
+        window_size=8,
+        index_n_heads=4,
+        index_head_dim=32,
+        candidate_block_size=7,
+        candidate_topk_blocks=2,
+        index_topk=5,
+    )
     model = VibyForCausalLM(cfg, skip_init=True)
     convert_model_dtype(model, "bfloat16")
     model.eval()
@@ -198,20 +235,27 @@ def test_full_model_prefill_and_eight_decode_steps(monkeypatch, batch):
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 def test_native_sorted_moe_complete_vjp(monkeypatch, dtype):
     from model.kernels import moe_dispatch
+
     monkeypatch.setattr(moe_dispatch, "_ENABLED", False)  # never custom GEMMs
     monkeypatch.setattr(moe_dispatch, "_COMBINE_ENABLED", True)
     b, t, d, e, k, width = 2, 17, 64, 12, 6, 32
     x = mx.random.normal((b, t, d)).astype(dtype)
-    gu = (mx.random.normal((e, 2*width, d)) / d**0.5).astype(dtype)
+    gu = (mx.random.normal((e, 2 * width, d)) / d**0.5).astype(dtype)
     dw = (mx.random.normal((e, d, width)) / width**0.5).astype(dtype)
-    ids_np = np.stack([np.random.default_rng(i).choice(e, k, replace=False) for i in range(b*t)])
+    ids_np = np.stack(
+        [np.random.default_rng(i).choice(e, k, replace=False) for i in range(b * t)]
+    )
     ids = mx.array(ids_np, mx.int32)
-    w = mx.random.uniform(shape=(b*t, k)) / k
+    w = mx.random.uniform(shape=(b * t, k)) / k
     cot = mx.random.normal((b, t, d)).astype(dtype)
 
     def forward(a, gate_up, down, weights):
         owner = SimpleNamespace(
-            top_k=k, n_routed=e, moe_in=width, swiglu_limit=10.0, training=True,
+            top_k=k,
+            n_routed=e,
+            moe_in=width,
+            swiglu_limit=10.0,
+            training=True,
             experts=SimpleNamespace(gate_up_w=gate_up, down_w=down),
         )
         return model_moe.MoEFeedForward._sparse_forward(owner, a, ids, weights)
@@ -222,7 +266,11 @@ def test_native_sorted_moe_complete_vjp(monkeypatch, dtype):
         (out,), grad = mx.vjp(forward, [x, gu, dw, w], [cot])
         mx.eval(out, grad)
         results.append((f32(out), [f32(g) for g in grad]))
-    tol = {mx.float32: (1e-4, 1e-5), mx.float16: (5e-3, 3e-3), mx.bfloat16: (3e-2, 2e-2)}[dtype]
+    tol = {
+        mx.float32: (1e-4, 1e-5),
+        mx.float16: (5e-3, 3e-3),
+        mx.bfloat16: (3e-2, 2e-2),
+    }[dtype]
     np.testing.assert_allclose(results[1][0], results[0][0], rtol=tol[0], atol=tol[1])
     for actual, expected in zip(results[1][1], results[0][1]):
         assert np.isfinite(actual).all()

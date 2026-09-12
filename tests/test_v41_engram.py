@@ -12,15 +12,18 @@
 """
 
 import numpy as np
-import pytest
 
 from _v41_common import cfg_engram, engram_model
-from model.engram import EngramLayout, NgramHashState, _build_primes, build_compressed_token_map
+from model.engram import (
+    EngramLayout,
+    build_compressed_token_map,
+)
 
 import mlx.core as mx
 
 
 # ------------------------------------------------------------------ 布局/范围
+
 
 def test_hash_ids_stay_within_layer_tables():
     """hash ids 必须落在本层表的行数内（可直接 gather）。"""
@@ -51,7 +54,6 @@ def test_hash_ids_stay_within_layer_tables():
 
 def test_ngram_orders_live_in_disjoint_prime_buckets():
     """同一层里不同 n-gram 阶各占一段素数桶，区间互不重叠。"""
-    from model.engram import compute_num_embeddings
 
     cfg = cfg_engram()
     layout = EngramLayout.from_config(cfg)
@@ -61,10 +63,13 @@ def test_ngram_orders_live_in_disjoint_prime_buckets():
     # 每列的行号区间 = [offset, offset + prime)
     flat_primes = [p for order in layout.primes[0] for p in order]
     offsets = np.concatenate([[0], np.cumsum(flat_primes)[:-1]])
-    ranges = [(int(offsets[i]), int(offsets[i] + flat_primes[i])) for i in range(len(flat_primes))]
+    ranges = [
+        (int(offsets[i]), int(offsets[i] + flat_primes[i]))
+        for i in range(len(flat_primes))
+    ]
     # 前 n_heads 列是 2-gram、接着是 3-gram、4-gram
     for o in range(n_orders):
-        cols = ranges[o * n_heads:(o + 1) * n_heads]
+        cols = ranges[o * n_heads : (o + 1) * n_heads]
         lo = min(c[0] for c in cols)
         hi = max(c[1] for c in cols)
         for c in cols:
@@ -72,9 +77,11 @@ def test_ngram_orders_live_in_disjoint_prime_buckets():
     # 不同阶的区间整体不重叠
     for o1 in range(n_orders):
         for o2 in range(o1 + 1, n_orders):
-            a = ranges[o1 * n_heads:(o1 + 1) * n_heads]
-            b = ranges[o2 * n_heads:(o2 + 1) * n_heads]
-            assert max(x[1] for x in a) <= min(x[0] for x in b) or max(x[1] for x in b) <= min(x[0] for x in a)
+            a = ranges[o1 * n_heads : (o1 + 1) * n_heads]
+            b = ranges[o2 * n_heads : (o2 + 1) * n_heads]
+            assert max(x[1] for x in a) <= min(x[0] for x in b) or max(
+                x[1] for x in b
+            ) <= min(x[0] for x in a)
     # 同一位置不同阶的哈希取值必然落在各自区间（用真实哈希验证）
     mx.random.seed(71)
     ids = mx.random.randint(0, cfg.vocab_size, (1, 6))
@@ -88,6 +95,7 @@ def test_ngram_orders_live_in_disjoint_prime_buckets():
 
 # ------------------------------------------------------------------ 截断语义
 
+
 def test_token_mask_and_dead_truncate_lookback():
     """mask 关闭处 = DEAD：它之后的位置不得看到它之前任何 token。"""
     model = engram_model()
@@ -95,14 +103,16 @@ def test_token_mask_and_dead_truncate_lookback():
     hs = model.model.engram_hash
     mx.random.seed(72)
     ids = mx.random.randint(0, cfg.vocab_size, (1, 8))
-    other = ids.at[:, :6].add(1)          # 只改 mask 之前的 token
+    other = ids.at[:, :6].add(1)  # 只改 mask 之前的 token
     m = np.ones((1, 8), bool)
-    m[0, 6] = False                       # 位置 6 = DEAD
+    m[0, 6] = False  # 位置 6 = DEAD
     mask = mx.array(m)
     h1, p1 = hs(ids, None, mask)
     h2, p2 = hs(other, None, mask)
     mx.eval(h1, h2, p1)
-    assert bool(mx.all(h1[:, 6:] == h2[:, 6:]).item()), "DEAD 之后的 n-gram 不得跨过 DEAD"
+    assert bool(mx.all(h1[:, 6:] == h2[:, 6:]).item()), (
+        "DEAD 之后的 n-gram 不得跨过 DEAD"
+    )
     assert bool(mx.any(h1[:, :6] != h2[:, :6]).item())
     # mask 位置落在回看窗口里 → 记成 DEAD 传给下一步（window=3，覆盖位置 5..7）
     assert -1 in np.asarray(p1)[0].tolist()
@@ -118,8 +128,8 @@ def test_prev_tokens_dead_truncates_ngram():
     mx.random.seed(73)
     ids = mx.random.randint(0, cfg.vocab_size, (1, 3))
     base = mx.array([[11, -1, 5]], dtype=mx.int32)
-    far = mx.array([[99, -1, 5]], dtype=mx.int32)     # 只改 DEAD 之前的那个
-    near = mx.array([[11, -1, 9]], dtype=mx.int32)    # 改最近的历史
+    far = mx.array([[99, -1, 5]], dtype=mx.int32)  # 只改 DEAD 之前的那个
+    near = mx.array([[11, -1, 9]], dtype=mx.int32)  # 改最近的历史
     h0, _ = hs(ids, base)
     h1, _ = hs(ids, far)
     h2, _ = hs(ids, near)
@@ -138,7 +148,7 @@ def test_prev_tokens_chunking_matches_single_pass():
     ids = mx.random.randint(0, cfg.vocab_size, (2, 14))
     full, prev_full = hs(ids)
     k = 6
-    chunk, prev_chunk = hs(ids[:, k:], prev_tokens=ids[:, k - w:k])
+    chunk, prev_chunk = hs(ids[:, k:], prev_tokens=ids[:, k - w : k])
     mx.eval(full, chunk, prev_full, prev_chunk)
     assert bool(mx.all(full[:, k:] == chunk).item())
     assert bool(mx.all(prev_full[:, -w:] == prev_chunk).item())
@@ -150,11 +160,11 @@ def test_prev_tokens_chunking_matches_single_pass():
 
 # ------------------------------------------------------------------ 门控写入
 
+
 def test_gate_writes_nothing_where_masked():
     """token_mask=False 的位置门 = 0，残差逐位原样通过。"""
     model = engram_model()
     cfg = model.config
-    layout = model.model.engram_layout
     eng = model.model.engram_layers[0]
     hs = model.model.engram_hash
     mx.random.seed(75)
@@ -214,8 +224,17 @@ def test_engram_layers_affect_model_output():
         mx.eval(out2.logits)
     assert float(mx.max(mx.abs(out.logits - out2.logits))) > 1e-4
     # 退出上下文后表已还原（不污染缓存实例）
-    assert float(mx.max(mx.abs(model.model.engram_layers[0].embed.weight
-                               - model.model.engram_layers[0].embed.weight))) == 0.0
+    assert (
+        float(
+            mx.max(
+                mx.abs(
+                    model.model.engram_layers[0].embed.weight
+                    - model.model.engram_layers[0].embed.weight
+                )
+            )
+        )
+        == 0.0
+    )
 
 
 def test_compressed_token_map_collapses_normalized_forms():
@@ -223,6 +242,7 @@ def test_compressed_token_map_collapses_normalized_forms():
     from transformers import AutoTokenizer
 
     from _v41_common import _ROOT
+
     tok = AutoTokenizer.from_pretrained(f"{_ROOT}/model")
     lookup, size = build_compressed_token_map(tok)
     assert len(lookup) == len(tok)
@@ -231,7 +251,9 @@ def test_compressed_token_map_collapses_normalized_forms():
     by_key: dict = {}
     for tid, cid in enumerate(lookup):
         by_key.setdefault(cid, []).append(tid)
-    assert any(len(v) > 1 for v in by_key.values()), "至少应有一组归一化同形的 token 被合并"
+    assert any(len(v) > 1 for v in by_key.values()), (
+        "至少应有一组归一化同形的 token 被合并"
+    )
     # 模型构造后 config 会填上真实压缩词表大小（乘子上界由它推出）
     model = engram_model()
     assert model.config.engram_compressed_vocab_size > 0

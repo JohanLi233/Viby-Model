@@ -2,7 +2,10 @@
 
 The original argpartition determines the fixed-k set. Only its position sort,
 eligibility/offset encoding and subsequent pool gathers are fused here.
+Up to 256 selected positions sort in one SIMD group's registers by default;
+VIBY_DECODE_SIMD_POST=0 restores the original threadgroup bitonic sort.
 """
+
 import os
 from functools import lru_cache
 
@@ -10,13 +13,63 @@ import mlx.core as mx
 
 _ENABLED = os.environ.get("VIBY_DECODE_METADATA", "1") != "0"
 _PREFILL_SELECT = os.environ.get("VIBY_PREFILL_SELECT", "1") != "0"
+_SIMD_POST = os.environ.get("VIBY_DECODE_SIMD_POST", "1") != "0"
+
+
+@lru_cache(None)
+def _simd_post_kernel():
+    """Sort up to 256 selected positions entirely in one SIMD group's registers.
+
+    Each lane holds CAP/32 positions. Small bitonic exchanges use shuffle_xor;
+    exchanges across 32-position blocks use registers in the same lane. All
+    lanes participate, including sentinel lanes when fewer than 32 ids exist.
+    """
+    return mx.fast.metal_kernel(
+        name="decode_fixed_k_simd_postprocess",
+        input_names=["ids", "scores", "reach", "dims"],
+        output_names=["out"],
+        source=r"""
+        uint lane=thread_position_in_threadgroup.x;
+        uint q=thread_position_in_grid.y;
+        uint n=dims[0], k=dims[1], offset=dims[2];
+        uint values[ITEMS];
+        for (uint r=0;r<ITEMS;++r) {
+            uint i=r*32+lane;
+            values[r]=i<k ? uint(ids[(size_t)q*k+i]) : 0xffffffffu;
+        }
+        for (uint size=2;size<=CAP;size*=2) {
+            for (uint stride=size/2;stride>0;stride/=2) {
+                uint next[ITEMS];
+                for (uint r=0;r<ITEMS;++r) {
+                    uint i=r*32+lane;
+                    uint a=values[r];
+                    uint b=stride<32 ? simd_shuffle_xor(a, ushort(stride))
+                                     : values[r^(stride/32)];
+                    bool take_min=((i&size)==0)==((i&stride)==0);
+                    next[r]=take_min ? min(a,b) : max(a,b);
+                }
+                for (uint r=0;r<ITEMS;++r) values[r]=next[r];
+            }
+        }
+        for (uint r=0;r<ITEMS;++r) {
+            uint i=r*32+lane;
+            if (i<k) {
+                uint j=values[r];
+                bool yes=reach[(size_t)q*n+j] && scores[(size_t)q*n+j]>-1e30f;
+                out[(size_t)q*k+i]=yes ? int(j+offset) : -1;
+            }
+        }
+        """,
+    )
 
 
 @lru_cache(None)
 def _kernels():
     post = mx.fast.metal_kernel(
-        name="decode_fixed_k_postprocess", input_names=["ids", "scores", "reach", "dims"],
-        output_names=["out"], source=r"""
+        name="decode_fixed_k_postprocess",
+        input_names=["ids", "scores", "reach", "dims"],
+        output_names=["out"],
+        source=r"""
         uint tid=thread_position_in_grid.x, q=thread_position_in_grid.y;
         uint n=dims[0], k=dims[1], offset=dims[2];
         threadgroup uint sorted[CAP];
@@ -42,8 +95,10 @@ def _kernels():
         """,
     )
     gather = mx.fast.metal_kernel(
-        name="decode_gather_kv_pools", input_names=["window", "compressed", "win_idx", "comp_idx", "dims"],
-        output_names=["kv", "valid"], source=r"""
+        name="decode_gather_kv_pools",
+        input_names=["window", "compressed", "win_idx", "comp_idx", "dims"],
+        output_names=["kv", "valid"],
+        source=r"""
         uint tid=thread_position_in_grid.x, slot=thread_position_in_grid.y, b=thread_position_in_grid.z;
         uint nw=dims[0], nc=dims[1], pool_n=dims[2], offset=dims[3];
         int raw=slot<nw ? win_idx[(size_t)b*nw+slot] : comp_idx[(size_t)b*nc+slot-nw];
@@ -69,11 +124,30 @@ def topk_indices(scores, reach, k, offset):
     adjusted = mx.stop_gradient(scores) - mx.arange(n, dtype=scores.dtype) * 1e-7
     # Intentionally retain the original fixed-k argpartition, including ties.
     ids = mx.argpartition(-adjusted, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
-    (out,) = _kernels()[0](
-        inputs=[ids, scores, mx.broadcast_to(reach, scores.shape), mx.array([n, k, offset], mx.uint32)],
-        template=[("CAP", 1 << (k - 1).bit_length())],
-        grid=(128, b * t, 1), threadgroup=(128, 1, 1),
-        output_shapes=[(b, t, k)], output_dtypes=[mx.int32],
+    return _postprocess_indices(ids, scores, reach, k, offset)
+
+
+def _postprocess_indices(ids, scores, reach, k, offset):
+    b, t, n = scores.shape
+    capacity = 1 << (k - 1).bit_length()
+    use_simd = _SIMD_POST and capacity <= 256
+    kernel = _simd_post_kernel() if use_simd else _kernels()[0]
+    template = [("CAP", capacity)]
+    if use_simd:
+        template.append(("ITEMS", max(1, capacity // 32)))
+    threads = 32 if use_simd else 128
+    (out,) = kernel(
+        inputs=[
+            ids,
+            scores,
+            mx.broadcast_to(reach, scores.shape),
+            mx.array([n, k, offset], mx.uint32),
+        ],
+        template=template,
+        grid=(threads, b * t, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[(b, t, k)],
+        output_dtypes=[mx.int32],
     )
     return out
 
@@ -85,18 +159,28 @@ def gather_pools(window, compressed, win_idx, comp_idx):
         compressed = mx.zeros((b, 0, d), window.dtype)
     dtype = mx.result_type(window, compressed)
     return _kernels()[1](
-        inputs=[window, compressed, win_idx, comp_idx, mx.array([nw, nc, compressed.shape[1], W], mx.uint32)],
+        inputs=[
+            window,
+            compressed,
+            win_idx,
+            comp_idx,
+            mx.array([nw, nc, compressed.shape[1], W], mx.uint32),
+        ],
         template=[("D", d), ("OutT", dtype)],
-        grid=(128, nw + nc, b), threadgroup=(128, 1, 1),
-        output_shapes=[(b, 1, nw + nc, d), (b, 1, nw + nc)], output_dtypes=[dtype, mx.bool_],
+        grid=(128, nw + nc, b),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(b, 1, nw + nc, d), (b, 1, nw + nc)],
+        output_dtypes=[dtype, mx.bool_],
     )
 
 
 @lru_cache(None)
 def _expert_view_kernel():
     return mx.fast.metal_kernel(
-        name="decode_expert_contributions", input_names=["y", "weights", "experts", "dims"],
-        output_names=["out"], source=r"""
+        name="decode_expert_contributions",
+        input_names=["y", "weights", "experts", "dims"],
+        output_names=["out"],
+        source=r"""
         uint tid=thread_position_in_grid.x, route=thread_position_in_grid.y;
         uint token=route/K, expert=uint(experts[route]), M=dims[0];
         for (uint d=tid;d<D;d+=128)
@@ -115,8 +199,11 @@ def _expert_view_op(n_experts, routes):
         return kernel(
             inputs=[y, weights, experts, mx.array([m], mx.uint32)],
             template=[("T", y.dtype), ("K", routes), ("D", d)],
-            grid=(128, m * routes, 1), threadgroup=(128, 1, 1),
-            output_shapes=[(n_experts, m, d)], output_dtypes=[y.dtype], init_value=0,
+            grid=(128, m * routes, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(n_experts, m, d)],
+            output_dtypes=[y.dtype],
+            init_value=0,
         )[0]
 
     @op.vjp

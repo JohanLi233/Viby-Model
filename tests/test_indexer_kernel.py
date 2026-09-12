@@ -1,4 +1,5 @@
 """Indexer 融合打分 kernel：与两次 einsum 的前向 / VJP 对拍。"""
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -21,7 +22,7 @@ def test_indexer_score_matches_einsum(device, heads, dim):
     q = mx.random.normal((B, T, heads, dim)).astype(mx.bfloat16)
     k = mx.random.normal((B, N, dim)).astype(mx.bfloat16)
     w = mx.random.normal((B, T, heads)).astype(mx.bfloat16)
-    reach = (mx.arange(N)[None, None, :] <= mx.arange(T)[None, :, None])
+    reach = mx.arange(N)[None, None, :] <= mx.arange(T)[None, :, None]
     reach = mx.broadcast_to(reach, (B, T, N))
     got = indexer_score(q, k, w, reach)
     ref = eager_indexer_score(q, k, w, reach)
@@ -93,18 +94,21 @@ def _compare(q, k, w, reach, rtol=5e-2, atol=2e-1, vjp=False):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="need GPU MMA")
-@pytest.mark.parametrize("seq,keys,heads,dim", [
-    (1, 64, 8, 64),   # decode：T=1，key 维切开
-    (64, 64, 8, 64),  # 训练：多块 BK=16
-    (17, 17, 4, 32),  # N 不整除 BK
-])
+@pytest.mark.parametrize(
+    "seq,keys,heads,dim",
+    [
+        (1, 64, 8, 64),  # decode：T=1，key 维切开
+        (64, 64, 8, 64),  # 训练：多块 BK=16
+        (17, 17, 4, 32),  # N 不整除 BK
+    ],
+)
 def test_indexer_score_mma_shapes(seq, keys, heads, dim):
     mx.set_default_device(mx.gpu)
     mx.random.seed(2)
     q = mx.random.normal((2, seq, heads, dim)).astype(mx.bfloat16)
     k = mx.random.normal((2, keys, dim)).astype(mx.bfloat16)
     w = mx.random.normal((2, seq, heads)).astype(mx.bfloat16)
-    reach = (mx.arange(keys)[None, None, :] <= mx.arange(seq)[None, :, None])
+    reach = mx.arange(keys)[None, None, :] <= mx.arange(seq)[None, :, None]
     reach = mx.broadcast_to(reach, (2, seq, keys))
     _compare(q, k, w, reach)
     _compare(q, k, w, reach, vjp=True)

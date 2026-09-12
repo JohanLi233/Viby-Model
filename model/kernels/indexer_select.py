@@ -4,6 +4,7 @@ Only the stopped-gradient entry fuses away global scores. Public differentiable
 scores retain the original query-owned VJP. Candidate arenas have static N/ NB
 capacity, GPU lengths, increasing global ids, and retain all threshold ties.
 """
+
 import os
 from functools import lru_cache
 
@@ -232,40 +233,101 @@ _SCORE = r"""
 @lru_cache(None)
 def _kernel():
     return mx.fast.metal_kernel(
-        name="indexer_bq_score_select", input_names=["q", "k", "w", "reach", "block_ids", "block_lengths", "latest", "dims"],
-        output_names=["out_scores", "indices", "lengths", "out_block_ids", "out_block_lengths"],
-        source=_SCORE, header=_HEADER,
+        name="indexer_bq_score_select",
+        input_names=[
+            "q",
+            "k",
+            "w",
+            "reach",
+            "block_ids",
+            "block_lengths",
+            "latest",
+            "dims",
+        ],
+        output_names=[
+            "out_scores",
+            "indices",
+            "lengths",
+            "out_block_ids",
+            "out_block_lengths",
+        ],
+        source=_SCORE,
+        header=_HEADER,
     )
 
 
 def supported(q, k):
-    return (mx.default_device() == mx.gpu and q.dtype in (mx.float16, mx.bfloat16)
-            and q.shape[-2] in (4, 8) and q.shape[-1] in (32, 64)
-            and q.shape[1] > 1 and 0 < k.shape[1] <= 1024)
+    return (
+        mx.default_device() == mx.gpu
+        and q.dtype in (mx.float16, mx.bfloat16)
+        and q.shape[-2] in (4, 8)
+        and q.shape[-1] in (32, 64)
+        and q.shape[1] > 1
+        and 0 < k.shape[1] <= 1024
+    )
 
 
-def _run(q, k, w, reach, *, fused, topk=1, candidates=None, candidate_source=False,
-         latest=None, block_size=32, block_topk=1, bq=None):
+def _run(
+    q,
+    k,
+    w,
+    reach,
+    *,
+    fused,
+    topk=1,
+    candidates=None,
+    candidate_source=False,
+    latest=None,
+    block_size=32,
+    block_topk=1,
+    bq=None,
+):
     b, t, h, d = q.shape
     n = k.shape[1]
     nb = (n + block_size - 1) // block_size
     candidate = candidates is not None
     bq = bq or (2 if candidate else 4)
-    ids, lens = candidates if candidate else (mx.zeros((2,), mx.int32), mx.zeros((2,), mx.int32))
+    ids, lens = (
+        candidates
+        if candidate
+        else (mx.zeros((2,), mx.int32), mx.zeros((2,), mx.int32))
+    )
     if latest is None:
         latest = mx.zeros((b, t), mx.int32)
     else:
         latest = mx.broadcast_to(latest, (b, t)).astype(mx.int32)
     nt = 32 * bq * (d // 32)
     outputs = _kernel()(
-        inputs=[q, k.astype(q.dtype), w.astype(q.dtype), mx.broadcast_to(reach, (b, t, n)), ids, lens, latest,
-                mx.array([t, n, topk, block_topk], mx.uint32)],
-        template=[("T", q.dtype), ("IH", h), ("ID", d), ("BQ", bq), ("CB", block_size),
-                  ("MAXN", n if fused else 1), ("FUSED", fused), ("CANDIDATE", candidate), ("SOURCE", candidate_source)],
-        grid=(nt, (t + bq - 1) // bq, b), threadgroup=(nt, 1, 1),
-        output_shapes=[(0,) if fused else (b, t, n), (b * t, n) if fused else (0,),
-                       (b * t,), (b * t, nb) if candidate_source else (0,),
-                       (b * t,) if candidate_source else (0,)],
+        inputs=[
+            q,
+            k.astype(q.dtype),
+            w.astype(q.dtype),
+            mx.broadcast_to(reach, (b, t, n)),
+            ids,
+            lens,
+            latest,
+            mx.array([t, n, topk, block_topk], mx.uint32),
+        ],
+        template=[
+            ("T", q.dtype),
+            ("IH", h),
+            ("ID", d),
+            ("BQ", bq),
+            ("CB", block_size),
+            ("MAXN", n if fused else 1),
+            ("FUSED", fused),
+            ("CANDIDATE", candidate),
+            ("SOURCE", candidate_source),
+        ],
+        grid=(nt, (t + bq - 1) // bq, b),
+        threadgroup=(nt, 1, 1),
+        output_shapes=[
+            (0,) if fused else (b, t, n),
+            (b * t, n) if fused else (0,),
+            (b * t,),
+            (b * t, nb) if candidate_source else (0,),
+            (b * t,) if candidate_source else (0,),
+        ],
         output_dtypes=[mx.float32, mx.int32, mx.int32, mx.int32, mx.int32],
     )
     return outputs
@@ -276,17 +338,41 @@ def score_bq(q, k, w, reach, bq=4):
     return _run(q, k, w, reach, fused=False, bq=bq)[0]
 
 
-def fused_select(q, k, w, reach, topk, *, candidates=None, candidate_source=False,
-                 latest=None, block_size=32, block_topk=1, bq=None):
+def fused_select(
+    q,
+    k,
+    w,
+    reach,
+    topk,
+    *,
+    candidates=None,
+    candidate_source=False,
+    latest=None,
+    block_size=32,
+    block_topk=1,
+    bq=None,
+):
     """Stopped-gradient row-major selection, optionally with source block ids."""
     if not supported(q, k):
-        raise ValueError("fused Indexer selection requires GPU, T>1, N<=1024, H=4/8, D=32/64")
+        raise ValueError(
+            "fused Indexer selection requires GPU, T>1, N<=1024, H=4/8, D=32/64"
+        )
     if candidate_source and candidates is not None:
         raise ValueError("a candidate source must scan the complete reachable domain")
     _, ids, lengths, blocks, block_lengths = _run(
-        mx.stop_gradient(q), mx.stop_gradient(k), mx.stop_gradient(w), mx.stop_gradient(reach),
-        fused=True, topk=topk, candidates=candidates, candidate_source=candidate_source,
-        latest=latest, block_size=block_size, block_topk=block_topk, bq=bq)
+        mx.stop_gradient(q),
+        mx.stop_gradient(k),
+        mx.stop_gradient(w),
+        mx.stop_gradient(reach),
+        fused=True,
+        topk=topk,
+        candidates=candidates,
+        candidate_source=candidate_source,
+        latest=latest,
+        block_size=block_size,
+        block_topk=block_topk,
+        bq=bq,
+    )
     return (ids, lengths), ((blocks, block_lengths) if candidate_source else None)
 
 
@@ -301,8 +387,10 @@ def candidate_mask(candidates, b, t, n, block_size):
 @lru_cache(None)
 def _selection_mask_kernel():
     return mx.fast.metal_kernel(
-        name="indexer_selection_mask", input_names=["indices", "lengths", "dims"],
-        output_names=["mask"], source=r"""
+        name="indexer_selection_mask",
+        input_names=["indices", "lengths", "dims"],
+        output_names=["mask"],
+        source=r"""
         uint tid=thread_position_in_grid.x, row=thread_position_in_grid.y, n=dims[0];
         for (uint slot=tid;slot<uint(lengths[row]);slot+=128)
             mask[(size_t)row*n+indices[(size_t)row*n+slot]]=true;
@@ -314,14 +402,18 @@ def selection_mask(selection, b, t, n):
     """Dense bool only when native prefill SDPA needs it; training omits it."""
     return _selection_mask_kernel()(
         inputs=[*selection, mx.array([n], mx.uint32)],
-        grid=(128, b * t, 1), threadgroup=(128, 1, 1),
-        output_shapes=[(b, t, n)], output_dtypes=[mx.bool_], init_value=0,
+        grid=(128, b * t, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(b, t, n)],
+        output_dtypes=[mx.bool_],
+        init_value=0,
     )[0]
 
 
 @lru_cache(None)
 def _compact_backward():
     from .indexer_score import _BWD, _HEADER as header
+
     source = _BWD.replace(
         "uint b = query / Tlen;",
         """uint b = query / Tlen;
@@ -344,12 +436,19 @@ def _compact_backward():
         if (!tile_ok) continue;""",
     )
     for offset in ("row", "j"):
-        source = source.replace(f"uint n = base + {offset};", f"""uint slot=base+{offset};
-            uint n=slot<count ? uint(block_ids[(size_t)query*nb+slot/CB])*CB+slot%CB : N;""")
+        source = source.replace(
+            f"uint n = base + {offset};",
+            f"""uint slot=base+{offset};
+            uint n=slot<count ? uint(block_ids[(size_t)query*nb+slot/CB])*CB+slot%CB : N;""",
+        )
     source = source.replace("float(gb[n])", "float(gb[slot])")
     return mx.fast.metal_kernel(
-        name="indexer_compact_score_bwd", input_names=["q", "k", "w", "reach", "block_ids", "block_lengths", "g", "dims"],
-        output_names=["dq", "dk", "dw"], source=source, header=header, atomic_outputs=True,
+        name="indexer_compact_score_bwd",
+        input_names=["q", "k", "w", "reach", "block_ids", "block_lengths", "g", "dims"],
+        output_names=["dq", "dk", "dw"],
+        source=source,
+        header=header,
+        atomic_outputs=True,
     )
 
 
@@ -359,7 +458,15 @@ def _compact_operation(block_size):
 
     @mx.custom_function
     def op(q, k, w, reach, ids, lengths):
-        output = _run(q, k, w, reach, fused=False, candidates=(ids, lengths), block_size=block_size)
+        output = _run(
+            q,
+            k,
+            w,
+            reach,
+            fused=False,
+            candidates=(ids, lengths),
+            block_size=block_size,
+        )
         return output[0], output[2]
 
     @op.vjp
@@ -369,14 +476,37 @@ def _compact_operation(block_size):
         b, t, h, d = q.shape
         n = k.shape[1]
         dq, dk, dw = backward(
-            inputs=[q, k, w, reach, ids, lengths, g.astype(q.dtype), mx.array([t, n, b, 1], mx.uint32)],
-            template=[("T", q.dtype), ("IH", h), ("ID", d), ("CB", block_size), ("SHARDS", 8)],
-            grid=(d, b * t, 1), threadgroup=(d, 1, 1),
-            output_shapes=[q.shape, (8,) + k.shape, w.shape], output_dtypes=[mx.float32] * 3,
+            inputs=[
+                q,
+                k,
+                w,
+                reach,
+                ids,
+                lengths,
+                g.astype(q.dtype),
+                mx.array([t, n, b, 1], mx.uint32),
+            ],
+            template=[
+                ("T", q.dtype),
+                ("IH", h),
+                ("ID", d),
+                ("CB", block_size),
+                ("SHARDS", 8),
+            ],
+            grid=(d, b * t, 1),
+            threadgroup=(d, 1, 1),
+            output_shapes=[q.shape, (8,) + k.shape, w.shape],
+            output_dtypes=[mx.float32] * 3,
             init_value=0,
         )
-        return (dq.astype(q.dtype), mx.sum(dk, axis=0).astype(k.dtype), dw.astype(w.dtype),
-                mx.zeros_like(reach), mx.zeros_like(ids), mx.zeros_like(lengths))
+        return (
+            dq.astype(q.dtype),
+            mx.sum(dk, axis=0).astype(k.dtype),
+            dw.astype(w.dtype),
+            mx.zeros_like(reach),
+            mx.zeros_like(ids),
+            mx.zeros_like(lengths),
+        )
 
     return op
 
@@ -388,5 +518,10 @@ def score_candidate_blocks(q, k, w, reach, candidates, block_size):
     block_ids[c//CB]*CB+c%CB. Gradients traverse those same slots and scatter
     directly to the original K primal without making dense score gradients.
     """
-    return _compact_operation(block_size)(q, k.astype(q.dtype), w.astype(q.dtype),
-                                         mx.broadcast_to(reach, (q.shape[0], q.shape[1], k.shape[1])), *candidates)
+    return _compact_operation(block_size)(
+        q,
+        k.astype(q.dtype),
+        w.astype(q.dtype),
+        mx.broadcast_to(reach, (q.shape[0], q.shape[1], k.shape[1])),
+        *candidates,
+    )

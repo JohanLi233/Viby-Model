@@ -1,4 +1,5 @@
 """Inference keeps fixed-k decode selection and original cache semantics."""
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -28,12 +29,19 @@ def test_decode_gather_reads_correct_pools(dtype):
     wi = mx.array([[[-1, -1, 0, 1, 2, 3, 4, 5]], [[7, 0, 1, 2, 3, 4, 5, 6]]], mx.int32)
     ci = mx.array([[[8, 12, -1]], [[9, 25, 26]]], mx.int32)
     out, valid = dm.gather_pools(w, c, wi, ci)
-    ref = mx.concatenate([mx.take_along_axis(w[:, None], mx.maximum(wi, 0)[..., None], axis=2),
-                          mx.take_along_axis(c[:, None], mx.maximum(ci - 8, 0)[..., None], axis=2)], axis=2)
+    ref = mx.concatenate(
+        [
+            mx.take_along_axis(w[:, None], mx.maximum(wi, 0)[..., None], axis=2),
+            mx.take_along_axis(c[:, None], mx.maximum(ci - 8, 0)[..., None], axis=2),
+        ],
+        axis=2,
+    )
     mask = mx.concatenate([wi >= 0, ci >= 0], axis=-1)
     ref = mx.where(mask[..., None], ref, 0)
     mx.eval(out, valid, ref)
-    np.testing.assert_array_equal(np.asarray(out.astype(mx.float32)), np.asarray(ref.astype(mx.float32)))
+    np.testing.assert_array_equal(
+        np.asarray(out.astype(mx.float32)), np.asarray(ref.astype(mx.float32))
+    )
     np.testing.assert_array_equal(np.asarray(valid), np.asarray(mask))
 
 
@@ -50,8 +58,16 @@ def test_prefill_and_multistep_decode_optimized_vs_reference(monkeypatch, option
     # otherwise produces different prefixes even for metadata-only changes.
     monkeypatch.setattr(moe_dispatch, "_COMBINE_ENABLED", True)
     mx.random.seed(15)
-    cfg = cfg_mix(n_heads=16, head_dim=64, window_size=8, index_n_heads=4, index_head_dim=32,
-                  candidate_block_size=7, candidate_topk_blocks=2, index_topk=5)
+    cfg = cfg_mix(
+        n_heads=16,
+        head_dim=64,
+        window_size=8,
+        index_n_heads=4,
+        index_head_dim=32,
+        candidate_block_size=7,
+        candidate_topk_blocks=2,
+        index_topk=5,
+    )
     model = VibyForCausalLM(cfg, skip_init=True)
     convert_model_dtype(model, "bfloat16")
     model.eval()
@@ -72,4 +88,6 @@ def test_prefill_and_multistep_decode_optimized_vs_reference(monkeypatch, option
         results.append([np.asarray(a.astype(mx.float32)) for a in steps])
     for step, (actual, expected) in enumerate(zip(results[1], results[0])):
         assert np.isfinite(actual).all()
-        np.testing.assert_array_equal(actual, expected, err_msg=f"{option}, step {step}")
+        np.testing.assert_array_equal(
+            actual, expected, err_msg=f"{option}, step {step}"
+        )

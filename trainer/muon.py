@@ -44,6 +44,9 @@ _sinkhorn_kernels: dict = {}
 _ns_core_fns: dict = {}
 _fro_norm_kernels: dict = {}
 _SINKHORN_FAST_NORM = os.environ.get("VIBY_OPT_SINKHORN_FAST_NORM", "1") == "1"
+_ADAM_CONTIG_GRADS = os.environ.get("VIBY_ADAM_CONTIG_GRADS", "0") == "1"
+_SINKHORN_FUSED_ROWS = os.environ.get("VIBY_SINKHORN_FUSED_ROWS", "0") == "1"
+_SINKHORN_FUSED_PAIRS = os.environ.get("VIBY_SINKHORN_FUSED_PAIRS", "0") == "1"
 
 # shapeful AdamW 缓存上限（按形状+超参），超出回退 shapeless
 _SHAPEFUL_CACHE_MAX = 128
@@ -550,7 +553,9 @@ def _polar_mom_kernel(m):
     return fn
 
 
-def _sinkhorn_body(beta, gamma, K, eps, tau, n, fast_norm=False):
+def _sinkhorn_body(
+    beta, gamma, K, eps, tau, n, fast_norm=False, fused_rows=False, fused_pairs=False
+):
     """算法 1（DeepSeek-V4.1 技术报告 §2.5）的一步更新（未编译）。
 
     逐行对照（编号 = 报告算法 1 的行号）：
@@ -583,6 +588,7 @@ def _sinkhorn_body(beta, gamma, K, eps, tau, n, fast_norm=False):
         # 行 3：逐行 ℓ₂ 范数 ρ_i 与均值 ρ̄（f32）
         if fast_norm:
             from .fast_norm import square_sum
+
             rho = mx.sqrt(square_sum(gh, 1))
         else:
             g32 = gh.astype(mx.float32)
@@ -592,6 +598,19 @@ def _sinkhorn_body(beta, gamma, K, eps, tau, n, fast_norm=False):
         U = mx.where(rho <= tau * rho_bar, mx.zeros_like(gh), gh)
         # 行 6-16：K 步交替行/列 L2 归一化（奇数步行、偶数步列）
         for k in range(1, K + 1):
+            if fast_norm and fused_pairs and K % 2:
+                from .sinkhorn_pairs import first_row_from_norm, column_then_row
+
+                if k == 1:
+                    U = first_row_from_norm(gh, rho, rho <= tau * rho_bar, eps)
+                elif k % 2 == 0:
+                    U = column_then_row(U, eps)
+                continue
+            if fast_norm and fused_rows and k % 2:
+                from .sinkhorn_rows import row_normalize
+
+                U = row_normalize(U, eps)
+                continue
             if fast_norm:
                 nrm = mx.sqrt(square_sum(U, 1 if k % 2 else 0))
             elif k % 2 == 1:
@@ -618,10 +637,30 @@ def _sinkhorn_kernel(beta, gamma, K, eps, tau, n):
     （MLX 弱类型提升下 float×bf16 保持 bf16，换成 f32 数组会抬 dtype）；
     lr 随 scheduler 每步变，作数组入参。
     """
-    key = (beta, gamma, K, eps, tau, n, _SINKHORN_FAST_NORM)
+    key = (
+        beta,
+        gamma,
+        K,
+        eps,
+        tau,
+        n,
+        _SINKHORN_FAST_NORM,
+        _SINKHORN_FUSED_ROWS,
+        _SINKHORN_FUSED_PAIRS,
+    )
     fn = _sinkhorn_kernels.get(key)
     if fn is None:
-        fn = partial(mx.compile, shapeless=not _SINKHORN_FAST_NORM)(_sinkhorn_body(*key))
+        if _SINKHORN_FUSED_ROWS:
+            from .sinkhorn_rows import _kernel
+
+            _kernel()
+        if _SINKHORN_FUSED_PAIRS:
+            from .sinkhorn_pairs import _kernel
+
+            _kernel()
+        fn = partial(mx.compile, shapeless=not _SINKHORN_FAST_NORM)(
+            _sinkhorn_body(*key)
+        )
         _sinkhorn_kernels[key] = fn
     return fn
 
@@ -696,7 +735,9 @@ def _adamw_kernel(b1, b2, eps, wd, bias_correction, cautious=False):
     return fn
 
 
-def _adamw_kernel_shapeful(b1, b2, eps, wd, bias_correction, shape, dtype, cautious=False):
+def _adamw_kernel_shapeful(
+    b1, b2, eps, wd, bias_correction, shape, dtype, cautious=False
+):
     """shapeful 版：按具体形状固化 grid 的编译 AdamW。
 
     shapeless kernel 在 100M 级大 tensor（堆叠专家栈）上只跑到
@@ -801,6 +842,16 @@ class FusedAdamW(optim.AdamW):
             self.cautious,
         )
         flat_g = tree_flatten(gradients)
+        if _ADAM_CONTIG_GRADS:
+            flat_g = [
+                (
+                    path,
+                    mx.contiguous(g)
+                    if g.size * g.dtype.size >= _SHAPEFUL_MIN_BYTES
+                    else g,
+                )
+                for path, g in flat_g
+            ]
         flat_p = dict(tree_flatten(parameters))
         gmap = dict(flat_g)
         groups: dict = {}
@@ -1158,19 +1209,14 @@ class BatchedMuon(optim.Muon):
                 b, r = orig[0], orig[1]
                 c = g.size // (b * r)
                 stack_groups.setdefault((b, r, c), []).append((path, orig))
-            elif (
-                (hd := self._per_head_dim(path)) > 0
-                and orig[0] % hd == 0
-            ):
+            elif (hd := self._per_head_dim(path)) > 0 and orig[0] % hd == 0:
                 # 逐头 Muon：Query 权重按行拆成 (n_heads, head_dim, in) 后
                 # 进 stack 组（batch 维无耦合，等于每头独立 NS + 逐头
                 # hyperball 范数冻结）。注意力用 config.head_dim、indexer 用
                 # config.index_head_dim——两者头数/头维度不同，key 天然分到
                 # 不同 stack 组（key 含 r=head_dim）。
                 nh = orig[0] // hd
-                stack_groups.setdefault((nh, hd, orig[1]), []).append(
-                    (path, orig)
-                )
+                stack_groups.setdefault((nh, hd, orig[1]), []).append((path, orig))
             else:
                 groups.setdefault(orig, []).append((path, orig))
 
@@ -1281,9 +1327,7 @@ class BatchedMuon(optim.Muon):
                         if self._no_ns
                         else self._ns5_gram(Gt, steps=self.stack_ns_steps)
                     )
-                    U, Vn = polar_mom_fn(
-                        Ot, state_v[path].reshape(b, r, c)
-                    )
+                    U, Vn = polar_mom_fn(Ot, state_v[path].reshape(b, r, c))
                     U = U * (
                         _fro_norm_auto(Ot) / mx.maximum(_fro_norm_auto(U), 1e-12)
                     ).astype(U.dtype)
@@ -1355,9 +1399,7 @@ def create_adamw_optimizer(model, args, training_type="pretrain"):
         # token embedding / lm_head / DSpark 头 / Engram 检索表：纯 AdamW 对照
         # 组（--optimizer adamw 的杠杆实验）下不细分，只按 embed 组统一 lr 系数
         return (
-            path.endswith(".embed.weight")
-            or "lm_head" in path
-            or "markov_head" in path
+            path.endswith(".embed.weight") or "lm_head" in path or "markov_head" in path
         )
 
     embed_count = sum(1 for p, a in trainable if _is_embed(p, a))
@@ -1468,9 +1510,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         if "engram_layers" in path:
             return False
         return (
-            path.endswith(".embed.weight")
-            or "lm_head" in path
-            or "markov_head" in path
+            path.endswith(".embed.weight") or "lm_head" in path or "markov_head" in path
         )
 
     def _is_ngram_table(path, arr):
@@ -1496,8 +1536,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     )
     _sink_gamma = float(os.environ.get("VIBY_SINKHORN_GAMMA", "0.18"))
     _sink_steps = int(
-        getattr(args, "sinkhorn_steps", None)
-        or os.environ.get("VIBY_SINKHORN_K", "11")
+        getattr(args, "sinkhorn_steps", None) or os.environ.get("VIBY_SINKHORN_K", "11")
     )
     _sink_eps = float(os.environ.get("VIBY_SINKHORN_EPS", "1e-20"))
     _sink_tau = float(os.environ.get("VIBY_SINKHORN_TAU", "1e-3"))
@@ -1543,13 +1582,9 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
             and (experts_in_muon or ".experts." not in path)
             and ".router." not in path
             and not (
-                ".engram_layers." in path
-                and path.endswith(("q_weight", "k_weight"))
+                ".engram_layers." in path and path.endswith(("q_weight", "k_weight"))
             )
             and "confidence_head" not in path
-            # Product-VQ centroids are embedding tables, not matrices whose
-            # original radius should be preserved by MuonH.
-            and not path.startswith("ncp.codebooks")
             and not path.endswith(("freq_cos", "freq_sin"))
         )
 
@@ -1665,8 +1700,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
                 f"{ngram_table_count} 个张量"
             )
     Logger(
-        f"  - AdamW 归一化层权重组 (lr=adam_lr, wd={adam_wd:g}): "
-        f"{norm_count} 个张量"
+        f"  - AdamW 归一化层权重组 (lr=adam_lr, wd={adam_wd:g}): {norm_count} 个张量"
     )
     Logger(
         f"  - MoE router 参数组 (lr=adam_lr×0.05, wd={adam_wd:g}): "
@@ -1739,7 +1773,8 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
             # muonh 加速旋钮（默认路径 muonh=False 时全部不影响数值）：
             # NS 迭代 bf16（范数仍 fp32）；逐专家 NS 的迭代步数
             ns_bf16=muonh and os.environ.get("VIBY_MUONH_NS_BF16", "1") == "1",
-            stack_ns_steps=int(os.environ.get("VIBY_MUONH_STACK_NS_STEPS", "0")) or None,
+            stack_ns_steps=int(os.environ.get("VIBY_MUONH_STACK_NS_STEPS", "0"))
+            or None,
             # 正交化固定每步全量重算。曾有的 NS 降频复用（EVERY=8）与
             # Temporal Q 缓存是 r082 回退的最大单项元凶（早期 −0.4~0.5 nat，
             # probe_p1/p5），已删除——负面结果见 BatchedMuon 类 docstring。

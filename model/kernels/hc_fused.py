@@ -201,7 +201,9 @@ def prewarm_hc_post(hc: int = 4, dtype=mx.bfloat16, dim: int = 8):
         comb = mx.zeros((1, hc, hc), dtype=mx.float32)
         dims = mx.array([dim, hc, 1], dtype=mx.int32)
         mx.eval(_hc_post_kernel(x, res, post, comb, dims))
-        if dtype != mx.float32:  # fp32 训练路径也预热一份，避免首调用落在 compile trace 里
+        if (
+            dtype != mx.float32
+        ):  # fp32 训练路径也预热一份，避免首调用落在 compile trace 里
             xf = x.astype(mx.float32)
             resf = res.astype(mx.float32)
             mx.eval(_hc_post_kernel(xf, resf, post, comb, dims))

@@ -341,9 +341,7 @@ class NgramHashState(nn.Module):
         mapped = self._token_map[mx.maximum(ids, 0)]
         return mx.where(alive, mapped, mx.array(self.DEAD, dtype=mx.int32))
 
-    def __call__(
-        self, input_ids: mx.array, prev_tokens=None, token_mask=None
-    ) -> tuple:
+    def __call__(self, input_ids: mx.array, prev_tokens=None, token_mask=None) -> tuple:
         """返回 (hash_ids, new_prev_tokens)。
 
         input_ids: [B, T] 原始 token id；prev_tokens: [B, max_ngram_size-1]
@@ -366,9 +364,7 @@ class NgramHashState(nn.Module):
         else:
             prev = prev_tokens.astype(mx.int32)
             if prev.shape != (batch, window):
-                raise ValueError(
-                    f"prev_tokens 必须是 [B, {window}]，得到 {prev.shape}"
-                )
+                raise ValueError(f"prev_tokens 必须是 [B, {window}]，得到 {prev.shape}")
         # [B, window + T]：可回看的完整窗口（前缀是历史，负值/越界都算 DEAD）
         ext = mx.concatenate(
             [self._compress(prev), self._compress(input_ids, token_mask)], axis=1
@@ -391,7 +387,9 @@ class NgramHashState(nn.Module):
 
         # 一个回看阶一个 XOR：第 i 步的滚动值就是 (i+1)-gram 的哈希；每阶落在
         # 自己的素数桶区间里
-        products = tokens[:, :, None, :].astype(mx.int64) * self._multipliers[None, None]
+        products = (
+            tokens[:, :, None, :].astype(mx.int64) * self._multipliers[None, None]
+        )
         rolling = products[..., 0]
         hashes = []
         for i in range(1, self._max_ngram_size):
@@ -404,7 +402,7 @@ class NgramHashState(nn.Module):
         else:
             raw = mx.where(token_mask, input_ids, mx.array(self.DEAD, dtype=mx.int32))
         full = mx.concatenate([prev, raw], axis=1)
-        new_prev = full[:, full.shape[1] - window:]
+        new_prev = full[:, full.shape[1] - window :]
         return hash_ids, new_prev
 
 

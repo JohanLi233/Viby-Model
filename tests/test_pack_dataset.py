@@ -79,7 +79,9 @@ def _reference_pack(path, tokenizer, max_length, with_segs=False):
     return packed, segs
 
 
-def _reference_align_pack(path, tokenizer, max_length, max_doc_len=None, with_segs=False):
+def _reference_align_pack(
+    path, tokenizer, max_length, max_doc_len=None, with_segs=False
+):
     """文档边界对齐参考实现：单篇先按 max_doc_len 截断再补 eos，块首落在文档
     开头，跨块尾部丢弃（与 _raw_int32_to_npy_aligned 相同口径）。"""
     import bisect

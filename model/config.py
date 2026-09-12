@@ -29,7 +29,6 @@
 """
 
 import json
-import math
 import os
 
 
@@ -116,13 +115,27 @@ class VibyConfig:
         preset = kw.pop("preset", None)
         base = dict(_DEFAULT_LAYER_PRESET)
         if preset == "tiny":
-            base.update(dim=256, n_layers=4, n_heads=4, head_dim=64, rope_head_dim=16,
-                        q_lora_rank=128, o_groups=2, o_lora_rank=64, moe_inter_dim=128,
-                        n_routed_experts=16, n_activated_experts=4, window_size=32,
-                        index_n_heads=4, index_head_dim=32, index_topk=16,
-                        engram_n_heads=2, engram_head_dim=32,
-                        # tiny 预设要显式压回小表，否则会继承 ≈1B 配方的大 Engram
-                        engram_vocab_size=8192)
+            base.update(
+                dim=256,
+                n_layers=4,
+                n_heads=4,
+                head_dim=64,
+                rope_head_dim=16,
+                q_lora_rank=128,
+                o_groups=2,
+                o_lora_rank=64,
+                moe_inter_dim=128,
+                n_routed_experts=16,
+                n_activated_experts=4,
+                window_size=32,
+                index_n_heads=4,
+                index_head_dim=32,
+                index_topk=16,
+                engram_n_heads=2,
+                engram_head_dim=32,
+                # tiny 预设要显式压回小表，否则会继承 ≈1B 配方的大 Engram
+                engram_vocab_size=8192,
+            )
         for k, v in base.items():
             kw.setdefault(k, v)
 
@@ -153,11 +166,20 @@ class VibyConfig:
         self.n_mtp_layers = n_mtp
         ratios = kw.get("compress_ratios")
         self.compress_ratios = tuple(
-            int(x) for x in (ratios if ratios is not None else default_compress_ratios(self.n_layers, n_mtp))
+            int(x)
+            for x in (
+                ratios
+                if ratios is not None
+                else default_compress_ratios(self.n_layers, n_mtp)
+            )
         )
         auto_kv, auto_idx, auto_cand = default_source_layers(self.n_layers)
-        self.kv_source_layers = tuple(int(x) for x in kw.get("kv_source_layers", auto_kv))
-        self.index_source_layers = tuple(int(x) for x in kw.get("index_source_layers", auto_idx))
+        self.kv_source_layers = tuple(
+            int(x) for x in kw.get("kv_source_layers", auto_kv)
+        )
+        self.index_source_layers = tuple(
+            int(x) for x in kw.get("index_source_layers", auto_idx)
+        )
         self.candidate_source_layer = int(kw.get("candidate_source_layer", auto_cand))
         self.candidate_topk_blocks = int(kw.get("candidate_topk_blocks", 64))
         self.candidate_block_size = int(kw.get("candidate_block_size", 8))
@@ -214,7 +236,9 @@ class VibyConfig:
         self.engram_n_heads = int(kw["engram_n_heads"])
         self.engram_head_dim = int(kw["engram_head_dim"])
         self.engram_pad_id = int(kw.get("engram_pad_id", self.pad_token_id))
-        self.engram_compressed_vocab_size = int(kw.get("engram_compressed_vocab_size", 0))
+        self.engram_compressed_vocab_size = int(
+            kw.get("engram_compressed_vocab_size", 0)
+        )
         _ne = kw.get("engram_num_embeddings")
         if _ne is None and self.engram_layer_ids:
             from .engram import compute_num_embeddings
@@ -233,13 +257,23 @@ class VibyConfig:
         self.route_scale = float(kw.get("route_scale", 1.5))
         self.swiglu_limit = float(kw.get("swiglu_limit", 10.0))
         self.bias_update_rate = float(kw.get("bias_update_rate", 1e-3))
+        self.moe_balance_method = str(kw.get("moe_balance_method", "qb"))
+        self.qb_update_rate = float(kw.get("qb_update_rate", 0.5))
+        self.qb_stats_rows = int(kw.get("qb_stats_rows", 8192))
+        self.router_fp32 = bool(kw.get("router_fp32", True))
 
         # ---- MTP / DSpark ----
         self.dspark_block_size = int(kw.get("dspark_block_size", 4))
-        self.dspark_noise_token_id = int(kw.get("dspark_noise_token_id", self.pad_token_id))
+        self.dspark_noise_token_id = int(
+            kw.get("dspark_noise_token_id", self.pad_token_id)
+        )
         _tgt = kw.get("dspark_target_layer_ids")
         if _tgt is None:
-            _tgt = tuple(range(max(0, self.n_layers - 3), self.n_layers)) if self.n_layers >= 3 else (self.n_layers - 1,)
+            _tgt = (
+                tuple(range(max(0, self.n_layers - 3), self.n_layers))
+                if self.n_layers >= 3
+                else (self.n_layers - 1,)
+            )
         self.dspark_target_layer_ids = tuple(int(x) for x in _tgt)
         self.dspark_markov_rank = int(kw.get("dspark_markov_rank", 64))
         self.dspark_n_routed_experts = int(kw.get("dspark_n_routed_experts", 32))
@@ -259,19 +293,12 @@ class VibyConfig:
         self.psr_max_rounds = int(kw.get("psr_max_rounds", 8))
         self.psr_update_scale = float(kw.get("psr_update_scale", 0.25))
 
-        self.ncp_enabled = bool(kw.get("ncp_enabled", False))
-        self.ncp_chunk_size = int(kw.get("ncp_chunk_size", 4))
-        self.ncp_layers = int(kw.get("ncp_layers", max(1, self.n_encoder_layers // 2)))
-        self.ncp_heads = int(kw.get("ncp_heads", max(1, self.dim // 128)))
-        self.ncp_codebooks = int(kw.get("ncp_codebooks", max(1, self.dim // 128)))
-        self.ncp_codebook_size = int(kw.get("ncp_codebook_size", 128))
-        self.ncp_inter_dim = int(kw.get("ncp_inter_dim", ((self.dim * 43 // 16 + 63) // 64) * 64))
-        self.ncp_rope_theta = float(kw.get("ncp_rope_theta", 500000.0))
-        self.ncp_fusion_init = float(kw.get("ncp_fusion_init", 0.1))
-        self.ncp_merge = str(kw.get("ncp_merge", "softmax"))
-        self.ncp_loss_reduction = str(kw.get("ncp_loss_reduction", "mean"))
-        self.ncp_loss_weight = float(kw.get("ncp_loss_weight", 1.0))
-        self.ncp_vq_loss_weight = float(kw.get("ncp_vq_loss_weight", 1.0))
+        # Residual lifting reuses the existing middle decoder weights. The
+        # execution identity must therefore be recorded independently of keys.
+        self.ced_recurrent_enabled = bool(kw.get("ced_recurrent_enabled", False))
+        self.ced_recurrent_stride = int(kw.get("ced_recurrent_stride", 4))
+        self.ced_recurrent_rounds = int(kw.get("ced_recurrent_rounds", 3))
+        self.ced_recurrent_arch = str(kw.get("ced_recurrent_arch", "residual_lift_v1"))
 
         self._validate()
 
@@ -322,31 +349,72 @@ class VibyConfig:
         )
 
     def _validate(self):
-        if self.ncp_enabled:
+        if self.ced_recurrent_stride < 1 or self.ced_recurrent_rounds < 1:
+            raise ValueError("CED recurrent stride and rounds must be positive")
+        if self.ced_recurrent_enabled:
+            if self.ced_recurrent_arch != "residual_lift_v1":
+                raise ValueError("Unsupported recurrent CED execution version")
             if self.psr_enabled:
-                raise ValueError("NCP and PSR are separate experiments; disable PSR for NCP")
-            if any(getattr(self, "ncp_" + k) < 1 for k in
-                   ("chunk_size", "layers", "heads", "codebooks", "codebook_size", "inter_dim")):
-                raise ValueError("NCP dimensions must be positive")
-            if self.dim % self.ncp_codebooks or self.dim % self.ncp_heads or (self.dim // self.ncp_heads) % 2:
-                raise ValueError("NCP requires divisible codebooks/heads and an even head dimension")
-            if self.ncp_merge not in ("softmax", "raw_logits") or self.ncp_loss_reduction not in ("mean", "l2"):
-                raise ValueError("invalid NCP merge or loss reduction")
-            if not all(math.isfinite(x) for x in (self.ncp_fusion_init,self.ncp_rope_theta,self.ncp_loss_weight,self.ncp_vq_loss_weight)) or self.ncp_rope_theta <= 0:
-                raise ValueError("NCP scales must be finite and RoPE theta positive")
-            if not (self.ncp_loss_weight >= 0 and self.ncp_vq_loss_weight >= 0):
-                raise ValueError("NCP loss weights must be nonnegative")
-        for name in ("slots", "dim", "blocks", "topk", "max_rounds", "horizon", "train_anchors"):
+                raise ValueError("Recurrent CED is a separate experiment; use --no-psr")
+            if self.n_mtp_layers != 0:
+                raise ValueError(
+                    "Recurrent CED requires --mtp_depth 0; disable MTP on both comparison sides"
+                )
+            boundary = self.n_encoder_layers
+            middle = range(boundary + 1, self.n_layers - 1)
+            if not middle:
+                raise ValueError(
+                    "Recurrent CED needs at least one middle decoder block"
+                )
+            if (
+                len(self.compress_ratios) < self.n_layers
+                or self.compress_ratios[boundary] != 1
+                or boundary not in self.kv_source_layers
+                or boundary not in self.index_source_layers
+            ):
+                raise ValueError("Recurrent CED requires a full ratio=1 CED boundary")
+            for i in range(boundary + 1, self.n_layers):
+                if self.compress_ratios[i] != 1 or i in self.kv_source_layers:
+                    raise ValueError(
+                        "Recurrent CED middle/output blocks must reuse token-level boundary KV (ratio=1, no new KV source)"
+                    )
+            if any(i in self.engram_layer_ids for i in middle):
+                raise ValueError(
+                    "Recurrent CED middle blocks cannot contain token Engram modules"
+                )
+            if self.n_layers - 1 in self.index_source_layers:
+                raise ValueError(
+                    "Recurrent CED output layer must reuse final anchor selection"
+                )
+            if self.candidate_source_layer not in (-1, boundary):
+                raise ValueError(
+                    "Recurrent CED candidate pool must originate at the full boundary"
+                )
+        for name in (
+            "slots",
+            "dim",
+            "blocks",
+            "topk",
+            "max_rounds",
+            "horizon",
+            "train_anchors",
+        ):
             if getattr(self, "psr_" + name) < 1:
                 raise ValueError(f"psr_{name} must be positive")
         if not 1 <= self.psr_rounds <= self.psr_max_rounds:
-            raise ValueError("psr_rounds must be within [1, psr_max_rounds]; use explicit off/state_only")
+            raise ValueError(
+                "psr_rounds must be within [1, psr_max_rounds]; use explicit off/state_only"
+            )
         if not 0 < self.psr_update_scale <= 1:
             raise ValueError("psr_update_scale must be within (0,1]")
         if self.psr_enabled:
             mid = self.n_encoder_layers
-            if (len(self.compress_ratios) <= mid or self.compress_ratios[mid] != 1
-                    or mid not in self.kv_source_layers or mid not in self.index_source_layers):
+            if (
+                len(self.compress_ratios) <= mid
+                or self.compress_ratios[mid] != 1
+                or mid not in self.kv_source_layers
+                or mid not in self.index_source_layers
+            ):
                 raise ValueError("PSR requires a Full ratio=1 CED boundary")
             if self.rope_head_dim > self.index_head_dim:
                 raise ValueError("PSR requires rope_head_dim <= index_head_dim")
@@ -356,7 +424,11 @@ class VibyConfig:
         # q 经 q_lora_rank 低秩再升到 n_heads*head_dim，不做 dim == n_heads*head_dim。
         if self.n_heads % self.o_groups != 0:
             raise ValueError("n_heads 必须被 o_groups 整除")
-        if self.rope_head_dim <= 0 or self.rope_head_dim % 2 or self.rope_head_dim > self.head_dim:
+        if (
+            self.rope_head_dim <= 0
+            or self.rope_head_dim % 2
+            or self.rope_head_dim > self.head_dim
+        ):
             raise ValueError("rope_head_dim 必须是 (0, head_dim] 内的偶数")
         if self.head_dim % (self.n_heads // self.o_groups) and False:
             pass
@@ -383,6 +455,14 @@ class VibyConfig:
             raise ValueError("score_func 必须是 sqrtsoftplus / softmax / sigmoid")
         if self.moe_inter_dim <= 0:
             raise ValueError("moe_inter_dim 必须 > 0")
+        if self.moe_balance_method not in ("qb", "noaux_tc"):
+            raise ValueError("moe_balance_method 必须是 qb / noaux_tc")
+        if not 0 <= self.qb_update_rate <= 1:
+            raise ValueError("qb_update_rate 必须在 [0, 1]")
+        if self.qb_stats_rows < 1:
+            raise ValueError("qb_stats_rows 必须 >= 1")
+        if not self.gate_temp > 0 or not self.bias_update_rate >= 0:
+            raise ValueError("gate_temp 必须 > 0，bias_update_rate 必须 >= 0")
         if self.index_topk <= 0 or self.index_n_heads <= 0 or self.index_head_dim <= 0:
             raise ValueError("indexer 的 heads / head_dim / topk 必须 > 0")
         if self.candidate_source_layer >= 0 and self.candidate_block_size <= 0:
@@ -406,7 +486,9 @@ class VibyConfig:
             if s not in self.kv_source_layers:
                 raise ValueError(f"第 {i} 层压缩率 {r} 但没有上游 kv 源")
             if self.compress_ratios[s] != r:
-                raise ValueError(f"第 {i} 层压缩率 {r} 与其 kv 源第 {s} 层 {self.compress_ratios[s]} 不一致")
+                raise ValueError(
+                    f"第 {i} 层压缩率 {r} 与其 kv 源第 {s} 层 {self.compress_ratios[s]} 不一致"
+                )
         for e in self.engram_layer_ids:
             if not 0 <= e < self.n_layers:
                 raise ValueError("engram_layer_ids 必须落在主干层内")
@@ -455,14 +537,20 @@ class VibyConfig:
         d = self.dim
         hd = self.head_dim
         total = 0
-        total += 2 * self.vocab_size * d if not self.tie_word_embeddings else self.vocab_size * d
+        total += (
+            2 * self.vocab_size * d
+            if not self.tie_word_embeddings
+            else self.vocab_size * d
+        )
         for i in range(self.n_layers):
             r = self.compress_ratios[i]
             mode = self.layer_mode(i)
             # attention：wq_a / wq_b / wkv / wo_a / wo_b
             total += d * self.q_lora_rank + self.q_lora_rank * self.n_heads * hd
             total += d * hd
-            total += (self.n_heads * hd // self.o_groups) * (self.o_groups * self.o_lora_rank)
+            total += (self.n_heads * hd // self.o_groups) * (
+                self.o_groups * self.o_lora_rank
+            )
             total += self.o_lora_rank * self.o_groups * d
             if mode == "full":  # 压缩器（+ ratio>1 时的门）
                 total += d * hd * (2 if r > 1 else 1)
@@ -491,36 +579,44 @@ class VibyConfig:
                 + d * self.q_lora_rank
                 + self.q_lora_rank * self.n_heads * hd
                 + d * hd
-                + (self.n_heads * hd // self.o_groups) * (self.o_groups * self.o_lora_rank)
+                + (self.n_heads * hd // self.o_groups)
+                * (self.o_groups * self.o_lora_rank)
                 + self.o_lora_rank * self.o_groups * d
-                + 2 * (2 + self.hc_mult) * self.hc_mult * self.hc_mult * d  # draft block 的 mHC
+                + 2
+                * (2 + self.hc_mult)
+                * self.hc_mult
+                * self.hc_mult
+                * d  # draft block 的 mHC
             )
             mtp += d * len(self.dspark_target_layer_ids) * d  # main_proj（仅第一层）
             mtp += 2 * self.vocab_size * self.dspark_markov_rank  # 马尔可夫头
             total += mtp
         if self.psr_enabled:
             s = self.psr_dim
-            total += s * (self.psr_slots + 2*d + 2*hd + self.psr_horizon + self.vocab_size)
-            total += (10*self.psr_blocks + 2)*s*s
-        if self.ncp_enabled:
-            total += self.ncp_layers*(4*d*d+3*d*self.ncp_inter_dim)
-            total += self.ncp_codebooks*d*self.ncp_codebook_size + self.ncp_codebook_size*d
+            total += s * (
+                self.psr_slots + 2 * d + 2 * hd + self.psr_horizon + self.vocab_size
+            )
+            total += (10 * self.psr_blocks + 2) * s * s
         return total
 
     def num_active_parameters(self) -> int:
         """每 token 激活的主干/桥接参数；PSR 前缀循环成本须按 R 单独计量。"""
         d = self.dim
         hd = self.head_dim
-        per_layer = self.n_activated_experts * 3 * d * self.moe_inter_dim + 3 * d * self.moe_inter_dim
-        per_layer += d * self.q_lora_rank + self.q_lora_rank * self.n_heads * hd + d * hd
-        per_layer += (self.n_heads * hd // self.o_groups) * (self.o_groups * self.o_lora_rank)
+        per_layer = (
+            self.n_activated_experts * 3 * d * self.moe_inter_dim
+            + 3 * d * self.moe_inter_dim
+        )
+        per_layer += (
+            d * self.q_lora_rank + self.q_lora_rank * self.n_heads * hd + d * hd
+        )
+        per_layer += (self.n_heads * hd // self.o_groups) * (
+            self.o_groups * self.o_lora_rank
+        )
         per_layer += self.o_lora_rank * self.o_groups * d
         total = self.n_layers * per_layer + 2 * self.vocab_size * d
         if self.n_mtp_layers > 0:
             total += self.n_mtp_layers * (
                 self.dspark_n_activated_experts * 3 * d * self.moe_inter_dim + per_layer
             )
-        if self.ncp_enabled:
-            total += (self.ncp_layers*(4*d*d+3*d*self.ncp_inter_dim)
-                      + self.ncp_codebooks*d*self.ncp_codebook_size)//self.ncp_chunk_size
         return total

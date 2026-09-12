@@ -39,18 +39,23 @@ if __name__ == "__main__":
     # 创建模型配置：CLI 结构参数（含 --preset 回填）→ VibyConfig kwargs，
     # 未显式传入的字段由 VibyConfig 的 ≈1B 默认配方补齐
     lm_config = VibyConfig(**build_model_kwargs(args))
-    if lm_config.ncp_enabled:
+    if lm_config.ced_recurrent_enabled:
         from .utils import Logger
-        Logger(f"NCP core enabled (PSR off): pool={lm_config.ncp_chunk_size}, "
-               f"concept_layers={lm_config.ncp_layers}, codebooks={lm_config.ncp_codebooks}x{lm_config.ncp_codebook_size}, "
-               f"merge={lm_config.ncp_merge}, MSE_reduction={lm_config.ncp_loss_reduction}; "
-               "Viby backbone retained, joint NTP + NCP + VQ")
+
+        Logger(
+            f"Residual-lifted recurrent CED: k={lm_config.ced_recurrent_stride}, "
+            f"q={lm_config.ced_recurrent_rounds}, full evidence KV, shared middle blocks; "
+            "NTP + original MoE balancing, MTP/protected PSR off. "
+            "Logical FLOPs estimates do not establish timing or quality gains."
+        )
     if lm_config.psr_enabled:
         from .utils import Logger
 
-        Logger(f"Protected PSR: output-only zero head, dense R={lm_config.psr_rounds}, "
-               f"H={lm_config.psr_horizon}, anchors/row={lm_config.psr_train_anchors}; "
-               "direct NTP, detached backbone, independent optimizer")
+        Logger(
+            f"Protected PSR: output-only zero head, dense R={lm_config.psr_rounds}, "
+            f"H={lm_config.psr_horizon}, anchors/row={lm_config.psr_train_anchors}; "
+            "direct NTP, detached backbone, independent optimizer"
+        )
 
     # 初始化模型
     model, tokenizer = init_model(lm_config, args)
@@ -72,14 +77,6 @@ if __name__ == "__main__":
     args.swanlab_run_name = args.swanlab_run_name.replace(
         "-LRauto", f"-LR{args.learning_rate:.4g}"
     )
-
-    if lm_config.ncp_enabled and not args.no_save:
-        import json
-        import time
-        from pathlib import Path
-        Path(args.out_dir, f"ncp_start_{time.time_ns()}.json").write_text(
-            json.dumps({"config": lm_config.to_dict(), "args": vars(args)}, indent=2, default=str)
-        )
 
     # 创建训练器
     trainer = BaseTrainer(args, model, tokenizer, lm_config, "pretrain")

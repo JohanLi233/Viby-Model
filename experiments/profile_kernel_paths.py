@@ -6,6 +6,7 @@ Indexer 打分（含无效 tile）的可节省整步时间。输出 profile.json
 捕获形状不靠 wrap 整图（会改变融合）；按配置静态计数调用次数，孤立 kernel
 在配方形状上计时。整步分母来自同进程一次 compiled f+b。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -36,7 +37,11 @@ from model.model import VibyForCausalLM
 from trainer.base_trainer import BaseTrainer
 from trainer.config import get_pretrain_parser, setup_training_args
 from trainer.flops import training_flops_per_token
-from trainer.utils import build_model_kwargs, convert_model_dtype, resolve_compute_scaled_hparams
+from trainer.utils import (
+    build_model_kwargs,
+    convert_model_dtype,
+    resolve_compute_scaled_hparams,
+)
 
 
 def isolated_indexer(shape, dtype, iters=8, warmup=3):
@@ -61,7 +66,10 @@ def isolated_indexer(shape, dtype, iters=8, warmup=3):
     idxk.prewarm_indexer_score(h, d, dtype)
     for _ in range(warmup):
         fwd()
-    ft = [(_t0 := time.perf_counter(), fwd(), time.perf_counter() - _t0)[2] for _ in range(iters)]
+    ft = [
+        (_t0 := time.perf_counter(), fwd(), time.perf_counter() - _t0)[2]
+        for _ in range(iters)
+    ]
     for _ in range(warmup):
         fb()
     bt = []
@@ -96,12 +104,14 @@ def isolated_sparse(shape, window_size, dtype, iters=8, warmup=3):
     keep = mx.random.uniform(shape=visible.shape) < min(1.0, 64 / max(n, 1))
     visible = visible & keep
     sinks = mx.zeros((h,), mx.float32)
-    scale = d ** -0.5
+    scale = d**-0.5
     mx.eval(q, window, compressed, visible, sinks)
     cot = mx.ones((b, h, t, d), dtype)
 
     def fn(a, wkv, ckv, s):
-        return sa.indexed_attention(a, wkv, ckv, visible, None, None, s, window_size, scale)
+        return sa.indexed_attention(
+            a, wkv, ckv, visible, None, None, s, window_size, scale
+        )
 
     def fwd():
         y = fn(q, window, compressed, sinks)
@@ -168,10 +178,19 @@ def main():
     mx.set_default_device(mx.gpu)
     mx.random.seed(args.seed)
     cli = [
-        "--out_dir", "research_runs/_bench", "--no_save",
-        "--batch_size", str(args.batch), "--accumulation_steps", "2",
-        "--max_seq_len", str(args.seq), "--cache_limit_gb", str(args.cache_limit_gb),
-        "--dtype", "bfloat16",
+        "--out_dir",
+        "research_runs/_bench",
+        "--no_save",
+        "--batch_size",
+        str(args.batch),
+        "--accumulation_steps",
+        "2",
+        "--max_seq_len",
+        str(args.seq),
+        "--cache_limit_gb",
+        str(args.cache_limit_gb),
+        "--dtype",
+        "bfloat16",
     ]
     targs = setup_training_args(get_pretrain_parser().parse_args(cli), "pretrain")
     cfg = VibyConfig(**build_model_kwargs(targs))
@@ -183,8 +202,10 @@ def main():
     modes = [cfg.layer_mode(i) for i in range(cfg.n_layers)]
     mode_counts = dict(Counter(modes))
     ratios = list(cfg.compress_ratios[: cfg.n_layers])
-    mid = cfg.n_layers // 2
-    n_index_calls = sum(1 for i in range(cfg.n_layers) if ratios[i] > 0 and cfg.layer_mode(i) != "reuse")
+    cfg.n_layers // 2
+    n_index_calls = sum(
+        1 for i in range(cfg.n_layers) if ratios[i] > 0 and cfg.layer_mode(i) != "reuse"
+    )
     n_sparse_calls = sum(1 for i in range(cfg.n_layers) if ratios[i] > 0)
     encoder_n = args.seq // 2
     decoder_n = args.seq
@@ -208,17 +229,32 @@ def main():
     mx.eval(grads)
     compiled_fb_s = time.perf_counter() - t0
     mem = memory_snapshot()
-    finite = all(bool(mx.all(mx.isfinite(g.astype(mx.float32)))) for _, g in tree_flatten(grads))
+    finite = all(
+        bool(mx.all(mx.isfinite(g.astype(mx.float32)))) for _, g in tree_flatten(grads)
+    )
     grad_info = indexer_grad_report(grads)
 
     idx_shapes = []
-    for n, count in ((encoder_n, sum(1 for i, r in enumerate(ratios) if r == 2 and modes[i] != "reuse")),
-                     (decoder_n, sum(1 for i, r in enumerate(ratios) if r == 1 and modes[i] != "reuse"))):
+    for n, count in (
+        (
+            encoder_n,
+            sum(1 for i, r in enumerate(ratios) if r == 2 and modes[i] != "reuse"),
+        ),
+        (
+            decoder_n,
+            sum(1 for i, r in enumerate(ratios) if r == 1 and modes[i] != "reuse"),
+        ),
+    ):
         if count <= 0:
             continue
         sh = {
-            "B": args.batch, "T": args.seq, "H": cfg.index_n_heads,
-            "D": cfg.index_head_dim, "N": n, "count": count, "role": "encoder" if n == encoder_n else "decoder",
+            "B": args.batch,
+            "T": args.seq,
+            "H": cfg.index_n_heads,
+            "D": cfg.index_head_dim,
+            "N": n,
+            "count": count,
+            "role": "encoder" if n == encoder_n else "decoder",
         }
         iso = isolated_indexer(sh, mx.bfloat16)
         iso["shape"] = sh
@@ -226,13 +262,20 @@ def main():
         idx_shapes.append(iso)
 
     sa_shapes = []
-    for n, count in ((encoder_n, sum(1 for r in ratios if r == 2)),
-                     (decoder_n, sum(1 for r in ratios if r == 1))):
+    for n, count in (
+        (encoder_n, sum(1 for r in ratios if r == 2)),
+        (decoder_n, sum(1 for r in ratios if r == 1)),
+    ):
         if count <= 0:
             continue
         sh = {
-            "B": args.batch, "T": args.seq, "H": cfg.n_heads,
-            "D": cfg.head_dim, "N": n, "count": count, "role": "encoder" if n == encoder_n else "decoder",
+            "B": args.batch,
+            "T": args.seq,
+            "H": cfg.n_heads,
+            "D": cfg.head_dim,
+            "N": n,
+            "count": count,
+            "role": "encoder" if n == encoder_n else "decoder",
         }
         iso = isolated_sparse(sh, cfg.window_size, mx.bfloat16)
         iso["shape"] = sh
@@ -267,7 +310,11 @@ def main():
     # Reindex 候选池不会减少 causal empty tile；P3a 还额外跳过 candidate 外的
     # 可达 tile。没有实测 candidate 密度时，用「空因果 tile + 一半可达打分」
     # 作为乐观上界，避免低估 P3a。
-    p3_optimistic = (empty_save + 0.5 * max(0.0, idx_fwd - empty_save)) / step_ref if step_ref else 0
+    p3_optimistic = (
+        (empty_save + 0.5 * max(0.0, idx_fwd - empty_save)) / step_ref
+        if step_ref
+        else 0
+    )
 
     pick = "P2"
     reason = "稀疏 Attention 反向的可节省整步时间更大"
@@ -319,7 +366,9 @@ def main():
             "Indexer 参数梯度为 0 时，训练预算不花在 indexer VJP/dK atomic 上。",
         ],
     }
-    (run_dir / "profile.json").write_text(json.dumps(profile, indent=2, ensure_ascii=False, default=str) + "\n")
+    (run_dir / "profile.json").write_text(
+        json.dumps(profile, indent=2, ensure_ascii=False, default=str) + "\n"
+    )
     md = [
         "# Kernel 路径归因",
         "",

@@ -274,8 +274,12 @@ def main():
         type=int,
         help="每轮草稿上限（默认 1，实际不超过 dspark_block_size-1 和剩余长度）",
     )
-    parser.add_argument("--mtp_confidence_threshold", type=float, default=0.0,
-                        help="DSpark 置信度低于此值时停止本轮草稿；0 关闭此调度，范围 [0,1]")
+    parser.add_argument(
+        "--mtp_confidence_threshold",
+        type=float,
+        default=0.0,
+        help="DSpark 置信度低于此值时停止本轮草稿；0 关闭此调度，范围 [0,1]",
+    )
     parser.add_argument(
         "--model_mode",
         "--mode",
@@ -315,14 +319,21 @@ def main():
     # 新架构（DeepSeek-V4.1 缩放版）只有一条推理路径：engine 的连续 batch。
     # 旧的 use_linear_attn 分支随旧架构一起删除了。
     engine = VibyEngine(model, tokenizer, max_num_seqs=1)
-    print("[engine] VibyEngine（window / compress_kv / index_k 三类池，连续 batch + 前缀复用）")
+    prefix_status = "前缀复用已启用" if engine.prefix is not None else "前缀复用已关闭"
+    print(
+        f"[engine] VibyEngine（window / compress_kv / index_k 三类池，连续 batch，{prefix_status}）"
+    )
+    if model.config.psr_enabled:
+        print(f"[engine] PSR 工作区已启用，每 {model.config.psr_horizon} 个位置刷新")
     if args.use_mtp_speculative:
         try:
             engine._validate_speculative(_sampling_params(args, tokenizer, 1))
         except ValueError as exc:
             parser.error(str(exc))
         limit = min(args.num_speculative_tokens, model.config.dspark_block_size - 1)
-        print(f"[engine] DSpark 投机解码已启用：每轮最多 {limit} 个草稿，主干验证 + 拒绝修正采样")
+        print(
+            f"[engine] DSpark 投机解码已启用：每轮最多 {limit} 个草稿，主干验证 + 拒绝修正采样"
+        )
 
     prompts = get_prompt_datas(args)
     test_mode = int(input("[0] 自动测试\n[1] 手动输入\n"))

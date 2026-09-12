@@ -1,15 +1,17 @@
 """Kernel 优化共用计时 / 快照 / JSONL 口径。
 
-测量纪律来自 research/KERNEL_OPTIMIZATION_PLAN_LUNA.md §3.4：
+现行测量协议见 research/EXPERIMENT_PROTOCOL.md「正确性与性能」：
 warmup ≥3；A,B,B,A block × ≥3 组 × 每槽 5 次；主指标用配对 block 中位数；
 A/A 首尾漂移 >3% 本轮无结论；f+b 不更新权重；整窗口从同一快照恢复。
 """
+
 from __future__ import annotations
 
 import hashlib
 import json
 import os
 import statistics
+import subprocess
 import time
 from pathlib import Path
 
@@ -22,6 +24,8 @@ DEFAULT_VIBY_FLAGS = {
     "VIBY_SPARSE_TOPK_KERNEL": "1",
     "VIBY_SPARSE_ATTN_BWD_SPLIT": "1",
     "VIBY_SPARSE_ATTN_KEY_BWD": "0",
+    "VIBY_SPARSE_ATTN_FUSED_BWD": "1",
+    "VIBY_SPARSE_ATTN_FUSED_BWD_TILE": "32",
     "VIBY_INDEXER_KERNEL": "1",
     "VIBY_INDEXER_SELECT": "1",
     "VIBY_INDEXER_BQ": "1",
@@ -31,6 +35,9 @@ DEFAULT_VIBY_FLAGS = {
     "VIBY_DECODE_METADATA": "1",
     "VIBY_PREFILL_SELECT": "1",
     "VIBY_MOE_DECODE_GATHER": "1",
+    "VIBY_MOE_DECODE_COMPILE": "1",
+    "VIBY_DECODE_SIMD_POST": "1",
+    "VIBY_SINKHORN_SIMD_DECODE": "1",
     "VIBY_HC_KERNEL": "1",
     "VIBY_HC_PRE_NORM_KERNEL": "1",
     "VIBY_SINKHORN_KERNEL": "1",
@@ -76,11 +83,11 @@ def memory_snapshot():
         "active_bytes": active,
         "cache_bytes": cache,
         "peak_gb": peak / 1e9,
-        "peak_gib": peak / 1024 ** 3,
+        "peak_gib": peak / 1024**3,
         "active_gb": active / 1e9,
-        "active_gib": active / 1024 ** 3,
+        "active_gib": active / 1024**3,
         "cache_gb": cache / 1e9,
-        "cache_gib": cache / 1024 ** 3,
+        "cache_gib": cache / 1024**3,
     }
 
 
@@ -103,7 +110,7 @@ def clone_tree(tree):
     return tree_map(lambda x: x, tree)
 
 
-def snapshot_train_state(model, optimizer):
+def snapshot_train_state(model, optimizer, trainer=None):
     biases = None
     if hasattr(model, "moe_bias_stack"):
         biases = model.moe_bias_stack()
@@ -112,17 +119,32 @@ def snapshot_train_state(model, optimizer):
         "trainable": clone_tree(model.trainable_parameters()),
         "optimizer": clone_tree(optimizer.state),
         "biases": None if biases is None else biases,
+        "side_optimizer": clone_tree(optimizer.psr_optimizer.state)
+        if getattr(optimizer, "psr_optimizer", None) is not None
+        else None,
+        "psr_step": getattr(trainer, "_psr_step", None),
+        "en_delta": clone_tree(getattr(trainer, "_en_delta", None)),
     }
 
 
-def restore_train_state(model, optimizer, snap):
+def restore_train_state(model, optimizer, snap, trainer=None):
     model.update(snap["params"])
     # Optimizers mutate state dictionaries in place, even though array leaves
     # are immutable. Hand back fresh containers on EVERY restore.
     optimizer.state = clone_tree(snap["optimizer"])
+    side = getattr(optimizer, "psr_optimizer", None)
+    if side is not None and snap.get("side_optimizer") is not None:
+        side.state = clone_tree(snap["side_optimizer"])
+    if trainer is not None:
+        if snap.get("psr_step") is not None:
+            trainer._psr_step = snap["psr_step"]
+            trainer.args.psr_microstep = snap["psr_step"]
+        trainer._en_delta = clone_tree(snap.get("en_delta"))
     if snap["biases"] is not None and hasattr(model, "apply_moe_biases"):
         model.apply_moe_biases(snap["biases"])
     mx.eval(model.parameters(), optimizer.state)
+    if side is not None:
+        mx.eval(side.state)
     if snap["biases"] is not None:
         mx.eval(snap["biases"])
 
@@ -138,9 +160,40 @@ def measure_fn(fn, iters, warmup=3):
     return times
 
 
+def check_exclusive_gpu():
+    """Opt-in measurement guard; never stops another user's experiment.
+
+    Probe outside timed regions. On a competing workspace benchmark, abort
+    this measurement instead of reporting contended throughput as a result.
+    """
+    if os.environ.get("VIBY_BENCH_EXCLUSIVE", "0") != "1":
+        return
+    rows = subprocess.run(
+        ["ps", "-axo", "pid=,command="], check=True, capture_output=True, text=True
+    ).stdout.splitlines()
+    for line in rows:
+        fields = line.strip().split(None, 2)
+        if len(fields) != 3 or int(fields[0]) == os.getpid():
+            continue
+        pid, executable, arguments = fields
+        if Path(executable).name.startswith("python") and (
+            "experiments/" in arguments or "trainer/train_" in arguments
+        ):
+            raise RuntimeError(
+                f"GPU benchmark interrupted by competing Python process {pid}: {arguments}"
+            )
+
+
 def abba_blocks(
-    run_a, run_b, warmup=3, block_iters=5, n_blocks=3, label_a="A", label_b="B",
-    before_a=None, before_b=None,
+    run_a,
+    run_b,
+    warmup=3,
+    block_iters=5,
+    n_blocks=3,
+    label_a="A",
+    label_b="B",
+    before_a=None,
+    before_b=None,
 ):
     """预热两臂后按 A,B,B,A 测。fn 自己负责 mx.eval；before_* 在计时外调用。"""
     if label_a == label_b:
@@ -149,6 +202,7 @@ def abba_blocks(
         raise ValueError("expected warmup >= 0 and positive block_iters/n_blocks")
 
     def _prep(name):
+        check_exclusive_gpu()
         fn = before_a if name == label_a else before_b
         if fn is not None:
             fn()
@@ -165,7 +219,12 @@ def abba_blocks(
     last_a_median = None
     for bi in range(n_blocks):
         slots = []
-        for name, run in ((label_a, run_a), (label_b, run_b), (label_b, run_b), (label_a, run_a)):
+        for name, run in (
+            (label_a, run_a),
+            (label_b, run_b),
+            (label_b, run_b),
+            (label_a, run_a),
+        ):
             mx.reset_peak_memory()
             times = []
             for _ in range(block_iters):
@@ -173,8 +232,14 @@ def abba_blocks(
                 t0 = time.perf_counter()
                 run()
                 times.append(time.perf_counter() - t0)
+                check_exclusive_gpu()
             mem = memory_snapshot()
-            rec = {"arm": name, "times_s": times, "median_s": statistics.median(times), "memory": mem}
+            rec = {
+                "arm": name,
+                "times_s": times,
+                "median_s": statistics.median(times),
+                "memory": mem,
+            }
             slots.append(rec)
             if name == label_a:
                 all_a.extend(times)
@@ -186,14 +251,16 @@ def abba_blocks(
         a_meds = [s["median_s"] for s in slots if s["arm"] == label_a]
         b_meds = [s["median_s"] for s in slots if s["arm"] == label_b]
         paired = statistics.median(b_meds) / statistics.median(a_meds)
-        blocks.append({
-            "index": bi,
-            "slots": slots,
-            "A_median_s": statistics.median(a_meds),
-            "B_median_s": statistics.median(b_meds),
-            "B_over_A": paired,
-            "delta_s": statistics.median(b_meds) - statistics.median(a_meds),
-        })
+        blocks.append(
+            {
+                "index": bi,
+                "slots": slots,
+                "A_median_s": statistics.median(a_meds),
+                "B_median_s": statistics.median(b_meds),
+                "B_over_A": paired,
+                "delta_s": statistics.median(b_meds) - statistics.median(a_meds),
+            }
+        )
     block_speedups = [b["B_over_A"] for b in blocks]
     aa_drift = None
     if first_a_median and last_a_median:

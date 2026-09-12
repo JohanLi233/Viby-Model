@@ -24,6 +24,7 @@ MFU = (tokens/s × 每 token 训练 FLOPs) / 硬件峰值。
 """
 
 from mlx.utils import tree_flatten
+from model.recurrent import recurrent_active
 
 # M4 Max bf16 稠密 GEMM 实测峰值中位（12.9~14 TFLOPS）
 DEFAULT_PEAK_TFLOPS = 13.5
@@ -77,7 +78,7 @@ def gemm_active_params(model) -> int:
     for path, value in tree_flatten(model.trainable_parameters()):
         # PSR runs once per prefix, with R shared transitions. Counting its
         # matrices once per token overstates work and omits repeated work.
-        if path.startswith(("psr.", "ncp.")):
+        if path.startswith("psr."):
             continue
         # 1-D（norm gain / mHC scale·base / attn_sink / router bias）不是 GEMM 权重
         if getattr(value, "ndim", 0) < 2:
@@ -104,14 +105,30 @@ def attn_fwdbwd_flops_per_token(config, seq_len: int, attention_lengths=None) ->
     ratios = tuple(config.compress_ratios)
     layers = int(config.n_layers) + int(config.n_mtp_layers)
     if attention_lengths is not None and len(attention_lengths) != layers:
-        raise ValueError("attention_lengths must contain one mean per backbone/draft layer")
+        raise ValueError(
+            "attention_lengths must contain one mean per backbone/draft layer"
+        )
     total = 0.0
     for i in range(layers):
         draft = i >= int(config.n_layers)
         multiplier = int(config.dspark_block_size) if draft else 1
+        middle = (
+            recurrent_active(config)
+            and config.n_encoder_layers < i < config.n_layers - 1
+        )
         length_t = multiplier if draft else t
+        if middle:
+            length_t = t // config.ced_recurrent_stride
+            if length_t == 0:
+                continue
+            multiplier = config.ced_recurrent_rounds * length_t / t
         r = ratios[i] if i < len(ratios) else 0
-        w = min(length_t, window)
+        window_slots = (
+            (window + config.ced_recurrent_stride - 1) // config.ced_recurrent_stride
+            if middle
+            else window
+        )
+        w = min(length_t, window_slots)
         # Average causal window length, before document/padding masks.
         length = w - w * (w - 1) / (2 * length_t)
         if attention_lengths is not None:
@@ -119,27 +136,42 @@ def attn_fwdbwd_flops_per_token(config, seq_len: int, attention_lengths=None) ->
             if length < 0:
                 raise ValueError("attention lengths must be nonnegative")
         elif r > 0:
-            length += min(int(config.index_topk), (length_t + r - 1) // r)
+            # Evidence stays token resolution even for short latent queries.
+            memory_t = t if middle else length_t
+            length += min(int(config.index_topk), (memory_t + r - 1) // r)
         total += multiplier * 6 * heads * (head_dim + head_dim) * length
     return int(total)
 
 
 def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int:
-    """训练一步（fwd+bwd）每个 token 的近似 FLOPs，不含优化器。"""
-    return 6 * gemm_active_params(model) + attn_fwdbwd_flops_per_token(
-        model.config, seq_len, attention_lengths
-    ) + psr_pretrain_flops_per_token(model.config, seq_len) + ncp_flops_per_token(model.config, seq_len)
+    """Nominal matrix work, not hardware performance or a budget acceptance.
 
-
-def ncp_flops_per_token(cfg, seq_len):
-    """Nominal concept GEMMs at T/k resolution, including VQ distance forward."""
-    if not getattr(cfg,"ncp_enabled",False) or seq_len < cfg.ncp_chunk_size:
-        return 0
-    d,n = cfg.dim,seq_len//cfg.ncp_chunk_size
-    weights=cfg.ncp_layers*(4*d*d+3*d*cfg.ncp_inter_dim)+cfg.ncp_codebooks*d*cfg.ncp_codebook_size
-    # Concept QK/AV are materialized densely; no sparse-gather speed claim.
-    total=6*n*weights+12*cfg.ncp_layers*n*n*d+8*n*cfg.ncp_codebook_size*d
-    return int(total/seq_len)
+    Recurrent weighting uses static anchor capacity floor(T/k). It excludes
+    lifting, routing/index scoring, masks, optimizer and gradient accumulation
+    overhead; packed valid anchor counts must be reported separately.
+    """
+    cfg = model.config
+    gemms = gemm_active_params(model)
+    if recurrent_active(cfg) and seq_len > 0:
+        fraction = (
+            cfg.ced_recurrent_rounds * (seq_len // cfg.ced_recurrent_stride) / seq_len
+        )
+        middle_gemms = 0
+        for path, value in tree_flatten(model.trainable_parameters()):
+            parts = path.split(".")
+            if (
+                len(parts) > 3
+                and parts[:2] == ["model", "layers"]
+                and cfg.n_encoder_layers < int(parts[2]) < cfg.n_layers - 1
+                and value.ndim >= 2
+            ):
+                middle_gemms += _active_size(path, value, cfg)
+        gemms += (fraction - 1) * middle_gemms
+    return int(
+        6 * gemms
+        + attn_fwdbwd_flops_per_token(model.config, seq_len, attention_lengths)
+        + psr_pretrain_flops_per_token(model.config, seq_len)
+    )
 
 
 def psr_pretrain_flops_per_token(cfg, seq_len):
@@ -151,13 +183,21 @@ def psr_pretrain_flops_per_token(cfg, seq_len):
     t = int(seq_len)
     if t <= 0 or not getattr(cfg, "psr_enabled", False):
         return 0
-    a,m,s,r,d = min(cfg.psr_train_anchors,t),cfg.psr_slots,cfg.psr_dim,cfg.psr_rounds,cfg.dim
+    a, m, s, r, d = (
+        min(cfg.psr_train_anchors, t),
+        cfg.psr_slots,
+        cfg.psr_dim,
+        cfg.psr_rounds,
+        cfg.dim,
+    )
     hd = cfg.head_dim
-    total = 6*a*d*s + 6*a*r*m*(2*s*hd + cfg.psr_blocks*10*s*s)
-    total += 12*a*r*m*t*hd + cfg.psr_blocks*12*a*r*m*m*s
-    total += 6*(t*d*s + 2*a*m*s*s + t*s*cfg.vocab_size) + 12*t*m*s
-    total += 2*t*d*cfg.vocab_size
-    return int(total/t)
+    total = 6 * a * d * s + 6 * a * r * m * (2 * s * hd + cfg.psr_blocks * 10 * s * s)
+    total += 12 * a * r * m * t * hd + cfg.psr_blocks * 12 * a * r * m * m * s
+    total += (
+        6 * (t * d * s + 2 * a * m * s * s + t * s * cfg.vocab_size) + 12 * t * m * s
+    )
+    total += 2 * t * d * cfg.vocab_size
+    return int(total / t)
 
 
 def model_flops_utilization(

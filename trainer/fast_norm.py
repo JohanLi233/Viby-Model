@@ -3,6 +3,7 @@
 These kernels are optimizer bookkeeping, not differentiable model operators.
 Reduction order may differ from native MLX; division/casts stay with callers.
 """
+
 from functools import lru_cache
 
 import mlx.core as mx
@@ -36,16 +37,22 @@ def _kernel(axis):
         out[(size_t)tile * C + c] = acc;
         """
     return mx.fast.metal_kernel(
-        name=f"optimizer_square_sum_axis{axis}", input_names=["x"],
-        output_names=["out"], source=source,
+        name=f"optimizer_square_sum_axis{axis}",
+        input_names=["x"],
+        output_names=["out"],
+        source=source,
     )
 
 
 def square_sum(x, axis):
     """Return FP32 [R,1] or [1,C] sum of squares for a 2D array."""
-    if (x.ndim != 2 or axis not in (0, 1) or x.size == 0
-            or mx.default_device() != mx.gpu
-            or x.dtype not in (mx.float32, mx.float16, mx.bfloat16)):
+    if (
+        x.ndim != 2
+        or axis not in (0, 1)
+        or x.size == 0
+        or mx.default_device() != mx.gpu
+        or x.dtype not in (mx.float32, mx.float16, mx.bfloat16)
+    ):
         y = x.astype(mx.float32)
         return mx.sum(y * y, axis=axis, keepdims=True)
     r, c = x.shape
@@ -53,9 +60,12 @@ def square_sum(x, axis):
     shape = (r, 1) if axis == 1 else (tiles, c)
     grid = (r * 32, 1, 1) if axis == 1 else (((c + 127) // 128) * 128, tiles, 1)
     (out,) = _kernel(axis)(
-        inputs=[x], template=[("R", r), ("C", c)], grid=grid,
+        inputs=[x],
+        template=[("R", r), ("C", c)],
+        grid=grid,
         threadgroup=(32 if axis == 1 else 128, 1, 1),
-        output_shapes=[shape], output_dtypes=[mx.float32],
+        output_shapes=[shape],
+        output_dtypes=[mx.float32],
     )
     return out if axis == 1 else mx.sum(out, axis=0, keepdims=True)
 
@@ -63,7 +73,9 @@ def square_sum(x, axis):
 @lru_cache(None)
 def _flat_kernel():
     return mx.fast.metal_kernel(
-        name="optimizer_gradient_square_sum", input_names=["x"], output_names=["out"],
+        name="optimizer_gradient_square_sum",
+        input_names=["x"],
+        output_names=["out"],
         source=r"""
         uint tile = threadgroup_position_in_grid.x;
         uint tid = thread_position_in_threadgroup.x;
@@ -91,7 +103,11 @@ def gradient_square_sum(x):
         return mx.sum(mx.square(x.astype(mx.float32)))
     tiles = (x.size + 4095) // 4096
     (partial,) = _flat_kernel()(
-        inputs=[x], template=[("N", x.size)], grid=(tiles * 256, 1, 1),
-        threadgroup=(256, 1, 1), output_shapes=[(tiles,)], output_dtypes=[mx.float32],
+        inputs=[x],
+        template=[("N", x.size)],
+        grid=(tiles * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(tiles,)],
+        output_dtypes=[mx.float32],
     )
     return mx.sum(partial)

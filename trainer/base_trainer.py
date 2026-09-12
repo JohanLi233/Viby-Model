@@ -27,6 +27,7 @@ from .utils import (
     resolve_lr_horizon,
     set_ddp_flag,
     get_optimizer_steps,
+    validate_checkpoint_execution,
 )
 
 _SENTINEL = object()
@@ -40,9 +41,8 @@ _ACCUM_EAGER = os.environ.get("VIBY_ACCUM_EAGER", "1") != "0"
 # 提前释放。A/B 开关：VIBY_OPT_CHUNKED_EVAL=1。
 _OPT_CHUNKED_EVAL = os.environ.get("VIBY_OPT_CHUNKED_EVAL", "0") == "1"
 _OPT_CHUNK_BYTES = 512 << 20
-# 注：MoE 负载均衡已从旧的分位数 QB（margin 样本拼接）换成 V4.1 的
-# noaux_tc：forward 物化每专家 token 计数 out.moe_loads，窗口内直接累加，
-# 不需要样本抽稀/拼接。
+# Router statistics are explicit graph outputs. Counts add across microbatches;
+# bounded QB samples are retained in a list and concatenated once per window.
 
 
 def _collate_numpy(samples):
@@ -201,6 +201,10 @@ class BaseTrainer:
         self.tokenizer = tokenizer
         self.lm_config = lm_config
         self.training_type = training_type
+        self._tail_sft = (
+            training_type == "sft"
+            and getattr(args, "sft_algorithm", "standard") == "tail"
+        )
 
         # 单设备 MLX 训练，无分布式概念（保留属性以兼容调用方）
         self.ddp = False
@@ -236,10 +240,16 @@ class BaseTrainer:
 
     def _init_training_components(self):
         """初始化训练组件"""
-        protected = getattr(self.lm_config, 'psr_enabled', False)
+        protected = getattr(self.lm_config, "psr_enabled", False)
         base_view = ParameterView(self.model) if protected else self.model
-        self.psr_optimizer = optim.AdamW(learning_rate=getattr(self.args,'psr_learning_rate',1e-4),
-                                        weight_decay=getattr(self.args,'psr_weight_decay',0.0)) if protected else None
+        self.psr_optimizer = (
+            optim.AdamW(
+                learning_rate=getattr(self.args, "psr_learning_rate", 1e-4),
+                weight_decay=getattr(self.args, "psr_weight_decay", 0.0),
+            )
+            if protected
+            else None
+        )
         self._psr_step = 0
         # 创建优化器
         if getattr(self.args, "optimizer", "muon") == "adamw":
@@ -255,10 +265,37 @@ class BaseTrainer:
 
         # Save/restore the side optimizer separately; never place it in baseline state.
         self.optimizer.psr_optimizer = self.psr_optimizer
-        # noaux_tc 的 e_score_correction_bias 更新：forward 把 [L,E] 的每专家
-        # token 计数作为图输出物化（out.moe_loads），_optimizer_step 在窗口
-        # 末尾按 b += γ·sign(load_frac − 1/E) 覆写 frozen 的 bias
+        # Keep the sample memory bounded across the entire accumulation window.
         self._moe_gates = list(getattr(self.model, "moe_gates", None) or [])
+        if (
+            self.lm_config.moe_balance_method == "qb"
+            and self.lm_config.qb_stats_rows < self.args.accumulation_steps
+        ):
+            raise ValueError(
+                "qb_stats_rows must be >= accumulation_steps (at least one sample per microbatch)"
+            )
+        for gate in self._moe_gates:
+            rounds = 1
+            if (
+                getattr(self.lm_config, "ced_recurrent_enabled", False)
+                and self.lm_config.n_encoder_layers
+                < gate.layer_idx
+                < self.lm_config.n_layers - 1
+            ):
+                rounds = self.lm_config.ced_recurrent_rounds
+            budget = self.lm_config.qb_stats_rows // self.args.accumulation_steps
+            if self.lm_config.moe_balance_method == "qb" and budget < rounds:
+                raise ValueError(
+                    "qb_stats_rows must cover every recurrent round in every accumulated microbatch"
+                )
+            gate.qb_stats_rows = max(1, budget // rounds)
+        if self._moe_gates:
+            Logger(
+                f"MoE balancing={self.lm_config.moe_balance_method}, "
+                f"router_fp32={self.lm_config.router_fp32}, "
+                f"qb_update_rate={self.lm_config.qb_update_rate}, "
+                f"qb_stats_rows/window={self.lm_config.qb_stats_rows}"
+            )
 
         # loss + 梯度函数（MoE 用 sorted gather_mm 分发，形状只随 (B,T,E,K)
         # 静态确定，mx.compile 可用，见 _build_loss_and_grad）
@@ -277,30 +314,56 @@ class BaseTrainer:
 
         # 处理检查点恢复
         self.start_epoch, self.start_step = self._handle_checkpoint_resume()
-        self._psr_step = int(getattr(self.args,"psr_resumed_microstep", self.start_step))
+        self._psr_step = int(
+            getattr(self.args, "psr_resumed_microstep", self.start_step)
+        )
 
-    def _loss_fn(self, X, Y, loss_mask, attn_mask, seg_ids=None, psr_key=0, psr_gate=None):
+    def _loss_fn(
+        self,
+        X,
+        Y,
+        loss_mask,
+        attn_mask,
+        seg_ids=None,
+        psr_key=0,
+        psr_gate=None,
+        tail_reference=None,
+        tail_fraction=None,
+    ):
         """训练 loss 函数（model 走闭包引用）
 
-        返回 (加权和 loss / accumulation_steps, mtp 分量 loss, moe_loads,
-        lm_loss / accumulation_steps, z_loss)。mtp/lm/z 分量仅作日志展示、
-        不缩放；总 loss 里已含加权后的 mtp 与 z-loss。
+        返回 (loss / accumulation_steps, mtp_loss, moe_loads,
+        lm_loss / accumulation_steps, z_loss, metrics, moe_qb_margins)。
 
         moe_loads 是 forward 物化的 [L, E] 每专家 token 计数（compile 下纯
         侧信道 g._last_load 会被剪枝，必须经返回值出图）。累积窗口内按元素
-        累加即可（计数可加），窗口末尾交给 model.update_moe_biases 做
-        noaux_tc 偏置更新；无 MoE 时用零长占位保持图结构稳定。
+        累加即可；QB margins 则在窗口末尾拼接一次再取分位数。
+        无 MoE 时用零长占位保持图结构稳定。
         """
-        psr_inputs = dict(psr_mode="off", return_metrics=getattr(self.lm_config, "psr_enabled", False))
-        if self.training_type == "pretrain" and getattr(self.lm_config, "psr_enabled", False):
+        psr_inputs = dict(
+            psr_mode="off", return_metrics=getattr(self.lm_config, "psr_enabled", False)
+        )
+        if tail_reference is not None:
+            psr_inputs.update(
+                return_metrics=False,
+                tail_reference=tail_reference,
+                tail_fraction=tail_fraction,
+            )
+        if self.training_type == "pretrain" and getattr(
+            self.lm_config, "psr_enabled", False
+        ):
             from .psr_pretrain import text_psr_inputs
 
-            if getattr(self.args, 'psr_training_mode', 'recurrent') == 'off':
-                psr_inputs = dict(psr_mode='off', return_metrics=True)
+            if getattr(self.args, "psr_training_mode", "recurrent") == "off":
+                psr_inputs = dict(psr_mode="off", return_metrics=True)
             else:
-                psr_inputs = text_psr_inputs(self.lm_config, X, Y, loss_mask, attn_mask, seg_ids, psr_key)
-                psr_inputs['psr_mode'] = getattr(self.args, 'psr_training_mode', 'recurrent')
-            psr_inputs['psr_gate'] = psr_gate
+                psr_inputs = text_psr_inputs(
+                    self.lm_config, X, Y, loss_mask, attn_mask, seg_ids, psr_key
+                )
+                psr_inputs["psr_mode"] = getattr(
+                    self.args, "psr_training_mode", "recurrent"
+                )
+            psr_inputs["psr_gate"] = psr_gate
         res = self.model(
             input_ids=X,
             labels=Y,
@@ -316,11 +379,22 @@ class BaseTrainer:
         if moe_loads is None:
             moe_loads = mx.zeros((0,), dtype=mx.float32)
         loss = res.loss
-        if getattr(self.args, 'psr_freeze_base', False):
-            loss = res.corrected_loss if res.corrected_loss is not None else mx.stop_gradient(res.loss)
-        metrics = res.metrics if res.metrics is not None else mx.zeros((X.shape[0],8,3))
-        if res.ncp_metrics is not None:
-            metrics = res.ncp_metrics
+        if getattr(self.args, "psr_freeze_base", False):
+            loss = (
+                res.corrected_loss
+                if res.corrected_loss is not None
+                else mx.stop_gradient(res.loss)
+            )
+        metrics = (
+            res.metrics if res.metrics is not None else mx.zeros((X.shape[0], 8, 3))
+        )
+        if res.ced_metrics is not None:
+            metrics = res.ced_metrics
+        if getattr(res, "tail_stats", None) is not None:
+            metrics = res.tail_stats
+        qb_margins = res.moe_qb_margins
+        if qb_margins is None:
+            qb_margins = mx.zeros((0,), dtype=mx.float32)
         return (
             loss / self.args.accumulation_steps,
             mtp_loss,
@@ -328,6 +402,7 @@ class BaseTrainer:
             lm_loss / self.args.accumulation_steps,
             z_loss,
             metrics,
+            qb_margins,
         )
 
     def _loss_and_grad_with_params(
@@ -338,7 +413,11 @@ class BaseTrainer:
         Y,
         loss_mask,
         attn_mask,
-        seg_ids=None, psr_key=0, psr_gate=None,
+        seg_ids=None,
+        psr_key=0,
+        psr_gate=None,
+        tail_reference=None,
+        tail_fraction=None,
     ):
         """参数与 MoE bias 显式作为入参的 loss 函数（value_and_grad 的目标）。
 
@@ -353,12 +432,46 @@ class BaseTrainer:
         self.model.update(params)
         if hasattr(self.model, "apply_moe_biases"):
             self.model.apply_moe_biases(moe_biases)
-        return self._loss_fn(X, Y, loss_mask, attn_mask, seg_ids, psr_key, psr_gate)
+        return self._loss_fn(
+            X,
+            Y,
+            loss_mask,
+            attn_mask,
+            seg_ids,
+            psr_key,
+            psr_gate,
+            tail_reference,
+            tail_fraction,
+        )
 
     def _compute_loss_and_grad(
-        self, X, Y, loss_mask, attn_mask, seg_ids=None
+        self,
+        X,
+        Y,
+        loss_mask,
+        attn_mask,
+        seg_ids=None,
+        tail_reference=None,
+        tail_fraction=None,
     ):
         """一次微批的 value_and_grad；compile 后立刻恢复 params 与 bias。"""
+        from model.attention import _RECURRENT_OPTIMIZED
+
+        if (
+            getattr(self.lm_config, "ced_recurrent_enabled", False)
+            and attn_mask is not None
+            and not _RECURRENT_OPTIMIZED
+        ):
+            # Select the regular single-document graph outside mx.compile.
+            # An all-valid mask and constant document ID per row are exactly
+            # equivalent to absent attention metadata. The real loss mask stays.
+            # This one batch-level synchronization belongs to trainer overhead;
+            # packed/masked batches keep the fully position-aware graph.
+            regular = mx.all(attn_mask.astype(mx.bool_))
+            if seg_ids is not None:
+                regular = regular & mx.all(seg_ids == seg_ids[:, :1])
+            if bool(regular.item()):
+                attn_mask, seg_ids = None, None
         params = self.model.trainable_parameters()
         eval_params = params
         if self._expl_nest_mu > 0 and self._en_delta is not None:
@@ -375,14 +488,25 @@ class BaseTrainer:
             if hasattr(self.model, "moe_bias_stack")
             else mx.zeros((0,), dtype=mx.float32)
         )
-        protected = getattr(getattr(self, 'lm_config', None), 'psr_enabled', False)
+        protected = getattr(getattr(self, "lm_config", None), "psr_enabled", False)
         extra = ()
         if protected:
-            microstep = getattr(self, '_psr_step', 0)
-            extra = (mx.array(microstep + getattr(self.args,'seed',1337),mx.uint32), self.model.psr.calibration_gate)
+            microstep = getattr(self, "_psr_step", 0)
+            extra = (
+                mx.array(microstep + getattr(self.args, "seed", 1337), mx.uint32),
+                self.model.psr.calibration_gate,
+            )
             self._psr_step = microstep + 1
             self.args.psr_microstep = self._psr_step
-        outputs, grads = self._loss_and_grad(eval_params, biases, X, Y, loss_mask, attn_mask, seg_ids, *extra)
+        if tail_reference is not None:
+            extra = (
+                (*extra, tail_reference, tail_fraction)
+                if protected
+                else (0, None, tail_reference, tail_fraction)
+            )
+        outputs, grads = self._loss_and_grad(
+            eval_params, biases, X, Y, loss_mask, attn_mask, seg_ids, *extra
+        )
         # 无论 eager 还是 compile，f 内部的 model.update / apply_moe_biases 都
         # 只把模块的叶子换成了"trace 期的中间量"（compile 下是无 primitive 的
         # 占位数组，eager 下是 vjp trace 的 tracer）。不恢复的话，下一个微批的
@@ -418,10 +542,20 @@ class BaseTrainer:
         会被整体跳过，只训到尾部数据。sidecar 缺失/无 training_type
         字段时按同阶段处理（兼容旧 checkpoint）。
         """
+        validate_checkpoint_execution(
+            checkpoint_path,
+            self.lm_config,
+            self.args,
+            automatic=bool(getattr(self.args, "auto_resume", False)),
+        )
         base = checkpoint_path
         if base.endswith(".safetensors"):
             base = base[: -len(".safetensors")]
         meta_path = f"{base}.json"
+        if self.training_type == "sft":
+            from .tail_sft import validate_resume
+
+            validate_resume(checkpoint_path, self.args)
         if not os.path.exists(meta_path):
             return True
         try:
@@ -473,32 +607,56 @@ class BaseTrainer:
             dataset,
             batch_size=self.args.batch_size,
             shuffle=True,
-            drop_last=True,
+            drop_last=not getattr(self, "_tail_sft", False),
         )
         return self._data_loader
 
-    def _optimizer_step(self, accum_grads, accum_count, moe_loads=None):
+    def _optimizer_step(
+        self, accum_grads, accum_count, moe_loads=None, moe_qb_margins=None
+    ):
         """累积窗口结束：梯度裁剪 + 优化器更新 + MoE 路由偏置更新"""
         if accum_count <= 0 or accum_grads is None:
             return 0.0
+        if (
+            moe_loads is not None
+            and moe_loads.size > 0
+            and getattr(self.lm_config, "moe_balance_method", "noaux_tc") == "qb"
+            and moe_qb_margins is None
+        ):
+            raise ValueError(
+                "QB margins must be passed before applying the optimizer update"
+            )
 
-        protected = getattr(getattr(self, 'lm_config', None), 'psr_enabled', False)
+        protected = getattr(getattr(self, "lm_config", None), "psr_enabled", False)
         if protected:
             accum_grads, side_grads = split_gradients(accum_grads)
-            if side_grads and getattr(self.args,'psr_training_mode','recurrent') != 'off':
-                clip = getattr(self.args, 'psr_grad_clip', 1.0)
+            if (
+                side_grads
+                and getattr(self.args, "psr_training_mode", "recurrent") != "off"
+            ):
+                clip = getattr(self.args, "psr_grad_clip", 1.0)
                 if clip:
                     side_grads, norm = optim.clip_grad_norm(side_grads, clip)
                 else:
-                    norm = mx.sqrt(sum(gradient_square_sum(g) for _,g in tree_flatten(side_grads)))
+                    norm = mx.sqrt(
+                        sum(gradient_square_sum(g) for _, g in tree_flatten(side_grads))
+                    )
                 if bool(mx.isfinite(norm)):
-                    self.psr_optimizer.update(ParameterView(self.model,side=True),side_grads)
-                    mx.eval(self.model.psr.parameters(),self.psr_optimizer.state)
-                    if getattr(self.args,"log_interval",10) <= getattr(self.args,"accumulation_steps",1):
-                        Logger(f"PSR optimizer_step={int(self.psr_optimizer.step)} grad_norm={float(norm):.6g}")
+                    self.psr_optimizer.update(
+                        ParameterView(self.model, side=True), side_grads
+                    )
+                    mx.eval(self.model.psr.parameters(), self.psr_optimizer.state)
+                    if getattr(self.args, "log_interval", 10) <= getattr(
+                        self.args, "accumulation_steps", 1
+                    ):
+                        Logger(
+                            f"PSR optimizer_step={int(self.psr_optimizer.step)} grad_norm={float(norm):.6g}"
+                        )
                 else:
-                    Logger('PSR gradient non-finite: skip side update only; baseline remains independent')
-            if getattr(self.args,'psr_freeze_base',False):
+                    Logger(
+                        "PSR gradient non-finite: skip side update only; baseline remains independent"
+                    )
+            if getattr(self.args, "psr_freeze_base", False):
                 return 0.0
         # 每个微批的 loss 已除以 accumulation_steps，
         # 累加的梯度即窗口平均梯度，无需再除
@@ -531,7 +689,9 @@ class BaseTrainer:
             # MLX 参数数组不可变，update 前抓到的引用即更新前的值；
             # update 替换 module 树上的数组后再抓一次，差分即实际更新 δ。
             en_before = dict(tree_flatten(self.model.trainable_parameters()))
-        self.optimizer.update(ParameterView(self.model) if protected else self.model, grads)
+        self.optimizer.update(
+            ParameterView(self.model) if protected else self.model, grads
+        )
         if self._expl_nest_mu > 0:
             en_after = dict(tree_flatten(self.model.trainable_parameters()))
             self._en_delta = tree_unflatten(
@@ -542,12 +702,10 @@ class BaseTrainer:
                 ]
             )
 
-        # noaux_tc 偏置更新：窗口内各微批的 [L,E] 计数已累加（计数可加），
-        # 这里按 b -= γ·sign(load_frac − 1/E) 覆写每个 gate 的
-        # e_score_correction_bias。必须在 compile 图外调用：它写的是冻结的
-        # buffer，下一次前向作为显式入参进图。
+        # Only the next window sees the new frozen biases. Do not update from
+        # statistics of the current sequence inside the compiled forward.
         if moe_loads is not None and getattr(moe_loads, "size", 0) > 0:
-            self.model.update_moe_biases(moe_loads)
+            self.model.update_moe_biases(moe_loads, qb_margins=moe_qb_margins)
 
         if _OPT_CHUNKED_EVAL:
             # 注意：不能在这里 `from mlx.utils import tree_flatten`——那会让
@@ -630,6 +788,7 @@ class BaseTrainer:
         accum_count = 0
         last_grad_norm = 0.0
         last_moe_loads = None
+        qb_samples = []
 
         for step, batch in enumerate(loader_iter):
             # 跳过步骤（恢复训练时）
@@ -637,11 +796,37 @@ class BaseTrainer:
                 continue
             self._last_epoch = epoch
             self._last_step = step
-            shuffle_state = getattr(getattr(self, '_data_loader', None), 'epoch_shuffle_state', None)
+            shuffle_state = getattr(
+                getattr(self, "_data_loader", None), "epoch_shuffle_state", None
+            )
             if shuffle_state is not None:
-                self.args.epoch_shuffle_state = (shuffle_state[0], shuffle_state[1].tolist(), *shuffle_state[2:])
+                self.args.epoch_shuffle_state = (
+                    shuffle_state[0],
+                    shuffle_state[1].tolist(),
+                    *shuffle_state[2:],
+                )
             # doc_mask 打包模式下 dataset 多返回一项 segment_ids
-            if len(batch) == 4:
+            tail_reference = None
+            tail_fraction = None
+            if getattr(self, "_tail_sft", False) and not isinstance(batch, dict):
+                raise ValueError(
+                    "TailSFT requires prepare_dataset() initial-policy losses"
+                )
+            if isinstance(batch, dict):
+                X, Y, loss_mask = batch["X"], batch["Y"], batch["loss_mask"]
+                seg_ids = None
+                tail_reference = batch["tail_reference"]
+                from .tail_sft import filter_fraction
+
+                horizon = min(
+                    self.args.epochs * iter_per_epoch,
+                    self.args.max_steps or self.args.epochs * iter_per_epoch,
+                )
+                tail_fraction = mx.array(
+                    filter_fraction(self.args, epoch * iter_per_epoch + step, horizon),
+                    mx.float32,
+                )
+            elif len(batch) == 4:
                 X, Y, loss_mask, seg_ids = batch
             else:
                 X, Y, loss_mask = batch
@@ -669,10 +854,19 @@ class BaseTrainer:
             # 路由偏置基于当前快照，而不是 trace 时的常量。
             # mtp_loss 是辅助输出，仅用于日志展示，不参与梯度
             (
-                (loss, mtp_loss, moe_loads, lm_loss, z_loss, metrics),
+                (loss, mtp_loss, moe_loads, lm_loss, z_loss, metrics, qb_margins),
                 grads,
             ) = self._compute_loss_and_grad(
-                X, Y, loss_mask, attn_mask, seg_ids
+                X,
+                Y,
+                loss_mask,
+                attn_mask,
+                seg_ids,
+                **(
+                    {"tail_reference": tail_reference, "tail_fraction": tail_fraction}
+                    if tail_reference is not None
+                    else {}
+                ),
             )
 
             # 立即物化本微批的 loss/grads 并释放反向图。MLX 是惰性求值，
@@ -682,27 +876,29 @@ class BaseTrainer:
             # 时 MLX 的图调度会把前向 tape 滞留与反向临时量同时顶到峰值
             # （r073 配置实测 46GB/4.0s）；拆开后前向先落定（~14.5GB）再跑
             # 反向（峰值 ~16GB），显存省 ~3×、单步快 ~2×，数值不变。
-            mx.eval(loss, mtp_loss, moe_loads, lm_loss, z_loss, metrics)
+            mx.eval(loss, mtp_loss, moe_loads, lm_loss, z_loss, metrics, qb_margins)
             mx.eval(grads)
-            if getattr(self.lm_config,'psr_enabled',False) and not getattr(self.args,'no_save',False):
+            if (
+                getattr(self.lm_config, "psr_enabled", False)
+                and tail_reference is None
+                and not getattr(self.args, "no_save", False)
+            ):
                 group_steps = get_optimizer_steps(self.optimizer)
-                record = dict(microstep=global_step+1, optimizer_step=max(group_steps, default=0),
-                              optimizer_group_steps=group_steps, phase="pre_update",
-                              consumed_input_tokens=int(mx.sum(attn_mask)),
-                              psr_optimizer_step=int(self.psr_optimizer.step) if self.psr_optimizer is not None else 0,
-                              sums=mx.sum(metrics,axis=0).tolist())
-                with open(os.path.join(self.args.out_dir,'psr_metrics.jsonl'),'a') as file:
-                    file.write(json.dumps(record)+'\n')
-            if getattr(self.lm_config, "ncp_enabled", False) and not getattr(self.args, "no_save", False):
-                values = metrics.tolist()
-                record = dict(microstep=global_step+1, optimizer_group_steps=get_optimizer_steps(self.optimizer),
-                              ntp_loss=float(lm_loss)*self.args.accumulation_steps,
-                              valid_label_count=int(mx.sum(loss_mask)),
-                              ncp_loss=values[0], vq_loss=values[1], feedback_coverage=values[2],
-                              valid_concepts=values[3], valid_pairs=values[4], codebook_usage=values[5],
-                              target_mean_square=values[6], predicted_mean_square=values[7])
-                with open(os.path.join(self.args.out_dir,"ncp_metrics.jsonl"),"a") as file:
-                    file.write(json.dumps(record)+"\n")
+                record = dict(
+                    microstep=global_step + 1,
+                    optimizer_step=max(group_steps, default=0),
+                    optimizer_group_steps=group_steps,
+                    phase="pre_update",
+                    consumed_input_tokens=int(mx.sum(attn_mask)),
+                    psr_optimizer_step=int(self.psr_optimizer.step)
+                    if self.psr_optimizer is not None
+                    else 0,
+                    sums=mx.sum(metrics, axis=0).tolist(),
+                )
+                with open(
+                    os.path.join(self.args.out_dir, "psr_metrics.jsonl"), "a"
+                ) as file:
+                    file.write(json.dumps(record) + "\n")
             # P-0/P-1 快照（env 门控，默认零开销）：捕获本微批梯度，
             # 供跨 microbatch 方向相关分析（research/OPTIMIZER_RESEARCH §0.5）
             from . import snapshot
@@ -712,12 +908,13 @@ class BaseTrainer:
                 snapshot.maybe_dump_grads(
                     step // acc + 1, step % acc, dict(tree_flatten(grads)), acc
                 )
-            # noaux_tc 的每专家 token 计数跨微批直接相加（计数可加，不需要
-            # 旧 QB 的 margin 样本拼接）：窗口末尾一次性更新路由偏置
+            # Sum counts, retain bounded detached samples without repeated copies.
             if getattr(moe_loads, "size", 0) > 0:
                 last_moe_loads = (
                     moe_loads if last_moe_loads is None else last_moe_loads + moe_loads
                 )
+            if qb_margins.size > 0:
+                qb_samples.append(qb_margins)
 
             # 梯度累加
             if accum_grads is None:
@@ -734,13 +931,27 @@ class BaseTrainer:
             accum_count += 1
 
             # 梯度累积窗口结束，执行更新
-            if (step + 1) % self.args.accumulation_steps == 0:
+            if (step + 1) % self.args.accumulation_steps == 0 or (
+                getattr(self, "_tail_sft", False) and step + 1 == iter_per_epoch
+            ):
+                if (
+                    getattr(self, "_tail_sft", False)
+                    and accum_count < self.args.accumulation_steps
+                ):
+                    scale = self.args.accumulation_steps / accum_count
+                    accum_grads = tree_map(lambda g: g * scale, accum_grads)
                 last_grad_norm = self._optimizer_step(
-                    accum_grads, accum_count, moe_loads=last_moe_loads
+                    accum_grads,
+                    accum_count,
+                    moe_loads=last_moe_loads,
+                    moe_qb_margins=mx.concatenate(qb_samples, axis=1)
+                    if qb_samples
+                    else qb_margins,
                 )
                 accum_grads = None
                 accum_count = 0
                 last_moe_loads = None
+                qb_samples = []
 
                 # 时长/步数预算只在窗口边界检查：中途停止会丢掉已累加但未更新的梯度
                 if self._time_limit_exceeded():
@@ -803,15 +1014,13 @@ class BaseTrainer:
                     # moe_loads 是随 loss 输出物化的 [L,E] 每专家 token 计数
                     # （compile 下侧信道 g._last_load 会被剪枝，不可直接 eval）；
                     # 行序与 self._moe_gates 一致
+                    gate_loads = (
+                        np.asarray(moe_loads)
+                        if moe_loads.ndim == 2
+                        else np.empty((0, 0))
+                    )
                     gate_max = (
-                        [
-                            float(moe_loads[gi].max())
-                            for gi in range(
-                                min(len(self._moe_gates), int(moe_loads.shape[0]))
-                            )
-                        ]
-                        if getattr(moe_loads, "ndim", 0) == 2
-                        else []
+                        gate_loads.max(axis=1).tolist() if gate_loads.size else []
                     )
                     extra = {
                         "mem/active_gb": round(act, 3),
@@ -820,6 +1029,19 @@ class BaseTrainer:
                     }
                     for gi, v in enumerate(gate_max):
                         extra[f"moe/gate{gi}_max_load_k"] = round(v / 2**10, 3)
+                        mean = max(float(gate_loads[gi].mean()), 1e-20)
+                        extra[f"moe/gate{gi}_max_load_ratio"] = float(v / mean)
+                        extra[f"moe/gate{gi}_load_cv"] = float(
+                            gate_loads[gi].std() / mean
+                        )
+                        extra[f"moe/gate{gi}_empty_experts"] = int(
+                            (gate_loads[gi] == 0).sum()
+                        )
+                    extra["moe/qb_update_rate"] = (
+                        self.lm_config.qb_update_rate
+                        if self.lm_config.moe_balance_method == "qb"
+                        else 0.0
+                    )
                     if debug_mem:
                         Logger(
                             f"[mem] active={act:.2f}G cache={cache:.2f}G "
@@ -827,13 +1049,36 @@ class BaseTrainer:
                             f"gate_maxK={'/'.join(f'{v / 2**10:.1f}' for v in gate_max)}"
                         )
 
-                if getattr(self.lm_config, "ncp_enabled", False):
+                if tail_reference is not None:
+                    from .tail_sft import TAIL_METRICS
+
                     extra = dict(extra or {})
-                    for index, name in enumerate(("loss", "vq_loss", "feedback_coverage", "valid_concepts",
-                                                   "valid_pairs", "codebook_usage", "target_ms", "predicted_ms")):
-                        extra["ncp/"+name] = float(metrics[index])
-                    Logger(f"NCP loss={float(metrics[0]):.5f} VQ={float(metrics[1]):.5f} "
-                           f"coverage={float(metrics[2]):.3f} usage={float(metrics[5]):.3f}")
+                    extra.update(
+                        {
+                            "tail/" + name: float(metrics[i])
+                            for i, name in enumerate(TAIL_METRICS)
+                        }
+                    )
+                    extra["tail/filter_fraction"] = float(tail_fraction)
+                    Logger(
+                        f"TailSFT kept={int(metrics[1])}/{int(metrics[0])} "
+                        f"tokens={int(metrics[2])} offset={float(metrics[4]):.5f}"
+                    )
+                elif (
+                    getattr(self.lm_config, "ced_recurrent_enabled", False)
+                    and metrics.ndim == 1
+                ):
+                    extra = dict(extra or {})
+                    for index, name in enumerate(
+                        (
+                            "valid_tokens",
+                            "valid_anchors",
+                            "anchor_capacity",
+                            "physical_middle_calls",
+                            "logical_middle_updates",
+                        )
+                    ):
+                        extra["ced/" + name] = float(metrics[index])
                 log_training_progress(
                     epoch,
                     step,
@@ -887,6 +1132,14 @@ class BaseTrainer:
                 )
             except KeyboardInterrupt:
                 self.interrupted = True
+                if getattr(self, "_tail_sft", False):
+                    # In-flight gradients/optimizer writes are not a resumable
+                    # window. Keep the last scheduled durable checkpoint.
+                    Logger(
+                        "TailSFT interrupted: keeping the last saved checkpoint; the in-flight window is not saved"
+                    )
+                    time_limit_hit = True
+                    break
                 if getattr(self.args, "no_save", False):
                     Logger(
                         "检测到 Ctrl-C：--no_save，直接退出"

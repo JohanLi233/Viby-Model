@@ -2,6 +2,15 @@
 
 基于 Apple MLX 的单设备中文大语言模型训练与推理项目。
 
+开发入口：[Astra / Codex 协作指引](AGENTS.md) · [环境与检查](docs/DEVELOPMENT.md) ·
+[研究索引](research/README.md) · [实验协议](research/EXPERIMENT_PROTOCOL.md)。
+
+```bash
+python3 scripts/check_repo.py              # 默认静态检查，不初始化 GPU
+python3 scripts/check_repo.py doctor       # 环境和 Git 摘要
+python3 scripts/check_repo.py list         # 按模块选择测试
+```
+
 架构是 **DeepSeek-V4.1 的等比例缩小版**：CED 因果编码器-解码器主干 +
 CSA2 跨层复用稀疏注意力 + Single-Pass mHC 残差流 + sqrt(softplus) 路由的
 细粒度 MoE + Engram n-gram 条件记忆 + DSpark 块式草稿头。旧版（Kimi Linear
@@ -11,10 +20,15 @@ V4.1 这一条技术路线；唯一的保留项是 **Gated XSA**（默认开，�
 架构语义对照官方实现（`deepseek-ai/DeepSeek-V4.1-Flash` 的 `inference/model.py`，
 已逐行核对）与技术报告 `DeepSeek_V41_Tech_Report`（下称"报告"）。
 
-预训练当前默认试验 **NCP-Core**：四 token 池化、因果 Concept Module、PQ codebook、下一 concept
-预测和 Decoder 融合，联合训练 NTP + NCP + VQ，**不叠加 PSR**。仅移植核心机制，保留 Viby 主干。
-[实现口径与运行说明](research/NCP_CORE.md)。`--no-ncp` 选择 token baseline；PSR 独立实验使用
-`--no-ncp --psr`，详见 [PSR 契约](research/VIBY_PSR.md)。
+预训练默认启用受保护的 **PSR**：从 CED 证据构造连续工作区，通过零初始化的词表输出头
+修正预测；主干与纠错分支使用隔离梯度及独立优化器。`--no-psr` 选择 token baseline，
+`--psr` 显式启用 PSR。推理支持工作区随连续 batch 搬运和按 horizon 刷新，
+详见 [PSR 契约](research/VIBY_PSR.md)。
+
+另有默认关闭的[残差提升式循环 CED 实验](research/CED_RECURRENT.md)：
+`--ced-recurrent --no-psr --mtp_depth 0` 在完整 CED 证据上，以 `k=4,q=3`
+复用中间 decoder 权重，直接训练 NTP。已通过 MLX 机制与缓存检查；融合核在
+B=4/T=1024 的前向加反向试测节省约 4.1%，B=1 仍较慢。整训练预算与质量验收尚未完成。
 
 ## 架构
 
@@ -82,9 +96,13 @@ V4.1 这一条技术路线；唯一的保留项是 **Gated XSA**（默认开，�
 
 - 亲和度 `sqrt(softplus(x·W)) `（不再是 V3 的 sigmoid），**没有** n_group /
   topk_group 分组约束；top-k 后按未归一化分数归一化并乘 `route_scale`。
-- **noaux_tc 偏置**：`e_score_correction_bias` 只参与 top-k 选择、不进梯度
-  （`freeze`，但随 checkpoint 保存），训练循环按
-  `b += γ·sign(load_frac − 1/E)` 覆写。
+- **QB 偏置（默认）**：偏置只参与 top-k 选择、不进梯度，随 checkpoint 保存。
+  用上一累积窗口的分数分位数估计新偏置，EMA 比例 0.5，每窗口每层最多
+  8192 个 token 样本。`--moe_balance_method noaux_tc` 可对照固定负反馈
+  `b -= γ·sign(load_frac − 1/E)`；两种更新都减去偏置均值。
+- 路由权重和打分默认保留 **fp32**；序列均衡损失先逐 token 归一化亲和度。
+  训练日志含 `max_load_ratio`（最大/平均负载）、`load_cv`、`empty_experts`。
+  原理、运行参数与验证边界见 [QB 路由说明](research/MOE_QB_ROUTING.md)。
 - **clamped SwiGLU 专家**：`silu(clamp(gate, max=L)) * clamp(up, ±L)`，
   `L = swiglu_limit`；1 个共享专家每 token 必走。
 - 分发两条路径：小 batch 走稠密广播 matmul，训练/大 prefill 走
@@ -140,40 +158,51 @@ V4.1 这一条技术路线；唯一的保留项是 **Gated XSA**（默认开，�
 - `engine/`：进程内连续 batch 推理引擎（新缓存结构）
 - `dataset/`：预训练 / SFT / DPO 数据集（与 MiniMind 格式对齐）
 - `tests/`：架构语义回归（CSA2 三种模式、分层索引、CED、mHC 双随机、MoE
-  sqrtsoftplus/noaux_tc、Engram 哈希、DSpark 梯度隔离、prefill/decode 一致性）
-- `research/`、`research_runs/`、`swanlog/`、`autoresearch-mlx/`：历史资料
-  （优化器研究、训练日志、旧架构时期的实验记录），不是当前架构的一部分
+  sqrtsoftplus/QB/noaux_tc、Engram 哈希、DSpark 梯度隔离、prefill/decode 一致性）
+- `scripts/check_repo.py`、`docs/`：开发检查和操作说明
+- `research/`：当前机制契约、实验协议与历史研究，见 [研究索引](research/README.md)
+- `research_runs/`、`swanlog/`：实验产物与训练日志，结论以对应配置和原始记录为准
+- `autoresearch-mlx/`：独立研究子项目，使用自身依赖和入口
 
 ## 训练
 
 ```bash
-# 冒烟（tiny，几分钟）
-python trainer/train_pretrain.py --preset tiny --data_path ../dataset/pretrain_hq.jsonl \
+# token baseline 冒烟（tiny；数据路径需指向已有语料）
+.venv/bin/python trainer/train_pretrain.py --preset tiny --no-psr --data_path ../dataset/pretrain_hq.jsonl \
   --max_seq_len 128 --batch_size 2 --accumulation_steps 1 --max_steps 50
 
 # ≈1B 配方（与 V4.1 结构比例一致）
-python trainer/train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl \
+.venv/bin/python trainer/train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl \
   --hidden_size 1024 --num_hidden_layers 12 --num_attention_heads 16 \
   --n_routed_experts 96 --num_experts_per_tok 6 --moe_intermediate_size 256 \
   --batch_size 12 --accumulation_steps 2 --max_seq_len 1024 \
   --pack_sequences --doc_mask --compile_model --muonh
 
-# 全量 SFT（需要 pretrain 检查点）
-python trainer/train_full_sft.py --data_path ../dataset/sft_512.jsonl
+# TailSFT（默认；需要 pretrain 检查点，先缓存初始模型的逐序列损失）
+.venv/bin/python trainer/train_full_sft.py --data_path ../dataset/sft_512.jsonl
+
+# 普通 SFT 对照
+.venv/bin/python trainer/train_full_sft.py --data_path ../dataset/sft_512.jsonl --sft_algorithm standard
 
 # DPO（需要 full_sft 检查点）
-python trainer/train_dpo.py --data_path ../dataset/dpo.jsonl
+.venv/bin/python trainer/train_dpo.py --data_path ../dataset/dpo.jsonl
 
 # DSpark 独立阶段（报告 §2.4.3）：预训练默认 --mtp_depth 0（§2.1：骨干预训练省略
 # MTP 模块），草稿层在这一阶段才引入并从零初始化；可训练集合变了会自动重置
 # 优化器状态。
-python trainer/train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl \
+.venv/bin/python trainer/train_pretrain.py --no-psr --data_path ../dataset/pretrain_hq.jsonl \
   --resume /path/to/pretrain.safetensors --mtp_depth 1 --freeze_backbone \
   --mtp_loss_weight 1.0
 ```
 
 要点：
 
+- SFT 默认使用 [TailSFT](research/TAIL_SFT.md)：每个前向微批按当前与初始模型的
+  assistant 平均 CE 差值排序，默认过滤 50% 进步最大的序列，保留 token 等权训练。
+  `--tail_sft_schedule ramp` 从 0 线性增加过滤比例；`--tail_sft_filter_fraction 0`
+  可作相同数据处理下的无过滤对照。TailSFT 使用逐样本数据，不支持流式
+  `--pack_sequences` / `--doc_mask`；`batch_size=1` 时保留唯一序列，不发生过滤。
+  checkpoint 仍命名为 `full_sft_*`，DPO 加载方式不变。尚无本仓库质量收益结论。
 - 结构参数只走 `VibyConfig`：`--preset`、`--hidden_size`、`--num_hidden_layers`、
   `--num_attention_heads`、`--head_dim`、`--rope_head_dim`、`--q_lora_rank`、
   `--o_groups`、`--o_lora_rank`、`--window_size`、`--hc_mult`、
@@ -182,6 +211,8 @@ python trainer/train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl \
   `--candidate_source_layer`、`--candidate_topk_blocks`、`--candidate_block_size`、
   `--n_routed_experts`、`--num_experts_per_tok`、`--moe_intermediate_size`、
   `--score_func`、`--route_scale`、`--swiglu_limit`、`--bias_update_rate`、
+  `--moe_balance_method`、`--qb_update_rate`、`--qb_stats_rows`、`--router_fp32`、
+  `--aux_balance_loss_weight`、
   `--engram_*`、`--mtp_depth`、`--dspark_*`、`--z_loss_weight`、
   `--tie_word_embeddings`。
 - 检查点：`--out_dir` 下 safetensors + 同名 `.json` sidecar（结构配置）+
@@ -257,7 +288,7 @@ DPO 同样经过 chat template 渲染与空 `<think>` 清洗，loss mask 只覆�
 ## 评估与推理
 
 ```bash
-python eval_model.py --out_dir out          # 交互式 / 自动评估
+.venv/bin/python eval_model.py --out_dir out          # 交互式 / 自动评估
 ```
 
 `--model_mode` 支持 `0`（预训练）、`1`（SFT-Chat）、`2`（DPO）；脚本从
@@ -292,7 +323,7 @@ out = model.generate(tokens, max_new_tokens=64, temperature=0.7, top_k=50)
 | §2.4.3 DSpark：块式草稿 + Markov 头 + 置信度头；预训练省略 MTP；单独阶段冻结主干；后训练不回传主干 | DSparkStage + --freeze_backbone + stop_gradient；预训练默认 --mtp_depth 0 |
 | §2.5 逐头 Muon（Query 权重按头拆）；Engram/嵌入/预测头用动量 + Sinkhorn 均衡；norm 权重受 wd、偏置与缩放因子不受 | trainer/muon.py：_per_head_dim、SinkhornBalanced、adamw_norm / adamw_nowd 分组 |
 | §4.2.2 超参（Muon m=0.95/wd=0.1；AdamW beta2=0.95/wd=0.1；Sinkhorn gamma=0.18/K=11/tau=1e-3/eps=1e-20；Engram lr x5） | 同（Sinkhorn 与官方 numpy 对拍 max|dW|=8.9e-9） |
-| §4.2.2 无辅助损失负载均衡（bias 更新率 1e-3）+ 权重 1e-4 的序列级均衡损失 | update_expert_bias + MoEFeedForward.seq_aux_loss（与 DeepSeek 官方 seq-aux 同式） |
+| §4.2.2 负载均衡 | 默认采用 QB + 归一化序列均衡损失；`noaux_tc` 保留固定 1e-3 偏置更新作对照，非原报告训练配方的逐项复现 |
 | §4.2.2 学习率：预热 -> 平台 -> 余弦衰减 | --lr_schedule wsd --wsd_decay_shape cosine（默认） |
 
 ## 与官方 V4.1 的刻意偏差
@@ -301,10 +332,11 @@ out = model.generate(tokens, max_new_tokens=64, temperature=0.7, top_k=50)
 
 1. **多模态**：官方 V4.1-Flash 带 ViT + Aligner，本项目是纯文本。
 2. **量化**：官方 fp8 权重 / fp4 主 KV（QAT）；本项目训练与推理都用 bf16。
-3. **稀疏算力**：训练/prefill 走稠密掩码注意力——可见集合与官方**逐位等价**
-   （已验证），但没有官方融合稀疏 kernel 的省算力效果；解码路径才是 gather 稀疏。
-4. **DSpark**：只挂 1 个草稿 stage（官方 3），5→4 个草稿位置；投机解码的
-   置信度调度采样循环未实现（只有草稿头前向 + 训练损失）。
+3. **稀疏算力**：训练/prefill 已接入 MLX/Metal 融合稀疏注意力，按形状、dtype
+   和开关分发，并保留参考路径；解码另有 gather 路径。具体性能由实际配置和
+   验收决定，见 [kernel 研究记录](research/README.md)。
+4. **DSpark 验证**：引擎已实现草稿、拒绝修正采样和置信度调度；主干验证复用
+   逐 token decode 图，尚未实现多 token 并行验证，不保证快于普通解码。
 5. **Engram**：表规模按比例缩小；表更新已按报告实现 momentum + Sinkhorn 均衡
    （§2.5 算法 1、§4.2.2 超参 K=11/τ=1e-3/ε=1e-20、Engram 5× lr）；不分片、
    不 fp8。
@@ -331,9 +363,12 @@ out = model.generate(tokens, max_new_tokens=64, temperature=0.7, top_k=50)
 ## 验证
 
 ```bash
-.venv/bin/python -m pytest tests/ -q
+python3 scripts/check_repo.py
+python3 scripts/check_repo.py test attention --dry-run
+# 根据改动选择模块；全量检查需显式选择：
+python3 scripts/check_repo.py test all
 ```
 
-已测：整段 prefill vs prefix+逐 token 解码（`max|Δlogit| ≈ 1e-6`，含 ratio=2
-压缩器）、同位置批量解码 vs 单条、packed 文档隔离、mx.compile 前向、
-`nn.value_and_grad` 全参数可微、Engram 哈希与官方 PyTorch 参考逐位一致。
+现有测试覆盖整段 prefill 与 prefix+逐 token 解码、同位置批量解码与单条、
+packed 文档隔离、编译前向、梯度、Engram、PSR 和循环 CED 等路径。
+历史验收数字见对应研究记录；当前工作区是否通过以本轮实际执行结果为准。

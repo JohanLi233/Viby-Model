@@ -7,6 +7,8 @@ import pytest
 import mlx.core as mx
 from mlx.utils import tree_flatten
 from test_psr import pair, trainer, batch
+from _v41_common import build, max_abs_diff
+from trainer.base_trainer import BaseTrainer
 from trainer.config import get_pretrain_parser, setup_training_args
 from trainer.utils import build_model_kwargs, load_checkpoint, save_checkpoint
 from model.config import VibyConfig
@@ -30,7 +32,7 @@ def test_cli_default_is_dense_short_local_protected_not_old_aux(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_pretrain.py", *argv])
     args = setup_training_args(get_pretrain_parser().parse_args(argv))
     cfg = VibyConfig(**build_model_kwargs(args))
-    assert cfg.ncp_enabled and not cfg.psr_enabled and cfg.psr_rounds == 1 and cfg.psr_horizon == 16
+    assert cfg.psr_enabled and cfg.psr_rounds == 1 and cfg.psr_horizon == 16
     assert cfg.psr_train_anchors == 2 and args.psr_learning_rate == 1e-4
     assert not hasattr(cfg, "psr_predictive_weight")
     assert not args.use_swanlab and not args.auto_resume
@@ -38,11 +40,80 @@ def test_cli_default_is_dense_short_local_protected_not_old_aux(monkeypatch):
     assert not off.psr_enabled
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_cli_default_and_baseline_reach_compiled_training(monkeypatch, enabled):
+    argv = [
+        "--preset",
+        "tiny",
+        "--no_save",
+        "--optimizer",
+        "adamw",
+        "--hidden_size",
+        "64",
+        "--num_attention_heads",
+        "2",
+        "--head_dim",
+        "32",
+        "--rope_head_dim",
+        "16",
+        "--q_lora_rank",
+        "32",
+        "--o_lora_rank",
+        "32",
+        "--o_groups",
+        "1",
+        "--moe_intermediate_size",
+        "32",
+        "--n_routed_experts",
+        "4",
+        "--num_experts_per_tok",
+        "2",
+        "--engram_layer_ids",
+        "",
+        "--vocab_size",
+        "32",
+        "--max_seq_len",
+        "16",
+        "--batch_size",
+        "1",
+        "--accumulation_steps",
+        "1",
+        "--learning_rate",
+        "0.0001",
+        "--psr_dim",
+        "32",
+        "--psr_slots",
+        "2",
+    ]
+    if not enabled:
+        argv.append("--no-psr")
+    monkeypatch.setattr(sys, "argv", ["train_pretrain.py", *argv])
+    args = setup_training_args(get_pretrain_parser().parse_args(argv))
+    args.compile_model = True
+    cfg = VibyConfig(**build_model_kwargs(args))
+    assert cfg.psr_enabled == enabled
+    model = build(cfg)
+    tr = BaseTrainer(args, model, SimpleNamespace(pad_token_id=0), cfg, "pretrain")
+    assert (tr.psr_optimizer is not None) == enabled
+    samples = tuple(value[:1] for value in batch())
+    before = mx.array(model.model.embed.weight)
+    out, grads = tr._compute_loss_and_grad(*samples)
+    mx.eval(out, grads)
+    assert bool(mx.isfinite(out[0]))
+    tr._optimizer_step(grads, 1, out[2], moe_qb_margins=out[6])
+    assert max_abs_diff(before, model.model.embed.weight) > 0
+    if enabled:
+        assert float(tr.psr_optimizer.step) == 1
+        assert float(mx.max(mx.abs(model.psr.output.weight))) > 0
+    else:
+        assert model.psr is None
+
+
 def test_checkpoint_upgrade_preserves_baseline_state_and_side_is_separate(tmp_path):
     base, model = pair()
     a = trainer(base)
     out, grad = a._compute_loss_and_grad(*batch())
-    a._optimizer_step(grad, 1, out[2])
+    a._optimizer_step(grad, 1, out[2], moe_qb_margins=out[6])
     args = SimpleNamespace(
         save_dir=str(tmp_path),
         no_save=False,
@@ -63,7 +134,7 @@ def test_checkpoint_upgrade_preserves_baseline_state_and_side_is_separate(tmp_pa
     assert all(bool(mx.array_equal(sa[k], sb[k])) for k in sa)
     assert bool(mx.all(model.psr.output.weight == 0))
     out, grad = b._compute_loss_and_grad(*batch())
-    b._optimizer_step(grad, 1, out[2])
+    b._optimizer_step(grad, 1, out[2], moe_qb_margins=out[6])
     save_checkpoint(model, b.optimizer, 2, 20, args, model.config)
     assert (tmp_path / "pretrain_64.psr_optimizer.safetensors").exists()
     _, other = pair()

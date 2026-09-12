@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Union
 
 import mlx.core as mx
@@ -26,7 +26,13 @@ from model.cache import VibyCache
 
 from .memory import StatePool, capture_state, copy_state_row, restore_state
 from .prefix import RadixPrefixCache
-from .sampling import find_stop_length, log_softmax, sample_one, speculative_correction, transform_logits
+from .sampling import (
+    find_stop_length,
+    log_softmax,
+    sample_one,
+    speculative_correction,
+    transform_logits,
+)
 from .types import CompletionOutput, RequestOutput, SamplingParams
 
 
@@ -66,15 +72,18 @@ class VibyEngine:
         prefix_stride: int = 64,
         enable_prefix_cache: bool = True,
         seed: Optional[int] = None,
-        page_size: Optional[int] = None,  # 旧参数（分页 KV 已删除），保留以便老调用方传入
+        page_size: Optional[
+            int
+        ] = None,  # 旧参数（分页 KV 已删除），保留以便老调用方传入
         max_num_pages: Optional[int] = None,
         **kwargs,
     ):
         cfg = model.config
-        if getattr(cfg, "ncp_enabled", False):
-            raise ValueError("NCP core currently uses model.generate with full-prefix recomputation; continuous-batch NCP cache is not implemented")
-        if getattr(cfg, "psr_enabled", False):
-            raise ValueError("PSR currently uses model.prefill/decode_step/generate; the continuous-batch engine does not yet transport ThinkingState")
+        if getattr(cfg, "ced_recurrent_enabled", False):
+            raise ValueError(
+                "Recurrent CED uses model.prefill/decode_step/generate; the continuous-batch engine does not yet transport per-round latent cache and anchor state"
+            )
+        self._psr = bool(getattr(cfg, "psr_enabled", False))
         model.eval()
         self.model = model
         self.config = cfg
@@ -86,20 +95,25 @@ class VibyEngine:
         self.pool = StatePool(cfg, 0)
         # 前缀快照的粒度：prefill 按 prefix_stride 分块，块尾插一个可复用点
         self.prefix_stride = max(1, int(prefix_stride))
+        # PSR 必须在完整问题末尾建立工作区；普通前缀快照不携带该边界和刷新时钟。
         self.prefix = (
             RadixPrefixCache(int(max_prefix_states))
-            if enable_prefix_cache and int(max_prefix_states) > 0
+            if enable_prefix_cache and int(max_prefix_states) > 0 and not self._psr
             else None
         )
         # Engram 的最近 token 历史宽度（模型侧 prev_tokens 的长度）
         self._engram = getattr(model.model, "engram_hash", None) is not None
         self._w = max(int(cfg.engram_max_ngram_size) - 1, 0) if self._engram else 0
         # 稠密路径的 indexer 只在"本块凑满至少一个压缩组"时才打分（见 _dense_min_chunk）
-        self._index_ratios = tuple(sorted({
-            int(cfg.compress_ratios[i])
-            for i in cfg.index_source_layers
-            if i in cfg.kv_source_layers and int(cfg.compress_ratios[i]) > 1
-        }))
+        self._index_ratios = tuple(
+            sorted(
+                {
+                    int(cfg.compress_ratios[i])
+                    for i in cfg.index_source_layers
+                    if i in cfg.kv_source_layers and int(cfg.compress_ratios[i]) > 1
+                }
+            )
+        )
         if seed is not None:
             mx.random.seed(int(seed))
         self.stats = self._fresh_stats()
@@ -230,6 +244,25 @@ class VibyEngine:
         rows = []
         for seq, pl in zip(sequences, prompt_lens):
             pl = int(pl)
+            if self._psr:
+                if not 1 <= pl <= len(seq):
+                    raise ValueError(
+                        "PSR scoring requires 1 <= prompt_len <= sequence length"
+                    )
+                # Anchor at the prompt boundary, then refresh exactly as generation
+                # does. Prefilling the completion would move the first anchor.
+                logits, cache = self.model.prefill(mx.array([list(seq[:pl])], mx.int32))
+                row = logits[0, -1]
+                vals = []
+                for j in range(len(seq) - pl):
+                    if j:
+                        logits, cache = self.model.decode_step(
+                            mx.array([seq[pl + j - 1]], mx.int32), cache
+                        )
+                        row = logits[0]
+                    vals.append(float(log_softmax(row)[int(seq[pl + j])].item()))
+                rows.append(vals + [0.0] * (gen - len(vals)))
+                continue
             logits, _ = self.model.prefill(mx.array([list(seq)], dtype=mx.int32))
             lp = log_softmax(logits)[0]
             n = len(seq) - pl
@@ -250,7 +283,9 @@ class VibyEngine:
         """池子 / 前缀缓存常驻字节数 + MLX 显存计数。"""
         out = {
             "pool_bytes": self.pool.memory_bytes(),
-            "prefix_bytes": self.prefix.memory_bytes() if self.prefix is not None else 0,
+            "prefix_bytes": self.prefix.memory_bytes()
+            if self.prefix is not None
+            else 0,
             "active_memory": int(mx.get_active_memory()),
             "peak_memory": int(mx.get_peak_memory()),
         }
@@ -262,11 +297,24 @@ class VibyEngine:
     def _validate_speculative(self, params):
         if not params.use_mtp_speculative:
             return
-        if not getattr(self.model, "mtp_modules", None) or not callable(getattr(self.model, "dspark_draft", None)):
-            raise ValueError("--use_mtp_speculative requires a checkpoint with trained DSpark/MTP modules")
+        if self._psr:
+            raise ValueError(
+                "MTP speculative decoding is not supported together with PSR"
+            )
+        if not getattr(self.model, "mtp_modules", None) or not callable(
+            getattr(self.model, "dspark_draft", None)
+        ):
+            raise ValueError(
+                "--use_mtp_speculative requires a checkpoint with trained DSpark/MTP modules"
+            )
         if self.config.dspark_block_size < 2:
-            raise ValueError("DSpark speculative decoding requires dspark_block_size >= 2")
-        if params.num_speculative_tokens is not None and params.num_speculative_tokens <= 0:
+            raise ValueError(
+                "DSpark speculative decoding requires dspark_block_size >= 2"
+            )
+        if (
+            params.num_speculative_tokens is not None
+            and params.num_speculative_tokens <= 0
+        ):
             raise ValueError("num_speculative_tokens must be positive")
         if not 0 <= params.mtp_confidence_threshold <= 1:
             raise ValueError("mtp_confidence_threshold must be between 0 and 1")
@@ -277,6 +325,9 @@ class VibyEngine:
         if seq.max_new <= 0:
             self._finish(seq, "length")
             return
+        if self._psr:
+            self._admit_psr(seq)
+            return
         # 1) 前缀匹配：拿最长可复用的状态快照
         n_hit, state = (0, None)
         if self.prefix is not None:
@@ -284,8 +335,12 @@ class VibyEngine:
             if state is not None and state.hidden is None and n_hit >= len(prompt):
                 # 快照缺末位 hidden 时无法产出首个 logits，退回整段 prefill
                 n_hit, state = 0, None
-            if (state is not None and seq.params.use_mtp_speculative
-                    and state.draft_mains is None and n_hit >= len(prompt)):
+            if (
+                state is not None
+                and seq.params.use_mtp_speculative
+                and state.draft_mains is None
+                and n_hit >= len(prompt)
+            ):
                 # An ordinary full-prefix hit has no DSpark anchor. Recompute
                 # it instead of silently disabling speculation or guessing it.
                 n_hit, state = 0, None
@@ -315,8 +370,13 @@ class VibyEngine:
                     hidden = None
                     for p in range(pos, end):
                         one = mx.array([[prompt[p]]], dtype=mx.int32)
-                        result = self._trunk(one, start_pos=p, cache=scratch, decode=True,
-                                             collect_main=seq.params.use_mtp_speculative)
+                        result = self._trunk(
+                            one,
+                            start_pos=p,
+                            cache=scratch,
+                            decode=True,
+                            collect_main=seq.params.use_mtp_speculative,
+                        )
                         if seq.params.use_mtp_speculative:
                             result, mains = result
                             draft_mains = tuple(mx.array(m[0, -1]) for m in mains)
@@ -326,8 +386,13 @@ class VibyEngine:
                     pos = end
                 else:
                     ids = mx.array([prompt[pos:nxt]], dtype=mx.int32)
-                    result = self._trunk(ids, start_pos=pos, cache=scratch, decode=False,
-                                         collect_main=seq.params.use_mtp_speculative)
+                    result = self._trunk(
+                        ids,
+                        start_pos=pos,
+                        cache=scratch,
+                        decode=False,
+                        collect_main=seq.params.use_mtp_speculative,
+                    )
                     if seq.params.use_mtp_speculative:
                         result, mains = result
                         draft_mains = tuple(mx.array(m[0, -1]) for m in mains)
@@ -340,7 +405,13 @@ class VibyEngine:
                 if self.prefix is not None and (self.prefix.has_room() or pos >= end):
                     self.prefix.insert(
                         prompt[:pos],
-                        capture_state(scratch, 0, pos, hidden=mx.array(hidden[0]), draft_mains=draft_mains),
+                        capture_state(
+                            scratch,
+                            0,
+                            pos,
+                            hidden=mx.array(hidden[0]),
+                            draft_mains=draft_mains,
+                        ),
                     )
         logits = self.model.logits(hidden)[0]
         mx.eval(logits)
@@ -359,6 +430,22 @@ class VibyEngine:
         if seq.streamer is not None:
             seq.streamer.put([list(prompt)])
         self._append_step([seq], logits[None])
+
+    def _admit_psr(self, seq: Sequence) -> None:
+        """Run the complete prompt before creating its first PSR workspace."""
+        ids = mx.array([seq.prompt_ids], mx.int32)
+        logits, scratch = self.model.prefill(ids)
+        logits = logits[:, -1]
+        mx.eval(logits)
+        row = len(self._running)
+        self.pool.ensure(row + 1, [len(s.token_ids) for s in self._running])
+        copy_state_row(self.pool.cache, row, scratch, 0, len(seq.prompt_ids))
+        seq.row = row
+        self.stats["prefill_tokens"] += len(seq.prompt_ids)
+        self._running.append(seq)
+        if seq.streamer is not None:
+            seq.streamer.put([list(seq.prompt_ids)])
+        self._append_step([seq], logits)
 
     def _dense_min_chunk(self, pos: int) -> int:
         """续跑时稠密块至少要覆盖的 token 数。
@@ -384,14 +471,70 @@ class VibyEngine:
         pos = mx.array([n - 1 for n in lens], dtype=mx.int32)
         cache = self.pool.cache
         cache.decode_max_pos = max(lens)
-        hidden = self._trunk(toks, start_pos=pos, cache=cache, decode=True)
-        logits = self.model.logits(hidden)[:, 0]
+        if self._psr:
+            logits = self._decode_psr(toks, pos, cache)
+        else:
+            hidden = self._trunk(toks, start_pos=pos, cache=cache, decode=True)
+            logits = self.model.logits(hidden)[:, 0]
         mx.eval(logits)
         self._update_engram_decode(cache, toks)
         self.stats["decode_tokens"] += len(seqs)
         self.stats["batch_steps"] += 1
         self.stats["max_batch"] = max(self.stats["max_batch"], len(seqs))
         return logits
+
+    def _decode_psr(self, toks: mx.array, pos: mx.array, cache: VibyCache) -> mx.array:
+        """One batched trunk step, with independent workspace refresh per row."""
+        refresh = pos >= cache.psr_next_anchor
+        needs_memory = bool(mx.any(refresh).item())
+        result = self.model.model(
+            toks,
+            start_pos=pos,
+            cache=cache,
+            decode=True,
+            prev_tokens=cache.engram_prev,
+            collect_main=False,
+            return_memory=needs_memory,
+        )
+        hidden = result[0]
+        state = cache.thinking_state
+        if needs_memory:
+            boundary = self.model.model.layers[self.config.n_encoder_layers].attn
+            anchors = mx.where(refresh, pos, -1)[:, None]
+            options = dict(cache.psr_options or {})
+            options.pop("mode", None)
+            fresh, _ = self.model.psr(
+                result[3],
+                anchors,
+                boundary.freq_cos,
+                boundary.freq_sin,
+                mode=cache.psr_mode,
+                **options,
+            )
+            arrays = {}
+            for name in ("slots", "anchor", "segment", "valid"):
+                old, new = getattr(state, name), getattr(fresh, name)
+                arrays[name] = (
+                    None
+                    if old is None
+                    else mx.where(
+                        refresh.reshape((-1,) + (1,) * (old.ndim - 1)), new, old
+                    )
+                )
+            state = cache.thinking_state = replace(fresh, **arrays)
+            cache.psr_next_anchor = mx.where(
+                refresh,
+                cache.psr_next_anchor + self.config.psr_horizon,
+                cache.psr_next_anchor,
+            )
+            cache.psr_phases = cache.psr_phases + refresh.astype(mx.int32)
+        vector, _, _ = self.model.psr.read_workspace(hidden, state, pos[:, None])
+        gate = (
+            self.model.psr.calibration_gate
+            if cache.psr_gate is None
+            else cache.psr_gate
+        )
+        return (self.model.logits(hidden) + gate * self.model.psr.output(vector))[:, 0]
 
     def _append_step(self, seqs: list, logits: mx.array) -> None:
         """逐条按各自的 SamplingParams 采样、追加 token、判定停止 + 流式输出。"""
@@ -421,8 +564,13 @@ class VibyEngine:
     def _verify_token(self, scratch, token, position, collect_main=True):
         scratch.decode_max_pos = position + 1
         ids = mx.array([[token]], mx.int32)
-        result = self._trunk(ids, start_pos=mx.array([position], mx.int32), cache=scratch,
-                             decode=True, collect_main=collect_main)
+        result = self._trunk(
+            ids,
+            start_pos=mx.array([position], mx.int32),
+            cache=scratch,
+            decode=True,
+            collect_main=collect_main,
+        )
         if collect_main:
             hidden, mains = result
             mains = tuple(mx.array(m[0, -1]) for m in mains)
@@ -433,8 +581,12 @@ class VibyEngine:
 
     def _decode_one(self, seq):
         scratch = self._scratch_for(seq)
-        logits, mains = self._verify_token(scratch, seq.token_ids[-1], len(seq.token_ids) - 1,
-                                           collect_main=seq.params.use_mtp_speculative)
+        logits, mains = self._verify_token(
+            scratch,
+            seq.token_ids[-1],
+            len(seq.token_ids) - 1,
+            collect_main=seq.params.use_mtp_speculative,
+        )
         mx.eval(logits)
         copy_state_row(self.pool.cache, seq.row, scratch, 0, len(seq.token_ids))
         seq.draft_mains = mains
@@ -451,9 +603,14 @@ class VibyEngine:
         proposals = []
         history = list(seq.token_ids)
         for _ in range(count):
-            logits, confidence = self.model.dspark_draft(mains, mx.array([known], mx.int32), last_only=True)
+            logits, confidence = self.model.dspark_draft(
+                mains, mx.array([known], mx.int32), last_only=True
+            )
             if seq.params.mtp_confidence_threshold > 0:
-                if float(mx.sigmoid(confidence[0, -1]).item()) < seq.params.mtp_confidence_threshold:
+                if (
+                    float(mx.sigmoid(confidence[0, -1]).item())
+                    < seq.params.mtp_confidence_threshold
+                ):
                     self.stats["mtp_confidence_stops"] += 1
                     break
             transformed = transform_logits(logits[0, -1], history, seq.params)
@@ -472,7 +629,11 @@ class VibyEngine:
 
     def _speculative_step(self, seq):
         remaining = seq.max_new - seq.n_generated
-        count = min(seq.params.num_speculative_tokens or 1, self.config.dspark_block_size - 1, remaining - 1)
+        count = min(
+            seq.params.num_speculative_tokens or 1,
+            self.config.dspark_block_size - 1,
+            remaining - 1,
+        )
         if count <= 0:
             self._decode_one(seq)
             return
@@ -501,7 +662,9 @@ class VibyEngine:
         chosen = states[0]
         for i, (draft, proposal) in enumerate(proposals):
             target = transform_logits(logits[i], seq.token_ids, seq.params)
-            token, accepted = speculative_correction(target, proposal, draft, seq.params)
+            token, accepted = speculative_correction(
+                target, proposal, draft, seq.params
+            )
             if accepted:
                 self.stats["mtp_accepted"] += 1
             else:
@@ -537,13 +700,20 @@ class VibyEngine:
     # ------------------------------------------------------------------
     # 前向 / Engram 记账
     # ------------------------------------------------------------------
-    def _trunk(self, ids: mx.array, start_pos, cache: VibyCache, decode: bool, collect_main=False):
+    def _trunk(
+        self,
+        ids: mx.array,
+        start_pos,
+        cache: VibyCache,
+        decode: bool,
+        collect_main=False,
+    ):
         """主干前向，返回末层 hidden [B,T,D]（等价于 VibyForCausalLM 的 hidden）。
 
         直接走 `VibyModel.__call__`：它同时支持标量 / [B] 的 start_pos，并且会
         把 per-row 的位置一路传到 `Attention.decode`。
         """
-        hidden, mains, _ = self.model.model(
+        out = self.model.model(
             ids,
             start_pos=start_pos,
             cache=cache,
@@ -551,6 +721,8 @@ class VibyEngine:
             prev_tokens=cache.engram_prev,
             collect_main=collect_main,
         )
+        # 前两位 (hidden, mains) 是稳定契约。
+        hidden, mains = out[0], out[1]
         return (hidden, mains) if collect_main else hidden
 
     def _update_engram_prefill(self, cache: VibyCache, ids: mx.array) -> None:
@@ -561,7 +733,7 @@ class VibyEngine:
         if prev is None or prev.shape[1] != self._w:
             # 序列开头：用 DEAD(-1) 左补齐到固定宽度（engram 里负值 = 无历史）
             prev = mx.full((ids.shape[0], self._w), -1, dtype=mx.int32)
-        cache.engram_prev = mx.concatenate([prev, ids], axis=1)[:, -self._w:]
+        cache.engram_prev = mx.concatenate([prev, ids], axis=1)[:, -self._w :]
 
     def _update_engram_decode(self, cache: VibyCache, toks: mx.array) -> None:
         """解码一步后的历史推进（逐字对应 model.decode_step 的写法）。"""
@@ -571,7 +743,7 @@ class VibyEngine:
         if prev is None:
             cache.engram_prev = mx.broadcast_to(toks, (toks.shape[0], self._w))
         else:
-            cache.engram_prev = mx.concatenate([prev, toks], axis=1)[:, -self._w:]
+            cache.engram_prev = mx.concatenate([prev, toks], axis=1)[:, -self._w :]
 
     # ------------------------------------------------------------------
     # 收尾
@@ -632,7 +804,9 @@ class VibyEngine:
             if self.tokenizer is None:
                 raise ValueError("字符串 prompt 需要 tokenizer")
             return list(
-                self.tokenizer(prompt, truncation=True, max_length=self.max_model_len).input_ids
+                self.tokenizer(
+                    prompt, truncation=True, max_length=self.max_model_len
+                ).input_ids
             )
         return [int(t) for t in prompt]
 

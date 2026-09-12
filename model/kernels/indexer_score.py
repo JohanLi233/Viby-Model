@@ -15,6 +15,7 @@ decode（T=1、B 小、N 大）把 key 维切到多个 threadgroup。
 
 开关：`VIBY_INDEXER_KERNEL=0` 回退 einsum（同样是 bf16 操作数）。
 """
+
 import os
 from functools import lru_cache
 
@@ -313,8 +314,7 @@ def _tile_valid(reach, tiles, block):
     nt = -(-n // block)
     pad = nt * block - n
     if pad:
-        reach = mx.concatenate(
-            [reach, mx.zeros((b, t, pad), mx.bool_)], axis=-1)
+        reach = mx.concatenate([reach, mx.zeros((b, t, pad), mx.bool_)], axis=-1)
     return mx.any(reach.reshape(b * t, nt, block), axis=-1)
 
 
@@ -327,6 +327,7 @@ def _operation():
         b, t, h, d = q.shape
         n = k.shape[1]
         from . import indexer_select as fused
+
         if fused._BQ_ENABLED and t > 1 and fused.supported(q, k):
             return fused.score_bq(q, k, w, reach)
         tiles = _n_tiles(b, t, n)
@@ -386,13 +387,18 @@ def indexer_score(q, k, w, reach):
     except Exception as exc:  # noqa: BLE001
         global _ENABLED
         _ENABLED = False
-        print(f"[indexer_score] kernel 不可用，回退 einsum：{type(exc).__name__}: {exc}")
+        print(
+            f"[indexer_score] kernel 不可用，回退 einsum：{type(exc).__name__}: {exc}"
+        )
         return eager_indexer_score(q, k, w, reach)
 
 
-def prewarm_indexer_score(n_heads: int, head_dim: int, dtype=mx.bfloat16, seq: int = 32):
+def prewarm_indexer_score(
+    n_heads: int, head_dim: int, dtype=mx.bfloat16, seq: int = 32
+):
     """Eager callable/JIT creation for training and key-split decode grids."""
     from .indexer_select import _kernel, _selection_mask_kernel
+
     _kernel()  # create callable before mx.compile traces a fused selection
     _selection_mask_kernel()
     if not _ENABLED or mx.default_device() != mx.gpu:

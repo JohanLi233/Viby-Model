@@ -16,7 +16,7 @@ import numpy as np
 from typing import Tuple
 
 import mlx.core as mx
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx.utils import tree_flatten, tree_unflatten
 from transformers import AutoTokenizer
 from model.config import VibyConfig
 from model.model import VibyForCausalLM
@@ -48,10 +48,25 @@ def convert_model_dtype(model, dtype_name):
 
     params = model.parameters()
 
-    def cast(p):
-        return p.astype(target) if mx.issubdtype(p.dtype, mx.floating) else p
-
-    model.update(tree_map(cast, params))
+    keep_router = getattr(model.config, "router_fp32", True)
+    model.update(
+        tree_unflatten(
+            [
+                (
+                    path,
+                    p.astype(
+                        mx.float32
+                        if keep_router
+                        and path.endswith(("router.weight", "router.bias"))
+                        else target
+                    )
+                    if mx.issubdtype(p.dtype, mx.floating)
+                    else p,
+                )
+                for path, p in tree_flatten(params)
+            ]
+        )
+    )
     mx.eval(model.parameters())
     return model
 
@@ -175,6 +190,10 @@ def load_model_weights(
                 f"{label} {checkpoint_path} 参数 {key} 形状不一致: "
                 f"checkpoint={value.shape}, model={model_shapes[key]}"
             )
+        if getattr(model.config, "router_fp32", True) and key.endswith(
+            ("router.weight", "router.bias")
+        ):
+            value = value.astype(mx.float32)
         loaded[key] = value
 
     missing = [
@@ -281,6 +300,7 @@ def build_model_and_tokenizer(
 
     if checkpoint_name is not None:
         checkpoint_path = os.path.join(args.save_dir, checkpoint_name)
+        validate_checkpoint_execution(checkpoint_path, lm_config, args)
         loaded = load_model_weights(
             model,
             checkpoint_path,
@@ -319,11 +339,28 @@ def build_model_and_tokenizer(
 # sidecar config / 组成 VibyConfig 的 kwargs。SFT/DPO 的 parser 把这些参数默认
 # 设为 None：表示"从基座 checkpoint 的 sidecar config 继承"，显式传入才覆盖。
 ARCH_ARG_TO_FIELD = {
-    **{name: name for name in ("ncp_enabled", "ncp_chunk_size", "ncp_layers", "ncp_heads",
-                               "ncp_codebooks", "ncp_codebook_size", "ncp_inter_dim", "ncp_merge",
-                               "ncp_loss_reduction", "ncp_loss_weight", "ncp_vq_loss_weight", "ncp_fusion_init")},
-    **{name: name for name in ("psr_enabled", "psr_slots", "psr_dim", "psr_blocks", "psr_topk",
-                                "psr_rounds", "psr_max_rounds", "psr_horizon", "psr_train_anchors")},
+    **{
+        name: name
+        for name in (
+            "ced_recurrent_enabled",
+            "ced_recurrent_stride",
+            "ced_recurrent_rounds",
+        )
+    },
+    **{
+        name: name
+        for name in (
+            "psr_enabled",
+            "psr_slots",
+            "psr_dim",
+            "psr_blocks",
+            "psr_topk",
+            "psr_rounds",
+            "psr_max_rounds",
+            "psr_horizon",
+            "psr_train_anchors",
+        )
+    },
     "hidden_size": "dim",
     "num_hidden_layers": "n_layers",
     "num_attention_heads": "n_heads",
@@ -362,6 +399,11 @@ ARCH_ARG_TO_FIELD = {
     "route_scale": "route_scale",
     "swiglu_limit": "swiglu_limit",
     "bias_update_rate": "bias_update_rate",
+    "moe_balance_method": "moe_balance_method",
+    "qb_update_rate": "qb_update_rate",
+    "qb_stats_rows": "qb_stats_rows",
+    "router_fp32": "router_fp32",
+    "aux_balance_loss_weight": "aux_balance_loss_weight",
     "engram_layer_ids": "engram_layer_ids",
     "engram_max_ngram_size": "engram_max_ngram_size",
     "engram_vocab_size": "engram_vocab_size",
@@ -384,9 +426,14 @@ ARCH_ARG_TO_FIELD = {
 # 旧名别名：命令行选项名 → ARCH_ARG_TO_FIELD 里的 dest
 # （--routed_scaling_factor 与 --route_scale 共用一个 dest，这里只用于
 #  --preset 判断"用户是否显式传过"）
-ARCH_ARG_ALIASES = {"routed_scaling_factor": "route_scale", "psr": "psr_enabled",
-                    "no_psr": "psr_enabled", "no_psr_enabled": "psr_enabled",
-                    "ncp": "ncp_enabled", "no_ncp": "ncp_enabled", "no_ncp_enabled": "ncp_enabled"}
+ARCH_ARG_ALIASES = {
+    "routed_scaling_factor": "route_scale",
+    "psr": "psr_enabled",
+    "ced_recurrent": "ced_recurrent_enabled",
+    "no_ced_recurrent": "ced_recurrent_enabled",
+    "no_psr": "psr_enabled",
+    "no_psr_enabled": "psr_enabled",
+}
 
 # 派生字段 → 生成它们的 CLI 结构参数。sidecar 里的派生字段是按当时的结构算好的；
 # 只要用户显式改了生成它的结构参数（如 --num_hidden_layers / --mtp_depth），
@@ -489,6 +536,49 @@ def load_checkpoint_config(save_dir, checkpoint_name):
     return config
 
 
+def checkpoint_execution(config):
+    """Execution identity independent of shared parameter names/shapes."""
+    cfg = config if isinstance(config, dict) else vars(config)
+    if not cfg.get("ced_recurrent_enabled", False):
+        return {"kind": "token_ced_v1"}
+    return {
+        "kind": cfg.get("ced_recurrent_arch", "residual_lift_v1"),
+        "stride": int(cfg.get("ced_recurrent_stride", 4)),
+        "rounds": int(cfg.get("ced_recurrent_rounds", 3)),
+    }
+
+
+def validate_checkpoint_execution(checkpoint_path, config, args, *, automatic=False):
+    """Require an explicit optimizer-reset warm start when CED execution changes.
+
+    Legacy sidecars without recurrent fields denote token CED. Missing metadata
+    cannot attest to recurrent execution and thus also requires conversion.
+    Returns True for a conversion, before any model/optimizer mutation occurs.
+    """
+    meta_path = os.path.splitext(os.fspath(checkpoint_path))[0] + ".json"
+    meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path, encoding="utf-8") as file:
+            meta = json.load(file)
+    source = meta.get("execution") or checkpoint_execution(meta.get("config", {}))
+    target = checkpoint_execution(config)
+    if source == target:
+        return False
+    explicit = (
+        not automatic
+        and not getattr(args, "auto_resume", False)
+        and bool(getattr(args, "reset_optimizer", False))
+    )
+    if not explicit:
+        raise ValueError(
+            f"Checkpoint CED execution {source} differs from requested {target}. "
+            "Automatic resume cannot convert execution. Use an explicit checkpoint "
+            "with --reset_optimizer for a warm start in a fresh output directory."
+        )
+    Logger(f"Explicit CED warm start: {source} -> {target}; optimizer/progress reset")
+    return True
+
+
 def build_config_from_sidecar(args, checkpoint_name):
     """以基座 checkpoint 的 sidecar config 为底，CLI 显式参数（非 None）覆盖。
 
@@ -508,7 +598,11 @@ def build_config_from_sidecar(args, checkpoint_name):
         # 结构生成参数被显式改动时，sidecar 里的派生字段作废（见
         # DERIVED_FIELD_TRIGGERS 的说明）；用户显式传了的派生字段保留
         for field, triggers in DERIVED_FIELD_TRIGGERS.items():
-            if field in cfg and field not in given and any(t in given for t in triggers):
+            if (
+                field in cfg
+                and field not in given
+                and any(t in given for t in triggers)
+            ):
                 cfg.pop(field)
     else:
         preset = getattr(args, "preset", None)
@@ -774,6 +868,7 @@ def get_lr_and_momentum(
             if wsd_decay_shape == "cosine":
                 # 报告 §4.2.2：平台后用余弦从 peak 衰减到 min_lr_ratio
                 import math as _math
+
                 cosine = 0.5 * (1.0 + _math.cos(_math.pi * min(progress, 1.0)))
                 lr_multiplier = min_lr_ratio + (1.0 - min_lr_ratio) * cosine
             else:
@@ -830,8 +925,11 @@ def _optimizer_hparams(optimizer):
     hparams = []
     for opt in _sub_optimizers(optimizer):
         h = {"class": type(opt).__name__}
-        for key,value in vars(opt).items():
-            if isinstance(value,(str,int,float,bool)) or (isinstance(value,(tuple,list)) and all(isinstance(x,(int,float)) for x in value)):
+        for key, value in vars(opt).items():
+            if isinstance(value, (str, int, float, bool)) or (
+                isinstance(value, (tuple, list))
+                and all(isinstance(x, (int, float)) for x in value)
+            ):
                 h[key] = value
         lr = opt.learning_rate
         h["learning_rate"] = None if callable(lr) else float(lr)
@@ -843,26 +941,28 @@ def _optimizer_hparams(optimizer):
 
 def _artifact_sha256(path, common_only=False):
     digest = hashlib.sha256()
-    with open(path,"rb") as file:
+    with open(path, "rb") as file:
         if not common_only:
-            for chunk in iter(lambda:file.read(8<<20),b""):
+            for chunk in iter(lambda: file.read(8 << 20), b""):
                 digest.update(chunk)
         else:
-            size = struct.unpack("<Q",file.read(8))[0]
+            size = struct.unpack("<Q", file.read(8))[0]
             header = json.loads(file.read(size))
             for name, entry in sorted(header.items()):
-                if name == "__metadata__" or name.startswith(("psr.", "ncp.")):
+                if name == "__metadata__" or name.startswith("psr."):
                     continue
-                digest.update(json.dumps([name,entry["dtype"],entry["shape"]]).encode())
-                start,end = entry["data_offsets"]
-                file.seek(8+size+start)
-                remaining=end-start
+                digest.update(
+                    json.dumps([name, entry["dtype"], entry["shape"]]).encode()
+                )
+                start, end = entry["data_offsets"]
+                file.seek(8 + size + start)
+                remaining = end - start
                 while remaining:
-                    chunk=file.read(min(remaining,8<<20))
+                    chunk = file.read(min(remaining, 8 << 20))
                     if not chunk:
                         raise ValueError("truncated checkpoint while hashing")
                     digest.update(chunk)
-                    remaining-=len(chunk)
+                    remaining -= len(chunk)
     return digest.hexdigest()
 
 
@@ -870,9 +970,9 @@ def _restore_optimizer_hparams(optimizer, records):
     for opt, record in zip(_sub_optimizers(optimizer), records or []):
         for key, value in record.items():
             if key in vars(opt) and key != "_initialized":
-                old = getattr(opt,key)
-                if isinstance(old,(str,int,float,bool,list,tuple)):
-                    setattr(opt,key,tuple(value) if isinstance(old,tuple) else value)
+                old = getattr(opt, key)
+                if isinstance(old, (str, int, float, bool, list, tuple)):
+                    setattr(opt, key, tuple(value) if isinstance(old, tuple) else value)
         if record.get("learning_rate") is not None:
             opt.learning_rate = record["learning_rate"]
 
@@ -917,34 +1017,66 @@ def save_checkpoint(
         "step": step,
         "args": vars(args),
         "config": lm_config.to_dict(),
+        "execution": checkpoint_execution(lm_config),
         "training_type": training_type,
         "optimizer": _optimizer_hparams(optimizer),
-        "psr_optimizer": _optimizer_hparams(optimizer.psr_optimizer) if getattr(optimizer,"psr_optimizer",None) is not None else None,
-        "psr_microstep": getattr(args,"psr_microstep",step+1),
+        "psr_optimizer": _optimizer_hparams(optimizer.psr_optimizer)
+        if getattr(optimizer, "psr_optimizer", None) is not None
+        else None,
+        "psr_microstep": getattr(args, "psr_microstep", step + 1),
     }
-    if getattr(lm_config, 'psr_enabled', False) or getattr(lm_config, 'ncp_enabled', False):
-        meta['code_sha'] = subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
-        meta['dirty_diff_sha256'] = hashlib.sha256(subprocess.check_output(['git','diff'])).hexdigest()
-        root=Path(__file__).resolve().parents[1]
-        meta['source_sha256'] = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-                                 for folder in ('model','trainer') for p in sorted((root/folder).rglob('*.py'))}
-        meta['tokenizer_sha256'] = {str(p):hashlib.sha256(p.read_bytes()).hexdigest()
-                                    for p in Path(getattr(args,'model_path','model')).glob('*token*.json')}
-        meta['rng'] = {'mlx_key': list(mx.random.state)[0].tolist(), 'python': random.getstate(),
-                       'numpy_epoch_start': getattr(args,'epoch_shuffle_state',None)}
-        filters = getattr(optimizer,'filters',[lambda *_: True])
-        group_key = 'optimizer_parameter_groups' if getattr(lm_config,'ncp_enabled',False) else 'baseline_parameter_groups'
+    if training_type == "sft" and getattr(args, "sft_algorithm", "standard") == "tail":
+        meta["rng"] = {
+            "mlx_key": list(mx.random.state)[0].tolist(),
+            "python": random.getstate(),
+            "numpy_epoch_start": getattr(args, "epoch_shuffle_state", None),
+        }
+    if any(
+        getattr(lm_config, flag, False)
+        for flag in ("psr_enabled", "ced_recurrent_enabled")
+    ):
+        meta["code_sha"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip()
+        meta["dirty_diff_sha256"] = hashlib.sha256(
+            subprocess.check_output(["git", "diff"])
+        ).hexdigest()
+        root = Path(__file__).resolve().parents[1]
+        meta["source_sha256"] = {
+            str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for folder in ("model", "trainer")
+            for p in sorted((root / folder).rglob("*.py"))
+        }
+        meta["tokenizer_sha256"] = {
+            str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in Path(getattr(args, "model_path", "model")).glob("*token*.json")
+        }
+        meta["rng"] = {
+            "mlx_key": list(mx.random.state)[0].tolist(),
+            "python": random.getstate(),
+            "numpy_epoch_start": getattr(args, "epoch_shuffle_state", None),
+        }
+        filters = getattr(optimizer, "filters", [lambda *_: True])
+        group_key = (
+            "baseline_parameter_groups"
+            if getattr(lm_config, "psr_enabled", False)
+            else "optimizer_parameter_groups"
+        )
         meta[group_key] = [[] for _ in filters]
-        for key,value in tree_flatten(model.trainable_parameters()):
-            if key.startswith('psr.'):
+        for key, value in tree_flatten(model.trainable_parameters()):
+            if key.startswith("psr."):
                 continue
-            for i,fn in enumerate(filters):
-                if fn(key,value):
+            for i, fn in enumerate(filters):
+                if fn(key, value):
                     meta[group_key][i].append(key)
                     break
     meta_path = os.path.join(args.save_dir, f"{ckp_name}.json")
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2, default=str)
+    if save_interval > 0 and step > 0 and step % save_interval == 0:
+        # A shared-weight recurrent snapshot cannot be identified by tensor keys.
+        with open(os.path.splitext(step_ckp)[0] + ".json", "w") as f:
+            json.dump(meta, f, indent=2, default=str)
     latest_ckp = os.path.join(args.save_dir, "latest_checkpoint.txt")
     with open(latest_ckp, "w") as f:
         f.write(os.path.abspath(ckp))
@@ -952,14 +1084,24 @@ def save_checkpoint(
     opt_path = os.path.join(args.save_dir, f"{ckp_name}.optimizer.safetensors")
     mx.save_safetensors(opt_path, dict(tree_flatten(optimizer.state)))
 
-    side = getattr(optimizer, 'psr_optimizer', None)
+    side = getattr(optimizer, "psr_optimizer", None)
     if side is not None:
-        mx.save_safetensors(os.path.join(args.save_dir, f"{ckp_name}.psr_optimizer.safetensors"), dict(tree_flatten(side.state)))
-    if getattr(lm_config,'psr_enabled',False) or getattr(lm_config,'ncp_enabled',False):
-        meta['common_weights_sha256'] = _artifact_sha256(ckp,common_only=True)
-        meta['optimizer_sha256' if getattr(lm_config,'ncp_enabled',False) else 'baseline_optimizer_sha256'] = _artifact_sha256(opt_path)
-        with open(meta_path,'w') as file:
-            json.dump(meta,file,indent=2,default=str)
+        mx.save_safetensors(
+            os.path.join(args.save_dir, f"{ckp_name}.psr_optimizer.safetensors"),
+            dict(tree_flatten(side.state)),
+        )
+    if any(
+        getattr(lm_config, flag, False)
+        for flag in ("psr_enabled", "ced_recurrent_enabled")
+    ):
+        meta["common_weights_sha256"] = _artifact_sha256(ckp, common_only=True)
+        meta[
+            "baseline_optimizer_sha256"
+            if getattr(lm_config, "psr_enabled", False)
+            else "optimizer_sha256"
+        ] = _artifact_sha256(opt_path)
+        with open(meta_path, "w") as file:
+            json.dump(meta, file, indent=2, default=str)
     Logger(f"Checkpoint saved: {ckp}")
 
     model.train()
@@ -968,18 +1110,21 @@ def save_checkpoint(
 def load_checkpoint(checkpoint_path, model, optimizer, args):
     """统一的检查点加载函数（safetensors 格式）"""
     Logger(f"Loading checkpoint from: {checkpoint_path}")
+    validate_checkpoint_execution(checkpoint_path, model.config, args)
     weights = dict(mx.load(checkpoint_path).items())
     psr_prefixes = ("psr.",)
-    if any(k.startswith(("model.reasoner.","model.workspace_bridges.")) for k in weights):
-        raise ValueError("Legacy PSR checkpoint: retain it for E0; load an explicit baseline checkpoint for protected PSR")
-    fresh_psr = (getattr(model.config, "psr_enabled", False)
-                 and not any(k.startswith(psr_prefixes) for k in weights))
-    fresh_prefixes = ("mtp_modules.",) if getattr(args, "freeze_backbone", False) else ()
-    fresh_ncp = getattr(model.config, "ncp_enabled", False) and not any(k.startswith("ncp.") for k in weights)
-    if fresh_ncp:
-        if not getattr(args,"reset_optimizer",False):
-            raise ValueError("NCP changes architecture/optimizer groups: use a fresh output directory or explicit --reset_optimizer for a baseline warm start")
-        fresh_prefixes += ("ncp.",)
+    if any(
+        k.startswith(("model.reasoner.", "model.workspace_bridges.")) for k in weights
+    ):
+        raise ValueError(
+            "Legacy PSR checkpoint: retain it for E0; load an explicit baseline checkpoint for protected PSR"
+        )
+    fresh_psr = getattr(model.config, "psr_enabled", False) and not any(
+        k.startswith(psr_prefixes) for k in weights
+    )
+    fresh_prefixes = (
+        ("mtp_modules.",) if getattr(args, "freeze_backbone", False) else ()
+    )
     if fresh_psr:
         fresh_prefixes += psr_prefixes
 
@@ -1010,11 +1155,19 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
 
     # 加载优化器状态（如未指定重置）。--freeze_backbone 的 DSpark 阶段可训练集合
     # 与基座训练不同（只有 mtp_modules.*），优化器分组天然不一致，必须重置。
-    if getattr(args, "freeze_backbone", False) and not getattr(args, "reset_optimizer", False):
-        Logger("--freeze_backbone：可训练集合与基座不同，自动跳过优化器状态（等价 --reset_optimizer）")
+    if getattr(args, "freeze_backbone", False) and not getattr(
+        args, "reset_optimizer", False
+    ):
+        Logger(
+            "--freeze_backbone：可训练集合与基座不同，自动跳过优化器状态（等价 --reset_optimizer）"
+        )
     if fresh_psr:
-        Logger("Protected PSR: loaded shared baseline exactly; new side initialized; preserving baseline optimizer/progress")
-    if not getattr(args, "reset_optimizer", False) and not getattr(args, "freeze_backbone", False):
+        Logger(
+            "Protected PSR: loaded shared baseline exactly; new side initialized; preserving baseline optimizer/progress"
+        )
+    if not getattr(args, "reset_optimizer", False) and not getattr(
+        args, "freeze_backbone", False
+    ):
         if os.path.exists(opt_path):
             optimizer.state = tree_unflatten(list(mx.load(opt_path).items()))
             mx.eval(optimizer.state)
@@ -1028,29 +1181,40 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
 
     # 如要求重置优化器，则从step 0开始
     if getattr(args, "reset_optimizer", False):
+        start_epoch = 0
         start_step = 0
         Logger(
             "reset_optimizer set: optimizer states not loaded; start_step reset to 0"
         )
 
-    side = getattr(optimizer, 'psr_optimizer', None)
+    side = getattr(optimizer, "psr_optimizer", None)
     side_path = f"{base}.psr_optimizer.safetensors"
-    if side is not None and not fresh_psr and not getattr(args,'reset_optimizer',False):
+    if (
+        side is not None
+        and not fresh_psr
+        and not getattr(args, "reset_optimizer", False)
+    ):
         if not os.path.exists(side_path):
-            raise ValueError('Protected PSR resume requires its separate optimizer state; use --reset_optimizer explicitly otherwise')
+            raise ValueError(
+                "Protected PSR resume requires its separate optimizer state; use --reset_optimizer explicitly otherwise"
+            )
         side.state = tree_unflatten(list(mx.load(side_path).items()))
-        _restore_optimizer_hparams(side, meta.get('psr_optimizer', []))
-    args.psr_resumed_microstep = meta.get('psr_microstep', start_step)
-    if not getattr(args,'reset_optimizer',False) and meta.get('rng'):
-        rng = meta['rng']
-        high,low = rng['mlx_key']
-        mx.random.seed((int(high)<<32)|int(low))
+        _restore_optimizer_hparams(side, meta.get("psr_optimizer", []))
+    args.psr_resumed_microstep = meta.get("psr_microstep", start_step)
+    if not getattr(args, "reset_optimizer", False) and meta.get("rng"):
+        rng = meta["rng"]
+        high, low = rng["mlx_key"]
+        mx.random.seed((int(high) << 32) | int(low))
+
         def tuples(value):
-            return tuple(tuples(x) for x in value) if isinstance(value,list) else value
-        random.setstate(tuples(rng['python']))
-        state = rng.get('numpy_epoch_start')
+            return tuple(tuples(x) for x in value) if isinstance(value, list) else value
+
+        random.setstate(tuples(rng["python"]))
+        state = rng.get("numpy_epoch_start")
         if state:
-            np.random.set_state((state[0],np.asarray(state[1],dtype=np.uint32),*state[2:]))
+            np.random.set_state(
+                (state[0], np.asarray(state[1], dtype=np.uint32), *state[2:])
+            )
 
     Logger(f"Resumed from epoch {start_epoch}, next_step {start_step}")
 

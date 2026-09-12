@@ -14,7 +14,6 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import mlx.core as mx  # noqa: E402
-from mlx import nn  # noqa: E402
 
 NEG_INF = float("-inf")
 
@@ -56,8 +55,11 @@ def main():
 
         def f():
             o = mx.fast.scaled_dot_product_attention(
-                q.transpose(0, 2, 1, 3), k[:, None], k[:, None],
-                scale=D ** -0.5, mask=mask,
+                q.transpose(0, 2, 1, 3),
+                k[:, None],
+                k[:, None],
+                scale=D**-0.5,
+                mask=mask,
             )
             mx.eval(o)
 
@@ -74,15 +76,20 @@ def main():
         mx.eval(idx)
 
         def f():
-            kg = mx.take_along_axis(kv[:, None, :, :], idx[..., None], axis=2)  # [B,T,S,D]
+            kg = mx.take_along_axis(
+                kv[:, None, :, :], idx[..., None], axis=2
+            )  # [B,T,S,D]
             qf = q.reshape(B * T, H, 1, D)
             kf = kg.reshape(B * T, 1, kg.shape[2], D)
-            o = mx.fast.scaled_dot_product_attention(qf, kf, kf, scale=D ** -0.5)
+            o = mx.fast.scaled_dot_product_attention(qf, kf, kf, scale=D**-0.5)
             mx.eval(o.reshape(B, T, H, D))
 
         return f
 
-    print("形状 B=%d T=%d H=%d D=%d window=%d topk=%d  (min/med ms, 前向)" % (B, T, H, D, W, K))
+    print(
+        "形状 B=%d T=%d H=%d D=%d window=%d topk=%d  (min/med ms, 前向)"
+        % (B, T, H, D, W, K)
+    )
     for S in (T, T + T // 2, 2 * T, W + K):
         mn, med = bench(dense(S) if S != W + K else gathered())
         tag = "dense S=%d" % S if S != W + K else "gather S=%d" % S

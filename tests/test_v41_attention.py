@@ -15,21 +15,26 @@
 """
 
 import numpy as np
-import pytest
 
 from _v41_common import (
-    assert_changed_exactly, build, ced_model, cfg_ced, cfg_mix, cfg_tiny, mix_model, row_diffs,
+    assert_changed_exactly,
+    ced_model,
+    cfg_ced,
+    cfg_mix,
+    cfg_tiny,
+    mix_model,
+    row_diffs,
 )
 from model.attention import Attention, _topk_masks, select_candidate_blocks
 from model.cache import SharedAttnState, VibyCache
 from model.hc import identity_pre_mix, hc_pre
-from model.config import VibyConfig
 from model.rope import precompute_freqs_cis
 
 import mlx.core as mx
 
 
 # ------------------------------------------------------------------ 滑窗
+
 
 def _sliding_attn(window=4):
     cfg = cfg_tiny(window_size=window)
@@ -66,18 +71,24 @@ def test_sliding_window_is_causal():
     mx.eval(yp)
     d = row_diffs(y, yp)[0]
     assert (d[:20] < 1e-6).all(), d[:20]
-    assert (d[20:28] > 1e-9).all()          # 窗口内（含自己）
-    assert (d[28:] < 1e-6).all()            # 超出窗口
+    assert (d[20:28] > 1e-9).all()  # 窗口内（含自己）
+    assert (d[28:] < 1e-6).all()  # 超出窗口
 
 
 # ------------------------------------------------------------------ 压缩可见性
 
+
 def test_compressed_group_visible_from_group_end():
     """压缩组 j 只对 t ≥ (j+1)·r-1 的 query 可见（组凑满之后）。"""
     R, W, T = 4, 2, 32
-    cfg = cfg_tiny(compress_ratios=(0, 0, R, 0, 0), kv_source_layers=(2,),
-                   index_source_layers=(2,), candidate_source_layer=-1, window_size=W,
-                   index_topk=64)
+    cfg = cfg_tiny(
+        compress_ratios=(0, 0, R, 0, 0),
+        kv_source_layers=(2,),
+        index_source_layers=(2,),
+        candidate_source_layer=-1,
+        window_size=W,
+        index_topk=64,
+    )
     mx.random.seed(14)
     attn = Attention(cfg, 2)
     mx.random.seed(15)
@@ -99,8 +110,12 @@ def test_compressed_group_is_average_of_ratio_tokens():
     """压缩器把 r 个 token 归一化池化成一个 latent（组首位置 = j·r）。"""
     from model.attention import Compressor
 
-    cfg = cfg_tiny(compress_ratios=(0, 0, 4, 0, 0), kv_source_layers=(2,),
-                   index_source_layers=(2,), candidate_source_layer=-1)
+    cfg = cfg_tiny(
+        compress_ratios=(0, 0, 4, 0, 0),
+        kv_source_layers=(2,),
+        index_source_layers=(2,),
+        candidate_source_layer=-1,
+    )
     mx.random.seed(16)
     comp = Compressor(cfg, 2)
     assert comp.ratio == 4 and comp.wgate is not None
@@ -109,23 +124,32 @@ def test_compressed_group_is_average_of_ratio_tokens():
     mx.eval(latent)
     assert latent.shape == (1, 2, cfg.head_dim)
     assert first == 0
-    assert np.asarray(pos).tolist() == [[0, 4]]     # 组首绝对位置
+    assert np.asarray(pos).tolist() == [[0, 4]]  # 组首绝对位置
     # 池化权重 = 组内 softmax(wgate·x)，手算对照（同一个 RMSNorm 再走一遍）
     kv, sc = comp.wkv(x), comp.wgate(x)
     w = mx.softmax(sc.reshape(1, 2, 4, cfg.head_dim), axis=2)
     expect = comp.norm((kv.reshape(1, 2, 4, cfg.head_dim) * w).sum(axis=2))
     mx.eval(expect)
-    assert np.allclose(np.asarray(latent), np.asarray(expect), atol=2e-6),         np.abs(np.asarray(latent) - np.asarray(expect)).max()
+    assert np.allclose(np.asarray(latent), np.asarray(expect), atol=2e-6), np.abs(
+        np.asarray(latent) - np.asarray(expect)
+    ).max()
     # ratio=1（CED 解码段的全局源）退化成一次普通投影
-    cfg1 = cfg_tiny(compress_ratios=(0, 0, 1, 1, 0), kv_source_layers=(2,),
-                    index_source_layers=(2,), candidate_source_layer=-1)
+    cfg1 = cfg_tiny(
+        compress_ratios=(0, 0, 1, 1, 0),
+        kv_source_layers=(2,),
+        index_source_layers=(2,),
+        candidate_source_layer=-1,
+    )
     c1 = Compressor(cfg1, 2)
     lat1, st1, pos1, _ = c1(x, 0, None)
     assert st1 is None and c1.wgate is None
-    assert lat1.shape == (1, 8, cfg1.head_dim) and np.asarray(pos1).tolist() == [list(range(8))]
+    assert lat1.shape == (1, 8, cfg1.head_dim) and np.asarray(pos1).tolist() == [
+        list(range(8))
+    ]
 
 
 # ------------------------------------------------------------------ top-k 稀疏
+
 
 def test_topk_masks_select_exactly_k_by_score():
     """_topk_masks 手算参照：恰好 k 个、与 numpy top-k 同集合、按位置排序。"""
@@ -154,8 +178,13 @@ def test_topk_masks_select_exactly_k_by_score():
 
 def test_sparse_selection_is_per_query_and_bounded():
     """每个 query 只关注 index_topk 个压缩位置（含 reach 截断）。"""
-    cfg = cfg_tiny(compress_ratios=(0, 0, 1, 0, 0), kv_source_layers=(2,),
-                   index_source_layers=(2,), candidate_source_layer=-1, index_topk=3)
+    cfg = cfg_tiny(
+        compress_ratios=(0, 0, 1, 0, 0),
+        kv_source_layers=(2,),
+        index_source_layers=(2,),
+        candidate_source_layer=-1,
+        index_topk=3,
+    )
     mx.random.seed(17)
     attn = Attention(cfg, 2)
     T = 10
@@ -169,10 +198,15 @@ def test_sparse_selection_is_per_query_and_bounded():
 
 def test_non_selected_compressed_kv_does_not_change_output():
     """index_topk 之外的压缩 KV 改动 → 输出 bit-level 不变。"""
-    cfg = cfg_tiny(compress_ratios=(0, 0, 1, 1, 0), kv_source_layers=(2,),
-                   index_source_layers=(2,), candidate_source_layer=-1, index_topk=3)
+    cfg = cfg_tiny(
+        compress_ratios=(0, 0, 1, 1, 0),
+        kv_source_layers=(2,),
+        index_source_layers=(2,),
+        candidate_source_layer=-1,
+        index_topk=3,
+    )
     mx.random.seed(18)
-    reuse = Attention(cfg, 3)              # Reuse 层：直接用上游的 keep_mask 与 KV 池
+    reuse = Attention(cfg, 3)  # Reuse 层：直接用上游的 keep_mask 与 KV 池
     assert reuse.mode == "reuse" and reuse.indexer is None
     T, N = 8, 8
     x = mx.random.normal((1, T, cfg.dim))
@@ -199,6 +233,7 @@ def test_non_selected_compressed_kv_does_not_change_output():
 
 
 # ------------------------------------------------------------------ CSA2 三模式
+
 
 def _layer_outputs(model, layer_idx, x, shared=None):
     sh = shared or SharedAttnState()
@@ -238,7 +273,7 @@ def test_reindex_reuses_upstream_kv_but_reselects_topk():
 
     def run():
         sh = SharedAttnState()
-        _layer_outputs(model, 3, x, sh)          # 上游 Full 层写 KV/index K/候选池
+        _layer_outputs(model, 3, x, sh)  # 上游 Full 层写 KV/index K/候选池
         y, sh = _layer_outputs(model, 5, x, sh)  # Reindex 层重算 top-k
         return y, sh
 
@@ -285,6 +320,7 @@ def test_reuse_layer_has_no_indexer_and_follows_upstream_selection():
 
 # ------------------------------------------------------------------ 分层索引
 
+
 def test_candidate_pool_is_upper_bound_for_deeper_indexer():
     """§2.3.2：候选块之外的压缩位置对更深的 indexer 不可见（keep ⊆ 候选池）。"""
     cfg = cfg_mix(candidate_topk_blocks=1, candidate_block_size=2, index_topk=4)
@@ -293,17 +329,18 @@ def test_candidate_pool_is_upper_bound_for_deeper_indexer():
     T = 16
     x = mx.random.normal((1, T, cfg.dim))
     sh = SharedAttnState()
-    _layer_outputs(model, 3, x, sh)                     # 候选源层（Full）
+    _layer_outputs(model, 3, x, sh)  # 候选源层（Full）
     cand = np.asarray(sh.candidates)[0].copy()
     assert cand.sum() > 0
-    _layer_outputs(model, 5, x, sh)                     # 更深 indexer（Reindex）
+    _layer_outputs(model, 5, x, sh)  # 更深 indexer（Reindex）
     keep = np.asarray(sh.keep_mask)[0]
     assert not (keep & ~cand).any(), "更深 indexer 选到了候选池之外的位置"
     # 非平凡性：候选源层自己的 Top-K 不受候选池限制（它是全局打分的那一层）
     sh_src = SharedAttnState()
     _layer_outputs(model, 3, x, sh_src)
-    assert (np.asarray(sh_src.keep_mask)[0] & ~cand).any(), \
+    assert (np.asarray(sh_src.keep_mask)[0] & ~cand).any(), (
         "候选源层应全局选 Top-K（候选池只是给更深层用的）"
+    )
 
 
 def test_candidate_blocks_pick_highest_block_scores():
@@ -332,8 +369,8 @@ def test_candidate_blocks_pick_highest_block_scores():
     # 块得分确实是"块内最大值"：块 0 只有一个峰、块 1 整体更高，块 0 仍应
     # 凭借自己的最大值挤进 top-2（另一个名额被最新块钉住）
     peak = mx.array(np.full((1, 1, N), -50.0, dtype=np.float32))
-    peak = peak.at[0, 0, 1].add(100.0)          # 块 0 的唯一峰
-    peak = peak.at[0, 0, 4:8].add(-1.0)         # 块 1 整体更高但没有峰
+    peak = peak.at[0, 0, 1].add(100.0)  # 块 0 的唯一峰
+    peak = peak.at[0, 0, 4:8].add(-1.0)  # 块 1 整体更高但没有峰
     got2 = np.asarray(select_candidate_blocks(peak, mx.array([[N]]), 2, BS))[0, 0]
     assert got2.reshape(nb, BS).all(axis=1).tolist() == [True, False, True]
     # 最新（未填满）的块必须钉住，即使它分数最低
@@ -344,6 +381,7 @@ def test_candidate_blocks_pick_highest_block_scores():
 
 
 # ------------------------------------------------------------------ CED
+
 
 def _manual_forward(model, ids, cache, perturb_before=None, delta=0.3):
     """复刻 VibyModel.__call__ 的层循环，可在某一层入口扰动 hidden。"""
@@ -387,10 +425,11 @@ def test_ced_decoder_compress_kv_comes_only_from_boundary_layer():
 
     base = pool_after(None)
     assert np.abs(base - pool_after(None)).max() == 0.0, "同输入两次前向应逐位一致"
-    after_boundary = pool_after(mid + 1)      # 扰动解码段入口的 hidden
-    assert np.abs(base - after_boundary).max() == 0.0, \
+    after_boundary = pool_after(mid + 1)  # 扰动解码段入口的 hidden
+    assert np.abs(base - after_boundary).max() == 0.0, (
         "解码层 hidden 不得进入全局压缩 KV（CED）"
-    before_boundary = pool_after(mid)         # 扰动边界层入口 → 池必须变（非平凡）
+    )
+    before_boundary = pool_after(mid)  # 扰动边界层入口 → 池必须变（非平凡）
     assert np.abs(base - before_boundary).max() > 1e-3
 
 
@@ -404,11 +443,15 @@ def test_ced_sliding_branch_still_layer_local():
     c0, c1 = VibyCache(cfg, 1), VibyCache(cfg, 1)
     _manual_forward(model, ids, c0, perturb_before=None)
     _manual_forward(model, ids, c1, perturb_before=mid + 1)
-    w0, w1 = np.asarray(c0.layers[mid + 1].window), np.asarray(c1.layers[mid + 1].window)
+    w0, w1 = (
+        np.asarray(c0.layers[mid + 1].window),
+        np.asarray(c1.layers[mid + 1].window),
+    )
     assert np.abs(w0 - w1).max() > 1e-6, "解码层的 SWA KV 必须由本层 hidden 产生"
 
 
 # ------------------------------------------------------------------ RoPE 常量回归
+
 
 def test_rope_tables_are_not_randomized_by_init():
     """回归：apply_trunc_normal_init 不得覆盖 freq_cos/freq_sin（RoPE 是常量）。"""
@@ -416,12 +459,23 @@ def test_rope_tables_are_not_randomized_by_init():
     mx.random.seed(20)
     from model.model import VibyForCausalLM
 
-    model = VibyForCausalLM(cfg)          # skip_init=False：走截断正态初始化
+    model = VibyForCausalLM(cfg)  # skip_init=False：走截断正态初始化
     for i, ratio in enumerate([cfg.compress_ratios[j] for j in range(cfg.n_layers)]):
         attn = model.model.layers[i].attn
-        seq, theta = (cfg.original_seq_len, cfg.compress_rope_theta) if ratio else (0, cfg.rope_theta)
-        cos, sin = precompute_freqs_cis(cfg.rope_head_dim, cfg.max_seq_len, seq, theta,
-                                        cfg.rope_factor, cfg.beta_fast, cfg.beta_slow)
+        seq, theta = (
+            (cfg.original_seq_len, cfg.compress_rope_theta)
+            if ratio
+            else (0, cfg.rope_theta)
+        )
+        cos, sin = precompute_freqs_cis(
+            cfg.rope_head_dim,
+            cfg.max_seq_len,
+            seq,
+            theta,
+            cfg.rope_factor,
+            cfg.beta_fast,
+            cfg.beta_slow,
+        )
         mx.eval(cos, sin)
         assert float(mx.max(mx.abs(attn.freq_cos - cos))) == 0.0
         assert float(mx.max(mx.abs(attn.freq_sin - sin))) == 0.0
@@ -434,6 +488,7 @@ def test_rope_tables_are_not_randomized_by_init():
 
 
 # ------------------------------------------------------- 训练路径分块 ≡ 稠密
+
 
 def test_chunked_window_matches_dense_path(monkeypatch):
     """分块滑窗路径必须与"全 T + 掩码"的稠密路径逐位一致（同输入同权重）。

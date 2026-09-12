@@ -31,12 +31,16 @@ def main():
     ap.add_argument("--head-dim", type=int, default=128)
     ap.add_argument("--window", type=int, default=128)
     ap.add_argument("--bwd", action="store_true", help="跑 mx.vjp")
-    ap.add_argument("--prewarm", action="store_true", help="直接调 prewarm_sparse_attention")
+    ap.add_argument(
+        "--prewarm", action="store_true", help="直接调 prewarm_sparse_attention"
+    )
     args = ap.parse_args()
 
     if args.prewarm:
         print("prewarm_sparse_attention(...) ...", flush=True)
-        prewarm_sparse_attention(args.head_dim, args.window, args.head_dim ** -0.5, mx.bfloat16)
+        prewarm_sparse_attention(
+            args.head_dim, args.window, args.head_dim**-0.5, mx.bfloat16
+        )
         print("prewarm OK")
         return
 
@@ -45,12 +49,18 @@ def main():
     compressed = mx.zeros((args.b, args.n, args.head_dim), mx.bfloat16)
     mask = mx.ones((args.b, args.t, args.n), mx.bool_)
     sinks = mx.zeros((16,), mx.float32)
-    scale = args.head_dim ** -0.5
+    scale = args.head_dim**-0.5
 
     if not args.bwd:
-        out = indexed_attention(q, window, compressed, mask, None, None, sinks, args.window, scale)
+        out = indexed_attention(
+            q, window, compressed, mask, None, None, sinks, args.window, scale
+        )
         mx.eval(out)
-        print("forward OK", tuple(out.shape), "window T=%d compressed N=%d" % (args.t, args.n))
+        print(
+            "forward OK",
+            tuple(out.shape),
+            "window T=%d compressed N=%d" % (args.t, args.n),
+        )
         return
 
     def fn(a, w, c, s):

@@ -5,6 +5,7 @@ uses one threadgroup; the RMS statistic is accumulated in FP32. The backward
 also fuses stream expansion and the per-token coefficient reductions.
 VIBY_HC_PRE_NORM_KERNEL=0 restores the composed MLX graph.
 """
+
 import os
 from functools import lru_cache
 
@@ -88,10 +89,13 @@ _BWD_GROUPED = r"""
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint d=tid;d<D;d+=128) dweight[(size_t)group*D+d]=dw_acc[d/128];
-""".replace("/*TOKEN_BACKWARD*/", _BWD[_BWD.index("    float dr="):].replace(
-    "dweight[pos]=T(g[pos]*T(h[pos]*T(r)));",
-    "dw_acc[d/128]+=float(T(g[pos]*T(h[pos]*T(r))));",
-))
+""".replace(
+    "/*TOKEN_BACKWARD*/",
+    _BWD[_BWD.index("    float dr=") :].replace(
+        "dweight[pos]=T(g[pos]*T(h[pos]*T(r)));",
+        "dw_acc[d/128]+=float(T(g[pos]*T(h[pos]*T(r))));",
+    ),
+)
 
 
 @lru_cache(None)
@@ -99,31 +103,46 @@ def _grouped_backward():
     return mx.fast.metal_kernel(
         name="hc_pre_rms_bwd_grouped",
         input_names=["x", "pre", "weight", "g", "h", "rstd", "dims"],
-        output_names=["dx", "dpre", "dweight"], source=_BWD_GROUPED,
+        output_names=["dx", "dpre", "dweight"],
+        source=_BWD_GROUPED,
     )
 
 
 @lru_cache(None)
 def _kernels():
     return (
-        mx.fast.metal_kernel(name="hc_pre_rms_fwd", input_names=["x", "pre", "weight", "epsilon"],
-                             output_names=["y", "h", "rstd"], source=_FWD),
-        mx.fast.metal_kernel(name="hc_pre_rms_bwd", input_names=["x", "pre", "weight", "g", "h", "rstd"],
-                             output_names=["dx", "dpre", "dweight"], source=_BWD),
+        mx.fast.metal_kernel(
+            name="hc_pre_rms_fwd",
+            input_names=["x", "pre", "weight", "epsilon"],
+            output_names=["y", "h", "rstd"],
+            source=_FWD,
+        ),
+        mx.fast.metal_kernel(
+            name="hc_pre_rms_bwd",
+            input_names=["x", "pre", "weight", "g", "h", "rstd"],
+            output_names=["dx", "dpre", "dweight"],
+            source=_BWD,
+        ),
     )
 
 
 def enabled_for(x):
-    return (_ENABLED and mx.default_device() == mx.gpu
-            and x.dtype in (mx.bfloat16, mx.float16) and x.shape[-2] == 4
-            and 0 < x.shape[-1] <= 4096 and x.shape[-1] % 32 == 0)
+    return (
+        _ENABLED
+        and mx.default_device() == mx.gpu
+        and x.dtype in (mx.bfloat16, mx.float16)
+        and x.shape[-2] == 4
+        and 0 < x.shape[-1] <= 4096
+        and x.shape[-1] % 32 == 0
+    )
 
 
 @lru_cache(None)
 def _reduce_kernels():
     """§7.3 两级非 atomic 权梯度归约。"""
     stage1 = mx.fast.metal_kernel(
-        name="hc_pre_dw_stage1", input_names=["partial", "dims"],
+        name="hc_pre_dw_stage1",
+        input_names=["partial", "dims"],
         output_names=["second"],
         source=r"""
     uint tid=thread_position_in_grid.x;
@@ -137,7 +156,8 @@ def _reduce_kernels():
 """,
     )
     stage2 = mx.fast.metal_kernel(
-        name="hc_pre_dw_stage2", input_names=["second", "dims"],
+        name="hc_pre_dw_stage2",
+        input_names=["second", "dims"],
         output_names=["dweight"],
         source=r"""
     uint dd=thread_position_in_grid.x;
@@ -161,8 +181,11 @@ def _operation(eps):
         n, _, d = x.shape
         y, h, r = forward(
             inputs=[x, pre, weight, mx.array([eps], mx.float32)],
-            template=[("T", x.dtype), ("D", d)], grid=(128, n, 1), threadgroup=(128, 1, 1),
-            output_shapes=[(n, d), (n, d), (n,)], output_dtypes=[x.dtype, x.dtype, mx.float32],
+            template=[("T", x.dtype), ("D", d)],
+            grid=(128, n, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(n, d), (n, d), (n,)],
+            output_dtypes=[x.dtype, x.dtype, mx.float32],
         )
         return y, h, r
 
@@ -178,25 +201,32 @@ def _operation(eps):
             dx, dp, dw = _grouped_backward()(
                 inputs=[x, pre, weight, g, h, r, mx.array([n], mx.uint32)],
                 template=[("T", x.dtype), ("D", d), ("RT", rt)],
-                grid=(128, groups, 1), threadgroup=(128, 1, 1),
+                grid=(128, groups, 1),
+                threadgroup=(128, 1, 1),
                 output_shapes=[x.shape, pre.shape, (groups, d)],
                 output_dtypes=[x.dtype, mx.float32, mx.float32],
             )
             rows = max(1, (groups + 63) // 64)
             second = stage1(
                 inputs=[dw, mx.array([groups, d], mx.uint32)],
-                grid=(d, rows, 1), threadgroup=(128, 1, 1),
-                output_shapes=[(rows, d)], output_dtypes=[mx.float32],
+                grid=(d, rows, 1),
+                threadgroup=(128, 1, 1),
+                output_shapes=[(rows, d)],
+                output_dtypes=[mx.float32],
             )[0]
             dweight = stage2(
                 inputs=[second, mx.array([rows, d], mx.uint32)],
-                grid=(d, 1, 1), threadgroup=(128, 1, 1),
-                output_shapes=[(d,)], output_dtypes=[mx.float32],
+                grid=(d, 1, 1),
+                threadgroup=(128, 1, 1),
+                output_shapes=[(d,)],
+                output_dtypes=[mx.float32],
             )[0]
             return dx, dp.astype(pre.dtype), dweight.astype(weight.dtype)
         dx, dp, dw = backward(
-            inputs=[x, pre, weight, g, h, r], template=[("T", x.dtype), ("D", d)],
-            grid=(128, n, 1), threadgroup=(128, 1, 1),
+            inputs=[x, pre, weight, g, h, r],
+            template=[("T", x.dtype), ("D", d)],
+            grid=(128, n, 1),
+            threadgroup=(128, 1, 1),
             output_shapes=[x.shape, pre.shape, (n, d)],
             output_dtypes=[x.dtype, mx.float32, weight.dtype],
         )
@@ -207,8 +237,11 @@ def _operation(eps):
 
 def hc_pre_norm(x, pre, weight, eps):
     shape, d = x.shape[:-2], x.shape[-1]
-    out, _, _ = _operation(eps)(x.reshape(-1, 4, d), pre.reshape(-1, 4).astype(mx.float32),
-                               weight.astype(x.dtype))
+    out, _, _ = _operation(eps)(
+        x.reshape(-1, 4, d),
+        pre.reshape(-1, 4).astype(mx.float32),
+        weight.astype(x.dtype),
+    )
     return out.reshape(*shape, d)
 
 
@@ -220,6 +253,7 @@ def prewarm_hc_pre_norm(dim, eps, dtype=mx.bfloat16):
         return
     p = mx.ones((1, 4), mx.float32)
     w = mx.ones((dim,), dtype)
-    out, grads = mx.vjp(lambda a, b, c: hc_pre_norm(a, b, c, eps), [x, p, w],
-                        [mx.ones((1, dim), dtype)])
+    out, grads = mx.vjp(
+        lambda a, b, c: hc_pre_norm(a, b, c, eps), [x, p, w], [mx.ones((1, dim), dtype)]
+    )
     mx.eval(out, grads)

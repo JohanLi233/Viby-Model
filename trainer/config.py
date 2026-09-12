@@ -127,30 +127,61 @@ def add_common_args(parser):
         "--candidate_block_size", type=int, default=_DEFAULT_CFG.candidate_block_size
     )
     parser.add_argument("--index_n_heads", type=int, default=_DEFAULT_CFG.index_n_heads)
-    parser.add_argument("--index_head_dim", type=int, default=_DEFAULT_CFG.index_head_dim)
+    parser.add_argument(
+        "--index_head_dim", type=int, default=_DEFAULT_CFG.index_head_dim
+    )
     parser.add_argument("--index_topk", type=int, default=_DEFAULT_CFG.index_topk)
-    parser.add_argument("--psr", "--psr_enabled", dest="psr_enabled",
-                        action=argparse.BooleanOptionalAction, default=False,
-                        help="启用预测状态工作区；普通预训练默认开启，--no-psr 关闭")
-    for name in ("psr_slots", "psr_dim", "psr_blocks", "psr_topk", "psr_rounds", "psr_max_rounds",
-                 "psr_horizon", "psr_train_anchors"):
+    parser.add_argument(
+        "--psr",
+        "--psr_enabled",
+        dest="psr_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="启用隔离的 PSR 纠错分支；预训练默认启用，--no-psr 选择基线",
+    )
+    parser.add_argument(
+        "--ced-recurrent",
+        dest="ced_recurrent_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="残差提升式循环 CED 研究路径；配合 --no-psr --mtp_depth 0",
+    )
+    parser.add_argument(
+        "--ced-recurrent-stride",
+        "--ced_recurrent_stride",
+        type=int,
+        default=4,
+        help="每个文档完成多少 token 后产生一个锚点",
+    )
+    parser.add_argument(
+        "--ced-recurrent-rounds",
+        "--ced_recurrent_rounds",
+        type=int,
+        default=3,
+        help="共享中间 decoder 栈的循环次数",
+    )
+    for name in (
+        "psr_slots",
+        "psr_dim",
+        "psr_blocks",
+        "psr_topk",
+        "psr_rounds",
+        "psr_max_rounds",
+        "psr_horizon",
+        "psr_train_anchors",
+    ):
         parser.add_argument("--" + name, type=int, default=getattr(_DEFAULT_CFG, name))
     parser.add_argument("--psr_learning_rate", type=float, default=1e-4)
     parser.add_argument("--psr_weight_decay", type=float, default=0.0)
     parser.add_argument("--psr_grad_clip", type=float, default=1.0)
-    parser.add_argument("--psr_freeze_base", action="store_true", help="冻结基座，只训练隔离纠错头")
-    parser.add_argument("--psr_training_mode", choices=["off", "state_only", "recurrent"], default="recurrent")
-    parser.add_argument("--ncp", "--ncp_enabled", dest="ncp_enabled", action=argparse.BooleanOptionalAction,
-                        default=False, help="NCP core experiment; pretraining defaults on, --no-ncp selects the token baseline")
-    for name in ("ncp_layers", "ncp_heads", "ncp_codebooks", "ncp_inter_dim"):
-        parser.add_argument("--"+name, type=int, default=None)
-    parser.add_argument("--ncp_chunk_size", type=int, default=4)
-    parser.add_argument("--ncp_codebook_size", type=int, default=128)
-    parser.add_argument("--ncp_merge", choices=["softmax", "raw_logits"], default="softmax")
-    parser.add_argument("--ncp_loss_reduction", choices=["mean", "l2"], default="mean")
-    parser.add_argument("--ncp_loss_weight", type=float, default=1.0)
-    parser.add_argument("--ncp_vq_loss_weight", type=float, default=1.0)
-    parser.add_argument("--ncp_fusion_init", type=float, default=0.1)
+    parser.add_argument(
+        "--psr_freeze_base", action="store_true", help="冻结基座，只训练隔离纠错头"
+    )
+    parser.add_argument(
+        "--psr_training_mode",
+        choices=["off", "state_only", "recurrent"],
+        default="recurrent",
+    )
     parser.add_argument(
         "--rope_theta",
         type=float,
@@ -163,7 +194,9 @@ def add_common_args(parser):
         default=_DEFAULT_CFG.compress_rope_theta,
         help="压缩分支的 RoPE base（配 YaRN）",
     )
-    parser.add_argument("--original_seq_len", type=int, default=_DEFAULT_CFG.original_seq_len)
+    parser.add_argument(
+        "--original_seq_len", type=int, default=_DEFAULT_CFG.original_seq_len
+    )
     parser.add_argument("--rope_factor", type=float, default=_DEFAULT_CFG.rope_factor)
     parser.add_argument("--beta_fast", type=int, default=_DEFAULT_CFG.beta_fast)
     parser.add_argument("--beta_slow", type=int, default=_DEFAULT_CFG.beta_slow)
@@ -200,6 +233,36 @@ def add_common_args(parser):
     )
     parser.add_argument("--gate_temp", type=float, default=_DEFAULT_CFG.gate_temp)
     parser.add_argument(
+        "--moe_balance_method",
+        choices=["qb", "noaux_tc"],
+        default=_DEFAULT_CFG.moe_balance_method,
+        help="专家负载均衡：qb=分位数偏置（默认）；noaux_tc=固定 sign 步长",
+    )
+    parser.add_argument(
+        "--qb_update_rate",
+        type=float,
+        default=_DEFAULT_CFG.qb_update_rate,
+        help="每个优化器窗口向 QB 目标偏置移动的比例，0=冻结，1=全量更新",
+    )
+    parser.add_argument(
+        "--qb_stats_rows",
+        type=int,
+        default=_DEFAULT_CFG.qb_stats_rows,
+        help="每层每累积窗口的 QB token 样本预算（默认 8192）",
+    )
+    parser.add_argument(
+        "--router_fp32",
+        action=argparse.BooleanOptionalAction,
+        default=_DEFAULT_CFG.router_fp32,
+        help="保留路由权重和打分 GEMM 为 fp32（默认开）",
+    )
+    parser.add_argument(
+        "--aux_balance_loss_weight",
+        type=float,
+        default=_DEFAULT_CFG.aux_balance_loss_weight,
+        help="归一化的序列级均衡损失权重；0=仅使用偏置均衡",
+    )
+    parser.add_argument(
         "--route_scale",
         type=float,
         default=_DEFAULT_CFG.route_scale,
@@ -223,7 +286,7 @@ def add_common_args(parser):
         type=float,
         default=_DEFAULT_CFG.bias_update_rate,
         help="noaux_tc 的 e_score_correction_bias 更新步长 γ："
-        "b += γ·sign(load_frac − 1/E)（V4.1 训练用 1e-3）",
+        "仅 noaux_tc 使用：b -= γ·sign(load_frac − 1/E)，随后减均值",
     )
     parser.add_argument(
         "--engram_layer_ids",
@@ -243,8 +306,12 @@ def add_common_args(parser):
         default=_DEFAULT_CFG.engram_vocab_size,
         help="n-gram 素数桶的模数上界（压缩 id 空间大小，决定表行数）",
     )
-    parser.add_argument("--engram_n_heads", type=int, default=_DEFAULT_CFG.engram_n_heads)
-    parser.add_argument("--engram_head_dim", type=int, default=_DEFAULT_CFG.engram_head_dim)
+    parser.add_argument(
+        "--engram_n_heads", type=int, default=_DEFAULT_CFG.engram_n_heads
+    )
+    parser.add_argument(
+        "--engram_head_dim", type=int, default=_DEFAULT_CFG.engram_head_dim
+    )
     parser.add_argument(
         "--mtp_depth",
         type=int,
@@ -267,8 +334,7 @@ def add_common_args(parser):
         "--dspark_target_layer_ids",
         type=_int_list,
         default=None,
-        help="DSpark 读取的主干目标层（逗号分隔，取这些层的注意力输入）；"
-        "默认最深 3 层",
+        help="DSpark 读取的主干目标层（逗号分隔，取这些层的注意力输入）；默认最深 3 层",
     )
     parser.add_argument(
         "--dspark_markov_rank", type=int, default=_DEFAULT_CFG.dspark_markov_rank
@@ -552,9 +618,7 @@ def get_pretrain_parser():
         # 专门阶段单独训练（冻结主干），见 §2.4.3。要训练草稿层就显式传
         # --mtp_depth N（配合 --resume 基座 + --freeze_backbone 即官方口径）。
         mtp_depth=0,
-        psr_enabled=False,
-        ncp_enabled=True,
-
+        psr_enabled=True,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-Pretrain")
@@ -565,10 +629,35 @@ def get_pretrain_parser():
 
 def get_sft_parser():
     """获取SFT参数解析器"""
-    parser = argparse.ArgumentParser(description="Viby Full SFT")
+    parser = argparse.ArgumentParser(
+        description="Viby TailSFT (default) / standard SFT"
+    )
     add_common_args(parser)
 
     # SFT特定参数
+    parser.add_argument(
+        "--sft_algorithm",
+        choices=["tail", "standard"],
+        default="tail",
+        help="默认 TailSFT；standard 保留普通 SFT 对照",
+    )
+    parser.add_argument(
+        "--tail_sft_filter_fraction",
+        type=float,
+        default=0.5,
+        help="每个前向微批过滤进步最大的序列比例 [0,1)，默认 0.5",
+    )
+    parser.add_argument(
+        "--tail_sft_schedule",
+        choices=["static", "ramp"],
+        default="static",
+        help="static=固定比例；ramp=从 0 线性升至目标比例",
+    )
+    parser.add_argument(
+        "--tail_sft_cache",
+        default=None,
+        help="初始模型逐序列损失缓存；默认在 .cache 中按数据/基座指纹复用",
+    )
     parser.add_argument(
         "--empty_think_ratio",
         type=float,
@@ -648,7 +737,9 @@ def _explicit_cli_keys() -> set:
 
 # 由 (n_layers, n_mtp_layers) 推导、preset 不该固定的结构参数（见 apply_preset）
 _PRESET_DERIVED_ARGS = {
-    "ncp_enabled", "ncp_layers", "ncp_heads", "ncp_codebooks", "ncp_inter_dim",
+    "ced_recurrent_enabled",
+    "ced_recurrent_stride",
+    "ced_recurrent_rounds",
     "psr_enabled",
     "mtp_depth",
     "xsa_last_n",
@@ -672,9 +763,7 @@ def apply_preset(args):
     cfg = VibyConfig(preset=preset)
     explicit = _explicit_cli_keys()
     # 旧名别名（--routed_scaling_factor → route_scale）同样算显式传入
-    explicit |= {
-        dest for alias, dest in ARCH_ARG_ALIASES.items() if alias in explicit
-    }
+    explicit |= {dest for alias, dest in ARCH_ARG_ALIASES.items() if alias in explicit}
     # 派生字段（压缩率/各源层/候选层/draft 目标层）与 mtp_depth 不由 preset 固定：
     # 它们由 VibyConfig 从 (n_layers, n_mtp_layers) 推导，而 mtp_depth 决定训练阶段
     # ——报告 §2.1 要求预训练不带 MTP，DSpark 在之后单独一阶段训练（§2.4.3）。
@@ -706,14 +795,29 @@ def setup_training_args(args, training_type="pretrain"):
         raise ValueError("max_train_minutes 必须大于 0（或不传入以禁用时间限制）")
     if getattr(args, "max_steps", None) is not None and args.max_steps <= 0:
         raise ValueError("max_steps 必须大于 0（或不传入以禁用步数限制）")
+    if training_type == "sft":
+        from .tail_sft import validate_args
+
+        validate_args(args)
 
     # 结构预设：只覆盖未显式传入的结构参数（pretrain 从零建模型；
     # SFT/DPO 的结构参数默认 None，交给 sidecar 继承逻辑）
     if training_type == "pretrain":
         apply_preset(args)
-        if args.ncp_enabled and (args.psr_enabled or args.psr_freeze_base):
-            raise ValueError("NCP does not stack with PSR; use --no-ncp for a separate PSR experiment")
-        if args.psr_learning_rate <= 0 or args.psr_weight_decay < 0 or args.psr_grad_clip < 0:
+        if args.ced_recurrent_enabled:
+            if args.psr_enabled or args.psr_freeze_base:
+                raise ValueError(
+                    "Recurrent CED requires --no-psr and an unfrozen backbone"
+                )
+            if args.mtp_depth != 0:
+                raise ValueError(
+                    "Recurrent CED requires --mtp_depth 0 on both comparison sides"
+                )
+        if (
+            args.psr_learning_rate <= 0
+            or args.psr_weight_decay < 0
+            or args.psr_grad_clip < 0
+        ):
             raise ValueError("invalid isolated PSR optimizer settings")
 
     # checkpoint 保存点必须落在梯度累积窗口边界上：窗口中间保存的 checkpoint

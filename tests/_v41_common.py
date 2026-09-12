@@ -33,6 +33,7 @@ def seed_of(name: str, default: int = 0) -> int:
 
 # ---------------------------------------------------------------- 配置预设
 
+
 def cfg_tiny(**kw) -> VibyConfig:
     """tiny 预设：4 层 / dim 256 / 16 专家 top-4，默认关 Engram（省 tokenizer）。"""
     base = dict(preset="tiny", engram_layer_ids=(), vocab_size=256, max_seq_len=128)
@@ -64,7 +65,9 @@ def cfg_mix(**kw) -> VibyConfig:
 
 def cfg_ced(**kw) -> VibyConfig:
     """纯 CED 配置：编码段 r=2（第 2 层），解码段 r=1（第 3 层起），无 reindex。"""
-    base = dict(preset="tiny", n_layers=6, engram_layer_ids=(), vocab_size=256, max_seq_len=128)
+    base = dict(
+        preset="tiny", n_layers=6, engram_layer_ids=(), vocab_size=256, max_seq_len=128
+    )
     base.update(kw)
     return VibyConfig(**base)
 
@@ -87,7 +90,9 @@ def cfg_engram(**kw) -> VibyConfig:
 _MODELS: dict = {}
 
 
-def build(cfg: VibyConfig, seed: int = DEFAULT_SEED, skip_init: bool = True) -> VibyForCausalLM:
+def build(
+    cfg: VibyConfig, seed: int = DEFAULT_SEED, skip_init: bool = True
+) -> VibyForCausalLM:
     """固定种子构造模型；skip_init 跳过截断正态覆盖（结构测试不需要真初始化）。"""
     mx.random.seed(seed)
     model = VibyForCausalLM(cfg, skip_init=skip_init)
@@ -123,6 +128,7 @@ def engram_model(tag: str = "", **kw) -> VibyForCausalLM:
 
 
 # ---------------------------------------------------------------- 参数工具
+
 
 def param(model, path: str) -> mx.array:
     return dict(tree_flatten(model.parameters()))[path]
@@ -178,17 +184,21 @@ def merge_caches(cfg: VibyConfig, caches: list, start_pos: int):
                 cur = bc[i].kv_state
                 if cur is None:
                     bc[i].kv_state = (
-                        src.kv_state[0], src.kv_state[1], src.kv_state[2],
+                        src.kv_state[0],
+                        src.kv_state[1],
+                        src.kv_state[2],
                     )
                 else:
                     bc[i].kv_state = tuple(
-                        mx.concatenate([cur[j], src.kv_state[j]], axis=0) for j in range(3)
+                        mx.concatenate([cur[j], src.kv_state[j]], axis=0)
+                        for j in range(3)
                     )
     bc.start_pos = int(start_pos)
     return bc
 
 
 # ---------------------------------------------------------------- 数值工具
+
 
 def max_abs_diff(a: mx.array, b: mx.array) -> float:
     d = mx.abs(a.astype(mx.float32) - b.astype(mx.float32))
@@ -208,9 +218,10 @@ def row_diffs(a: mx.array, b: mx.array):
     return np.asarray(d)
 
 
-def assert_changed_exactly(a: mx.array, b: mx.array, expected, changed_tol=1e-9, same_tol=1e-6):
+def assert_changed_exactly(
+    a: mx.array, b: mx.array, expected, changed_tol=1e-9, same_tol=1e-6
+):
     """扰动探针：expected 里的位置必须变，其余位置必须（近似）bit 不变。"""
-    import numpy as np
 
     d = row_diffs(a, b)[0]
     expected = set(int(i) for i in expected)

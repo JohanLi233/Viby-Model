@@ -3,6 +3,7 @@
 默认对照是当前默认开关，不是「全部 kernel 关闭」。f+b 对照不更新权重；
 整窗口每次从冻结快照恢复后再跑两次微批 + clip + optimizer + bias。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -23,7 +24,7 @@ from experiments.kernel_bench_utils import (
     param_identity,
     restore_train_state,
     snapshot_train_state,
-    summarize_times,
+    check_exclusive_gpu,
 )
 
 import mlx.core as mx
@@ -34,7 +35,11 @@ from model.model import VibyForCausalLM
 from trainer.base_trainer import BaseTrainer
 from trainer.config import get_pretrain_parser, setup_training_args
 from trainer.flops import training_flops_per_token
-from trainer.utils import build_model_kwargs, convert_model_dtype, resolve_compute_scaled_hparams
+from trainer.utils import (
+    build_model_kwargs,
+    convert_model_dtype,
+    resolve_compute_scaled_hparams,
+)
 
 
 def packed_segments(batch, seq, mean_len, seed):
@@ -59,14 +64,21 @@ def make_batch(cfg, batch, seq, seed, seg):
 
 
 def build_trainer(args):
+    check_exclusive_gpu()
     cli = [
-        "--out_dir", "research_runs/_bench",
+        "--out_dir",
+        "research_runs/_bench",
         "--no_save",
-        "--batch_size", str(args.batch),
-        "--accumulation_steps", str(args.accum),
-        "--max_seq_len", str(args.seq),
-        "--cache_limit_gb", str(args.cache_limit_gb),
-        "--dtype", "bfloat16",
+        "--batch_size",
+        str(args.batch),
+        "--accumulation_steps",
+        str(args.accum),
+        "--max_seq_len",
+        str(args.seq),
+        "--cache_limit_gb",
+        str(args.cache_limit_gb),
+        "--dtype",
+        "bfloat16",
     ]
     if args.no_compile:
         cli.append("--no_compile")
@@ -94,28 +106,45 @@ def run_fb(trainer, batch):
 def run_window(trainer, batches):
     accum_grads = None
     last_moe = None
+    qb_samples = []
     for batch in batches:
         outputs, grads = trainer._compute_loss_and_grad(*batch)
         eval_fwd_bwd(outputs, grads)
         moe_loads = outputs[2]
+        if outputs[6].size:
+            qb_samples.append(outputs[6])
         if getattr(moe_loads, "size", 0) > 0:
             last_moe = moe_loads if last_moe is None else last_moe + moe_loads
-        accum_grads = grads if accum_grads is None else tree_map(mx.add, accum_grads, grads)
+        accum_grads = (
+            grads if accum_grads is None else tree_map(mx.add, accum_grads, grads)
+        )
         mx.eval(accum_grads)
         if last_moe is not None:
             mx.eval(last_moe)
-    trainer._optimizer_step(accum_grads, len(batches), moe_loads=last_moe)
+    trainer._optimizer_step(
+        accum_grads,
+        len(batches),
+        moe_loads=last_moe,
+        moe_qb_margins=mx.concatenate(qb_samples, axis=1) if qb_samples else None,
+    )
 
 
 def record_base(path, rec):
     append_jsonl(path, rec)
-    print(json.dumps({k: rec[k] for k in rec if k != "blocks"}, ensure_ascii=False, default=str), flush=True)
+    print(
+        json.dumps(
+            {k: rec[k] for k in rec if k != "blocks"}, ensure_ascii=False, default=str
+        ),
+        flush=True,
+    )
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", required=True)
-    ap.add_argument("--mode", choices=["aa-fb", "aa-window", "cfg-dump"], default="aa-fb")
+    ap.add_argument(
+        "--mode", choices=["aa-fb", "aa-window", "cfg-dump"], default="aa-fb"
+    )
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--seq", type=int, default=1024)
     ap.add_argument("--accum", type=int, default=2)
@@ -160,7 +189,9 @@ def main():
         "flags": active_viby_flags(),
         "flops_per_token": training_flops_per_token(model, args.seq),
     }
-    (run_dir / "resolved_cfg.json").write_text(json.dumps(cfg_dump, indent=2, ensure_ascii=False) + "\n")
+    (run_dir / "resolved_cfg.json").write_text(
+        json.dumps(cfg_dump, indent=2, ensure_ascii=False) + "\n"
+    )
     if args.mode == "cfg-dump":
         print(json.dumps(cfg_dump, indent=2, ensure_ascii=False))
         return
@@ -170,14 +201,13 @@ def main():
         make_batch(cfg, args.batch, args.seq, args.seed + i, args.seg)
         for i in range(args.accum)
     ]
-    ident = input_identity(*[a for batch in [fb_batch, *window_batches] for a in batch if a is not None])
+    ident = input_identity(
+        *[a for batch in [fb_batch, *window_batches] for a in batch if a is not None]
+    )
 
     # 常驻优化器状态（计时外）。
-    _, g0 = run_fb(trainer, fb_batch)
-    trainer.optimizer.update(model, g0)
-    mx.eval(model.parameters(), trainer.optimizer.state)
-    del g0
-    snap = snapshot_train_state(model, trainer.optimizer)
+    run_window(trainer, window_batches)
+    snap = snapshot_train_state(model, trainer.optimizer, trainer)
 
     tokens_fb = args.batch * args.seq
     tokens_window = args.accum * tokens_fb
@@ -193,7 +223,10 @@ def main():
     }
 
     if args.mode == "aa-fb":
+
         def arm():
+            if snap["psr_step"] is not None:
+                trainer._psr_step = snap["psr_step"]
             run_fb(trainer, fb_batch)
 
         result = abba_blocks(arm, arm, args.warmup, args.block_iters, args.blocks)
@@ -205,25 +238,37 @@ def main():
             "exit": "ok",
         }
         record_base(jsonl, rec)
-        (run_dir / "aa_fb.json").write_text(json.dumps(rec, indent=2, ensure_ascii=False, default=str) + "\n")
+        (run_dir / "aa_fb.json").write_text(
+            json.dumps(rec, indent=2, ensure_ascii=False, default=str) + "\n"
+        )
         print(
             "A/A f+b median %.4fs  %.0f tok/s  drift=%.3f%%  inconclusive=%s"
-            % (med, tokens_fb / med, 100 * (result["aa_end_over_start_abs_rel"] or 0),
-               result["inconclusive_aa_drift"]),
+            % (
+                med,
+                tokens_fb / med,
+                100 * (result["aa_end_over_start_abs_rel"] or 0),
+                result["inconclusive_aa_drift"],
+            ),
             flush=True,
         )
         return
 
     if args.mode == "aa-window":
+
         def arm():
             run_window(trainer, window_batches)
 
         def reset():
-            restore_train_state(model, trainer.optimizer, snap)
+            restore_train_state(model, trainer.optimizer, snap, trainer)
 
         result = abba_blocks(
-            arm, arm, args.warmup, args.block_iters, args.blocks,
-            before_a=reset, before_b=reset,
+            arm,
+            arm,
+            args.warmup,
+            args.block_iters,
+            args.blocks,
+            before_a=reset,
+            before_b=reset,
         )
         med = result["A"]["median_s"]
         rec = {
@@ -234,11 +279,17 @@ def main():
             "exit": "ok",
         }
         record_base(jsonl, rec)
-        (run_dir / "aa_window.json").write_text(json.dumps(rec, indent=2, ensure_ascii=False, default=str) + "\n")
+        (run_dir / "aa_window.json").write_text(
+            json.dumps(rec, indent=2, ensure_ascii=False, default=str) + "\n"
+        )
         print(
             "A/A window median %.4fs  %.0f tok/s  drift=%.3f%%  inconclusive=%s"
-            % (med, tokens_window / med, 100 * (result["aa_end_over_start_abs_rel"] or 0),
-               result["inconclusive_aa_drift"]),
+            % (
+                med,
+                tokens_window / med,
+                100 * (result["aa_end_over_start_abs_rel"] or 0),
+                result["inconclusive_aa_drift"],
+            ),
             flush=True,
         )
 

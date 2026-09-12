@@ -126,14 +126,14 @@ def test_t03_ten_protected_updates_match_parameters_optimizer_and_moe(
     a, b = trainer(base, compiled), trainer(model, compiled, mode)
     # Copy optimizer moments explicitly after a shared warmup update.
     outputs, g = a._compute_loss_and_grad(*batch())
-    a._optimizer_step(g, 1, outputs[2])
+    a._optimizer_step(g, 1, outputs[2], moe_qb_margins=outputs[6])
     model.load_weights(tree_flatten(base.parameters()), strict=False)
     b.optimizer.state = tree_map(lambda v: mx.array(v), a.optimizer.state)
     for _ in range(10):
         oa, ga = a._compute_loss_and_grad(*batch())
         ob, gb = b._compute_loss_and_grad(*batch())
-        a._optimizer_step(ga, 1, oa[2])
-        b._optimizer_step(gb, 1, ob[2])
+        a._optimizer_step(ga, 1, oa[2], moe_qb_margins=oa[6])
+        b._optimizer_step(gb, 1, ob[2], moe_qb_margins=ob[6])
         shared = dict(tree_flatten(model.parameters()))
         for k, v in tree_flatten(base.parameters()):
             assert max_abs_diff(v, shared[k]) < 2e-6, k
@@ -330,8 +330,8 @@ def test_independent_nan_handling_and_baseline_lr_groups():
     oa, ga = a._compute_loss_and_grad(*batch())
     ob, gb = b._compute_loss_and_grad(*batch())
     gb["psr"]["output"]["weight"] = mx.full_like(gb["psr"]["output"]["weight"], mx.nan)
-    a._optimizer_step(ga, 1, oa[2])
-    b._optimizer_step(gb, 1, ob[2])
+    a._optimizer_step(ga, 1, oa[2], moe_qb_margins=oa[6])
+    b._optimizer_step(gb, 1, ob[2], moe_qb_margins=ob[6])
     for k, v in tree_flatten(base.parameters()):
         assert max_abs_diff(v, dict(tree_flatten(model.parameters()))[k]) < 2e-6
     assert bool(mx.all(model.psr.output.weight == 0))
@@ -349,8 +349,8 @@ def test_t03_actual_muon_parameter_groups_and_ten_updates():
     for _ in range(10):
         oa, ga = a._compute_loss_and_grad(*batch())
         ob, gb = b._compute_loss_and_grad(*batch())
-        a._optimizer_step(ga, 1, oa[2])
-        b._optimizer_step(gb, 1, ob[2])
+        a._optimizer_step(ga, 1, oa[2], moe_qb_margins=oa[6])
+        b._optimizer_step(gb, 1, ob[2], moe_qb_margins=ob[6])
         shared = dict(tree_flatten(model.parameters()))
         for key, value in tree_flatten(base.parameters()):
             assert max_abs_diff(value, shared[key]) < 2e-6, key
@@ -389,5 +389,5 @@ def test_padded_anchor_bfloat16_backward_is_finite():
         mx.eval(out, grads)
         for key, value in tree_flatten(grads):
             assert bool(mx.all(mx.isfinite(value))), key
-        tr._optimizer_step(grads, 1, out[2])
+        tr._optimizer_step(grads, 1, out[2], moe_qb_margins=out[6])
     assert float(mx.max(mx.abs(model.psr.output.weight))) > 0

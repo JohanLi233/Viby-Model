@@ -28,7 +28,6 @@ from model.config import VibyConfig  # noqa: E402
 from model.model import VibyForCausalLM  # noqa: E402
 from trainer.base_trainer import BaseTrainer  # noqa: E402
 from trainer.config import get_pretrain_parser, setup_training_args  # noqa: E402
-from trainer.flops import training_flops_per_token  # noqa: E402
 from trainer.utils import build_model_kwargs, resolve_compute_scaled_hparams  # noqa: E402
 
 
@@ -65,16 +64,26 @@ def _patch(stubs):
         save(attn_mod, "_group_doc_mask", lambda ratio, seg: True)
         save(attn_mod, "_group_pad_mask", lambda ratio, pad: True)
     if "no_indexer" in stubs:
+
         def _scores(self, x, qr, index_k, token_pos, reach, cos_all, sin_all):
             B, T, _ = x.shape
-            return mx.where(reach, mx.zeros((B, T, index_k.shape[1]), dtype=mx.float32), attn_mod.NEG_INF)
+            return mx.where(
+                reach,
+                mx.zeros((B, T, index_k.shape[1]), dtype=mx.float32),
+                attn_mod.NEG_INF,
+            )
 
         save(attn_mod.Indexer, "scores", _scores)
     if "no_compressor" in stubs:
+
         def _comp(self, x, start_pos, state=None):
             B, T, _ = x.shape
             n = max(1, (start_pos + T) // self.ratio)
-            lat = mx.zeros((B, n, self.dim_out), dtype=x.dtype) if hasattr(self, "dim_out") else None
+            lat = (
+                mx.zeros((B, n, self.dim_out), dtype=x.dtype)
+                if hasattr(self, "dim_out")
+                else None
+            )
             if lat is None:
                 lat = mx.zeros((B, n, self.wkv.weight.shape[0]), dtype=x.dtype)
             base = start_pos // self.ratio
@@ -82,28 +91,53 @@ def _patch(stubs):
 
         save(attn_mod.Compressor, "__call__", _comp)
     if "no_topk" in stubs:
-        save(attn_mod, "_topk_masks",
-             lambda score, reach, k, offset, need_idx=True: (mx.ones_like(score, dtype=mx.bool_), None))
+        save(
+            attn_mod,
+            "_topk_masks",
+            lambda score, reach, k, offset, need_idx=True: (
+                mx.ones_like(score, dtype=mx.bool_),
+                None,
+            ),
+        )
     if "no_router" in stubs:
-        save(moe_mod.MoEGate, "scores",
-             lambda self, x: mx.zeros((x.shape[0], self.n_routed), dtype=mx.float32))
+        save(
+            moe_mod.MoEGate,
+            "scores",
+            lambda self, x: mx.zeros((x.shape[0], self.n_routed), dtype=mx.float32),
+        )
     if "no_router_topk" in stubs:
+
         def _gate_call(self, x):
             M = x.shape[0]
             sc = mx.zeros((M, self.n_routed), dtype=mx.float32)
-            idx = mx.broadcast_to(mx.arange(self.top_k, dtype=mx.int32)[None, :], (M, self.top_k))
+            idx = mx.broadcast_to(
+                mx.arange(self.top_k, dtype=mx.int32)[None, :], (M, self.top_k)
+            )
             w = mx.full((M, self.top_k), 1.0 / self.top_k, dtype=mx.float32)
             self._last_load = mx.zeros((self.n_routed,), dtype=mx.float32)
             return w, idx, sc
+
         save(moe_mod.MoEGate, "__call__", _gate_call)
     if "no_moe" in stubs:
         save(moe_mod.MoEFeedForward, "__call__", lambda self, x: self.shared(x))
     if "no_attn" in stubs:
-        save(attn_mod.Attention, "__call__",
-             lambda self, x, start_pos, shared, cache=None, segment_ids=None, pad_mask=None: mx.zeros_like(x))
+        save(
+            attn_mod.Attention,
+            "__call__",
+            lambda self,
+            x,
+            start_pos,
+            shared,
+            cache=None,
+            segment_ids=None,
+            pad_mask=None: mx.zeros_like(x),
+        )
     if "no_aux" in stubs:
-        save(moe_mod.MoEFeedForward, "seq_aux_loss",
-             lambda self, scores, idx, B, T: mx.array(0.0))
+        save(
+            moe_mod.MoEFeedForward,
+            "seq_aux_loss",
+            lambda self, scores, idx, B, T: mx.array(0.0),
+        )
     if "no_load" in stubs:
         old_call = moe_mod.MoEGate.__call__
 
@@ -121,8 +155,22 @@ def _restore(saved):
         setattr(mod, name, old)
 
 
-STUBS = ["base", "no_topk", "no_compressor", "no_router", "no_router_topk", "no_sdpa", "no_moe", "no_attn", "no_moe+no_attn", "no_rope", "no_norm",
-         "no_masks", "no_indexer+no_compressor", "no_aux+no_load"]
+STUBS = [
+    "base",
+    "no_topk",
+    "no_compressor",
+    "no_router",
+    "no_router_topk",
+    "no_sdpa",
+    "no_moe",
+    "no_attn",
+    "no_moe+no_attn",
+    "no_rope",
+    "no_norm",
+    "no_masks",
+    "no_indexer+no_compressor",
+    "no_aux+no_load",
+]
 
 
 def main():
@@ -134,9 +182,19 @@ def main():
     args = ap.parse_args()
     wanted = [s for s in args.only.split(",") if s]
 
-    cli = ["--out_dir", "research_runs/_bench", "--no_save",
-           "--batch_size", str(args.batch), "--accumulation_steps", "2",
-           "--max_seq_len", str(args.seq), "--cache_limit_gb", "8"]
+    cli = [
+        "--out_dir",
+        "research_runs/_bench",
+        "--no_save",
+        "--batch_size",
+        str(args.batch),
+        "--accumulation_steps",
+        "2",
+        "--max_seq_len",
+        str(args.seq),
+        "--cache_limit_gb",
+        "8",
+    ]
     targs = setup_training_args(get_pretrain_parser().parse_args(cli), "pretrain")
     cfg = VibyConfig(**build_model_kwargs(targs))
     targs = resolve_compute_scaled_hparams(targs, 467617)
@@ -161,11 +219,13 @@ def main():
             from trainer.utils import convert_model_dtype
 
             model = VibyForCausalLM(cfg)
-            convert_model_dtype(model, getattr(targs, 'dtype', ''))
+            convert_model_dtype(model, getattr(targs, "dtype", ""))
             trainer = BaseTrainer(targs, model, None, cfg, "pretrain")
 
             def step():
-                out, grads = trainer._compute_loss_and_grad(X, Y, loss_mask, attn_mask, seg)
+                out, grads = trainer._compute_loss_and_grad(
+                    X, Y, loss_mask, attn_mask, seg
+                )
                 mx.eval(*[o for o in out if o is not None])
                 mx.eval(grads)
 
@@ -177,8 +237,11 @@ def main():
                 delta = ""
             else:
                 delta = " Δ%+.1f%%" % (100 * (mn - base_t) / base_t)
-            print("%-58s %6.0f tok/s  min %.3fs med %.3fs%s  峰值 %.1fGB"
-                  % (name, tps, mn, med, delta, mx.get_peak_memory() / 1e9), flush=True)
+            print(
+                "%-58s %6.0f tok/s  min %.3fs med %.3fs%s  峰值 %.1fGB"
+                % (name, tps, mn, med, delta, mx.get_peak_memory() / 1e9),
+                flush=True,
+            )
             del trainer, model
             gc.collect()
             mx.clear_cache()

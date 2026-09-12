@@ -28,6 +28,15 @@ rules are not approximated. VIBY_SPARSE_ATTN_KERNEL=0 restores native SDPA.
 threadgroup 预算：拆分的 `_BWD_KV` 在 D=128/BK=32 时会超出 Metal 的
 32 KiB 静态上限，因此反向固定 BK=16（前向仍可用 `VIBY_SPARSE_ATTN_KEY_TILE=32`）。
 
+2026-09-12 默认融合 VJP（`VIBY_SPARSE_ATTN_FUSED_BWD=1`）：
+先按 SIMD head 计算 Delta，再在一次 key tile 遍历中共同计算 dQ/dKV，
+复用 QK、dOK 和概率。Q/G staging 与后续梯度 scratch 复用；D=128、BK=32
+的 threadgroup 存储为 27,076 bytes。dQ 唯一写一次 FP32 atomic_store，
+以兼容 MLX 全部输出同为 atomic 的接口，再转换为激活 dtype。
+`VIBY_SPARSE_ATTN_FUSED_BWD=0` 恢复上述拆分后端；key-owned 优先于融合后端。
+前向、可见集合、概率降精度位置不变。32-key 反向的归约与 atomic 到达顺序
+允许舍入差异；定向数值与整窗口验收见 research/KERNEL_SPEED_20260912.md。
+
 §2 key-owned dKV（`VIBY_SPARSE_ATTN_KEY_BWD=1`，默认关）：
 window 用解析邻接，compressed 直接从 selection 构建 occurrence CSR
 （count / GPU 递归 exclusive scan / fill），不去重。`_ONE_KEY` 的四个 SIMD
@@ -47,6 +56,7 @@ boundary ties 全部保留，不按名义 k 截断。
 2026-09-11 验收后默认：前向 BK=16，exact radix 开启；融合 Indexer 与
 token-owned MoE combine 的组合通过同协议整步 ABBA（见 research/CSA2_KERNEL_ACCEPTANCE.md）。
 """
+
 import os
 from functools import lru_cache
 
@@ -68,6 +78,10 @@ _SPLIT_BWD = os.environ.get("VIBY_SPARSE_ATTN_BWD_SPLIT", "1") != "0"
 # 同协议直接 ABBA 未胜过 sharded 后端，默认关。
 _KEY_OWNED_BWD = os.environ.get("VIBY_SPARSE_ATTN_KEY_BWD", "0") != "0"
 _SHARDS = 4
+_PARALLEL_BWD = os.environ.get("VIBY_SPARSE_ATTN_PARALLEL_BWD", "0") != "0"
+_FUSED_BWD = os.environ.get("VIBY_SPARSE_ATTN_FUSED_BWD", "1") != "0"
+_FUSED_BWD_TILE = int(os.environ.get("VIBY_SPARSE_ATTN_FUSED_BWD_TILE", "32"))
+_WINDOW_OWNED_BWD = os.environ.get("VIBY_WINDOW_KEY_BWD", "0") == "1"
 _KEY_TILE = int(os.environ.get("VIBY_SPARSE_ATTN_KEY_TILE", "16"))
 if _KEY_TILE not in (16, 32):
     raise ValueError("VIBY_SPARSE_ATTN_KEY_TILE must be 16 or 32")
@@ -169,13 +183,15 @@ _SELECT = r"""
 @lru_cache(None)
 def _selection_kernel():
     return mx.fast.metal_kernel(
-        name="mqa_topk_compact", input_names=["scores", "reach", "dims"],
-        output_names=["keep", "indices", "lengths"], source=_SELECT,
+        name="mqa_topk_compact",
+        input_names=["scores", "reach", "dims"],
+        output_names=["keep", "indices", "lengths"],
+        source=_SELECT,
     )
 
 
 def _selection_items(n):
-    return 1 << max(0, ((n+127)//128-1).bit_length())
+    return 1 << max(0, ((n + 127) // 128 - 1).bit_length())
 
 
 def topk_enabled():
@@ -191,15 +207,22 @@ def select_topk(scores, reach, k):
     逐位一致。只在 eligibility 域选阈值的融合 Indexer 入口另见
     indexer_select.fused_select；这里始终保留通用 dense rank 域。
     """
-    b, t, n=scores.shape
-    if n==0:
-        return mx.zeros(scores.shape, mx.bool_), (mx.zeros((b*t, 0), mx.int32), mx.zeros((b*t,), mx.int32))
+    b, t, n = scores.shape
+    if n == 0:
+        return mx.zeros(scores.shape, mx.bool_), (
+            mx.zeros((b * t, 0), mx.int32),
+            mx.zeros((b * t,), mx.int32),
+        )
     keep, indices, lengths = _selection_kernel()(
-        inputs=[mx.stop_gradient(scores), mx.broadcast_to(reach, scores.shape),
-                mx.array([n, min(k, n)], mx.uint32)],
+        inputs=[
+            mx.stop_gradient(scores),
+            mx.broadcast_to(reach, scores.shape),
+            mx.array([n, min(k, n)], mx.uint32),
+        ],
         template=[("ITEMS", _selection_items(n))],
-        grid=(128, b*t, 1), threadgroup=(128, 1, 1),
-        output_shapes=[scores.shape, (b*t, n), (b*t,)],
+        grid=(128, b * t, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[scores.shape, (b * t, n), (b * t,)],
         output_dtypes=[mx.bool_, mx.int32, mx.int32],
     )
     return keep, (indices, lengths)
@@ -208,8 +231,10 @@ def select_topk(scores, reach, k):
 @lru_cache(None)
 def _pack_selection_kernel():
     return mx.fast.metal_kernel(
-        name="mqa_pack_selection", input_names=["indices", "lengths", "offsets", "dims"],
-        output_names=["flat"], source=r"""
+        name="mqa_pack_selection",
+        input_names=["indices", "lengths", "offsets", "dims"],
+        output_names=["flat"],
+        source=r"""
         uint tid=thread_position_in_grid.x, row=thread_position_in_grid.y;
         for (uint slot=tid;slot<uint(lengths[row]);slot+=128)
             flat[offsets[row]+slot]=indices[(size_t)row*dims[0]+slot];
@@ -230,22 +255,24 @@ def select_topk_packed(scores, reach, k):
         return row_offsets, keep, (mx.zeros((0,), mx.int32), lengths)
     (flat,) = _pack_selection_kernel()(
         inputs=[indices, lengths, row_offsets, mx.array([width], mx.uint32)],
-        grid=(128, rows, 1), threadgroup=(128, 1, 1),
-        output_shapes=[(indices.size,)], output_dtypes=[mx.int32],
+        grid=(128, rows, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(indices.size,)],
+        output_dtypes=[mx.int32],
     )
     return row_offsets, keep, (flat, lengths)
 
 
 @lru_cache(None)
 def prewarm_topk(max_keys):
-    if not _TOPK_ENABLED or mx.default_device()!=mx.gpu:
+    if not _TOPK_ENABLED or mx.default_device() != mx.gpu:
         return
-    items=1
-    while items<=_selection_items(max_keys):
-        n=items*128
-        values=mx.zeros((1, 1, n), mx.float32)
+    items = 1
+    while items <= _selection_items(max_keys):
+        n = items * 128
+        values = mx.zeros((1, 1, n), mx.float32)
         mx.eval(select_topk(values, mx.ones(values.shape, mx.bool_), min(64, n)))
-        items*=2
+        items *= 2
 
 
 # Every forward/backward key tile has exactly the same visibility and addresses.
@@ -283,6 +310,18 @@ _LOAD_TILE = r"""
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 """
+
+# Recurrent CED uses compressed query slots but original token RoPE positions.
+# The static W slots are an upper bound; this predicate enforces the actual
+# token span, including packed document boundaries and gaps between anchors.
+# dims[3] is the selection's storage width, independent of full memory NC.
+_POSITION_LOAD_TILE = _LOAD_TILE.replace(
+    "p>=0 && pad[b*TQ+uint(p)] && segment[b*TQ+uint(p)]==segment[query]",
+    "p>=0 && pad[query] && pad[b*TQ+uint(p)] "
+    "&& segment[b*TQ+uint(p)]==segment[query] "
+    "&& positions[b*TQ+uint(p)]<=positions[query] "
+    "&& positions[b*TQ+uint(p)]>positions[query]-int(dims[4])",
+).replace("indices[(size_t)query*NC+slot-W]", "indices[(size_t)query*dims[3]+slot-W]")
 
 _FWD = r"""
     uint tid=thread_position_in_grid.x, sg=tid/32;
@@ -859,53 +898,262 @@ _BWD = r"""
 
 
 @lru_cache(None)
-def _kernels():
+def _kernels(positioned=False):
     compact = mx.fast.metal_kernel(
-        name="mqa_compact_visible", input_names=["visible", "dims"],
-        output_names=["indices", "lengths"], source=_COMPACT,
+        name="mqa_compact_visible",
+        input_names=["visible", "dims"],
+        output_names=["indices", "lengths"],
+        source=_COMPACT,
     )
-    inputs = ["q", "window", "compressed", "indices", "lengths", "segment", "pad", "sinks", "dims", "scale"]
+    inputs = [
+        "q",
+        "window",
+        "compressed",
+        "indices",
+        "lengths",
+        "segment",
+        "pad",
+        "sinks",
+        "dims",
+        "scale",
+    ]
+    load_tile = _POSITION_LOAD_TILE if positioned else _LOAD_TILE
+    suffix = "_positioned" if positioned else ""
+    if positioned:
+        inputs += ["positions"]
     fwd = mx.fast.metal_kernel(
-        name="mqa_indexed_flash_fwd", input_names=inputs, output_names=["out", "lse"],
-        source=_FWD.replace("/*LOAD_TILE*/", _LOAD_TILE), header=_HEADER,
+        name="mqa_indexed_flash_fwd" + suffix,
+        input_names=inputs,
+        output_names=["out", "lse"],
+        source=_FWD.replace("/*LOAD_TILE*/", load_tile),
+        header=_HEADER,
     )
     legacy = mx.fast.metal_kernel(
-        name="mqa_indexed_flash_bwd", input_names=inputs+["g", "out", "lse"],
+        name="mqa_indexed_flash_bwd" + suffix,
+        input_names=inputs + ["g", "out", "lse"],
         output_names=["dq", "dwindow", "dcompressed", "dsink"],
-        source=_BWD.replace("/*LOAD_TILE*/", _LOAD_TILE), header=_HEADER,
+        source=_BWD.replace("/*LOAD_TILE*/", load_tile),
+        header=_HEADER,
         atomic_outputs=True,
     )
     delta = mx.fast.metal_kernel(
         name="mqa_indexed_flash_delta_sink",
         input_names=["g", "out", "sinks", "lse"],
-        output_names=["delta", "dsinkrow"], source=_DELTA_SINK, header=_HEADER,
+        output_names=["delta", "dsinkrow"],
+        source=_DELTA_SINK,
+        header=_HEADER,
     )
     q_sink = mx.fast.metal_kernel(
-        name="mqa_indexed_flash_bwd_q_sink",
-        input_names=inputs+["g", "lse", "out"],
+        name="mqa_indexed_flash_bwd_q_sink" + suffix,
+        input_names=inputs + ["g", "lse", "out"],
         output_names=["dq", "delta", "dsinkrow"],
-        source=_BWD_Q_SINK.replace("/*LOAD_TILE*/", _LOAD_TILE), header=_HEADER,
+        source=_BWD_Q_SINK.replace("/*LOAD_TILE*/", load_tile),
+        header=_HEADER,
     )
     kv = mx.fast.metal_kernel(
-        name="mqa_indexed_flash_bwd_kv",
-        input_names=inputs+["g", "lse", "deltaglobal"],
+        name="mqa_indexed_flash_bwd_kv" + suffix,
+        input_names=inputs + ["g", "lse", "deltaglobal"],
         output_names=["dpoolshard"],
-        source=_BWD_KV.replace("/*LOAD_TILE*/", _LOAD_TILE), header=_HEADER,
+        source=_BWD_KV.replace("/*LOAD_TILE*/", load_tile),
+        header=_HEADER,
         atomic_outputs=True,
     )
     pool = mx.fast.metal_kernel(
         name="mqa_finalize_pool_grad",
         input_names=["poolshard", "dims"],
-        output_names=["dwindow", "dcompressed"], source=_FINALIZE_POOL,
+        output_names=["dwindow", "dcompressed"],
+        source=_FINALIZE_POOL,
         header=_HEADER,
     )
     sink = mx.fast.metal_kernel(
         name="mqa_finalize_sink_grad",
         input_names=["dsinkrow", "dims"],
-        output_names=["dsink"], source=_FINALIZE_SINK,
+        output_names=["dsink"],
+        source=_FINALIZE_SINK,
         header=_HEADER,
     )
     return compact, fwd, legacy, delta, q_sink, kv, pool, sink
+
+
+@lru_cache(None)
+def _parallel_backward_kernels():
+    """Distribute independent (head,key) scalars across the whole group.
+
+    The original split VJP assigns all probability/score work to 16 lanes,
+    leaving 48/112 lanes idle. The arithmetic within each element is unchanged;
+    only its owning lane changes. Keep the original kernels for paired checks.
+    """
+
+    def parallel_source(source):
+        old = "if (tid<H) for (uint j=0;j<BK;++j) {"
+        # Both blocks have only per-(head,key) reads and unique stores.
+        while old in source:
+            begin = source.index(old)
+            end = source.index("\n        }", begin) + len("\n        }")
+            body = source[begin + len(old) : end - len("\n        }")]
+            body = body.replace("tid", "h")
+            source = (
+                source[:begin]
+                + "for (uint i=tid;i<H*BK;i+=NT) {\n            uint h=i/BK, j=i%BK;"
+                + body
+                + "\n        }"
+                + source[end:]
+            )
+        return source.replace("/*LOAD_TILE*/", _LOAD_TILE)
+
+    inputs = [
+        "q",
+        "window",
+        "compressed",
+        "indices",
+        "lengths",
+        "segment",
+        "pad",
+        "sinks",
+        "dims",
+        "scale",
+    ]
+    return (
+        mx.fast.metal_kernel(
+            name="mqa_indexed_bwd_q_parallel",
+            input_names=inputs + ["g", "lse", "out"],
+            output_names=["dq", "delta", "dsinkrow"],
+            source=parallel_source(_BWD_Q_SINK),
+            header=_HEADER,
+        ),
+        mx.fast.metal_kernel(
+            name="mqa_indexed_bwd_kv_parallel",
+            input_names=inputs + ["g", "lse", "deltaglobal"],
+            output_names=["dpoolshard"],
+            source=parallel_source(_BWD_KV),
+            header=_HEADER,
+            atomic_outputs=True,
+        ),
+    )
+
+
+@lru_cache(None)
+def _fused_delta_kernel():
+    return mx.fast.metal_kernel(
+        name="mqa_indexed_delta_simd",
+        input_names=["g", "out", "sinks", "lse"],
+        output_names=["delta", "dsinkrow"],
+        source=r"""
+        uint tid=thread_position_in_grid.x, query=thread_position_in_grid.y;
+        uint lane=tid%32, sg=tid/32;
+        for (uint h=sg;h<H;h+=D/32) {
+            float value=0.0f;
+            for (uint d=lane;d<D;d+=32)
+                value+=float(g[((size_t)query*H+h)*D+d])*out[((size_t)query*H+h)*D+d];
+            value=simd_sum(value);
+            if (lane==0) {
+                delta[query*H+h]=value;
+                dsinkrow[query*H+h]=-exp(sinks[h]-lse[query*H+h])*value;
+            }
+        }
+        """,
+    )
+
+
+@lru_cache(None)
+def _fused_backward_kernel(positioned=False, window_owned=False):
+    """Reuse QK/dOK/probabilities for dQ and dKV in a single tile visit.
+
+    Keep the split kernel's head reduction and shard ownership. Atomic stores
+    for uniquely owned FP32 dQ allow MLX's all-atomic output signature; dQ is
+    cast once after the launch. The 16-row Grad8 scratch is dead after the last
+    pool atomic and is reused for dQ, keeping threadgroup storage below 32 KiB.
+    """
+    if positioned and window_owned:
+        raise ValueError(
+            "key-owned window gradients require consecutive token positions"
+        )
+    source = _BWD_KV.replace(
+        "simdgroup_matrix<T,8,8> Qf[DD/8], Gf[DD/8];",
+        "simdgroup_matrix<T,8,8> Qf[DD/8], Gf[DD/8];\n    simdgroup_matrix<float,8,8> DQ[DD/8];",
+    ).replace(
+        "simdgroup_load(Qf[d],Qs+",
+        "DQ[d]=make_filled_simdgroup_matrix<float,8,8>(0.0f);\n        simdgroup_load(Qf[d],Qs+",
+    )
+    # Q/G staging dies once its MMA fragments have loaded. Alias it with the
+    # later pool/dQ scratch, saving 8 KiB at D=128 and permitting BK=32.
+    source = source.replace(
+        "threadgroup T Qs[H*(D+8)], Gs[H*(D+8)];",
+        r"""
+    union FusedWorkspace {
+        T stage[2*H*(D+8)];
+        float gradient[2*8*(D+4)];
+    };
+    threadgroup FusedWorkspace work;
+    threadgroup T* Qs=work.stage;
+    threadgroup T* Gs=work.stage+H*(D+8);
+    threadgroup float* Grad8=work.gradient;""",
+    )
+    source = source.replace("    threadgroup float Grad8[2*8*(D+4)];\n", "")
+    old = "if (tid<H) for (uint j=0;j<BK;++j) {"
+    while old in source:
+        begin = source.index(old)
+        end = source.index("\n        }", begin) + len("\n        }")
+        body = source[begin + len(old) : end - len("\n        }")].replace("tid", "h")
+        source = (
+            source[:begin]
+            + "for (uint i=tid;i<H*BK;i+=NT) {\n            uint h=i/BK, j=i%BK;"
+            + body
+            + "\n        }"
+            + source[end:]
+        )
+    source = source.replace(
+        "        for (uint key8=0;key8<BK;key8+=8) {",
+        r"""
+        for (uint d=0;d<DD/8;++d) for (uint j=0;j<BK/8;++j) {
+            simdgroup_matrix<T,8,8> Df,Kf;
+            simdgroup_load(Df,Ds+hg*8*(BK+8)+j*8,BK+8);
+            simdgroup_load(Kf,Ks+j*8*(D+8)+col+d*8,D+8);
+            simdgroup_multiply_accumulate(DQ[d],Df,Kf,DQ[d]);
+        }
+        for (uint key8=0;key8<BK;key8+=8) {""",
+    )
+    if window_owned:
+        # dQ above still consumes every visible key. Whole window stripes
+        # need no dKV MMA or atomic; a mixed stripe only stores compressed dKV.
+        source = source.replace(
+            "for (uint key8=0;key8<BK;key8+=8) {",
+            "for (uint key8=0;key8<BK;key8+=8) {\n            if (base+key8+8<=W) continue;",
+        )
+        source = source.replace("if (key>=0) {", "if (key>=0 && uint(key)>=TQ) {")
+    source += r"""
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint d=0;d<DD/8;++d)
+        simdgroup_store(DQ[d],Grad8+hg*8*(D+4)+col+d*8,D+4);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i=tid;i<H*D;i+=NT)
+        atomic_store_explicit(dq+(size_t)query*H*D+i,Grad8[(i/D)*(D+4)+i%D],memory_order_relaxed);
+    """
+    inputs = [
+        "q",
+        "window",
+        "compressed",
+        "indices",
+        "lengths",
+        "segment",
+        "pad",
+        "sinks",
+        "dims",
+        "scale",
+    ]
+    load_tile = _POSITION_LOAD_TILE if positioned else _LOAD_TILE
+    if positioned:
+        inputs += ["positions"]
+    return mx.fast.metal_kernel(
+        name="mqa_indexed_bwd_fused"
+        + ("_positioned" if positioned else "")
+        + ("_compressed_dkv" if window_owned else ""),
+        input_names=inputs + ["g", "lse", "deltaglobal"],
+        output_names=["dpoolshard", "dq"],
+        source=source.replace("/*LOAD_TILE*/", load_tile),
+        header=_HEADER,
+        atomic_outputs=True,
+    )
 
 
 @lru_cache(None)
@@ -913,35 +1161,60 @@ def _key_owned_kernels():
     csr_count = mx.fast.metal_kernel(
         name="mqa_count_compressed_edges",
         input_names=["indices", "lengths", "dims"],
-        output_names=["counts"], source=_CSR_COUNT, header=_HEADER,
+        output_names=["counts"],
+        source=_CSR_COUNT,
+        header=_HEADER,
         atomic_outputs=True,
     )
     scan_block = mx.fast.metal_kernel(
-        name="mqa_csr_scan_block", input_names=["counts", "dims"],
-        output_names=["local_prefix", "block_total"], source=_CSR_SCAN_BLOCK,
+        name="mqa_csr_scan_block",
+        input_names=["counts", "dims"],
+        output_names=["local_prefix", "block_total"],
+        source=_CSR_SCAN_BLOCK,
         header=_HEADER,
     )
     scan_add = mx.fast.metal_kernel(
-        name="mqa_csr_scan_add", input_names=["local_prefix", "block_prefix", "dims"],
-        output_names=["row_ptr"], source=_CSR_SCAN_ADD, header=_HEADER,
+        name="mqa_csr_scan_add",
+        input_names=["local_prefix", "block_prefix", "dims"],
+        output_names=["row_ptr"],
+        source=_CSR_SCAN_ADD,
+        header=_HEADER,
     )
     csr_fill = mx.fast.metal_kernel(
         name="mqa_fill_compressed_edges",
         input_names=["indices", "lengths", "row_ptr", "dims"],
-        output_names=["cursor", "edge_q", "edge_slot"], source=_CSR_FILL,
-        header=_HEADER, atomic_outputs=True,
+        output_names=["cursor", "edge_q", "edge_slot"],
+        source=_CSR_FILL,
+        header=_HEADER,
+        atomic_outputs=True,
     )
     one_key = mx.fast.metal_kernel(
         name="mqa_backward_one_key",
-        input_names=["Q", "window", "compressed", "LSE", "dO", "Delta",
-                     "row_ptr", "edge_q", "edge_slot", "segment", "pad",
-                     "dims", "scale"],
+        input_names=[
+            "Q",
+            "window",
+            "compressed",
+            "LSE",
+            "dO",
+            "Delta",
+            "row_ptr",
+            "edge_q",
+            "edge_slot",
+            "segment",
+            "pad",
+            "dims",
+            "scale",
+        ],
         output_names=["dKV"],
-        source=_ONE_KEY, header=_HEADER,
+        source=_ONE_KEY,
+        header=_HEADER,
     )
     reduce_parts = mx.fast.metal_kernel(
-        name="mqa_key_reduce_parts", input_names=["partial", "dims"],
-        output_names=["dcompressed"], source=_KEY_REDUCE_PARTS, header=_HEADER,
+        name="mqa_key_reduce_parts",
+        input_names=["partial", "dims"],
+        output_names=["dcompressed"],
+        source=_KEY_REDUCE_PARTS,
+        header=_HEADER,
     )
     return csr_count, scan_block, scan_add, csr_fill, one_key, reduce_parts
 
@@ -955,16 +1228,21 @@ def _csr_exclusive_scan(counts):
     blocks = (n + 255) // 256
     dims = mx.array([n], mx.uint32)
     local, totals = scan_block(
-        inputs=[counts, dims], grid=(blocks * 256, 1, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(n + 1,), (blocks,)], output_dtypes=[mx.int32, mx.int32],
+        inputs=[counts, dims],
+        grid=(blocks * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(n + 1,), (blocks,)],
+        output_dtypes=[mx.int32, mx.int32],
     )
     if blocks == 1:
         return local
     block_prefix = _csr_exclusive_scan(totals)
     (row_ptr,) = scan_add(
         inputs=[local, block_prefix, dims],
-        grid=(n + 1, 1, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(n + 1,)], output_dtypes=[mx.int32],
+        grid=(n + 1, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(n + 1,)],
+        output_dtypes=[mx.int32],
     )
     return row_ptr
 
@@ -972,7 +1250,11 @@ def _csr_exclusive_scan(counts):
 def _compressed_occurrence_csr(indices, lengths, b, t, n):
     """Invert the existing row-major selection, preserving each (query, slot)."""
     if n == 0:
-        return mx.zeros((1,), mx.int32), mx.zeros((0,), mx.int32), mx.zeros((0,), mx.int32)
+        return (
+            mx.zeros((1,), mx.int32),
+            mx.zeros((0,), mx.int32),
+            mx.zeros((0,), mx.int32),
+        )
     # This is the selection's static storage capacity, including possible ties,
     # not the nominal top-k. Unused capacity is never read by the consumer.
     edge_cap = indices.size
@@ -982,46 +1264,85 @@ def _compressed_occurrence_csr(indices, lengths, b, t, n):
     dims = mx.array([b, t, n], mx.uint32)
     (counts,) = csr_count(
         inputs=[indices, lengths, dims],
-        grid=(128, b * t, 1), threadgroup=(128, 1, 1),
-        output_shapes=[(b * n,)], output_dtypes=[mx.int32], init_value=0,
+        grid=(128, b * t, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(b * n,)],
+        output_dtypes=[mx.int32],
+        init_value=0,
     )
     row_ptr = _csr_exclusive_scan(counts)
     _, edge_q, edge_slot = csr_fill(
         inputs=[indices, lengths, row_ptr, dims],
-        grid=(128, b * t, 1), threadgroup=(128, 1, 1),
+        grid=(128, b * t, 1),
+        threadgroup=(128, 1, 1),
         output_shapes=[(b * n,), (edge_cap,), (edge_cap,)],
-        output_dtypes=[mx.int32, mx.int32, mx.int32], init_value=0,
+        output_dtypes=[mx.int32, mx.int32, mx.int32],
+        init_value=0,
     )
     return row_ptr, edge_q, edge_slot
 
 
-def _key_owned_pool_grad(q, window, compressed, indices, lengths, segment, pad,
-                         dims, scale, gcast, lse, deltas, window_size):
+def _key_owned_pool_grad(
+    q,
+    window,
+    compressed,
+    indices,
+    lengths,
+    segment,
+    pad,
+    dims,
+    scale,
+    gcast,
+    lse,
+    deltas,
+    window_size,
+):
     """Implicit window adjacency + occurrence CSR; no floating-point atomics."""
     b, t, h, d = q.shape
     n = compressed.shape[1]
     _, _, _, _, one_key, reduce_parts = _key_owned_kernels()
     row_ptr, edge_q, edge_slot = _compressed_occurrence_csr(indices, lengths, b, t, n)
     # The wrapper's transpose has already been differentiated: gcast is BTHD.
-    inputs = [q, window, compressed, lse, gcast, deltas, row_ptr, edge_q, edge_slot,
-              segment, pad, dims, scale]
+    inputs = [
+        q,
+        window,
+        compressed,
+        lse,
+        gcast,
+        deltas,
+        row_ptr,
+        edge_q,
+        edge_slot,
+        segment,
+        pad,
+        dims,
+        scale,
+    ]
     template = [("T", q.dtype), ("D", d), ("H", h), ("WIN", window_size)]
     (dw,) = one_key(
-        inputs=inputs, template=template + [("COMPRESSED", False), ("OutT", window.dtype)],
-        grid=(128, b * t, 1), threadgroup=(128, 1, 1),
-        output_shapes=[window.shape], output_dtypes=[window.dtype],
+        inputs=inputs,
+        template=template + [("COMPRESSED", False), ("OutT", window.dtype)],
+        grid=(128, b * t, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[window.shape],
+        output_dtypes=[window.dtype],
     )
     if n:
         (partial,) = one_key(
-            inputs=inputs, template=template + [("COMPRESSED", True), ("OutT", mx.float32)],
-            grid=(128, b * n, 4), threadgroup=(128, 1, 1),
-            output_shapes=[(4, b, n, d)], output_dtypes=[mx.float32],
+            inputs=inputs,
+            template=template + [("COMPRESSED", True), ("OutT", mx.float32)],
+            grid=(128, b * n, 4),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(4, b, n, d)],
+            output_dtypes=[mx.float32],
         )
         (dc,) = reduce_parts(
             inputs=[partial, mx.array([b * n * d], mx.uint32)],
             template=[("T", compressed.dtype)],
-            grid=(b * n * d, 1, 1), threadgroup=(128, 1, 1),
-            output_shapes=[compressed.shape], output_dtypes=[compressed.dtype],
+            grid=(b * n * d, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[compressed.shape],
+            output_dtypes=[compressed.dtype],
         )
     else:
         dc = mx.zeros((b, 0, d), compressed.dtype)
@@ -1029,17 +1350,24 @@ def _key_owned_pool_grad(q, window, compressed, indices, lengths, segment, pad,
 
 
 def enabled_for(q, window_size):
-    return (_ENABLED and mx.default_device() == mx.gpu and q.shape[-2] == 16
-            and q.shape[-1] in (64, 128) and window_size > 0
-            and q.dtype in (mx.bfloat16, mx.float16))
+    return (
+        _ENABLED
+        and mx.default_device() == mx.gpu
+        and q.shape[-2] == 16
+        and q.shape[-1] in (64, 128)
+        and window_size > 0
+        and q.dtype in (mx.bfloat16, mx.float16)
+    )
 
 
 def _compact_mask(mask):
     b, t, n = mask.shape
     return _kernels()[0](
         inputs=[mask, mx.array([n], mx.uint32)],
-        grid=(32, b*t, 1), threadgroup=(32, 1, 1),
-        output_shapes=[(b*t, n), (b*t,)], output_dtypes=[mx.int32, mx.int32],
+        grid=(32, b * t, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(b * t, n), (b * t,)],
+        output_dtypes=[mx.int32, mx.int32],
     )
 
 
@@ -1060,12 +1388,15 @@ def compact_visible(mask):
 def _operation(window_size, softmax_scale, key_tile):
     if key_tile not in (16, 32):
         raise ValueError("forward key tile must be 16 or 32")
-    (compact, forward, legacy, delta_k, q_sink, kv, finalize_pool,
-     finalize_sink) = _kernels()
+    (compact, forward, legacy, delta_k, q_sink, kv, finalize_pool, finalize_sink) = (
+        _kernels()
+    )
 
     def constants(q, compressed):
         b, t, _, d = q.shape
-        return mx.array([b, t, compressed.shape[1]], mx.uint32), mx.array([softmax_scale], mx.float32)
+        return mx.array([b, t, compressed.shape[1]], mx.uint32), mx.array(
+            [softmax_scale], mx.float32
+        )
 
     @mx.custom_function
     def op(q, window, compressed, indices, lengths, segment, pad, sinks):
@@ -1073,10 +1404,29 @@ def _operation(window_size, softmax_scale, key_tile):
         parts, threads = d // 64, d
         dims, scale = constants(q, compressed)
         out, lse = forward(
-            inputs=[q, window, compressed, indices, lengths, segment, pad, sinks, dims, scale],
-            template=[("T", q.dtype), ("D", d), ("W", window_size), ("BK", key_tile), ("NP", parts)],
-            grid=(threads, b*t, 1), threadgroup=(threads, 1, 1),
-            output_shapes=[q.shape, (b, t, h)], output_dtypes=[mx.float32, mx.float32],
+            inputs=[
+                q,
+                window,
+                compressed,
+                indices,
+                lengths,
+                segment,
+                pad,
+                sinks,
+                dims,
+                scale,
+            ],
+            template=[
+                ("T", q.dtype),
+                ("D", d),
+                ("W", window_size),
+                ("BK", key_tile),
+                ("NP", parts),
+            ],
+            grid=(threads, b * t, 1),
+            threadgroup=(threads, 1, 1),
+            output_shapes=[q.shape, (b, t, h)],
+            output_dtypes=[mx.float32, mx.float32],
         )
         return out, lse
 
@@ -1088,59 +1438,194 @@ def _operation(window_size, softmax_scale, key_tile):
         b, t, h, d = q.shape
         parts, threads = d // 64, d
         backward_tile = 16
+        if _FUSED_BWD and _SPLIT_BWD and not _KEY_OWNED_BWD:
+            if _FUSED_BWD_TILE not in (16, 32):
+                raise ValueError("fused backward key tile must be 16 or 32")
+            backward_tile = _FUSED_BWD_TILE
         dims, scale = constants(q, compressed)
         if _SPLIT_BWD:
-            (compact, forward, legacy, delta_k, q_sink, kv, finalize_pool,
-             finalize_sink) = _kernels()
+            (
+                compact,
+                forward,
+                legacy,
+                delta_k,
+                q_sink,
+                kv,
+                finalize_pool,
+                finalize_sink,
+            ) = _kernels()
+            if _PARALLEL_BWD:
+                q_sink, kv = _parallel_backward_kernels()
             gcast = g.astype(q.dtype)
-            dq, deltas, dsinkrow = q_sink(
-                inputs=[q, window, compressed, indices, lengths, segment, pad, sinks,
-                        dims, scale, gcast, lse, out],
-                template=[("T", q.dtype), ("D", d), ("W", window_size), ("BK", backward_tile), ("NP", parts)],
-                grid=(threads, b*t, 1), threadgroup=(threads, 1, 1),
-                output_shapes=[q.shape, (b, t, h), (b, t, h)],
-                output_dtypes=[q.dtype, mx.float32, mx.float32],
-            )
+            fused_bwd = _FUSED_BWD and not _KEY_OWNED_BWD
+            if fused_bwd:
+                deltas, dsinkrow = _fused_delta_kernel()(
+                    inputs=[gcast, out, sinks, lse],
+                    template=[("D", d), ("H", h)],
+                    grid=(threads, b * t, 1),
+                    threadgroup=(threads, 1, 1),
+                    output_shapes=[(b, t, h), (b, t, h)],
+                    output_dtypes=[mx.float32] * 2,
+                )
+            else:
+                dq, deltas, dsinkrow = q_sink(
+                    inputs=[
+                        q,
+                        window,
+                        compressed,
+                        indices,
+                        lengths,
+                        segment,
+                        pad,
+                        sinks,
+                        dims,
+                        scale,
+                        gcast,
+                        lse,
+                        out,
+                    ],
+                    template=[
+                        ("T", q.dtype),
+                        ("D", d),
+                        ("W", window_size),
+                        ("BK", backward_tile),
+                        ("NP", parts),
+                    ],
+                    grid=(threads, b * t, 1),
+                    threadgroup=(threads, 1, 1),
+                    output_shapes=[q.shape, (b, t, h), (b, t, h)],
+                    output_dtypes=[q.dtype, mx.float32, mx.float32],
+                )
             (ds,) = finalize_sink(
                 inputs=[dsinkrow, mx.array([t, b], mx.uint32)],
                 template=[("H", h)],
-                grid=(128, h, 1), threadgroup=(128, 1, 1),
-                output_shapes=[sinks.shape], output_dtypes=[sinks.dtype],
+                grid=(128, h, 1),
+                threadgroup=(128, 1, 1),
+                output_shapes=[sinks.shape],
+                output_dtypes=[sinks.dtype],
             )
             n_comp = compressed.shape[1]
             if _KEY_OWNED_BWD:
                 dw, dc = _key_owned_pool_grad(
-                    q, window, compressed, indices, lengths, segment, pad,
-                    dims, scale, gcast, lse, deltas, window_size)
-            else:
-                (poolshard,) = kv(
-                    inputs=[q, window, compressed, indices, lengths, segment, pad, sinks,
-                            dims, scale, gcast, lse, deltas],
-                    template=[("T", q.dtype), ("D", d), ("W", window_size), ("BK", backward_tile),
-                              ("NP", parts), ("SHARDS", _SHARDS)],
-                    grid=(threads, b*t, 1), threadgroup=(threads, 1, 1),
-                    output_shapes=[(_SHARDS,) + (b, t + n_comp, d)],
-                    output_dtypes=[mx.float32], init_value=0,
+                    q,
+                    window,
+                    compressed,
+                    indices,
+                    lengths,
+                    segment,
+                    pad,
+                    dims,
+                    scale,
+                    gcast,
+                    lse,
+                    deltas,
+                    window_size,
                 )
+            else:
+                window_owned = fused_bwd and _WINDOW_OWNED_BWD
+                pool_outputs = (
+                    _fused_backward_kernel(False, window_owned) if fused_bwd else kv
+                )(
+                    inputs=[
+                        q,
+                        window,
+                        compressed,
+                        indices,
+                        lengths,
+                        segment,
+                        pad,
+                        sinks,
+                        dims,
+                        scale,
+                        gcast,
+                        lse,
+                        deltas,
+                    ],
+                    template=[
+                        ("T", q.dtype),
+                        ("D", d),
+                        ("W", window_size),
+                        ("BK", backward_tile),
+                        ("NP", parts),
+                        ("SHARDS", _SHARDS),
+                    ],
+                    grid=(threads, b * t, 1),
+                    threadgroup=(threads, 1, 1),
+                    output_shapes=[(_SHARDS,) + (b, t + n_comp, d)]
+                    + ([q.shape] if fused_bwd else []),
+                    output_dtypes=[mx.float32] * (2 if fused_bwd else 1),
+                    init_value=0,
+                )
+                poolshard = pool_outputs[0]
+                if fused_bwd:
+                    dq = pool_outputs[1]
                 dw, dc = finalize_pool(
                     inputs=[poolshard, mx.array([t, n_comp, b], mx.uint32)],
                     template=[("T", window.dtype), ("D", d), ("SHARDS", _SHARDS)],
-                    grid=(d, t + n_comp, b), threadgroup=(d, 1, 1),
+                    grid=(d, t + n_comp, b),
+                    threadgroup=(d, 1, 1),
                     output_shapes=[window.shape, compressed.shape],
                     output_dtypes=[window.dtype, compressed.dtype],
                 )
+                if window_owned:
+                    from .window_attention_backward import window_attention_backward
+
+                    dw = window_attention_backward(
+                        q,
+                        window,
+                        gcast,
+                        lse,
+                        deltas,
+                        segment,
+                        pad,
+                        window_size,
+                        softmax_scale,
+                    )
         else:
-            (compact, forward, legacy, delta_k, q_sink, kv, finalize_pool,
-             finalize_sink) = _kernels()
+            (
+                compact,
+                forward,
+                legacy,
+                delta_k,
+                q_sink,
+                kv,
+                finalize_pool,
+                finalize_sink,
+            ) = _kernels()
             dq, dw, dc, ds = legacy(
-                inputs=[q, window, compressed, indices, lengths, segment, pad, sinks,
-                        dims, scale, g.astype(q.dtype), out, lse],
-                template=[("T", q.dtype), ("D", d), ("W", window_size), ("BK", backward_tile),
-                          ("NP", parts), ("SHARDS", _SHARDS)],
-                grid=(threads, b*t, 1), threadgroup=(threads, 1, 1),
-                output_shapes=[q.shape, (_SHARDS,)+window.shape,
-                               (_SHARDS,)+compressed.shape, (b, t, h)],
-                output_dtypes=[mx.float32]*4, init_value=0,
+                inputs=[
+                    q,
+                    window,
+                    compressed,
+                    indices,
+                    lengths,
+                    segment,
+                    pad,
+                    sinks,
+                    dims,
+                    scale,
+                    g.astype(q.dtype),
+                    out,
+                    lse,
+                ],
+                template=[
+                    ("T", q.dtype),
+                    ("D", d),
+                    ("W", window_size),
+                    ("BK", backward_tile),
+                    ("NP", parts),
+                    ("SHARDS", _SHARDS),
+                ],
+                grid=(threads, b * t, 1),
+                threadgroup=(threads, 1, 1),
+                output_shapes=[
+                    q.shape,
+                    (_SHARDS,) + window.shape,
+                    (_SHARDS,) + compressed.shape,
+                    (b, t, h),
+                ],
+                output_dtypes=[mx.float32] * 4,
+                init_value=0,
             )
             dw = mx.sum(dw, axis=0)
             dc = mx.sum(dc, axis=0)
@@ -1166,27 +1651,257 @@ def _operation(window_size, softmax_scale, key_tile):
     return op
 
 
-def indexed_attention(q, window, compressed, visible, segment_ids, pad_mask, sinks,
-                      window_size, softmax_scale, selection=None, key_tile=None):
-    """Returns [B,H,T,D]. Caller selects the supported no-cache training path."""
+@lru_cache(None)
+def _position_operation(window_size, token_window_size, softmax_scale, key_tile):
+    """Same MMA math with explicit token-span visibility and compact routing.
+
+    Position mode uses the fused or original sharded VJP. The optional key-owned
+    and parallel split experiments use implicit token-index adjacency, so they
+    intentionally fall back to this position-aware sharded implementation.
+    The old operation and its backend dispatch remain unchanged.
+    """
+    if key_tile not in (16, 32):
+        raise ValueError("forward key tile must be 16 or 32")
+    (_, forward, legacy, _, q_sink, kv, finalize_pool, finalize_sink) = _kernels(True)
+
+    def constants(q, compressed, indices):
+        b, t, _, _ = q.shape
+        dims = mx.array(
+            [b, t, compressed.shape[1], indices.shape[-1], token_window_size], mx.uint32
+        )
+        return dims, mx.array([softmax_scale], mx.float32)
+
+    @mx.custom_function
+    def op(q, window, compressed, indices, lengths, segment, pad, sinks, positions):
+        b, t, h, d = q.shape
+        dims, scale = constants(q, compressed, indices)
+        return forward(
+            inputs=[
+                q,
+                window,
+                compressed,
+                indices,
+                lengths,
+                segment,
+                pad,
+                sinks,
+                dims,
+                scale,
+                positions,
+            ],
+            template=[
+                ("T", q.dtype),
+                ("D", d),
+                ("W", window_size),
+                ("BK", key_tile),
+                ("NP", d // 64),
+            ],
+            grid=(d, b * t, 1),
+            threadgroup=(d, 1, 1),
+            output_shapes=[q.shape, (b, t, h)],
+            output_dtypes=[mx.float32, mx.float32],
+        )
+
+    @op.vjp
+    def vjp(primals, cotangent, output):
+        q, window, compressed, indices, lengths, segment, pad, sinks, positions = (
+            primals
+        )
+        g, _ = cotangent
+        out, lse = output
+        b, t, h, d = q.shape
+        n = compressed.shape[1]
+        dims, scale = constants(q, compressed, indices)
+        inputs = [
+            q,
+            window,
+            compressed,
+            indices,
+            lengths,
+            segment,
+            pad,
+            sinks,
+            dims,
+            scale,
+            positions,
+        ]
+        gcast = g.astype(q.dtype)
+        fused = _SPLIT_BWD and _FUSED_BWD
+        bk = _FUSED_BWD_TILE if fused else 16
+        if bk not in (16, 32):
+            raise ValueError("fused backward key tile must be 16 or 32")
+        template = [
+            ("T", q.dtype),
+            ("D", d),
+            ("W", window_size),
+            ("BK", bk),
+            ("NP", d // 64),
+        ]
+        if _SPLIT_BWD:
+            if fused:
+                deltas, dsinkrow = _fused_delta_kernel()(
+                    inputs=[gcast, out, sinks, lse],
+                    template=[("D", d), ("H", h)],
+                    grid=(d, b * t, 1),
+                    threadgroup=(d, 1, 1),
+                    output_shapes=[(b, t, h), (b, t, h)],
+                    output_dtypes=[mx.float32] * 2,
+                )
+            else:
+                dq, deltas, dsinkrow = q_sink(
+                    inputs=inputs + [gcast, lse, out],
+                    template=template,
+                    grid=(d, b * t, 1),
+                    threadgroup=(d, 1, 1),
+                    output_shapes=[q.shape, (b, t, h), (b, t, h)],
+                    output_dtypes=[q.dtype, mx.float32, mx.float32],
+                )
+            (ds,) = finalize_sink(
+                inputs=[dsinkrow, mx.array([t, b], mx.uint32)],
+                template=[("H", h)],
+                grid=(128, h, 1),
+                threadgroup=(128, 1, 1),
+                output_shapes=[sinks.shape],
+                output_dtypes=[sinks.dtype],
+            )
+            outputs = (_fused_backward_kernel(True) if fused else kv)(
+                inputs=inputs + [gcast, lse, deltas],
+                template=template + [("SHARDS", _SHARDS)],
+                grid=(d, b * t, 1),
+                threadgroup=(d, 1, 1),
+                output_shapes=[(_SHARDS, b, t + n, d)] + ([q.shape] if fused else []),
+                output_dtypes=[mx.float32] * (2 if fused else 1),
+                init_value=0,
+            )
+            if fused:
+                dq = outputs[1]
+            dw, dc = finalize_pool(
+                inputs=[outputs[0], mx.array([t, n, b], mx.uint32)],
+                template=[("T", window.dtype), ("D", d), ("SHARDS", _SHARDS)],
+                grid=(d, t + n, b),
+                threadgroup=(d, 1, 1),
+                output_shapes=[window.shape, compressed.shape],
+                output_dtypes=[window.dtype, compressed.dtype],
+            )
+        else:
+            dq, dw, dc, ds = legacy(
+                inputs=inputs + [gcast, out, lse],
+                template=template + [("SHARDS", _SHARDS)],
+                grid=(d, b * t, 1),
+                threadgroup=(d, 1, 1),
+                output_shapes=[
+                    q.shape,
+                    (_SHARDS,) + window.shape,
+                    (_SHARDS,) + compressed.shape,
+                    (b, t, h),
+                ],
+                output_dtypes=[mx.float32] * 4,
+                init_value=0,
+            )
+            dw, dc, ds = mx.sum(dw, axis=0), mx.sum(dc, axis=0), mx.sum(ds, axis=(0, 1))
+        # Every array primal needs a VJP array leaf, including explicit positions.
+        return (
+            dq.astype(q.dtype),
+            dw.astype(window.dtype),
+            dc.astype(compressed.dtype),
+            mx.zeros_like(indices),
+            mx.zeros_like(lengths),
+            mx.zeros_like(segment),
+            mx.zeros_like(pad),
+            ds.astype(sinks.dtype),
+            mx.zeros_like(positions),
+        )
+
+    return op
+
+
+def indexed_attention(
+    q,
+    window,
+    compressed,
+    visible,
+    segment_ids,
+    pad_mask,
+    sinks,
+    window_size,
+    softmax_scale,
+    selection=None,
+    key_tile=None,
+    query_positions=None,
+    token_window_size=None,
+):
+    """Returns [B,H,Q,D]; caller selects the supported no-cache training path.
+
+    With query_positions [B,Q], window_size is the maximum latent neighbors,
+    and token_window_size is the exclusive upper bound on actual token distance.
+    Queries/latent window keys must be in increasing original position order;
+    window_size must upper-bound the number of same-document anchors in that
+    span. Compressed evidence selections already carry their document/pad/causal
+    checks, and position mode accepts compact [B*Q,K] storage for these indices.
+    """
     b, t, h, d = q.shape
     if selection is None:
         visible = mx.broadcast_to(visible, (b, t, compressed.shape[1]))
         indices, lengths = _compact_mask(mx.stop_gradient(visible))
     else:
         indices, lengths = selection
-    segment = (mx.zeros((b, t), mx.int32) if segment_ids is None
-               else segment_ids.astype(mx.int32))
-    pad = (mx.ones((b, t), mx.bool_) if pad_mask is None else pad_mask.astype(mx.bool_))
-    out, _ = _operation(window_size, softmax_scale, _KEY_TILE if key_tile is None else key_tile)(
-        q, window.astype(q.dtype), compressed.astype(q.dtype), indices, lengths,
-        segment, pad, sinks.astype(mx.float32),
+    segment = (
+        mx.zeros((b, t), mx.int32)
+        if segment_ids is None
+        else segment_ids.astype(mx.int32)
     )
+    pad = mx.ones((b, t), mx.bool_) if pad_mask is None else pad_mask.astype(mx.bool_)
+    if query_positions is None:
+        if token_window_size is not None:
+            raise ValueError("token_window_size requires query_positions")
+        out, _ = _operation(
+            window_size, softmax_scale, _KEY_TILE if key_tile is None else key_tile
+        )(
+            q,
+            window.astype(q.dtype),
+            compressed.astype(q.dtype),
+            indices,
+            lengths,
+            segment,
+            pad,
+            sinks.astype(mx.float32),
+        )
+    else:
+        if query_positions.shape != (b, t):
+            raise ValueError("query_positions must have shape [B,Q]")
+        if token_window_size is None or token_window_size <= 0:
+            raise ValueError(
+                "explicit query positions require a positive token_window_size"
+            )
+        if window.shape != (b, t, d):
+            raise ValueError(
+                "position-aware indexed attention requires one self key per query"
+            )
+        if indices.ndim != 2 or indices.shape[0] != b * t or lengths.shape != (b * t,):
+            raise ValueError("selection must be (indices [B*Q,K], lengths [B*Q])")
+        out, _ = _position_operation(
+            window_size,
+            int(token_window_size),
+            softmax_scale,
+            _KEY_TILE if key_tile is None else key_tile,
+        )(
+            q,
+            window.astype(q.dtype),
+            compressed.astype(q.dtype),
+            mx.stop_gradient(indices),
+            mx.stop_gradient(lengths),
+            segment,
+            pad,
+            sinks.astype(mx.float32),
+            mx.stop_gradient(query_positions.astype(mx.int32)),
+        )
     return out.astype(q.dtype).transpose(0, 2, 1, 3)
 
 
 @lru_cache(None)
-def prewarm_sparse_attention(head_dim, window_size, softmax_scale, dtype=mx.bfloat16, key_tile=None):
+def prewarm_sparse_attention(
+    head_dim, window_size, softmax_scale, dtype=mx.bfloat16, key_tile=None
+):
     """Materialize JIT libraries eagerly; no correctness or performance checks."""
     q = mx.zeros((1, 1, 16, head_dim), dtype)
     if not enabled_for(q, window_size):
@@ -1196,7 +1911,9 @@ def prewarm_sparse_attention(head_dim, window_size, softmax_scale, dtype=mx.bflo
     sinks = mx.zeros((16,), mx.float32)
 
     def fn(a, b, c, s):
-        return indexed_attention(a, b, c, mask, None, None, s, window_size, softmax_scale, key_tile=key_tile)
+        return indexed_attention(
+            a, b, c, mask, None, None, s, window_size, softmax_scale, key_tile=key_tile
+        )
 
     out, grads = mx.vjp(fn, [q, kv, kv, sinks], [mx.ones((1, 16, 1, head_dim), dtype)])
     mx.eval(out, grads)

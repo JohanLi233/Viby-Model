@@ -23,6 +23,7 @@ from model.engram import EngramLayout, _build_primes, compute_num_embeddings
 
 # ------------------------------------------------------------------ 配方可构造
 
+
 def test_default_recipe_is_about_1b():
     """默认 ≈1B 配方：12 层、96 专家 top-6，静态计数 ≈1e9 / 激活 ≈1.3e8。"""
     cfg = VibyConfig()
@@ -41,10 +42,10 @@ def test_default_compress_ratio_schedule_matches_flash():
     """[0,0] + [2]*18 + [1]*20 + [0]*3：浅层纯 SWA、编码段 r=2、解码段 r=1。"""
     assert default_compress_ratios(40, 3) == [0, 0] + [2] * 18 + [1] * 20 + [0] * 3
     cfg = VibyConfig()
-    assert cfg.compress_ratios[:2] == (0, 0)          # 前两层只有 SWA
-    assert set(cfg.compress_ratios[2:6]) == {2}       # 编码段
-    assert set(cfg.compress_ratios[6:12]) == {1}      # 解码段
-    assert cfg.compress_ratios[12:] == (0,)           # draft 层纯 SWA
+    assert cfg.compress_ratios[:2] == (0, 0)  # 前两层只有 SWA
+    assert set(cfg.compress_ratios[2:6]) == {2}  # 编码段
+    assert set(cfg.compress_ratios[6:12]) == {1}  # 解码段
+    assert cfg.compress_ratios[12:] == (0,)  # draft 层纯 SWA
 
 
 def test_ced_boundary_is_first_decoder_and_kv_source():
@@ -88,11 +89,17 @@ def test_tiny_preset_constructs_and_is_small():
 
 # ------------------------------------------------------------------ 模式推导
 
+
 def test_layer_modes_full_reindex_reuse_sliding():
     """§2.3.1：Full=自产 KV+indexer，Reindex=复用 KV/新算 top-k，Reuse=两者都复用。"""
     cfg = cfg_mix()
     assert [cfg.layer_mode(i) for i in range(6)] == [
-        "sliding", "sliding", "full", "full", "reuse", "reindex",
+        "sliding",
+        "sliding",
+        "full",
+        "full",
+        "reuse",
+        "reindex",
     ]
     # ratio 0 → sliding（不参与压缩 KV 共享）
     assert cfg.compress_ratios[0] == 0 and cfg.compress_ratios[1] == 0
@@ -111,7 +118,9 @@ def test_compressor_and_indexer_ownership_matches_mode():
 
     cfg = cfg_mix()
     att = [Attention(cfg, i) for i in range(6)]
-    for i, mode in enumerate(["sliding", "sliding", "full", "full", "reuse", "reindex"]):
+    for i, mode in enumerate(
+        ["sliding", "sliding", "full", "full", "reuse", "reindex"]
+    ):
         assert att[i].mode == mode
         assert (att[i].compressor is not None) == (i in cfg.kv_source_layers)
         assert (att[i].indexer is not None) == (i in cfg.index_source_layers)
@@ -129,22 +138,31 @@ def test_compressor_and_indexer_ownership_matches_mode():
 
 # ------------------------------------------------------------------ 非法配置
 
+
 def test_invalid_compress_layer_without_upstream_source():
     """压缩层没有同 ratio 上游源 → 报错（§2.3 的跨层复用前提）。"""
     with pytest.raises(ValueError, match="没有上游 kv 源"):
         VibyConfig(
-            preset="tiny", n_layers=6, engram_layer_ids=(),
-            compress_ratios=(0, 0, 0, 2, 2, 2, 0), kv_source_layers=(4,),
-            index_source_layers=(4,), candidate_source_layer=4,
+            preset="tiny",
+            n_layers=6,
+            engram_layer_ids=(),
+            compress_ratios=(0, 0, 0, 2, 2, 2, 0),
+            kv_source_layers=(4,),
+            index_source_layers=(4,),
+            candidate_source_layer=4,
         )
 
 
 def test_invalid_ratio_mismatch_with_source():
     with pytest.raises(ValueError, match="不一致"):
         VibyConfig(
-            preset="tiny", n_layers=6, engram_layer_ids=(),
-            compress_ratios=(0, 0, 2, 1, 1, 1, 0), kv_source_layers=(2,),
-            index_source_layers=(2,), candidate_source_layer=2,
+            preset="tiny",
+            n_layers=6,
+            engram_layer_ids=(),
+            compress_ratios=(0, 0, 2, 1, 1, 1, 0),
+            kv_source_layers=(2,),
+            index_source_layers=(2,),
+            candidate_source_layer=2,
         )
 
 
@@ -154,7 +172,9 @@ def test_invalid_source_lists_and_lengths():
     with pytest.raises(ValueError, match="第 0 层"):
         VibyConfig(preset="tiny", engram_layer_ids=(), kv_source_layers=(0,))
     with pytest.raises(ValueError, match="落在主干层内"):
-        VibyConfig(preset="tiny", n_layers=4, engram_layer_ids=(), kv_source_layers=(4,))
+        VibyConfig(
+            preset="tiny", n_layers=4, engram_layer_ids=(), kv_source_layers=(4,)
+        )
     with pytest.raises(ValueError, match="compress_ratios 长度"):
         VibyConfig(preset="tiny", engram_layer_ids=(), compress_ratios=(0, 0, 1, 1))
     with pytest.raises(ValueError, match="不能为负"):
@@ -188,13 +208,18 @@ def test_invalid_moe_and_rope_configs():
 
 # ------------------------------------------------------------------ Engram 布局
 
+
 def test_engram_num_embeddings_derived_from_prime_buckets():
     """§2.4.2：每个 (层, 阶, 头) 独占一段素数桶，表行数 = 各桶素数之和。"""
     cfg = VibyConfig()
     rows = compute_num_embeddings(cfg)
     assert len(rows) == len(cfg.engram_layer_ids)
-    primes = _build_primes(cfg.engram_layer_ids, cfg.engram_max_ngram_size,
-                           cfg.engram_n_heads, cfg.engram_vocab_size)
+    primes = _build_primes(
+        cfg.engram_layer_ids,
+        cfg.engram_max_ngram_size,
+        cfg.engram_n_heads,
+        cfg.engram_vocab_size,
+    )
     assert len(primes) == len(cfg.engram_layer_ids)
     for layer, n_orders in zip(primes, [cfg.engram_max_ngram_size - 1]):
         assert len(layer) == n_orders
@@ -202,7 +227,9 @@ def test_engram_num_embeddings_derived_from_prime_buckets():
     assert len(flat) == len(set(flat)), "素数桶全局不重复"
     for layer_primes, n in zip(primes, rows):
         assert n == sum(sum(order) for order in layer_primes)
-        assert all(p > cfg.engram_vocab_size - 1 for order in layer_primes for p in order)
+        assert all(
+            p > cfg.engram_vocab_size - 1 for order in layer_primes for p in order
+        )
     layout = EngramLayout.from_config(cfg)
     assert layout is not None and layout.num_embeddings == rows
     assert layout.window == cfg.engram_max_ngram_size - 1
@@ -216,19 +243,28 @@ def test_engram_layout_rejects_too_small_tables():
     bad = cfg.engram_num_embeddings[0] - 1
     with pytest.raises(ValueError, match="小于桶总数"):
         EngramLayout.from_config(
-            VibyConfig(**{**cfg.to_dict(), "engram_num_embeddings": (bad, cfg.engram_num_embeddings[1])})
+            VibyConfig(
+                **{
+                    **cfg.to_dict(),
+                    "engram_num_embeddings": (bad, cfg.engram_num_embeddings[1]),
+                }
+            )
         )
 
 
 # ------------------------------------------------------------------ draft / 序列化
+
 
 def test_draft_layers_use_narrow_moe():
     """§2.4.3：DSpark draft 层是 3 层 SWA block，MoE 比主干窄。"""
     cfg = VibyConfig(dspark_n_routed_experts=32, dspark_n_activated_experts=3)
     assert cfg.moe_of(0) == (cfg.n_routed_experts, cfg.n_activated_experts)
     assert cfg.moe_of(cfg.n_layers) == (32, 3)
-    assert cfg.compress_ratios[cfg.n_layers:] == (0,)
-    assert all(cfg.layer_mode(i) == "sliding" for i in range(cfg.n_layers, cfg.n_layers + cfg.n_mtp_layers))
+    assert cfg.compress_ratios[cfg.n_layers :] == (0,)
+    assert all(
+        cfg.layer_mode(i) == "sliding"
+        for i in range(cfg.n_layers, cfg.n_layers + cfg.n_mtp_layers)
+    )
     assert cfg.n_mtp_layers == 1 and cfg.dspark_block_size == 4
 
 

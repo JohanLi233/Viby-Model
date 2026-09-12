@@ -18,7 +18,6 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import mlx.core as mx  # noqa: E402
-from mlx import nn  # noqa: E402
 
 from model.config import VibyConfig  # noqa: E402
 from model.moe import MoEFeedForward, expert_act  # noqa: E402
@@ -63,7 +62,9 @@ def sparse_bucketed(x, idx, w, gu_t, dw_t, E):
     tok_s = (order // K).astype(mx.int32)
     w_s = w.reshape(G)[order].astype(x.dtype)
     # 每个 (token,choice) 行在本专家桶内的槽位 = 组内序号
-    counts = mx.zeros((E,), dtype=mx.int32).at[exps_s].add(mx.ones((G,), dtype=mx.int32))
+    counts = (
+        mx.zeros((E,), dtype=mx.int32).at[exps_s].add(mx.ones((G,), dtype=mx.int32))
+    )
     starts = mx.concatenate([mx.zeros((1,), dtype=mx.int32), mx.cumsum(counts)[:-1]])
     slot = mx.arange(G, dtype=mx.int32) - starts[exps_s]
     C = int(mx.max(counts).item())
@@ -105,21 +106,30 @@ def main():
     dw_t = dw_t.astype(x.dtype)
     mx.eval(gu_t, dw_t)
 
-    gflops = (2 * M * K * D * 2 * cfg.moe_inter_dim + 2 * M * K * cfg.moe_inter_dim * D) / 1e9
-    print("MoE 分发对比 M=%d D=%d E=%d K=%d I=%d  专家 GEMM 共 %.1f GFLOP(fwd)"
-          % (M, D, E, K, cfg.moe_inter_dim, gflops))
+    gflops = (
+        2 * M * K * D * 2 * cfg.moe_inter_dim + 2 * M * K * cfg.moe_inter_dim * D
+    ) / 1e9
+    print(
+        "MoE 分发对比 M=%d D=%d E=%d K=%d I=%d  专家 GEMM 共 %.1f GFLOP(fwd)"
+        % (M, D, E, K, cfg.moe_inter_dim, gflops)
+    )
     for name, fn in (
         ("gather_mm(sorted)", lambda: sparse_gather_mm(x, idx, w, gu_t, dw_t)),
         ("容量分桶批量 matmul", lambda: sparse_bucketed(x, idx, w, gu_t, dw_t, E)),
     ):
         mn, med = bench(lambda: mx.eval(fn()), iters=4, warmup=2)
-        print("  %-20s %7.2f / %7.2f ms   %5.1f TFLOPS(fwd)"
-              % (name, mn, med, gflops / mn))
+        print(
+            "  %-20s %7.2f / %7.2f ms   %5.1f TFLOPS(fwd)"
+            % (name, mn, med, gflops / mn)
+        )
     # 数值对拍
     a = sparse_gather_mm(x, idx, w, gu_t, dw_t)
     b = sparse_bucketed(x, idx, w, gu_t, dw_t, E)
     mx.eval(a, b)
-    print("  max|Δ| = %.3e" % float(mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32)))))
+    print(
+        "  max|Δ| = %.3e"
+        % float(mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32))))
+    )
 
 
 if __name__ == "__main__":

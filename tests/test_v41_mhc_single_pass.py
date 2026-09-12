@@ -25,15 +25,22 @@ from model.model import VibyForCausalLM  # noqa: E402
 
 def _build(seed: int = 0):
     mx.random.seed(seed)
-    cfg = VibyConfig(preset="tiny", max_seq_len=64, window_size=16, index_topk=8,
-                     candidate_topk_blocks=4, candidate_block_size=4, dspark_block_size=2)
+    cfg = VibyConfig(
+        preset="tiny",
+        max_seq_len=64,
+        window_size=16,
+        index_topk=8,
+        candidate_topk_blocks=4,
+        candidate_block_size=4,
+        dspark_block_size=2,
+    )
     return VibyForCausalLM(cfg), cfg
 
 
 def _trace(model, ids):
     """按执行顺序抓 (hc_pre 的输入, 每块返回的 ffn_pre)。"""
-    calls = []          # [(x, pre_mix)]
-    ret = {}            # layer_idx -> ffn_pre
+    calls = []  # [(x, pre_mix)]
+    ret = {}  # layer_idx -> ffn_pre
     orig_apply = block_mod.apply_hc_pre_norm
     orig_block = block_mod.Block.__call__
 
@@ -41,10 +48,20 @@ def _trace(model, ids):
         calls.append((np.array(x), np.array(pre_mix)))
         return orig_apply(x, pre_mix, norm)
 
-    def cap_block(self, x, start_pos, pre_mix, shared, cache=None,
-                  segment_ids=None, pad_mask=None, decode=False):
-        out, ffn_pre = orig_block(self, x, start_pos, pre_mix, shared, cache,
-                                  segment_ids, pad_mask, decode)
+    def cap_block(
+        self,
+        x,
+        start_pos,
+        pre_mix,
+        shared,
+        cache=None,
+        segment_ids=None,
+        pad_mask=None,
+        decode=False,
+    ):
+        out, ffn_pre = orig_block(
+            self, x, start_pos, pre_mix, shared, cache, segment_ids, pad_mask, decode
+        )
         ret[self.layer_idx] = np.array(ffn_pre)
         return out, ffn_pre
 
@@ -74,29 +91,33 @@ def test_each_sublayer_consumes_the_previous_sublayers_coefficients():
 
     first = calls[0][1]
     assert first.shape[-1] == cfg.hc_mult
-    assert np.allclose(first[..., 0], 1.0) and np.allclose(first[..., 1:], 0.0), \
+    assert np.allclose(first[..., 0], 1.0) and np.allclose(first[..., 1:], 0.0), (
         "第 0 块注意力输入不是 identity pre_mix（第 0 条流）"
+    )
 
     for l in range(n):
-        x_attn, pre_attn = calls[2 * l + 0]      # 注意力输入处的 (X_l, pre_mix)
-        x_ffn, pre_ffn = calls[2 * l + 1]        # FFN 输入处的   (X_l_after_attn, pre_mix)
+        x_attn, pre_attn = calls[2 * l + 0]  # 注意力输入处的 (X_l, pre_mix)
+        x_ffn, pre_ffn = calls[2 * l + 1]  # FFN 输入处的   (X_l_after_attn, pre_mix)
         layer = model.model.layers[l]
 
         # 注意力输入用的是上一块 FFN 的系数（第 0 块是 identity，上面已单独断言）
         if l > 0:
             assert np.allclose(pre_attn, ffn_pre[l - 1], atol=1e-6), (
                 "layer%d 注意力输入用的不是 layer%d FFN 的系数（Single-Pass 错位丢失）"
-                % (l, l - 1))
+                % (l, l - 1)
+            )
 
         # FFN 输入用的是本块注意力的系数（模型自己的 mixes 现算）
         attn_pre, _, _ = layer.attn_hc.mixes(mx.array(x_attn))
-        assert np.allclose(pre_ffn, np.array(attn_pre), atol=1e-6), \
+        assert np.allclose(pre_ffn, np.array(attn_pre), atol=1e-6), (
             "layer%d FFN 输入用的不是本块注意力算出的系数" % l
+        )
 
         # 本块注意力自己的系数不能出现在它自己的输入里（那是 V4 旧口径）
         own = np.array(attn_pre)
-        assert not np.allclose(pre_attn, own, atol=1e-4), \
+        assert not np.allclose(pre_attn, own, atol=1e-4), (
             "layer%d 注意力输入等于本层系数（V4 口径），Single-Pass 未生效" % l
+        )
 
         assert x_ffn.shape == x_attn.shape
 
@@ -113,8 +134,9 @@ def test_perturbation_invariances():
     hc = model.model.layers[1].attn_hc
     hc.fn.weight = hc.fn.weight + 0.7
     calls2, _ = _trace(model, ids)
-    assert np.allclose(base_attn1, calls2[2][1], atol=1e-6), \
+    assert np.allclose(base_attn1, calls2[2][1], atol=1e-6), (
         "本层注意力系数污染了自己的注意力输入"
+    )
     assert not np.allclose(base_ffn1, calls2[3][1]), "本层注意力系数没有喂本层 FFN 输入"
 
     # 本层 FFN 系数变了：自己的 FFN 输入不变，但下一块注意力拿到的 pre_mix 必须变
@@ -124,8 +146,9 @@ def test_perturbation_invariances():
     ffn_hc = model2.model.layers[1].ffn_hc
     ffn_hc.fn.weight = ffn_hc.fn.weight + 0.7
     b, _ = _trace(model2, ids2)
-    assert np.allclose(a[3][1], b[3][1], atol=1e-6), \
+    assert np.allclose(a[3][1], b[3][1], atol=1e-6), (
         "本层 FFN 系数影响了自己的 FFN 输入（应只喂下一块）"
+    )
     assert not np.allclose(a[4][1], b[4][1]), "本层 FFN 系数没有传给下一块的注意力输入"
 
 

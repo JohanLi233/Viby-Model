@@ -51,11 +51,15 @@ def bench(fn, iters, warmup):
 
 def run_one(name, cfg_kw, compile_model, batch, seq, iters, warmup):
     cli = [
-        "--out_dir", "research_runs/_bench",
+        "--out_dir",
+        "research_runs/_bench",
         "--no_save",
-        "--batch_size", str(batch),
-        "--accumulation_steps", "2",
-        "--max_seq_len", str(seq),
+        "--batch_size",
+        str(batch),
+        "--accumulation_steps",
+        "2",
+        "--max_seq_len",
+        str(seq),
     ]
     if not compile_model:
         cli.append("--no_compile")
@@ -69,9 +73,9 @@ def run_one(name, cfg_kw, compile_model, batch, seq, iters, warmup):
     from trainer.utils import convert_model_dtype
 
     model = VibyForCausalLM(cfg)
-    convert_model_dtype(model, getattr(targs, 'dtype', ''))
+    convert_model_dtype(model, getattr(targs, "dtype", ""))
     trainer = BaseTrainer(targs, model, None, cfg, "pretrain")
-    build_s = time.time() - t0
+    time.time() - t0
 
     B, T = batch, seq
     X = mx.random.randint(0, cfg.vocab_size, (B, T))
@@ -81,7 +85,9 @@ def run_one(name, cfg_kw, compile_model, batch, seq, iters, warmup):
     mx.eval(X, Y, loss_mask, attn_mask)
 
     def step():
-        outputs, grads = trainer._compute_loss_and_grad(X, Y, loss_mask, attn_mask, None)
+        outputs, grads = trainer._compute_loss_and_grad(
+            X, Y, loss_mask, attn_mask, None
+        )
         mx.eval(*[o for o in outputs if o is not None])
         mx.eval(grads)
 
@@ -97,8 +103,18 @@ def run_one(name, cfg_kw, compile_model, batch, seq, iters, warmup):
     print(
         "%-18s %6.0f tok/s  MFU %5.1f%%  min %.3fs med %.3fs  trace %.0fs  "
         "峰值 %5.2fGB  参 %.0fM/%.0fM  FLOPs/tok %.3fG"
-        % (name, tps, mfu, mn, med, trace_s, peak,
-           model.num_parameters() / 1e6, cfg.num_active_parameters() / 1e6, fpt / 1e9),
+        % (
+            name,
+            tps,
+            mfu,
+            mn,
+            med,
+            trace_s,
+            peak,
+            model.num_parameters() / 1e6,
+            cfg.num_active_parameters() / 1e6,
+            fpt / 1e9,
+        ),
         flush=True,
     )
     del trainer, model, X, Y, loss_mask, attn_mask
@@ -116,13 +132,24 @@ def main():
     args = ap.parse_args()
 
     wanted = [s for s in args.only.split(",") if s]
-    print("=== B=%d T=%d iters=%d warmup=%d（min 口径）==="
-          % (args.batch, args.seq, args.iters, args.warmup), flush=True)
+    print(
+        "=== B=%d T=%d iters=%d warmup=%d（min 口径）==="
+        % (args.batch, args.seq, args.iters, args.warmup),
+        flush=True,
+    )
     for name, cfg_kw, compile_model in VARIANTS:
         if wanted and name not in wanted:
             continue
         try:
-            run_one(name, cfg_kw, compile_model, args.batch, args.seq, args.iters, args.warmup)
+            run_one(
+                name,
+                cfg_kw,
+                compile_model,
+                args.batch,
+                args.seq,
+                args.iters,
+                args.warmup,
+            )
         except Exception as e:  # noqa: BLE001
             print("%-18s FAILED %s: %s" % (name, type(e).__name__, e), flush=True)
             mx.clear_cache()

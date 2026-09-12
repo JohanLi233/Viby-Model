@@ -50,7 +50,10 @@ def main():
 
         mx.eval(nn.value_and_grad(moe, loss)(moe))
 
-    print("MoE E=%d k=%d inter=%d B=%d T=%d" % (cfg.n_routed_experts, cfg.n_activated_experts, cfg.moe_inter_dim, B, T))
+    print(
+        "MoE E=%d k=%d inter=%d B=%d T=%d"
+        % (cfg.n_routed_experts, cfg.n_activated_experts, cfg.moe_inter_dim, B, T)
+    )
     print("  fwd     %.2f / %.2f ms" % bench(fwd))
     print("  fwd+bwd %.2f / %.2f ms" % bench(fwdbwd, iters=3, warmup=1))
 
@@ -69,15 +72,18 @@ def main():
         # [M,k,D] gather 权重再逐 k 做 matmul（等价 FLOPs，形状友好）
         acc = mx.zeros((M, D), dtype=mx.bfloat16)
         for j in range(k):
-            wj = w1[idx[:, j]]                     # [M, D, 2I]
+            wj = w1[idx[:, j]]  # [M, D, 2I]
             h = mx.einsum("md,mdi->mi", xf, wj)
             g, u = mx.split(h, 2, axis=-1)
             a = expert_act(g, u, cfg.swiglu_limit)
-            wj2 = w2[idx[:, j]]                    # [M, I, D]
+            wj2 = w2[idx[:, j]]  # [M, I, D]
             acc = acc + mx.einsum("mi,mid->md", a, wj2)
         return acc
 
-    print("  k 次 [M,D]×[M,D,2I] einsum 上界  %.2f / %.2f ms" % bench(lambda: mx.eval(upper()), iters=3, warmup=1))
+    print(
+        "  k 次 [M,D]×[M,D,2I] einsum 上界  %.2f / %.2f ms"
+        % bench(lambda: mx.eval(upper()), iters=3, warmup=1)
+    )
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ VIBY_MOE_COMBINE_KERNEL=0 disables the native gather_mm route-combine P2 path.
 原因：MLX 原生 gather_mm 的两段专家 GEMM 已跑到 11.7 / 10.8 TFLOPS（稠密上限 12~14），
 本 kernel 只到 ~5 TFLOPS。重新启用前请先把这两段 MMA 效率追平。
 """
+
 import os
 from functools import lru_cache
 
@@ -27,10 +28,13 @@ import mlx.core as mx
 # Token-owned FP32 combine is enabled after paired whole-step acceptance.
 # The experimental expert GEMM remains disabled; native gather_mm is retained.
 _ENABLED = os.environ.get("VIBY_MOE_KERNEL", "0") != "0"
-_COMBINE_ENABLED = os.environ.get(
-    "VIBY_MOE_COMBINE_KERNEL",
-    os.environ.get("VIBY_MOE_COMBINE", "1"),
-) != "0"
+_COMBINE_ENABLED = (
+    os.environ.get(
+        "VIBY_MOE_COMBINE_KERNEL",
+        os.environ.get("VIBY_MOE_COMBINE", "1"),
+    )
+    != "0"
+)
 _HEADER = "#include <metal_simdgroup_matrix>\nusing namespace metal;\n"
 
 _META_SOURCE = r"""
@@ -273,39 +277,95 @@ _INVERSE_SOURCE = r"""
 @lru_cache(None)
 def _kernels():
     def make(name, inputs, outputs, source, mma=False, atomic=False):
-        return mx.fast.metal_kernel(name=name, input_names=inputs,
-                                    output_names=outputs, source=source,
-                                    header=_HEADER if mma else "", atomic_outputs=atomic)
+        return mx.fast.metal_kernel(
+            name=name,
+            input_names=inputs,
+            output_names=outputs,
+            source=source,
+            header=_HEADER if mma else "",
+            atomic_outputs=atomic,
+        )
+
     return (
-        make("moe_route_meta", ["order", "experts", "dims"],
-             ["offsets", "tile_offsets", "inverse"], _META_SOURCE),
-        make("moe_gather_gate_up", ["x", "weight", "order", "offsets", "tile_offsets"],
-             ["out"], _GATHER_MM_SOURCE, True),
-        make("moe_gather_weight_vjp", ["x", "grad", "order", "offsets"],
-             ["dw"], _DW_SOURCE, True),
+        make(
+            "moe_route_meta",
+            ["order", "experts", "dims"],
+            ["offsets", "tile_offsets", "inverse"],
+            _META_SOURCE,
+        ),
+        make(
+            "moe_gather_gate_up",
+            ["x", "weight", "order", "offsets", "tile_offsets"],
+            ["out"],
+            _GATHER_MM_SOURCE,
+            True,
+        ),
+        make(
+            "moe_gather_weight_vjp",
+            ["x", "grad", "order", "offsets"],
+            ["dw"],
+            _DW_SOURCE,
+            True,
+        ),
         make("moe_inverse_reduce", ["g", "inverse"], ["out"], _REDUCE_SOURCE),
-        make("moe_route_combine", ["y", "weights", "inverse"], ["out"], _COMBINE_SOURCE),
-        make("moe_route_combine_vjp", ["y", "weights", "inverse", "g"],
-             ["dy", "dw"], _COMBINE_VJP_SOURCE),
-        make("moe_down_write", ["x", "weight", "order", "offsets", "tile_offsets", "weights"],
-             ["out"], _DOWN_SOURCE, True, True),
-        make("moe_down_upstream", ["x", "weight", "order", "offsets", "tile_offsets"],
-             ["out"], _UPSTREAM_SOURCE, True),
-        make("moe_down_weight_vjp", ["x", "grad", "order", "offsets", "weights"],
-             ["dw"], _DOWN_DW_SOURCE, True),
-        make("moe_gate_input_vjp", ["x", "weight", "order", "offsets", "tile_offsets", "weights"],
-             ["out"], _DX_SOURCE, True, True),
-        make("moe_down_scale_vjp", ["x", "upstream", "weights", "order"],
-             ["dx", "dw"], _DOWN_SCALE_VJP),
+        make(
+            "moe_route_combine", ["y", "weights", "inverse"], ["out"], _COMBINE_SOURCE
+        ),
+        make(
+            "moe_route_combine_vjp",
+            ["y", "weights", "inverse", "g"],
+            ["dy", "dw"],
+            _COMBINE_VJP_SOURCE,
+        ),
+        make(
+            "moe_down_write",
+            ["x", "weight", "order", "offsets", "tile_offsets", "weights"],
+            ["out"],
+            _DOWN_SOURCE,
+            True,
+            True,
+        ),
+        make(
+            "moe_down_upstream",
+            ["x", "weight", "order", "offsets", "tile_offsets"],
+            ["out"],
+            _UPSTREAM_SOURCE,
+            True,
+        ),
+        make(
+            "moe_down_weight_vjp",
+            ["x", "grad", "order", "offsets", "weights"],
+            ["dw"],
+            _DOWN_DW_SOURCE,
+            True,
+        ),
+        make(
+            "moe_gate_input_vjp",
+            ["x", "weight", "order", "offsets", "tile_offsets", "weights"],
+            ["out"],
+            _DX_SOURCE,
+            True,
+            True,
+        ),
+        make(
+            "moe_down_scale_vjp",
+            ["x", "upstream", "weights", "order"],
+            ["dx", "dw"],
+            _DOWN_SCALE_VJP,
+        ),
         make("moe_route_inverse", ["order"], ["inverse"], _INVERSE_SOURCE),
     )
 
 
 def enabled_for(x, n_experts, width):
-    return (_ENABLED and mx.default_device() == mx.gpu
-            and x.dtype in (mx.bfloat16, mx.float16)
-            and x.shape[-1] % 32 == 0 and width % 32 == 0
-            and 0 < n_experts <= 128)
+    return (
+        _ENABLED
+        and mx.default_device() == mx.gpu
+        and x.dtype in (mx.bfloat16, mx.float16)
+        and x.shape[-1] % 32 == 0
+        and width % 32 == 0
+        and 0 < n_experts <= 128
+    )
 
 
 def combine_enabled_for(x, k=None):
@@ -314,17 +374,22 @@ def combine_enabled_for(x, k=None):
     This flag intentionally does not consult ``VIBY_MOE_KERNEL``: the native
     two-GEMM path and the route-combine epilogue are separate experiments.
     """
-    return (_COMBINE_ENABLED and mx.default_device() == mx.gpu
-            and x.dtype in (mx.bfloat16, mx.float16)
-            and x.shape[-1] > 0 and (k is None or k > 0))
+    return (
+        _COMBINE_ENABLED
+        and mx.default_device() == mx.gpu
+        and x.dtype in (mx.bfloat16, mx.float16)
+        and x.shape[-1] > 0
+        and (k is None or k > 0)
+    )
 
 
 def route_metadata(order, experts, n_experts):
     return _kernels()[0](
         inputs=[order, experts, mx.array([n_experts], mx.uint32)],
-        grid=(((order.size+127)//128)*128, 1, 1), threadgroup=(128, 1, 1),
-        output_shapes=[(n_experts+1,), (n_experts+1,), order.shape],
-        output_dtypes=[mx.int32]*3,
+        grid=(((order.size + 127) // 128) * 128, 1, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(n_experts + 1,), (n_experts + 1,), order.shape],
+        output_dtypes=[mx.int32] * 3,
     )
 
 
@@ -336,7 +401,8 @@ def route_inverse(order):
         inputs=[order],
         grid=(((order.size + 255) // 256) * 256, 1, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[order.shape], output_dtypes=[mx.int32],
+        output_shapes=[order.shape],
+        output_dtypes=[mx.int32],
     )[0]
 
 
@@ -351,8 +417,10 @@ def _linear_op(k):
         return forward(
             inputs=[x, weight, order, offsets, tile_offsets],
             template=[("T", x.dtype), ("D", d), ("N", n), ("K", k)],
-            grid=(((g+31)//32+e)*128, (n+63)//64, 1), threadgroup=(128, 1, 1),
-            output_shapes=[(g, n)], output_dtypes=[x.dtype],
+            grid=(((g + 31) // 32 + e) * 128, (n + 63) // 64, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(g, n)],
+            output_dtypes=[x.dtype],
         )[0]
 
     @op.vjp
@@ -361,23 +429,38 @@ def _linear_op(k):
         g, n, d, e = order.size, weight.shape[1], x.shape[-1], weight.shape[0]
         cotangent = cotangent.astype(x.dtype)
         dx = input_vjp(
-            inputs=[cotangent, weight, order, offsets, tile_offsets, mx.ones((g,), mx.float32)],
+            inputs=[
+                cotangent,
+                weight,
+                order,
+                offsets,
+                tile_offsets,
+                mx.ones((g,), mx.float32),
+            ],
             template=[("T", x.dtype), ("D", n), ("N", d), ("K", k)],
-            grid=(((g+31)//32+e)*128, (d+63)//64, 1), threadgroup=(128, 1, 1),
-            output_shapes=[x.shape], output_dtypes=[mx.float32], init_value=0,
+            grid=(((g + 31) // 32 + e) * 128, (d + 63) // 64, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[x.shape],
+            output_dtypes=[mx.float32],
+            init_value=0,
         )[0].astype(x.dtype)
         dw = weight_vjp(
             inputs=[x, cotangent, order, offsets],
             template=[("T", x.dtype), ("D", d), ("N", n), ("K", k)],
-            grid=(((n+31)//32)*128, d//32, e), threadgroup=(128, 1, 1),
-            output_shapes=[weight.shape], output_dtypes=[weight.dtype],
+            grid=(((n + 31) // 32) * 128, d // 32, e),
+            threadgroup=(128, 1, 1),
+            output_shapes=[weight.shape],
+            output_dtypes=[weight.dtype],
         )[0]
         # MLX 0.32.2 drops None leaves while flattening custom-VJP results.
         # Keep one array placeholder for every primal, including metadata.
         return (
-            dx, dw,
-            mx.zeros_like(order), mx.zeros_like(experts),
-            mx.zeros_like(offsets), mx.zeros_like(tile_offsets),
+            dx,
+            dw,
+            mx.zeros_like(order),
+            mx.zeros_like(experts),
+            mx.zeros_like(offsets),
+            mx.zeros_like(tile_offsets),
             mx.zeros_like(inverse),
         )
 
@@ -395,11 +478,14 @@ def _combine_op(k):
 
     @mx.custom_function
     def op(y, weights, order, inverse):
-        d, m = y.shape[-1], order.size//k
+        d, m = y.shape[-1], order.size // k
         return forward(
-            inputs=[y, weights, inverse], template=[("T", y.dtype), ("D", d), ("K", k)],
-            grid=(128, m, 1), threadgroup=(128, 1, 1),
-            output_shapes=[(m, d)], output_dtypes=[y.dtype],
+            inputs=[y, weights, inverse],
+            template=[("T", y.dtype), ("D", d), ("K", k)],
+            grid=(128, m, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(m, d)],
+            output_dtypes=[y.dtype],
         )[0]
 
     @op.vjp
@@ -408,14 +494,18 @@ def _combine_op(k):
         dy, dw = backward(
             inputs=[y, weights, inverse, cotangent],
             template=[("T", y.dtype), ("D", y.shape[-1]), ("K", k)],
-            grid=(128, order.size//k, 1), threadgroup=(128, 1, 1),
-            output_shapes=[y.shape, weights.shape], output_dtypes=[y.dtype, mx.float32],
+            grid=(128, order.size // k, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[y.shape, weights.shape],
+            output_dtypes=[y.dtype, mx.float32],
         )
         # Keep placeholders for integer metadata; a None before a trainable
         # input can shift argnums after tree flattening on MLX 0.32.2.
         return (
-            dy, dw.astype(weights.dtype),
-            mx.zeros_like(order), mx.zeros_like(inverse),
+            dy,
+            dw.astype(weights.dtype),
+            mx.zeros_like(order),
+            mx.zeros_like(inverse),
         )
 
     return op
@@ -438,8 +528,11 @@ def _down_op(k):
         return forward(
             inputs=[x, weight, order, offsets, tile_offsets, weights],
             template=[("T", x.dtype), ("D", d), ("N", n), ("K", k)],
-            grid=(((g+31)//32+e)*128, (n+63)//64, 1), threadgroup=(128, 1, 1),
-            output_shapes=[(g//k, n)], output_dtypes=[mx.float32], init_value=0,
+            grid=(((g + 31) // 32 + e) * 128, (n + 63) // 64, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(g // k, n)],
+            output_dtypes=[mx.float32],
+            init_value=0,
         )[0].astype(x.dtype)
 
     @op.vjp
@@ -452,23 +545,33 @@ def _down_op(k):
         u = upstream(
             inputs=[cotangent, weight, order, offsets, tile_offsets],
             template=[("T", x.dtype), ("D", n), ("N", d), ("K", k)],
-            grid=(((g+31)//32+e)*128, (d+63)//64, 1), threadgroup=(128, 1, 1),
-            output_shapes=[x.shape], output_dtypes=[x.dtype],
+            grid=(((g + 31) // 32 + e) * 128, (d + 63) // 64, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[x.shape],
+            output_dtypes=[x.dtype],
         )[0]
         dx, dweights = scale_vjp(
-            inputs=[x, u, weights, order], template=[("T", x.dtype), ("D", d)],
-            grid=(128, g, 1), threadgroup=(128, 1, 1),
-            output_shapes=[x.shape, weights.shape], output_dtypes=[x.dtype, mx.float32],
+            inputs=[x, u, weights, order],
+            template=[("T", x.dtype), ("D", d)],
+            grid=(128, g, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[x.shape, weights.shape],
+            output_dtypes=[x.dtype, mx.float32],
         )
         dw = weight_vjp(
             inputs=[x, cotangent, order, offsets, weights],
             template=[("T", x.dtype), ("D", d), ("N", n), ("K", k)],
-            grid=(((n+31)//32)*128, d//32, e), threadgroup=(128, 1, 1),
-            output_shapes=[weight.shape], output_dtypes=[weight.dtype],
+            grid=(((n + 31) // 32) * 128, d // 32, e),
+            threadgroup=(128, 1, 1),
+            output_shapes=[weight.shape],
+            output_dtypes=[weight.dtype],
         )[0]
         return (
-            dx, dw, dweights.astype(weights.dtype),
-            mx.zeros_like(order), mx.zeros_like(offsets),
+            dx,
+            dw,
+            dweights.astype(weights.dtype),
+            mx.zeros_like(order),
+            mx.zeros_like(offsets),
             mx.zeros_like(tile_offsets),
         )
 
@@ -492,20 +595,25 @@ def prewarm_moe(dim, width, k, dtype=mx.bfloat16):
     linear = _linear_op(k)
     args = (x, weight, order, experts, *meta)
     out = linear(*args)
-    _, grads = mx.vjp(lambda a, b: linear(a, b, *args[2:]), [x, weight],
-                      [mx.ones((k, width), dtype)])
+    _, grads = mx.vjp(
+        lambda a, b: linear(a, b, *args[2:]), [x, weight], [mx.ones((k, width), dtype)]
+    )
     y = mx.zeros((k, dim), dtype)
     weights = mx.ones((k,), mx.float32)
     combine = _combine_op(k)
     result = combine(y, weights, order, meta[2])
-    _, dg = mx.vjp(lambda a, b: combine(a, b, order, meta[2]), [y, weights],
-                   [mx.ones((1, dim), dtype)])
-    hidden = mx.zeros((k, width//2), dtype)
-    down_w = mx.zeros((1, dim, width//2), dtype)
+    _, dg = mx.vjp(
+        lambda a, b: combine(a, b, order, meta[2]),
+        [y, weights],
+        [mx.ones((1, dim), dtype)],
+    )
+    hidden = mx.zeros((k, width // 2), dtype)
+    down_w = mx.zeros((1, dim, width // 2), dtype)
     down = _down_op(k)
     down_out, down_grads = mx.vjp(
         lambda a, b, c: down(a, b, c, order, meta[0], meta[1]),
-        [hidden, down_w, weights], [mx.ones((1, dim), dtype)],
+        [hidden, down_w, weights],
+        [mx.ones((1, dim), dtype)],
     )
     mx.eval(out, grads, result, dg, down_out, down_grads)
 
@@ -526,7 +634,8 @@ def prewarm_route_combine(dim, k, dtype=mx.bfloat16):
     weights = mx.ones((k,), mx.float32)
     combine = _combine_op(k)
     out, grads = mx.vjp(
-        lambda a, b: combine(a, b, order, inverse), [y, weights],
+        lambda a, b: combine(a, b, order, inverse),
+        [y, weights],
         [mx.ones((1, dim), dtype)],
     )
     mx.eval(inverse, out, grads)

@@ -4,13 +4,48 @@ Forward uses one dispatch; backward uses recomputation plus one VJP dispatch.
 Each GPU thread owns one matrix. Training intermediates use [step, entry, token]
 layout for coalesced writes. Other sizes/dtypes retain the reference path.
 Set VIBY_SINKHORN_KERNEL=0 before launch to disable.
+For at most eight matrices, a SIMD group processes all 16 entries in parallel
+with the original summation order. VIBY_SINKHORN_SIMD_DECODE=0 disables this path.
 """
+
 import os
 from functools import lru_cache
 
 import mlx.core as mx
 
 _ENABLED = os.environ.get("VIBY_SINKHORN_KERNEL", "1") != "0"
+_SIMD_DECODE = os.environ.get("VIBY_SINKHORN_SIMD_DECODE", "1") != "0"
+
+
+@lru_cache(None)
+def _simd_forward():
+    """One SIMD group per tiny matrix, with the original sequential sums.
+
+    Small decode batches used to leave all but one lane idle for 40 dependent
+    normalizations. Sixteen lanes now own the sixteen entries; shuffle reads
+    preserve the exact four-term summation order and all epsilon additions.
+    """
+    return mx.fast.metal_kernel(
+        name="sinkhorn4_simd_decode",
+        input_names=["x", "epsilon"],
+        output_names=["out"],
+        source=r"""
+        uint lane=thread_position_in_threadgroup.x, row=lane/4, col=lane%4;
+        uint matrix=thread_position_in_grid.y;
+        float v=lane<16 ? x[(size_t)matrix*16+lane] : 0.0f;
+        float m=simd_shuffle(v, ushort(row*4));
+        for (uint j=1;j<4;++j) m=max(m,simd_shuffle(v,ushort(row*4+j)));
+        float c=exp(v-m);
+        for (uint s=0;s<STEPS;++s) {
+            float d=0.0f;
+            for (uint j=0;j<4;++j)
+                d+=simd_shuffle(c,ushort(s%2==0 ? row*4+j : j*4+col));
+            d+=epsilon[0];
+            c/=d;
+        }
+        if (lane<16) out[(size_t)matrix*16+lane]=c;
+        """,
+    )
 
 
 def sinkhorn_ref(x, iters, eps):
@@ -94,12 +129,16 @@ _BWD = r"""
 def _operation(iters, eps):
     steps = 2 * max(1, iters)
     fwd = mx.fast.metal_kernel(
-        name="sinkhorn4_fwd", input_names=["x", "epsilon", "dims"],
-        output_names=["out", "hist", "den"], source=_FWD,
+        name="sinkhorn4_fwd",
+        input_names=["x", "epsilon", "dims"],
+        output_names=["out", "hist", "den"],
+        source=_FWD,
     )
     bwd = mx.fast.metal_kernel(
-        name="sinkhorn4_bwd", input_names=["x", "g", "hist", "den", "dims"],
-        output_names=["dx"], source=_BWD,
+        name="sinkhorn4_bwd",
+        input_names=["x", "g", "hist", "den", "dims"],
+        output_names=["dx"],
+        source=_BWD,
     )
 
     def forward(x, save):
@@ -107,14 +146,28 @@ def _operation(iters, eps):
         return fwd(
             inputs=[x, mx.array([eps], mx.float32), mx.array([n], mx.uint32)],
             template=[("STEPS", steps), ("SAVE", save)],
-            grid=(n, 1, 1), threadgroup=(128, 1, 1),
-            output_shapes=[x.shape, (steps, 16, n) if save else (1,),
-                           (steps, 4, n) if save else (1,)],
-            output_dtypes=[mx.float32]*3,
+            grid=(n, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[
+                x.shape,
+                (steps, 16, n) if save else (1,),
+                (steps, 4, n) if save else (1,),
+            ],
+            output_dtypes=[mx.float32] * 3,
         )
 
     @mx.custom_function
     def op(x):
+        n = x.size // 16
+        if _SIMD_DECODE and 0 < n <= 8:
+            return _simd_forward()(
+                inputs=[x, mx.array([eps], mx.float32)],
+                template=[("STEPS", steps)],
+                grid=(32, n, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[x.shape],
+                output_dtypes=[mx.float32],
+            )[0]
         return forward(x, False)[0]
 
     @op.vjp
@@ -123,9 +176,12 @@ def _operation(iters, eps):
         # Recompute tiny matrices only for backward; inference writes no tape.
         _, hist, den = forward(x, True)
         (dx,) = bwd(
-            inputs=[x, cotangent, hist, den, mx.array([x.size // 16], mx.uint32)], template=[("STEPS", steps)],
-            grid=(x.size // 16, 1, 1), threadgroup=(128, 1, 1),
-            output_shapes=[x.shape], output_dtypes=[mx.float32],
+            inputs=[x, cotangent, hist, den, mx.array([x.size // 16], mx.uint32)],
+            template=[("STEPS", steps)],
+            grid=(x.size // 16, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[x.shape],
+            output_dtypes=[mx.float32],
         )
         return dx
 
@@ -133,8 +189,13 @@ def _operation(iters, eps):
 
 
 def sinkhorn_fused(x, iters, eps):
-    if (not _ENABLED or x.dtype != mx.float32 or x.shape[-2:] != (4, 4)
-            or x.size == 0 or mx.default_device() != mx.gpu):
+    if (
+        not _ENABLED
+        or x.dtype != mx.float32
+        or x.shape[-2:] != (4, 4)
+        or x.size == 0
+        or mx.default_device() != mx.gpu
+    ):
         return sinkhorn_ref(x, iters, eps)
     return _operation(iters, eps)(x)
 

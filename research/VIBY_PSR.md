@@ -2,8 +2,8 @@
 
 日期：2026-09-11。
 
-当前预训练默认已切换为独立 [NCP-Core](NCP_CORE.md) 试验；PSR 需显式 `--no-ncp --psr`。
-下文记录受保护 PSR 的机制及历史验收，不表示它仍是默认实验。
+当前预训练默认启用受保护 PSR；`--psr` 显式启用，`--no-psr` 运行 token baseline。
+下文记录受保护 PSR 的机制及历史验收。
 修订基点为 `52d17a67f3012af1052c99ff48f4eccade6dcd7e`。
 本文描述当前实现及验收边界，不是验证集收益或效率优势声明。旧 PSR 实现、旧配方和实验历史
 保留在该 commit；已有 checkpoint 未被覆盖。旧的 Decoder 多层注入与辅助分类/自蒸馏/value
@@ -52,7 +52,7 @@ MoE bias 更新保持原规则。侧路使用独立 optimizer state、LR、裁�
 - `state_only`：构造 S0，不执行循环，但读出与词表修正仍存在。
 - `recurrent`：明确执行 R≥1。R=0 报错，不再兼任开关。
 
-模型库仍显式使用 `VibyConfig(psr_enabled=True)`；`train_pretrain.py --no-ncp --psr` 开启受保护路径，
+模型库仍显式使用 `VibyConfig(psr_enabled=True)`；`train_pretrain.py` 默认开启受保护路径，
 `--no-psr` 关闭。默认 **H=16、R=1、8 槽、dim=256、2 个共享 dense block**。
 每个文档从文档首位置开始划分长度 H 的块；anchor b 只能看 `x<=b`，只修正 `[b,b+H)`，
 并继续受同文档/PAD 限制。对应 logits 始终预测 `x[t+1]`，读出 query 来自合法的实际 `h0_t`。
@@ -88,10 +88,15 @@ out = model(
 从已观察的原始 CED cache 启动下一块，继续沿用当前模式、R 和 gate。该修正不反馈入 token KV；
 同一输入 token 序列的原始 cache 不变。采样 token 可以因输出分布改变而不同。
 `cache.psr_phases` 记录发起的工作区阶段，不能当成 GPU profiler 计数。不同条件使用全新 cache。
-多文档 packed 数据支持无缓存训练/评估；多文档 cached 生成明确拒绝。连续 batch engine 和
-DSpark speculative 生成尚未搬运该工作区，仍拒绝 PSR 配置；MTP 的原主干训练目标可以保留。
+多文档 packed 数据支持无缓存训练/评估；多文档 cached 生成明确拒绝。
+`VibyEngine` 支持 PSR：完整 prompt 建立首个工作区，连续 batch 按行保存 `ThinkingState`、
+下一次 anchor 和阶段计数；不同长度、不同入队时间的请求独立刷新，扩容及移除请求时一并搬运。
+`score` 从 prompt 边界启动工作区，逐 token 强制输入 completion，刷新口径与生成一致。
+PSR 下关闭普通前缀复用（快照未包含问题边界及工作区），DSpark speculative 仍明确拒绝；
+MTP 的原主干训练目标可以保留。`tests/test_psr_engine.py` 用非零纠错头对照原生 prefill/decode，
+检查 logits、logprob、生成 token 及状态迁移；这些是正确性检查，不代表质量或速度收益。
 
-PSR 独立预训练使用 `--no-ncp --psr`，配方为受保护 R=1；可选参数包括：
+PSR 预训练默认启用，也可显式使用 `--psr`，配方为受保护 R=1；可选参数包括：
 
 ```text
 --psr_horizon 16 --psr_rounds 1 --psr_train_anchors 2

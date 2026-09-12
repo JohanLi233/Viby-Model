@@ -141,7 +141,9 @@ class RadixPrefixCache:
 
     def _refresh_stats(self) -> None:
         self.stats["cached_states"] = self._n_states
-        self.stats["cached_tokens"] = max((n.depth for n in self._state_nodes()), default=0)
+        self.stats["cached_tokens"] = max(
+            (n.depth for n in self._state_nodes()), default=0
+        )
 
     # ------------------------------------------------------------------
     def memory_bytes(self) -> int:

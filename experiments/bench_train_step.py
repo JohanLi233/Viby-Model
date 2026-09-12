@@ -67,7 +67,10 @@ def bench(fn, iters, warmup, label=""):
         fn()
         times.append(time.perf_counter() - t0)
     if os.environ.get("BENCH_VERBOSE"):
-        print("  [%s] 逐轮 %s" % (label, " ".join("%.3f" % float(t) for t in times)), flush=True)
+        print(
+            "  [%s] 逐轮 %s" % (label, " ".join("%.3f" % float(t) for t in times)),
+            flush=True,
+        )
     times.sort()
     return times[0], times[len(times) // 2]
 
@@ -115,12 +118,17 @@ def main():
     args = ap.parse_args()
 
     cli = [
-        "--out_dir", "research_runs/_bench",
+        "--out_dir",
+        "research_runs/_bench",
         "--no_save",
-        "--batch_size", str(args.batch),
-        "--accumulation_steps", str(args.accum),
-        "--max_seq_len", str(args.seq),
-        "--cache_limit_gb", str(args.cache_limit_gb),
+        "--batch_size",
+        str(args.batch),
+        "--accumulation_steps",
+        str(args.accum),
+        "--max_seq_len",
+        str(args.seq),
+        "--cache_limit_gb",
+        str(args.cache_limit_gb),
     ]
     if args.no_compile:
         cli.append("--no_compile")
@@ -171,21 +179,36 @@ def main():
         "配置：dim=%d layers=%d heads=%d×%d experts=%d/%d hc=%d engram=%s "
         "compile=%s B=%d T=%d accum=%d"
         % (
-            cfg.dim, cfg.n_layers, cfg.n_heads, cfg.head_dim,
-            cfg.n_activated_experts, cfg.n_routed_experts, cfg.hc_mult,
-            list(cfg.engram_layer_ids), trainer._compiled, B, T, args.accum,
+            cfg.dim,
+            cfg.n_layers,
+            cfg.n_heads,
+            cfg.head_dim,
+            cfg.n_activated_experts,
+            cfg.n_routed_experts,
+            cfg.hc_mult,
+            list(cfg.engram_layer_ids),
+            trainer._compiled,
+            B,
+            T,
+            args.accum,
         )
     )
     print(
         "      逐层模式 %s  参数量 %.1fM/%.1fM  名义 sparse FLOPs/token 估算 %.3fG  构建 %.1fs"
         % (
-            modes, model.num_parameters() / 1e6,
-            cfg.num_active_parameters() / 1e6, fpt / 1e9, build_s,
+            modes,
+            model.num_parameters() / 1e6,
+            cfg.num_active_parameters() / 1e6,
+            fpt / 1e9,
+            build_s,
         ),
         flush=True,
     )
 
+    bench_psr_step = getattr(trainer, "_psr_step", 0)
+
     def run_step():
+        trainer._psr_step = bench_psr_step
         outputs, grads = trainer._compute_loss_and_grad(
             X, Y, loss_mask, attn_mask, seg_ids
         )
@@ -197,9 +220,10 @@ def main():
         # 先走一次完整的窗口（fwd+bwd + optimizer），让优化器状态真正分配出来：
         # 真实训练从第 2 个窗口起是"优化器状态常驻 + 分配器缓存已长起来"的状态，
         # 冷启动测出来的数会偏乐观。
-        _g = run_step()
-        trainer.optimizer.update(model, _g)
-        mx.eval(model.parameters(), trainer.optimizer.state)
+        from experiments.bench_kernel_optimizations import run_window
+
+        run_window(trainer, [(X, Y, loss_mask, attn_mask, seg_ids)] * args.accum)
+        bench_psr_step = getattr(trainer, "_psr_step", 0)
 
     mx.reset_peak_memory()
     if args.fwd_only:
@@ -224,6 +248,7 @@ def main():
         def run_fwd():
             loss, loads = fwd_fn()
             mx.eval(loss, loads)
+
         f_min, f_med = bench(run_fwd, args.iters, args.warmup, "fwd")
         print(
             "fwd      min %.3fs (med %.3fs)  %6.0f tok/s  峰值 %.2f GB"
@@ -242,9 +267,15 @@ def main():
     if not args.no_opt:
         _, grads = trainer._compute_loss_and_grad(X, Y, loss_mask, attn_mask, seg_ids)
         mx.eval(grads)
+        from trainer.psr_optim import ParameterView, split_gradients
+
+        protected = getattr(cfg, "psr_enabled", False)
+        opt_model = ParameterView(model) if protected else model
+        if protected:
+            grads, _ = split_gradients(grads)
 
         def run_opt():
-            trainer.optimizer.update(model, grads)
+            trainer.optimizer.update(opt_model, grads)
             mx.eval(model.parameters(), trainer.optimizer.state)
 
         opt_min, _ = bench(run_opt, args.iters, 1)
@@ -252,13 +283,17 @@ def main():
         print(
             "optimizer min %.3fs  → accum=%d 拼接窗口估计 %.2fs  %6.0f tok/s  opt 占比 %.1f%%  峰值 %.2f GB"
             % (
-                opt_min, args.accum, window, args.accum * B * T / window,
-                100 * opt_min / window, mx.get_peak_memory() / 1e9,
+                opt_min,
+                args.accum,
+                window,
+                args.accum * B * T / window,
+                100 * opt_min / window,
+                mx.get_peak_memory() / 1e9,
             ),
             flush=True,
         )
     print(
-        "注：上方 MFU 只计 fwd+bwd 墙钟；拼接窗口不含梯度累加/范数/bias 更新。"
+        "注：上方 MFU 只计 fwd+bwd 墙钟；optimizer仅主干，拼接窗口不含PSR优化器/梯度累加/范数/bias更新。"
         "真实训练窗口与实测稀疏长度请用 experiments/bench_csa2_plan.py --mode window。"
     )
 

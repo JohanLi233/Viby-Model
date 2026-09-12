@@ -3,6 +3,7 @@
 The small fake MLX module executes the production native-count fallback with
 NumPy and records Metal launch contracts. GPU numerical tests live separately.
 """
+
 import importlib.util
 import sys
 import types
@@ -62,14 +63,18 @@ def load(monkeypatch):
         def attach(vjp):
             fn.recorded_vjp = vjp
             return vjp
+
         fn.vjp = attach
         return fn
 
     def metal_kernel(**spec):
         def launch(**kw):
             mx.launches.append((spec, kw))
-            return [np.zeros(shape, dtype=dtype) for shape, dtype in
-                    zip(kw["output_shapes"], kw["output_dtypes"])]
+            return [
+                np.zeros(shape, dtype=dtype)
+                for shape, dtype in zip(kw["output_shapes"], kw["output_dtypes"])
+            ]
+
         return launch
 
     mx.custom_function = custom
@@ -81,7 +86,9 @@ def load(monkeypatch):
 
     def module(name):
         path = ROOT / "model" / "kernels" / f"{name}.py"
-        spec = importlib.util.spec_from_file_location(f"model.kernels._host_{name}", path)
+        spec = importlib.util.spec_from_file_location(
+            f"model.kernels._host_{name}", path
+        )
         result = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(result)
         return result, mx
@@ -89,7 +96,9 @@ def load(monkeypatch):
     return module
 
 
-@pytest.mark.parametrize("m,d,k", [(0, 65, 6), (1, 1, 1), (9, 127, 6), (33, 1031, 1), (7, 0, 6)])
+@pytest.mark.parametrize(
+    "m,d,k", [(0, 65, 6), (1, 1, 1), (9, 127, 6), (33, 1031, 1), (7, 0, 6)]
+)
 def test_production_gather_cpu_fallback_and_adjoint(load, m, d, k):
     mod, _ = load("moe_gather")
     rng = np.random.default_rng(7)
@@ -101,8 +110,12 @@ def test_production_gather_cpu_fallback_and_adjoint(load, m, d, k):
     np.testing.assert_array_equal(got, x[order // k])
     # Independent adjoint identity for the proposed inverse-permutation VJP.
     dx = g[inverse].reshape(m, k, d).sum(axis=1, dtype=np.float64)
-    np.testing.assert_allclose(np.sum(got.astype(np.float64) * g),
-                               np.sum(x.astype(np.float64) * dx), rtol=1e-12, atol=1e-10)
+    np.testing.assert_allclose(
+        np.sum(got.astype(np.float64) * g),
+        np.sum(x.astype(np.float64) * dx),
+        rtol=1e-12,
+        atol=1e-10,
+    )
 
 
 @pytest.mark.parametrize("d", [1, 127, 128, 129, 1024, 1031])
@@ -114,7 +127,9 @@ def test_actual_vjp_launch_has_unique_output_owners(load, d):
     order = array(np.arange(m * k)[::-1])
     inv = array(np.argsort(order))
     mod.gather_routes(x, order, inv, k)
-    grads = mod._op(k).recorded_vjp((x, order, inv), np.ones((m*k, d), np.float32), None)
+    grads = mod._op(k).recorded_vjp(
+        (x, order, inv), np.ones((m * k, d), np.float32), None
+    )
     assert len(grads) == 3 and grads[0].shape == x.shape
     np.testing.assert_array_equal(grads[1], np.zeros_like(order))
     np.testing.assert_array_equal(grads[2], np.zeros_like(inv))
@@ -122,24 +137,35 @@ def test_actual_vjp_launch_has_unique_output_owners(load, d):
     assert not spec.get("atomic_outputs", False) and "init_value" not in kw
     assert kw["threadgroup"] == (128, 1, 1)
     assert dict(kw["template"])["D"] == d and dict(kw["template"])["K"] == k
-    owners = [(t, f) for t in range(kw["grid"][1]) for f in range(kw["grid"][0]) if f < d]
+    owners = [
+        (t, f) for t in range(kw["grid"][1]) for f in range(kw["grid"][0]) if f < d
+    ]
     assert len(owners) == len(set(owners)) == m * d
     assert "threadgroup_barrier" not in spec["source"]
 
 
-@pytest.mark.parametrize("b,t,e,k", [(0, 3, 8, 1), (2, 0, 8, 6), (1, 1, 8, 1),
-                                    (3, 17, 96, 6), (4, 1024, 96, 6), (2, 5, 513, 6)])
+@pytest.mark.parametrize(
+    "b,t,e,k",
+    [
+        (0, 3, 8, 1),
+        (2, 0, 8, 6),
+        (1, 1, 8, 1),
+        (3, 17, 96, 6),
+        (4, 1024, 96, 6),
+        (2, 5, 513, 6),
+    ],
+)
 def test_production_compact_counts_cpu_fallback(load, b, t, e, k):
     mod, mx = load("moe_counts")
     rng = np.random.default_rng(6)
-    ids = array(rng.integers(e, size=(b*t, k)))
+    ids = array(rng.integers(e, size=(b * t, k)))
     got = mod.sequence_route_counts(ids, b, t, e)
-    dense = np.zeros((b*t, e), np.float32)
+    dense = np.zeros((b * t, e), np.float32)
     for j in range(k):
-        np.add.at(dense, (np.arange(b*t), ids[:, j]), 1)
+        np.add.at(dense, (np.arange(b * t), ids[:, j]), 1)
     expected = dense.reshape(b, t, e).sum(axis=1)
     np.testing.assert_array_equal(got, expected)
-    assert all(shape in ((b*e,), (b, e)) for shape in mx.allocations)
+    assert all(shape in ((b * e,), (b, e)) for shape in mx.allocations)
     assert not mx.launches
 
 
@@ -148,7 +174,7 @@ def test_actual_histogram_grid_visits_every_occurrence_once(load, t, k):
     mod, mx = load("moe_counts")
     mx.device = mx.gpu
     b, e = 3, 96
-    mod.sequence_route_counts(array(np.zeros((b*t, k))), b, t, e)
+    mod.sequence_route_counts(array(np.zeros((b * t, k))), b, t, e)
     spec, kw = mx.launches[-1]
     cfg = dict(kw["template"])
     assert cfg["E"] * 4 <= 32768
@@ -162,7 +188,7 @@ def test_actual_histogram_grid_visits_every_occurrence_once(load, t, k):
                 r = tile * cfg["RT"] + i
                 if r < cfg["R"]:
                     visited.append(r)
-    assert sorted(visited) == list(range(t*k))
+    assert sorted(visited) == list(range(t * k))
     assert "threadgroup atomic_uint counts[E]" in spec["source"]
 
 
@@ -179,13 +205,15 @@ def test_shape_validation_precedes_dispatch(load):
     assert not mx.launches
 
 
-def test_flags_default_to_opt_in(load, monkeypatch):
-    for name, flag in [("moe_gather", "VIBY_MOE_GATHER_VJP"),
-                       ("moe_counts", "VIBY_MOE_COMPACT_AUX"),
-                       ("moe_decode", "VIBY_MOE_DECODE_COMPILE")]:
+def test_validated_decode_default_and_training_opt_ins(load, monkeypatch):
+    for name, flag, expected in [
+        ("moe_gather", "VIBY_MOE_GATHER_VJP", False),
+        ("moe_counts", "VIBY_MOE_COMPACT_AUX", False),
+        ("moe_decode", "VIBY_MOE_DECODE_COMPILE", True),
+    ]:
         monkeypatch.delenv(flag, raising=False)
         mod, _ = load(name)
-        assert not mod._ENABLED
+        assert mod._ENABLED == expected
 
 
 def test_compact_count_exactness_guard(load):
@@ -197,32 +225,67 @@ def test_compact_count_exactness_guard(load):
 
 def test_native_sorted_gemms_keep_single_index():
     import ast
+
     tree = ast.parse((ROOT / "model/moe.py").read_text())
-    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_sparse_forward")
-    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
-             and isinstance(n.func, ast.Attribute) and n.func.attr == "gather_mm"]
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_sparse_forward"
+    )
+    calls = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "gather_mm"
+    ]
     assert len(calls) == 2
     for call in calls:
         kw = {k.arg: k.value for k in call.keywords}
         assert "rhs_indices" in kw and "lhs_indices" not in kw
-        assert isinstance(kw["sorted_indices"], ast.Constant) and kw["sorted_indices"].value is True
+        assert (
+            isinstance(kw["sorted_indices"], ast.Constant)
+            and kw["sorted_indices"].value is True
+        )
 
 
 def test_train_benchmark_independent_switches():
     import ast
+
     tree = ast.parse((ROOT / "experiments/bench_csa2_plan.py").read_text())
     nodes = []
     for node in tree.body:
         text = ast.unparse(node)
-        if (isinstance(node, ast.Assign) and text.startswith("VARIANTS =")) or (
-                isinstance(node, ast.Expr) and text.startswith("VARIANTS.update(")) or (
-                isinstance(node, ast.For) and text.startswith("for variant in VARIANTS.values():")) or (
-                isinstance(node, ast.FunctionDef) and node.name == "configure"):
+        if (
+            (isinstance(node, ast.Assign) and text.startswith("VARIANTS ="))
+            or (isinstance(node, ast.Expr) and text.startswith("VARIANTS.update("))
+            or (
+                isinstance(node, ast.For)
+                and text.startswith("for variant in VARIANTS.values():")
+            )
+            or (isinstance(node, ast.FunctionDef) and node.name == "configure")
+        ):
             nodes.append(node)
-    ns = {k: types.SimpleNamespace() for k in ("sa", "fs", "moe", "hc", "moe_counts", "moe_decode", "moe_gather", "optimizer_impl")}
+    ns = {
+        k: types.SimpleNamespace()
+        for k in (
+            "sa",
+            "fs",
+            "moe",
+            "hc",
+            "moe_counts",
+            "moe_decode",
+            "moe_gather",
+            "optimizer_impl",
+        )
+    }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "bench-config", "exec"), ns)
-    for name, expected in [("fused_combine", (False, False)), ("dataflow_gather", (True, False)),
-                           ("dataflow_counts", (False, True)), ("dataflow_combined", (True, True))]:
+    for name, expected in [
+        ("fused_combine", (False, False)),
+        ("dataflow_gather", (True, False)),
+        ("dataflow_counts", (False, True)),
+        ("dataflow_combined", (True, True)),
+    ]:
         ns["configure"](name)
         assert (ns["moe_gather"]._ENABLED, ns["moe_counts"]._ENABLED) == expected
         assert ns["moe"]._COMBINE_ENABLED and ns["fs"]._ENABLED
@@ -231,9 +294,24 @@ def test_train_benchmark_independent_switches():
 
 def test_decode_benchmark_is_incremental_not_all_experts_baseline():
     import ast
+
     tree = ast.parse((ROOT / "experiments/bench_csa2_inference.py").read_text())
-    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "configure")
-    ns = {k: types.SimpleNamespace() for k in ("dm", "moe", "fs", "moe_dispatch", "moe_decode")}
+    fn = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "configure"
+    )
+    ns = {
+        k: types.SimpleNamespace()
+        for k in (
+            "dm",
+            "moe",
+            "fs",
+            "moe_dispatch",
+            "moe_decode",
+            "sinkhorn",
+            "hc_decode",
+            "rope_decode",
+        )
+    }
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "decode-config", "exec"), ns)
     for name, flag in [("combined", False), ("compiled_moe", True)]:
         ns["configure"](name)
@@ -249,7 +327,9 @@ def test_decode_guard_rejects_training_large_batches_and_mixed_dtype(load):
     assert mod.enabled_for(x, False, True, 8, weights)
     assert not mod.enabled_for(x, True, True, 8, weights)
     assert not mod.enabled_for(x, False, False, 8, weights)
-    assert not mod.enabled_for(array(np.zeros((9, 1, 64)), np.float32), False, True, 8, weights)
+    assert not mod.enabled_for(
+        array(np.zeros((9, 1, 64)), np.float32), False, True, 8, weights
+    )
     assert not mod.enabled_for(x, False, True, 8, (x.astype(np.float32),) + weights[1:])
     xf = x.astype(np.float32)
     assert not mod.enabled_for(xf, False, True, 8, (xf,) * 5)
@@ -259,17 +339,21 @@ def test_decode_guard_rejects_training_large_batches_and_mixed_dtype(load):
 
 def test_decode_cache_forwards_new_parameter_arrays(load, monkeypatch):
     mod, mx = load("moe_decode")
-    for name, member in [("model.moe", "expert_act"),
-                         ("model.kernels.decode_metadata", "combine_selected_experts")]:
+    for name, member in [
+        ("model.moe", "expert_act"),
+        ("model.kernels.decode_metadata", "combine_selected_experts"),
+    ]:
         stub = types.ModuleType(name)
         setattr(stub, member, lambda *args: None)
         monkeypatch.setitem(sys.modules, name, stub)
     # Record explicit inputs, not GPU numerics. A changed weight must be passed
     # through a cache hit, never captured as a constant by the wrapper.
     traced = []
+
     def compile_fn(fn):
         traced.append(fn)
         return lambda *args: args
+
     mx.compile = compile_fn
     args0 = tuple(object() for _ in range(8))
     args1 = args0[:3] + tuple(object() for _ in range(5))

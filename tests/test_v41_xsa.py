@@ -11,6 +11,7 @@ XSA 是注意力输出的逐 head 后处理：z = y − tanh(α)·(yᵀv/‖v‖
 整模型前向因 MoE scatter 存在 ~1e-6 的 run-to-run 噪声，故恒等性断言用
 "不超过噪声底"而不是 "== 0"。
 """
+
 import os
 import sys
 
@@ -26,8 +27,9 @@ from model.config import VibyConfig
 
 
 def _cfg(use_xsa=True, xsa_last_n=0, **kw):
-    return VibyConfig(**{**cfg_mix().to_dict(), "use_xsa": use_xsa,
-                         "xsa_last_n": xsa_last_n, **kw})
+    return VibyConfig(
+        **{**cfg_mix().to_dict(), "use_xsa": use_xsa, "xsa_last_n": xsa_last_n, **kw}
+    )
 
 
 def _xsa_paths(model):
@@ -134,5 +136,3 @@ def test_xsa_prefill_matches_decode():
     mx.eval(full, last)
     diff = float(mx.max(mx.abs(full[:, -1] - last[:, 0])).item())
     assert diff < 5e-5, diff
-
-

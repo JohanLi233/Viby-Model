@@ -35,6 +35,7 @@ def _forward(model, ids, **kw):
 
 # ------------------------------------------------------------------ DSpark 结构
 
+
 def test_dspark_stage_layout():
     """draft 阶段：首层锚点投影 + 末层预测头，逐层一个 SWA block。"""
     cfg = cfg_tiny(n_mtp_layers=1, dspark_block_size=4, dspark_target_layer_ids=(1, 3))
@@ -42,11 +43,20 @@ def test_dspark_stage_layout():
     assert len(model.mtp_modules) == 1
     stage = model.mtp_modules[0]
     assert stage.block_size == 4
-    assert hasattr(stage, "main_proj") and stage.main_proj.weight.shape == (cfg.dim, cfg.dim * 2)
+    assert hasattr(stage, "main_proj") and stage.main_proj.weight.shape == (
+        cfg.dim,
+        cfg.dim * 2,
+    )
     assert hasattr(stage, "main_norm")
     assert hasattr(stage, "markov_head") and hasattr(stage, "confidence_head")
-    assert stage.markov_head.embed.weight.shape == (cfg.vocab_size, cfg.dspark_markov_rank)
-    assert stage.confidence_head.proj.weight.shape == (1, cfg.dim + cfg.dspark_markov_rank)
+    assert stage.markov_head.embed.weight.shape == (
+        cfg.vocab_size,
+        cfg.dspark_markov_rank,
+    )
+    assert stage.confidence_head.proj.weight.shape == (
+        1,
+        cfg.dim + cfg.dspark_markov_rank,
+    )
     # draft block 是纯滑窗层（ratio=0）且用 DSpark 的窄 MoE
     dtype_idx = cfg.n_layers
     assert cfg.compress_ratios[dtype_idx] == 0
@@ -68,11 +78,13 @@ def test_mtp_loss_computable_and_backpropagates():
     g = dict(tree_flatten(grads))
     assert np.isfinite(np.asarray(_forward(model, ids).mtp_loss)).all()
     assert _forward(model, ids).mtp_loss.item() > 0
-    for key in ("mtp_modules.0.markov_head.embed.weight",
-                "mtp_modules.0.markov_head.head.weight",
-                "mtp_modules.0.confidence_head.proj.weight",
-                "mtp_modules.0.layer.ffn.router.weight",
-                "mtp_modules.0.layer.attn.wq_a.weight"):
+    for key in (
+        "mtp_modules.0.markov_head.embed.weight",
+        "mtp_modules.0.markov_head.head.weight",
+        "mtp_modules.0.confidence_head.proj.weight",
+        "mtp_modules.0.layer.ffn.router.weight",
+        "mtp_modules.0.layer.attn.wq_a.weight",
+    ):
         assert key in g, key
         assert float(mx.max(mx.abs(g[key]))) > 0, key
     # 置信度头确实参与损失：清零后损失必须变（BCE 项退化成常数 log2）
@@ -102,17 +114,24 @@ def test_total_loss_combines_lm_mtp_and_z():
     mx.random.seed(82)
     ids = mx.random.randint(0, cfg.vocab_size, (1, 10))
     out = _forward(model, ids)
-    want = float(out.lm_loss) + cfg.z_loss_weight * float(out.z_loss) \
-        + cfg.mtp_loss_weight * float(out.mtp_loss) \
+    want = (
+        float(out.lm_loss)
+        + cfg.z_loss_weight * float(out.z_loss)
+        + cfg.mtp_loss_weight * float(out.mtp_loss)
         + cfg.aux_balance_loss_weight * float(out.aux_loss)
+    )
     assert float(out.loss) == pytest.approx(want, rel=1e-5, abs=1e-6)
     # use_mtp=False：不算 MTP，也不返回 mtp_loss
     plain = model(ids, labels=ids, use_mtp=False)
     mx.eval(plain.loss, plain.mtp_loss)
     assert plain.mtp_loss is None
     assert float(plain.loss) == pytest.approx(
-        float(plain.lm_loss) + cfg.z_loss_weight * float(plain.z_loss)
-        + cfg.aux_balance_loss_weight * float(plain.aux_loss), rel=1e-5, abs=1e-6)
+        float(plain.lm_loss)
+        + cfg.z_loss_weight * float(plain.z_loss)
+        + cfg.aux_balance_loss_weight * float(plain.aux_loss),
+        rel=1e-5,
+        abs=1e-6,
+    )
     # 关掉 MTP 后 loss 与开 MTP 不同
     assert abs(float(plain.loss) - float(out.loss)) > 1e-6
 
@@ -128,19 +147,27 @@ def test_mtp_loss_does_not_backprop_into_backbone():
     mx.random.seed(83)
     ids = mx.random.randint(0, cfg.vocab_size, (1, 10))
     g = nn.value_and_grad(model, lambda m, x: m(x, labels=x, use_mtp=True).mtp_loss)(
-        model, ids)[1]
+        model, ids
+    )[1]
     mx.eval(g)
     gl = dict(tree_flatten(g))
-    backbone = {k: float(mx.max(mx.abs(v))) for k, v in gl.items()
-                if k.startswith("model.layers") or k.startswith("model.norm")}
+    backbone = {
+        k: float(mx.max(mx.abs(v)))
+        for k, v in gl.items()
+        if k.startswith("model.layers") or k.startswith("model.norm")
+    }
     assert backbone, "应当有主干参数的梯度槽位"
     bad = {k: v for k, v in backbone.items() if v != 0.0}
     assert not bad, f"主干拿到了 DSpark 梯度：{list(bad)[:5]}"
     # 锚点被截断：主干里唯一能拿到梯度的是共享的 token 嵌入
     nonzero = [k for k, v in gl.items() if float(mx.max(mx.abs(v))) > 0]
     assert any(k.startswith("mtp_modules") for k in nonzero)
-    assert all(k.startswith("mtp_modules") or k == "model.embed.weight"
-               or k.startswith("lm_head") for k in nonzero), nonzero
+    assert all(
+        k.startswith("mtp_modules")
+        or k == "model.embed.weight"
+        or k.startswith("lm_head")
+        for k in nonzero
+    ), nonzero
 
 
 def test_freeze_backbone_trains_only_dspark():
@@ -155,14 +182,18 @@ def test_freeze_backbone_trains_only_dspark():
     assert trainable, "DSpark 参数必须仍可训练"
     assert all(k.startswith("mtp_modules") for k in trainable), list(trainable)[:5]
     g = nn.value_and_grad(model, lambda m, x: m(x, labels=x, use_mtp=True).mtp_loss)(
-        model, ids)[1]
+        model, ids
+    )[1]
     mx.eval(g)
     gl = dict(tree_flatten(g))
     assert set(gl) == set(trainable)
-    assert all(float(mx.max(mx.abs(v))) > 0 for v in gl.values()), "DSpark 参数应全部有梯度"
+    assert all(float(mx.max(mx.abs(v))) > 0 for v in gl.values()), (
+        "DSpark 参数应全部有梯度"
+    )
 
 
 # ------------------------------------------------------------------ 梯度 / 编译
+
 
 def test_value_and_grad_covers_all_trainable_parameters():
     """nn.value_and_grad 覆盖全部 trainable 参数，梯度有限。"""
@@ -188,8 +219,10 @@ def test_value_and_grad_covers_all_trainable_parameters():
     ids2 = mx.random.randint(0, cfg.vocab_size, (2, 10))
     g2 = dict(tree_flatten(nn.value_and_grad(model, loss_fn)(model, ids2)[1]))
     mx.eval(list(g2.values()))
-    assert not np.allclose(np.asarray(g2["model.layers.0.attn.wq_a.weight"]),
-                           np.asarray(gl["model.layers.0.attn.wq_a.weight"]))
+    assert not np.allclose(
+        np.asarray(g2["model.layers.0.attn.wq_a.weight"]),
+        np.asarray(gl["model.layers.0.attn.wq_a.weight"]),
+    )
 
 
 def test_compile_forward_is_reproducible_and_matches_eager():
@@ -216,12 +249,14 @@ def test_compile_forward_is_reproducible_and_matches_eager():
     loss2, grads2 = compiled_vg(ids)
     mx.eval(loss2, grads2)
     assert abs(float(loss2) - float(eager)) < 1e-4
-    assert all(np.isfinite(np.asarray(v)).all() for v in dict(tree_flatten(grads2)).values())
+    assert all(
+        np.isfinite(np.asarray(v)).all() for v in dict(tree_flatten(grads2)).values()
+    )
 
 
 def test_optimizer_steps_reduce_loss_on_fixed_batch():
     """训练步烟测：连续 AdamW 更新能把单批 loss 压下去（参数有限不过冲）。"""
-    model = build(cfg_tiny())        # 用新模型：本用例会改参数，不能污染缓存实例
+    model = build(cfg_tiny())  # 用新模型：本用例会改参数，不能污染缓存实例
     cfg = model.config
     mx.random.seed(87)
     ids = mx.random.randint(0, cfg.vocab_size, (1, 12))
@@ -231,7 +266,7 @@ def test_optimizer_steps_reduce_loss_on_fixed_batch():
 
     import mlx.optimizers as optim
 
-    opt = optim.AdamW(learning_rate=1e-3)     # 1e-2 在这个小模型上会过冲
+    opt = optim.AdamW(learning_rate=1e-3)  # 1e-2 在这个小模型上会过冲
     vg = nn.value_and_grad(model, loss_fn)
     before = float(loss_fn(model, ids))
     hist = [before]
@@ -247,6 +282,7 @@ def test_optimizer_steps_reduce_loss_on_fixed_batch():
 
 # ------------------------------------------------------------------ 损失口径
 
+
 def test_lm_head_ce_loss_mask_semantics():
     """lm_head_ce：mask 只统计有效 token；z_loss = mean(lse²)。"""
     mx.random.seed(88)
@@ -260,14 +296,20 @@ def test_lm_head_ce_loss_mask_semantics():
     assert float(z_none) == pytest.approx(float(z_ones), rel=1e-5)
     # 手算 CE（fp32）
     logits = np.asarray(h) @ np.asarray(w).T
-    lse = np.log(np.exp(logits - logits.max(-1, keepdims=True)).sum(-1)) + logits.max(-1)
-    want_ce = float(np.mean(lse - np.take_along_axis(logits, labels[:, :, None], -1)[..., 0]))
+    lse = np.log(np.exp(logits - logits.max(-1, keepdims=True)).sum(-1)) + logits.max(
+        -1
+    )
+    want_ce = float(
+        np.mean(lse - np.take_along_axis(logits, labels[:, :, None], -1)[..., 0])
+    )
     assert float(ce_none) == pytest.approx(want_ce, rel=1e-4, abs=1e-5)
-    assert float(z_none) == pytest.approx(float(np.mean(lse ** 2)), rel=1e-4)
+    assert float(z_none) == pytest.approx(float(np.mean(lse**2)), rel=1e-4)
     # 只保留一半 token：CE 等于那一半上的平均
     mask = np.zeros((1, 6), np.float32)
     mask[0, 2:] = 1.0
-    ce_half, _ = lm_head_ce(h[:1], w, mx.array(labels[:1]), mx.array(mask), z_weight=0.0)
+    ce_half, _ = lm_head_ce(
+        h[:1], w, mx.array(labels[:1]), mx.array(mask), z_weight=0.0
+    )
     mx.eval(ce_half)
     ce_tok = lse[:1] - np.take_along_axis(logits[:1], labels[:1, :, None], -1)[..., 0]
     assert float(ce_half) == pytest.approx(float(ce_tok[0, 2:].mean()), rel=1e-4)

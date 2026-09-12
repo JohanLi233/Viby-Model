@@ -93,7 +93,10 @@ def main():
 
     t_all = time.perf_counter()
     for _ in range(args.repeat):
-        h = timed("embed+repeat", lambda: mx.repeat(m.embed(ids)[:, :, None, :], m.hc_mult, axis=2))
+        h = timed(
+            "embed+repeat",
+            lambda: mx.repeat(m.embed(ids)[:, :, None, :], m.hc_mult, axis=2),
+        )
         hashes = None
         if m.engram_hash is not None:
             hashes, _ = timed("engram_hash", lambda: m.engram_hash(ids, None, None))
@@ -103,7 +106,10 @@ def main():
             if hashes is not None and i in m._engram_slot:
                 slot = m._engram_slot[i]
                 eng = m.engram_layers[slot]
-                h = timed("engram[%d]" % i, lambda eng=eng, slot=slot: eng(h, hashes[:, :, slot, :]))
+                h = timed(
+                    "engram[%d]" % i,
+                    lambda eng=eng, slot=slot: eng(h, hashes[:, :, slot, :]),
+                )
 
             def sub(name, fn, h):
                 return timed(name, fn)
@@ -118,7 +124,9 @@ def main():
                 "attn[%s]" % cfg.layer_mode(i),
                 lambda: layer.attn(hh, 0, shared, None, None, None),
             )
-            h = timed("hc_post(attn)", lambda: hc_post(hh, residual, attn_post, attn_comb))
+            h = timed(
+                "hc_post(attn)", lambda: hc_post(hh, residual, attn_post, attn_comb)
+            )
 
             residual = h
             ffn_pre, ffn_post, ffn_comb = timed(
@@ -136,7 +144,10 @@ def main():
             lambda: lm_head_ce(h, model._head_weight(), labels, loss_mask, 0.0),
         )
     total = time.perf_counter() - t_all
-    print("配置 dim=%d layers=%d hc=%d B=%d T=%d repeat=%d" % (cfg.dim, cfg.n_layers, cfg.hc_mult, B, T, args.repeat))
+    print(
+        "配置 dim=%d layers=%d hc=%d B=%d T=%d repeat=%d"
+        % (cfg.dim, cfg.n_layers, cfg.hc_mult, B, T, args.repeat)
+    )
     timer.report(total)
 
 

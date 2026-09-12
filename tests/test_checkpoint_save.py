@@ -87,7 +87,9 @@ class TestFinishTraining(unittest.TestCase):
 
     def test_finishes_active_swanlab_run(self):
         calls = []
-        swanlab = SimpleNamespace(finish=lambda: calls.append("finish"), has_run=lambda: True)
+        swanlab = SimpleNamespace(
+            finish=lambda: calls.append("finish"), has_run=lambda: True
+        )
         finish_training(swanlab, interrupted=False)
         self.assertEqual(calls, ["finish"])
 

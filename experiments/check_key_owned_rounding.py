@@ -4,6 +4,7 @@ Run: .venv/bin/python experiments/check_key_owned_rounding.py
 This probes the two dot-product orders, then reduces both with the same MLX
 formula so any difference cannot be attributed to CSR or key ownership.
 """
+
 import sys
 from pathlib import Path
 
@@ -70,26 +71,49 @@ def main():
     idx, lens = sa.compact_visible(vis)
     out, lse = sa._operation(W, scale, 16)(q, w, c, idx, lens, seg, pad, sinks)
     _, delta, _ = sa._kernels()[4](
-        inputs=[q, w, c, idx, lens, seg, pad, sinks, mx.array([b, t, n], mx.uint32),
-                mx.array([scale], mx.float32), g, lse, out],
+        inputs=[
+            q,
+            w,
+            c,
+            idx,
+            lens,
+            seg,
+            pad,
+            sinks,
+            mx.array([b, t, n], mx.uint32),
+            mx.array([scale], mx.float32),
+            g,
+            lse,
+            out,
+        ],
         template=[("T", q.dtype), ("D", d), ("W", W), ("BK", 16), ("NP", d // 64)],
-        grid=(d, b * t, 1), threadgroup=(d, 1, 1),
-        output_shapes=[q.shape, (b, t, 16), (b, t, 16)], output_dtypes=[q.dtype, mx.float32, mx.float32],
+        grid=(d, b * t, 1),
+        threadgroup=(d, 1, 1),
+        output_shapes=[q.shape, (b, t, 16), (b, t, 16)],
+        output_dtypes=[q.dtype, mx.float32, mx.float32],
     )
     kernel = mx.fast.metal_kernel(
-        name="diagnose_key_dot", input_names=["q", "g", "k"],
-        output_names=["mma", "scalar"], source=_DOTS, header=sa._HEADER,
+        name="diagnose_key_dot",
+        input_names=["q", "g", "k"],
+        output_names=["mma", "scalar"],
+        source=_DOTS,
+        header=sa._HEADER,
     )
     a, z = kernel(
-        inputs=[q, g, w[0, 0]], template=[("T", q.dtype), ("D", d)],
-        grid=(d, 16, 1), threadgroup=(d, 1, 1),
-        output_shapes=[(16, 16, 2)] * 2, output_dtypes=[mx.float32] * 2,
+        inputs=[q, g, w[0, 0]],
+        template=[("T", q.dtype), ("D", d)],
+        grid=(d, 16, 1),
+        threadgroup=(d, 1, 1),
+        output_shapes=[(16, 16, 2)] * 2,
+        output_dtypes=[mx.float32] * 2,
     )
 
     def coeff(x):
         p = mx.exp(x[..., 0] * scale - lse[0, :16])
         ds = p * (x[..., 1] - delta[0, :16]) * scale
-        return p.astype(q.dtype).astype(mx.float32), ds.astype(q.dtype).astype(mx.float32)
+        return p.astype(q.dtype).astype(mx.float32), ds.astype(q.dtype).astype(
+            mx.float32
+        )
 
     ap, ads = coeff(a)
     zp, zds = coeff(z)
@@ -97,18 +121,42 @@ def main():
     ka = mx.sum(ads[..., None] * qa + ap[..., None] * ga, axis=(0, 1))
     kz = mx.sum(zds[..., None] * qa + zp[..., None] * ga, axis=(0, 1))
     mx.eval(a, z, ap, ads, zp, zds, ka, kz)
-    print("dot max abs difference [QK, dOK]:", np.max(abs(np.asarray(a) - np.asarray(z)), axis=(0, 1)))
+    print(
+        "dot max abs difference [QK, dOK]:",
+        np.max(abs(np.asarray(a) - np.asarray(z)), axis=(0, 1)),
+    )
     pwhere = np.argwhere(np.asarray(ap) != np.asarray(zp))
     print("P rounding differences (query, head):", pwhere.tolist())
     for i, j in pwhere:
-        print("P at", (int(i), int(j)), "MMA:", ap[i, j].item(), "SIMD:", zp[i, j].item())
+        print(
+            "P at", (int(i), int(j)), "MMA:", ap[i, j].item(), "SIMD:", zp[i, j].item()
+        )
     where = np.argwhere(np.asarray(ads) != np.asarray(zds))
     print("Ds rounding differences (query, head):", where.tolist())
     for i, j in where:
-        print("Ds at", (int(i), int(j)), "MMA:", ads[i, j].item(), "SIMD:", zds[i, j].item())
+        print(
+            "Ds at",
+            (int(i), int(j)),
+            "MMA:",
+            ads[i, j].item(),
+            "SIMD:",
+            zds[i, j].item(),
+        )
     dimension = int(np.argmax(abs(np.asarray(ka) - np.asarray(kz))))
-    print("largest-difference dimension", dimension, "common FP32 reduction: MMA:", ka[dimension].item(), "SIMD:", kz[dimension].item())
-    print("final bf16: MMA:", ka.astype(q.dtype)[dimension].item(), "SIMD:", kz.astype(q.dtype)[dimension].item())
+    print(
+        "largest-difference dimension",
+        dimension,
+        "common FP32 reduction: MMA:",
+        ka[dimension].item(),
+        "SIMD:",
+        kz[dimension].item(),
+    )
+    print(
+        "final bf16: MMA:",
+        ka.astype(q.dtype)[dimension].item(),
+        "SIMD:",
+        kz.astype(q.dtype)[dimension].item(),
+    )
 
 
 if __name__ == "__main__":

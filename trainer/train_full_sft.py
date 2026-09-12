@@ -9,6 +9,7 @@ from model.config import VibyConfig
 from dataset.lm_dataset import SFTDataset
 from .base_trainer import BaseTrainer
 from .config import get_sft_parser, setup_training_args
+from .tail_sft import enabled as tail_enabled, prepare_dataset
 from .utils import (
     base_checkpoint_name,
     build_config_from_sidecar,
@@ -25,6 +26,11 @@ def init_model(lm_config, args):
     """初始化模型和tokenizer，加载预训练权重"""
     checkpoint_name = base_checkpoint_name(
         args, lm_config, "pretrain_checkpoint", "pretrain"
+    )
+    if tail_enabled(args) and args.resume and args.reset_optimizer:
+        checkpoint_name = os.path.abspath(args.resume)
+    args.sft_initial_checkpoint = os.path.abspath(
+        os.path.join(args.save_dir, checkpoint_name)
     )
     return build_model_and_tokenizer(
         lm_config,
@@ -46,6 +52,8 @@ if __name__ == "__main__":
     # 先按 --pretrain_checkpoint / --hidden_size（缺省即 VibyConfig 默认 dim）
     # 猜出基座文件名，再读它的 sidecar config 继承结构；CLI 显式参数优先
     checkpoint_name = sidecar_checkpoint_hint(args, "pretrain_checkpoint", "pretrain")
+    if tail_enabled(args) and args.resume and args.reset_optimizer:
+        checkpoint_name = os.path.abspath(args.resume)
     cfg, has_sidecar = build_config_from_sidecar(args, checkpoint_name)
     # SFT 的上下文长度由 max_seq_len 决定
     cfg["max_position_embeddings"] = args.max_seq_len
@@ -53,9 +61,6 @@ if __name__ == "__main__":
 
     # 初始化模型
     model, tokenizer = init_model(lm_config, args)
-
-    # 创建训练器
-    trainer = BaseTrainer(args, model, tokenizer, lm_config, "sft")
 
     # 创建数据集和数据加载器（打包模式与 pretrain 同口径：定长块、无 pad、不截断）
     if getattr(args, "doc_mask", False) and not getattr(args, "pack_sequences", False):
@@ -67,7 +72,14 @@ if __name__ == "__main__":
         pack_sequences=getattr(args, "pack_sequences", False),
         doc_mask=getattr(args, "doc_mask", False),
         empty_think_ratio=getattr(args, "empty_think_ratio", 0.0),
+        deterministic_seed=args.seed if tail_enabled(args) else None,
     )
+    if tail_enabled(args):
+        train_ds = prepare_dataset(
+            train_ds, model, lm_config, args, args.sft_initial_checkpoint
+        )
+    # 必须在 pi_0 评分后恢复训练中的权重；不能把恢复点当作初始策略。
+    trainer = BaseTrainer(args, model, tokenizer, lm_config, "sft")
     train_loader = trainer.create_data_loader(train_ds)
 
     swanlab = init_swanlab(args, trainer)
@@ -81,7 +93,7 @@ if __name__ == "__main__":
 
 # 执行命令示例:
 #
-# 标准SFT训练:
+# TailSFT 训练（普通 SFT 对照加 --sft_algorithm standard）:
 # python train_full_sft.py
 #
 # 自定义配置:

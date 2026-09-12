@@ -35,6 +35,9 @@ NEG_INF = -1e30
 # 训练路径的滑窗分块开关（export VIBY_ATTN_CHUNK=0 回退全 T 稠密掩码路径，
 # 用于数值对拍与排障；两条路径数学等价，见 tests/test_v41_attention.py）
 _CHUNK_ENABLED = os.environ.get("VIBY_ATTN_CHUNK", "1") != "0"
+_RECURRENT_SPARSE = os.environ.get("VIBY_CED_RECURRENT_SPARSE", "1") != "0"
+_RECURRENT_OPTIMIZED = os.environ.get("VIBY_CED_OPTIMIZED", "1") != "0"
+_RECURRENT_METADATA_FUSED = os.environ.get("VIBY_CED_METADATA_FUSION", "0") != "0"
 
 
 def _cos_sin(cos_all, sin_all, pos, head_axis: bool):
@@ -45,7 +48,9 @@ def _cos_sin(cos_all, sin_all, pos, head_axis: bool):
     return c, s
 
 
-def select_candidate_blocks(logits: mx.array, compress_lens, topk_blocks: int, block_size: int):
+def select_candidate_blocks(
+    logits: mx.array, compress_lens, topk_blocks: int, block_size: int
+):
     """分层索引第一级：每个 query 只保留得分最高的 topk_blocks 个块。
 
     logits: [B,T,N]，不可达位置已经是 -inf（块得分 -inf 即"还不可达"）。
@@ -56,7 +61,8 @@ def select_candidate_blocks(logits: mx.array, compress_lens, topk_blocks: int, b
     pad = (-width) % block_size
     if pad:
         logits = mx.concatenate(
-            [logits, mx.full((*logits.shape[:-1], pad), NEG_INF, dtype=logits.dtype)], axis=-1
+            [logits, mx.full((*logits.shape[:-1], pad), NEG_INF, dtype=logits.dtype)],
+            axis=-1,
         )
     blocks = logits.reshape(*logits.shape[:-1], -1, block_size)
     scores = mx.max(blocks, axis=-1)  # 块得分 = 块内最好位置
@@ -92,8 +98,9 @@ def select_candidate_blocks(logits: mx.array, compress_lens, topk_blocks: int, b
     return keep[..., :width]
 
 
-def _topk_masks(score: mx.array, reach: mx.array, k: int, offset: int,
-                need_idx: bool = True):
+def _topk_masks(
+    score: mx.array, reach: mx.array, k: int, offset: int, need_idx: bool = True
+):
     """从打分矩阵里取出每 query 的 k 个压缩位置。
 
     返回 (keep_mask [B,T,N] bool, topk_idx [B,T,k'] int32)：
@@ -122,9 +129,13 @@ def _topk_masks(score: mx.array, reach: mx.array, k: int, offset: int,
     keep = (sel_score >= thr[..., None]) & reach & selectable
     if not need_idx:
         return keep, None
-    sel = mx.argpartition(-sel_score, kth=k_eff - 1, axis=-1)[..., :k_eff].astype(mx.int32)
+    sel = mx.argpartition(-sel_score, kth=k_eff - 1, axis=-1)[..., :k_eff].astype(
+        mx.int32
+    )
     idx = mx.sort(sel, axis=-1)
-    valid = mx.take_along_axis(reach, idx, axis=-1) & mx.take_along_axis(selectable, idx, axis=-1)
+    valid = mx.take_along_axis(reach, idx, axis=-1) & mx.take_along_axis(
+        selectable, idx, axis=-1
+    )
     idx = mx.where(valid, idx + offset, -1).astype(mx.int32)
     return keep, idx
 
@@ -143,7 +154,11 @@ class Compressor(nn.Module):
         self.head_dim = config.head_dim
         self.norm = RMSNorm(config.head_dim, config.norm_eps)
         self.wkv = nn.Linear(config.dim, config.head_dim, bias=False)
-        self.wgate = nn.Linear(config.dim, config.head_dim, bias=False) if self.ratio > 1 else None
+        self.wgate = (
+            nn.Linear(config.dim, config.head_dim, bias=False)
+            if self.ratio > 1
+            else None
+        )
         self.last_filled = 0
 
     def init_state(self, batch: int, dtype):
@@ -161,7 +176,7 @@ class Compressor(nn.Module):
         (pooled [B,1,hd], valid [B], 新 state)：valid 为该序列这一步是否
         刚好凑满一组（未凑满时 pooled 无效，由 reach 掩掉）。
         """
-        B = x.shape[0]
+        x.shape[0]
         kv, sc = self.wkv(x)[:, 0], self.wgate(x)[:, 0]  # [B,hd]
         filled = state[2]
         slot = filled % self.ratio
@@ -171,7 +186,9 @@ class Compressor(nn.Module):
         sc_st = mx.where(oh, sc[:, None, :], state[1])
         new_filled = filled + 1
         valid = new_filled >= self.ratio
-        pooled = self.norm(mx.sum(kv_st * mx.softmax(sc_st, axis=1), axis=1, keepdims=True))
+        pooled = self.norm(
+            mx.sum(kv_st * mx.softmax(sc_st, axis=1), axis=1, keepdims=True)
+        )
         # 组满后必须把 score 缓冲清成 -inf：否则上一组的 token 会混进下一组的池化
         sc_st = mx.where(valid[:, None, None], mx.full_like(sc_st, -mx.inf), sc_st)
         return pooled, valid, (kv_st, sc_st, mx.where(valid, 0, new_filled))
@@ -186,7 +203,12 @@ class Compressor(nn.Module):
         r = self.ratio
         if r == 1:
             self.last_filled = 0
-            return self.norm(self.wkv(x)), None, start_pos + mx.arange(T)[None, :], start_pos
+            return (
+                self.norm(self.wkv(x)),
+                None,
+                start_pos + mx.arange(T)[None, :],
+                start_pos,
+            )
         kv, sc = self.wkv(x), self.wgate(x)
         if filled:
             kv = mx.concatenate([state[0][:B, :filled], kv], axis=1)
@@ -200,8 +222,13 @@ class Compressor(nn.Module):
         pad = r - rem
         tail_kv, tail_sc = kv[:, n * r :], sc[:, n * r :]
         if pad:
-            tail_kv = mx.concatenate([tail_kv, mx.zeros((B, pad, self.head_dim), dtype=kv.dtype)], axis=1)
-            tail_sc = mx.concatenate([tail_sc, mx.full((B, pad, self.head_dim), -mx.inf, dtype=mx.float32)], axis=1)
+            tail_kv = mx.concatenate(
+                [tail_kv, mx.zeros((B, pad, self.head_dim), dtype=kv.dtype)], axis=1
+            )
+            tail_sc = mx.concatenate(
+                [tail_sc, mx.full((B, pad, self.head_dim), -mx.inf, dtype=mx.float32)],
+                axis=1,
+            )
         new_state = (tail_kv, tail_sc, mx.full((B,), rem, dtype=mx.int32))
         self.last_filled = rem
         if n == 0:
@@ -233,8 +260,10 @@ class Indexer(nn.Module):
         self.head_dim = config.index_head_dim
         self.rope_head_dim = config.rope_head_dim
         self.index_topk = config.index_topk
-        self.softmax_scale = self.head_dim ** -0.5
-        self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.softmax_scale = self.head_dim**-0.5
+        self.wq_b = nn.Linear(
+            config.q_lora_rank, self.n_heads * self.head_dim, bias=False
+        )
         self.weights_proj = nn.Linear(config.dim, self.n_heads, bias=False)
         if self.owns_k:
             self.wk = nn.Linear(config.head_dim, self.head_dim, bias=False)
@@ -245,8 +274,9 @@ class Indexer(nn.Module):
         c, s = _cos_sin(cos_all, sin_all, pos, False)
         return rope_partial(self.k_norm(self.wk(latent)), c, s, self.rope_head_dim)
 
-    def scores(self, x, qr, index_k, token_pos, reach, cos_all, sin_all,
-               q_cos=None, q_sin=None):
+    def scores(
+        self, x, qr, index_k, token_pos, reach, cos_all, sin_all, q_cos=None, q_sin=None
+    ):
         """返回 [B,T,N] 的打分（不可达位置 = -inf，fp32）。
 
         q_cos/q_sin 若已由主注意力按 token_pos 取过，直接复用，避免 indexer
@@ -256,13 +286,15 @@ class Indexer(nn.Module):
         q, w = self._query_weights(x, qr, token_pos, cos_all, sin_all, q_cos, q_sin)
         return indexer_score(q, index_k, w, reach)
 
-    def _query_weights(self, x, qr, token_pos, cos_all, sin_all, q_cos=None, q_sin=None):
+    def _query_weights(
+        self, x, qr, token_pos, cos_all, sin_all, q_cos=None, q_sin=None
+    ):
         B, T, _ = x.shape
         q = self.wq_b(qr).reshape(B, T, self.n_heads, self.head_dim)
         if q_cos is None:
             q_cos, q_sin = _cos_sin(cos_all, sin_all, token_pos, True)
         q = rope_partial(q, q_cos, q_sin, self.rope_head_dim)
-        w = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        w = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         return q, w
 
 
@@ -307,14 +339,20 @@ class Attention(nn.Module):
         self.o_groups = config.o_groups
         self.o_lora_rank = config.o_lora_rank
         self.window_size = config.window_size
+        self.recurrent_stride = (
+            getattr(config, "ced_recurrent_stride", 1)
+            if config.n_encoder_layers < layer_idx < config.n_layers - 1
+            else 1
+        )
         self.eps = config.norm_eps
         self.ratio = int(config.compress_ratios[layer_idx])
         self.mode = config.layer_mode(layer_idx)
         self.is_kv_source = layer_idx in config.kv_source_layers
         self.is_index_source = layer_idx in config.index_source_layers
-        self.softmax_scale = self.head_dim ** -0.5
+        self.softmax_scale = self.head_dim**-0.5
 
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
+        self.index_topk = config.index_topk
         # Gated XSA：只在主干最深 xsa_last_n 层挂逐 head 可学习 tanh(α)。
         # 零初始化 ⇒ tanh(0)=0 ⇒ step-0 严格恒等，不扰动已有权重。
         # DSpark 草稿层（layer_idx >= n_layers）不挂，与旧实现口径一致。
@@ -330,7 +368,9 @@ class Attention(nn.Module):
         )
         self.wq_a = nn.Linear(config.dim, config.q_lora_rank, bias=False)
         self.q_norm = RMSNorm(config.q_lora_rank, self.eps)
-        self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.wq_b = nn.Linear(
+            config.q_lora_rank, self.n_heads * self.head_dim, bias=False
+        )
         self.wkv = nn.Linear(config.dim, self.head_dim, bias=False)
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         self.wo_a = nn.Linear(
@@ -417,9 +457,20 @@ class Attention(nn.Module):
         shared.reach = reach
         return reach
 
-    def _compress_dense(self, x, qr, token_pos, shared, cache, start_pos,
-                        segment_ids=None, pad_mask=None, sparse_selection=False,
-                        token_cs=None, materialize_keep=False):
+    def _compress_dense(
+        self,
+        x,
+        qr,
+        token_pos,
+        shared,
+        cache,
+        start_pos,
+        segment_ids=None,
+        pad_mask=None,
+        sparse_selection=False,
+        token_cs=None,
+        materialize_keep=False,
+    ):
         """压缩分支（prefill / 训练）：产出/复用压缩 KV，并返回可见性掩码。
 
         返回 (comp, cmask)：cmask 是 [B 或 1, T, N] 的 bool，等于
@@ -430,7 +481,11 @@ class Attention(nn.Module):
         B, T, _ = x.shape
         ratio = self.ratio
         N = (start_pos + T) // ratio
-        if not self.is_kv_source and not self.is_index_source and shared.keep_mask is not None:
+        if (
+            not self.is_kv_source
+            and not self.is_index_source
+            and shared.keep_mask is not None
+        ):
             return self._reuse_compress(shared, cache, B, N)
         keep = None
         latent = None
@@ -473,20 +528,45 @@ class Attention(nn.Module):
                     q_cos, q_sin = token_cs[0][..., None, :], token_cs[1][..., None, :]
                 # 候选池先并进 reach：indexer 只在候选域内打分/打分块，
                 # 而 reach 的语义保持“原始可达 + 候选”不变。
-                can_fuse = (sparse_selection and fused_index._ENABLED and (cache is None or start_pos == 0)
-                            and T > 1 and 0 < N <= 1024 and idxo.n_heads in (4, 8)
-                            and idxo.head_dim in (32, 64) and x.dtype in (mx.float16, mx.bfloat16))
+                can_fuse = (
+                    sparse_selection
+                    and fused_index._ENABLED
+                    and (cache is None or start_pos == 0)
+                    and T > 1
+                    and 0 < N <= 1024
+                    and idxo.n_heads in (4, 8)
+                    and idxo.head_dim in (32, 64)
+                    and x.dtype in (mx.float16, mx.bfloat16)
+                )
                 if can_fuse:
-                    iq, iw = idxo._query_weights(x, qr, token_pos, self.freq_cos, self.freq_sin, q_cos, q_sin)
-                    candidates = shared.candidate_blocks if idxo.uses_candidates else None
-                    if idxo.uses_candidates and candidates is None and shared.candidates is not None:
+                    iq, iw = idxo._query_weights(
+                        x, qr, token_pos, self.freq_cos, self.freq_sin, q_cos, q_sin
+                    )
+                    candidates = (
+                        shared.candidate_blocks if idxo.uses_candidates else None
+                    )
+                    if (
+                        idxo.uses_candidates
+                        and candidates is None
+                        and shared.candidates is not None
+                    ):
                         from .kernels.sparse_attention import compact_visible
-                        candidates = compact_visible(shared.candidates[..., ::idxo.candidate_block_size])
+
+                        candidates = compact_visible(
+                            shared.candidates[..., :: idxo.candidate_block_size]
+                        )
                     selection, blocks = fused_index.fused_select(
-                        iq, shared.index_k, iw, reach, idxo.index_topk,
-                        candidates=candidates, candidate_source=idxo.is_candidate_source,
-                        latest=(token_pos + 1) // ratio, block_size=idxo.candidate_block_size,
-                        block_topk=idxo.candidate_topk_blocks)
+                        iq,
+                        shared.index_k,
+                        iw,
+                        reach,
+                        idxo.index_topk,
+                        candidates=candidates,
+                        candidate_source=idxo.is_candidate_source,
+                        latest=(token_pos + 1) // ratio,
+                        block_size=idxo.candidate_block_size,
+                        block_topk=idxo.candidate_topk_blocks,
+                    )
                     shared.sparse_selection = (ratio, selection)
                     shared.keep_mask = None
                     if materialize_keep:
@@ -496,11 +576,26 @@ class Attention(nn.Module):
                         shared.candidate_blocks = blocks
                         shared.candidates = None
                 else:
-                    if idxo.uses_candidates and shared.candidates is None and shared.candidate_blocks is not None:
+                    if (
+                        idxo.uses_candidates
+                        and shared.candidates is None
+                        and shared.candidate_blocks is not None
+                    ):
                         shared.candidates = fused_index.candidate_mask(
-                            shared.candidate_blocks, B, T, N, idxo.candidate_block_size)
+                            shared.candidate_blocks, B, T, N, idxo.candidate_block_size
+                        )
                     keep = self._indexer_dense_selection(
-                        idxo, x, qr, shared, token_pos, reach, ratio, sparse_selection, q_cos, q_sin)
+                        idxo,
+                        x,
+                        qr,
+                        shared,
+                        token_pos,
+                        reach,
+                        ratio,
+                        sparse_selection,
+                        q_cos,
+                        q_sin,
+                    )
                     shared.keep_mask = keep
         else:
             keep = shared.keep_mask
@@ -516,30 +611,60 @@ class Attention(nn.Module):
             if cache is not None:
                 cache.compress_kv[:B, first_group : first_group + kv.shape[1]] = kv
             shared.compress_kv = kv
-        comp = (cache.src_cache.compress_kv[:B, :N] if N else None) if cache is not None else shared.compress_kv
+        comp = (
+            (cache.src_cache.compress_kv[:B, :N] if N else None)
+            if cache is not None
+            else shared.compress_kv
+        )
         return comp, cmask
 
-    def _indexer_dense_selection(self, idxo, x, qr, shared, token_pos, reach, ratio,
-                                 sparse_selection, q_cos, q_sin):
+    def _indexer_dense_selection(
+        self,
+        idxo,
+        x,
+        qr,
+        shared,
+        token_pos,
+        reach,
+        ratio,
+        sparse_selection,
+        q_cos,
+        q_sin,
+    ):
         reach_eff = reach
         if idxo.uses_candidates and shared.candidates is not None:
             reach_eff = reach & shared.candidates
-        sc = idxo.scores(x, qr, shared.index_k, token_pos, reach_eff, self.freq_cos, self.freq_sin,
-                         q_cos=q_cos, q_sin=q_sin)
+        sc = idxo.scores(
+            x,
+            qr,
+            shared.index_k,
+            token_pos,
+            reach_eff,
+            self.freq_cos,
+            self.freq_sin,
+            q_cos=q_cos,
+            q_sin=q_sin,
+        )
         if idxo.is_candidate_source:
             shared.candidates = select_candidate_blocks(
-                sc, (token_pos + 1) // ratio, idxo.candidate_topk_blocks, idxo.candidate_block_size)
+                sc,
+                (token_pos + 1) // ratio,
+                idxo.candidate_topk_blocks,
+                idxo.candidate_block_size,
+            )
             shared.candidate_blocks = None
         elif idxo.uses_candidates and shared.candidates is not None:
             sc = mx.where(shared.candidates, sc, NEG_INF)
         if sparse_selection:
             from .kernels.sparse_attention import select_topk
+
             keep, selection = select_topk(sc, reach, idxo.index_topk)
             shared.sparse_selection = (ratio, selection)
         else:
             keep, _ = _topk_masks(sc, reach, idxo.index_topk, 0, need_idx=False)
             if keep.shape[-1] and mx.default_device() == mx.gpu:
                 from .kernels.sparse_attention import compact_visible
+
                 shared.sparse_selection = (ratio, compact_visible(keep))
         return keep
 
@@ -565,13 +690,15 @@ class Attention(nn.Module):
         vv = mx.maximum(mx.sum(vf * vf, axis=-1, keepdims=True), mx.array(1e-12))
         # [B,T,1] → [B,1,T,1]，对 H 轴广播
         coef = mx.einsum("bhtd,btd->bht", of, vf)[..., None] / vv[:, None]
-        alpha = mx.tanh(self.xsa_alpha).astype(mx.float32).reshape(
-            1, self.n_heads, 1, 1
+        alpha = (
+            mx.tanh(self.xsa_alpha).astype(mx.float32).reshape(1, self.n_heads, 1, 1)
         )
         return (of - alpha * coef * vf[:, None]).astype(o.dtype)
 
     # ------------------------------------------------------------------
-    def __call__(self, x, start_pos: int, shared, cache=None, segment_ids=None, pad_mask=None):
+    def __call__(
+        self, x, start_pos: int, shared, cache=None, segment_ids=None, pad_mask=None
+    ):
         """prefill / 训练路径：窗口与压缩两组掩码拼在一次 sdpa 里做注意力。
 
         两条路径（数学等价，只是可见集的表示方式不同）：
@@ -604,12 +731,30 @@ class Attention(nn.Module):
         token_cs = (c, s)
         if chunked:
             o = self._attend_chunked(
-                q, kv_win, qr, x, token_pos, shared, segment_ids, pad_mask, token_cs,
+                q,
+                kv_win,
+                qr,
+                x,
+                token_pos,
+                shared,
+                segment_ids,
+                pad_mask,
+                token_cs,
             )
         else:
             o = self._attend_dense(
-                q, kv_win, qr, x, token_pos, tpos, shared, cache, start_pos,
-                segment_ids, pad_mask, token_cs,
+                q,
+                kv_win,
+                qr,
+                x,
+                token_pos,
+                tpos,
+                shared,
+                cache,
+                start_pos,
+                segment_ids,
+                pad_mask,
+                token_cs,
             )
         # Gated XSA 在反向旋转之前、对未投影的 [B,H,T,D] 输出做。v 必须取
         # kv_win（query 自己的滑窗 V），不能用 kv_all[:, -T:]——尾部是压缩 latent。
@@ -617,14 +762,583 @@ class Attention(nn.Module):
             o = self._xsa(o, kv_win)
         return self._out_proj(o.transpose(0, 2, 1, 3), token_pos, ch, sh)
 
+    def recurrent(
+        self,
+        x,
+        shared,
+        *,
+        query_positions,
+        memory_positions,
+        query_segment_ids=None,
+        memory_segment_ids=None,
+        query_pad_mask=None,
+        memory_pad_mask=None,
+        cache=None,
+    ):
+        from .kernels.sparse_attention import enabled_for
+
+        window = (self.window_size + self.recurrent_stride - 1) // self.recurrent_stride
+        supported = (
+            self.n_heads == 16
+            and self.head_dim in (64, 128)
+            and mx.default_device() == mx.gpu
+            and x.dtype in (mx.bfloat16, mx.float16)
+        )
+        if (
+            _RECURRENT_OPTIMIZED
+            and _RECURRENT_SPARSE
+            and cache is None
+            and supported
+            and enabled_for(
+                mx.zeros((1, 1, self.n_heads, self.head_dim), x.dtype), window
+            )
+        ):
+            return self._recurrent_fast(
+                x,
+                shared,
+                query_positions=query_positions,
+                memory_positions=memory_positions,
+                query_segment_ids=query_segment_ids,
+                memory_segment_ids=memory_segment_ids,
+                query_pad_mask=query_pad_mask,
+                memory_pad_mask=memory_pad_mask,
+            )
+        return self._recurrent_reference(
+            x,
+            shared,
+            query_positions=query_positions,
+            memory_positions=memory_positions,
+            query_segment_ids=query_segment_ids,
+            memory_segment_ids=memory_segment_ids,
+            query_pad_mask=query_pad_mask,
+            memory_pad_mask=memory_pad_mask,
+            cache=cache,
+        )
+
+    def _recurrent_fast(
+        self,
+        x,
+        shared,
+        *,
+        query_positions,
+        memory_positions,
+        query_segment_ids,
+        memory_segment_ids,
+        query_pad_mask,
+        memory_pad_mask,
+    ):
+        """Same sparse read set, hoisted metadata, original-position fused VJP.
+
+        Metadata is valid only for this exact query/memory coordinate identity.
+        The boundary sample and each reindex validate selection once; reuse
+        stages consume that unchanged validated state without rebuilding gathers.
+        """
+        from .kernels.sparse_attention import indexed_attention
+
+        b, qlen, _ = x.shape
+        memory = shared.compress_kv
+        if self.is_kv_source or self.ratio != 1 or memory is None:
+            raise ValueError(
+                "recurrent fast attention requires a ratio=1 boundary KV consumer"
+            )
+        if memory.shape[0] != b:
+            raise ValueError("recurrent boundary memory batch mismatch")
+        n = memory.shape[1]
+        identity = (
+            query_positions,
+            memory_positions,
+            query_segment_ids,
+            memory_segment_ids,
+            query_pad_mask,
+            memory_pad_mask,
+            memory,
+            shared.index_k,
+            shared.candidates,
+        )
+        meta = shared.recurrent_metadata
+        if meta is None or not all(a is v for a, v in zip(meta["identity"], identity)):
+
+            def field(value, length, fill, dtype):
+                if value is None:
+                    return mx.full((b, length), fill, dtype)
+                if (
+                    value.ndim != 2
+                    or value.shape[0] not in (1, b)
+                    or value.shape[1] != length
+                ):
+                    raise ValueError("recurrent coordinate metadata shape mismatch")
+                return mx.stop_gradient(mx.broadcast_to(value, (b, length)))
+
+            qp = field(query_positions, qlen, 0, mx.int32)
+            mp = field(memory_positions, n, 0, mx.int32)
+            qs = field(query_segment_ids, qlen, 0, mx.int32)
+            ms = field(memory_segment_ids, n, 0, mx.int32)
+            qpad = field(query_pad_mask, qlen, True, mx.bool_)
+            mpad = field(memory_pad_mask, n, True, mx.bool_)
+            meta = dict(
+                identity=identity,
+                qp=qp,
+                mp=mp,
+                qs=qs,
+                ms=ms,
+                qpad=qpad,
+                mpad=mpad,
+                safe_qp=mx.where(qpad, qp, 0),
+                rope={},
+                selection=None,
+                selected=None,
+            )
+            shared.recurrent_metadata = meta
+        if qlen == 0:
+            return mx.zeros_like(x)
+        qp, mp, qs, ms, qpad, mpad = (
+            meta[k] for k in ("qp", "mp", "qs", "ms", "qpad", "mpad")
+        )
+        safe_qp = meta["safe_qp"]
+        # Layer-specific frozen tables may differ in imported checkpoints. Reuse
+        # only this layer's cos/sin across its physical rounds, never other tables.
+        if self.layer_idx not in meta["rope"]:
+            c, s = _cos_sin(self.freq_cos, self.freq_sin, safe_qp, False)
+            meta["rope"][self.layer_idx] = (c, s, c[..., None, :], s[..., None, :])
+        c, s, ch, sh = meta["rope"][self.layer_idx]
+        qr, q = self._q(x, safe_qp, ch, sh)
+        kv = self._window_kv(x, safe_qp, c, s)
+        revalidate = self.is_index_source or meta["selected"] is not shared.topk_idx
+        if self.is_index_source:
+            if shared.index_k is None or shared.index_k.shape[:2] != (b, n):
+                raise ValueError("recurrent reindex requires full boundary index keys")
+            if "reach" not in meta:
+                meta["reach"] = (
+                    (mp[:, None, :] <= qp[..., None])
+                    & (ms[:, None, :] == qs[..., None])
+                    & mpad[:, None, :]
+                    & qpad[..., None]
+                )
+                if self.indexer.uses_candidates:
+                    if shared.candidates is None or shared.candidates.shape != (
+                        b,
+                        qlen,
+                        n,
+                    ):
+                        raise ValueError(
+                            "recurrent reindex requires the fixed boundary candidate pool"
+                        )
+                    meta["effective_reach"] = meta["reach"] & shared.candidates
+                else:
+                    meta["effective_reach"] = meta["reach"]
+            scores = self.indexer.scores(
+                x,
+                qr,
+                shared.index_k,
+                safe_qp,
+                meta["effective_reach"],
+                self.freq_cos,
+                self.freq_sin,
+                q_cos=ch,
+                q_sin=sh,
+            )
+            _, selected = _topk_masks(
+                scores, meta["effective_reach"], self.index_topk, 0
+            )
+        else:
+            selected = shared.topk_idx
+            if selected is None:
+                raise ValueError("recurrent reuse requires a sampled top-k selection")
+            if selected.ndim != 3 or selected.shape[:2] != (b, qlen):
+                raise ValueError("recurrent top-k selection must have shape [B,Q,K]")
+        if revalidate:
+            selected = mx.stop_gradient(selected[..., : self.index_topk])
+            from .kernels import recurrent_metadata
+
+            fused_meta = _RECURRENT_METADATA_FUSED and recurrent_metadata.supported(
+                selected, qp, mp, qs, ms, qpad, mpad
+            )
+            compact = None
+            if fused_meta:
+                selected, compact = recurrent_metadata.validate_compact(
+                    selected, qp, mp, qs, ms, qpad, mpad
+                )
+            elif n and selected.shape[-1]:
+                safe = mx.stop_gradient(mx.clip(selected, 0, n - 1))
+                kp = mx.take_along_axis(mp[:, None, :], safe, axis=2)
+                ks = mx.take_along_axis(ms[:, None, :], safe, axis=2)
+                kpad = mx.take_along_axis(mpad[:, None, :], safe, axis=2)
+                good = (
+                    (selected >= 0)
+                    & (selected < n)
+                    & (kp <= qp[..., None])
+                    & (ks == qs[..., None])
+                    & kpad
+                    & qpad[..., None]
+                )
+                selected = mx.where(good, selected, -1).astype(mx.int32)
+            if selected.shape[-1] < self.index_topk:
+                selected = mx.concatenate(
+                    [
+                        selected,
+                        mx.full(
+                            (b, qlen, self.index_topk - selected.shape[-1]),
+                            -1,
+                            mx.int32,
+                        ),
+                    ],
+                    axis=-1,
+                )
+            shared.topk_idx = mx.stop_gradient(selected)
+            if compact is None:
+                ordered = mx.sort(mx.where(selected >= 0, selected, n), axis=-1)[
+                    ..., : min(n, self.index_topk)
+                ]
+                lengths = (
+                    mx.sum(ordered < n, axis=-1).astype(mx.int32).reshape(b * qlen)
+                )
+                indices = (
+                    mx.where(ordered < n, ordered, -1)
+                    .astype(mx.int32)
+                    .reshape(b * qlen, -1)
+                )
+                compact = (mx.stop_gradient(indices), mx.stop_gradient(lengths))
+            meta["selection"] = compact
+            meta["selected"] = shared.topk_idx
+        shared.keep_mask = None
+        shared.sparse_selection = (
+            None  # optimized compact-K metadata is not the legacy padded-N format
+        )
+        window = (self.window_size + self.recurrent_stride - 1) // self.recurrent_stride
+        o = indexed_attention(
+            q,
+            kv,
+            memory,
+            None,
+            qs,
+            qpad,
+            self.attn_sink,
+            window,
+            self.softmax_scale,
+            selection=meta["selection"],
+            query_positions=qp,
+            token_window_size=self.window_size,
+        )
+        if self.xsa_alpha is not None:
+            o = self._xsa(o, kv)
+        result = self._out_proj(o.transpose(0, 2, 1, 3), safe_qp, ch, sh)
+        return mx.where(qpad[..., None], result, 0)
+
+    def _recurrent_reference(
+        self,
+        x,
+        shared,
+        *,
+        query_positions,
+        memory_positions,
+        query_segment_ids=None,
+        memory_segment_ids=None,
+        query_pad_mask=None,
+        memory_pad_mask=None,
+        cache=None,
+    ):
+        """Explicit-position CED consumer with independent query/memory lengths.
+
+        The boundary's rotated ``compress_kv`` and ``index_k`` remain immutable.
+        ``topk_idx`` contains zero-based memory indices (no window offset), or a
+        sampled ``keep_mask`` can seed the first call. Reindex layers replace
+        only this selection; their candidate pool is fixed by the boundary.
+
+        Self KV belongs to this physical (round, layer) call. A caller-provided
+        dict caches its own latent history, including document/pad metadata.
+        Window visibility is measured in original token positions, NOT latent
+        indices. Attention gathers at most window_size + index_topk keys per
+        query; a dense reach mask and the original indexer scoring are metadata
+        work, not an additional dense evidence-attention branch.
+        """
+        if self.is_kv_source or self.ratio != 1:
+            raise ValueError("recurrent attention requires a ratio=1 CED consumer")
+        B, Q, _ = x.shape
+        cached_selection = shared.sparse_selection
+        memory = shared.compress_kv
+        if memory is None or memory.shape[0] != B:
+            raise ValueError("recurrent attention requires full boundary memory")
+        N = memory.shape[1]
+
+        def metadata(value, length, fill, dtype, name):
+            if value is None:
+                return mx.full((B, length), fill, dtype=dtype)
+            if (
+                value.ndim != 2
+                or value.shape[-1] != length
+                or value.shape[0] not in (1, B)
+            ):
+                raise ValueError(f"{name} must have shape [B,{length}] or [1,{length}]")
+            return mx.stop_gradient(mx.broadcast_to(value, (B, length)))
+
+        qp = metadata(query_positions, Q, 0, mx.int32, "query_positions")
+        mp = metadata(memory_positions, N, 0, mx.int32, "memory_positions")
+        qs = metadata(query_segment_ids, Q, 0, mx.int32, "query_segment_ids")
+        ms = metadata(memory_segment_ids, N, 0, mx.int32, "memory_segment_ids")
+        qpad = metadata(query_pad_mask, Q, True, mx.bool_, "query_pad_mask")
+        mpad = metadata(memory_pad_mask, N, True, mx.bool_, "memory_pad_mask")
+        if Q == 0:
+            return mx.zeros_like(x)
+        # Invalid rectangular packing slots must never index RoPE with -1.
+        safe_qp = mx.where(qpad, qp, 0)
+        c, s = _cos_sin(self.freq_cos, self.freq_sin, safe_qp, False)
+        ch, sh = c[..., None, :], s[..., None, :]
+        qr, q = self._q(x, safe_qp, ch, sh)
+        kv_new = self._window_kv(x, safe_qp, c, s)
+
+        history = (kv_new, qp, qs, qpad)
+        if cache is not None:
+            if cache.get("layer_idx", self.layer_idx) != self.layer_idx:
+                raise ValueError(
+                    "a recurrent self-KV cache cannot be shared across layers"
+                )
+            old = cache.get("history")
+            if old is not None:
+                if old[0].shape[0] != B:
+                    raise ValueError(
+                        "recurrent cache batch size changed; start a fresh cache"
+                    )
+                history = tuple(
+                    mx.concatenate([a, b], axis=1) for a, b in zip(old, history)
+                )
+            cache["layer_idx"] = self.layer_idx
+            # At most W distinct original-token positions can lie in a span W.
+            # Compact per batch so rectangular padding never evicts valid keys.
+            L = history[0].shape[1]
+            K = min(max(self.window_size, 0), L)
+            if K:
+                slots = mx.where(history[3], mx.arange(L, dtype=mx.int32), -1)
+                last = mx.sort(
+                    mx.partition(slots, kth=L - K, axis=-1)[..., -K:], axis=-1
+                )
+                take = mx.stop_gradient(mx.maximum(last, 0))
+                retained = tuple(
+                    mx.take_along_axis(
+                        a, take[..., None] if a.ndim == 3 else take, axis=1
+                    )
+                    for a in history
+                )
+                cache["history"] = (*retained[:3], retained[3] & (last >= 0))
+            else:
+                cache["history"] = tuple(a[:, :0] for a in history)
+        kv_history, hp, hs, hpad = history
+        reach = None
+        if self.is_index_source:
+            reach = (
+                (mp[:, None, :] <= qp[:, :, None])
+                & (ms[:, None, :] == qs[:, :, None])
+                & mpad[:, None, :]
+                & qpad[:, :, None]
+            )
+            if shared.index_k is None or shared.index_k.shape[:2] != (B, N):
+                raise ValueError("recurrent reindex requires full boundary index keys")
+            effective = reach
+            if self.indexer.uses_candidates:
+                if shared.candidates is None:
+                    raise ValueError(
+                        "sample the boundary candidate pool before recurrent reindex"
+                    )
+                if shared.candidates.shape != (B, Q, N):
+                    raise ValueError("recurrent candidates must have shape [B,Q,N]")
+                effective = effective & shared.candidates
+            scores = self.indexer.scores(
+                x,
+                qr,
+                shared.index_k,
+                safe_qp,
+                effective,
+                self.freq_cos,
+                self.freq_sin,
+                q_cos=ch,
+                q_sin=sh,
+            )
+            _, selected = _topk_masks(scores, effective, self.index_topk, 0)
+        elif shared.topk_idx is not None:
+            selected = mx.stop_gradient(shared.topk_idx)
+            if selected.shape[:2] != (B, Q):
+                raise ValueError("recurrent topk_idx must have shape [B,Q,K]")
+            selected = selected[..., : self.index_topk]
+        elif shared.keep_mask is not None:
+            if shared.keep_mask.shape != (B, Q, N):
+                raise ValueError("recurrent keep_mask must have shape [B,Q,N]")
+            selected = self._bounded_visible_indices(shared.keep_mask, self.index_topk)
+        else:
+            raise ValueError("recurrent reuse requires the boundary's sparse selection")
+        # Recheck positions, documents, and padding even for a carried selection.
+        # This also prevents accidentally interpreting legacy window-offset ids.
+        selected = mx.stop_gradient(selected)
+        if N and selected.shape[-1]:
+            safe = mx.stop_gradient(mx.clip(selected, 0, N - 1))
+            key_positions = mx.take_along_axis(mp[:, None, :], safe, axis=2)
+            key_docs = mx.take_along_axis(ms[:, None, :], safe, axis=2)
+            key_pad = mx.take_along_axis(mpad[:, None, :], safe, axis=2)
+            valid = (
+                (selected >= 0)
+                & (selected < N)
+                & (key_positions <= qp[..., None])
+                & (key_docs == qs[..., None])
+                & key_pad
+                & qpad[..., None]
+            )
+            selected = mx.where(valid, selected, -1).astype(mx.int32)
+        else:
+            selected = mx.full((B, Q, 0), -1, dtype=mx.int32)
+        if selected.shape[-1] < self.index_topk:
+            selected = mx.concatenate(
+                [
+                    selected,
+                    mx.full((B, Q, self.index_topk - selected.shape[-1]), -1, mx.int32),
+                ],
+                axis=-1,
+            )
+        shared.topk_idx = mx.stop_gradient(selected)
+        # Sparse metadata is the authoritative control state on this path.
+        # Avoid reconstructing a Q x N mask after every reuse block.
+        shared.keep_mask = None
+        shared.sparse_selection = None
+
+        from .kernels.sparse_attention import enabled_for, indexed_attention
+
+        latent_window = (
+            self.window_size + self.recurrent_stride - 1
+        ) // self.recurrent_stride
+        if (
+            cache is None
+            and _RECURRENT_SPARSE
+            and query_pad_mask is None
+            and memory_pad_mask is None
+            and memory_segment_ids is None
+            and enabled_for(q, latent_window)
+        ):
+            # The existing kernel already separates query count Q and evidence
+            # count N. An unpadded single-document anchor sequence makes its
+            # W-slot window exactly the original-token span ceil(W/k). Explicit
+            # masks retain the position-aware path, including interior PAD gaps.
+            if (
+                not self.is_index_source
+                and cached_selection is not None
+                and cached_selection[1][0].shape == (B * Q, N)
+            ):
+                selection = cached_selection[1]
+            else:
+                ordered = mx.sort(mx.where(selected >= 0, selected, N), axis=-1)[
+                    ..., :N
+                ]
+                lengths = mx.sum(ordered < N, axis=-1).astype(mx.int32).reshape(B * Q)
+                ordered = mx.where(ordered < N, ordered, -1)
+                if ordered.shape[-1] < N:
+                    ordered = mx.concatenate(
+                        [ordered, mx.full((B, Q, N - ordered.shape[-1]), -1, mx.int32)],
+                        axis=-1,
+                    )
+                selection = (
+                    mx.stop_gradient(ordered.reshape(B * Q, N)),
+                    mx.stop_gradient(lengths),
+                )
+            shared.sparse_selection = (1, selection)
+            o = indexed_attention(
+                q,
+                kv_new,
+                memory,
+                None,
+                qs,
+                qpad,
+                self.attn_sink,
+                latent_window,
+                self.softmax_scale,
+                selection=selection,
+            )
+            if self.xsa_alpha is not None:
+                o = self._xsa(o, kv_new)
+            result = self._out_proj(o.transpose(0, 2, 1, 3), safe_qp, ch, sh)
+            return mx.where(qpad[..., None], result, 0)
+
+        # Canonical anchor plans are chronological, at least k original tokens
+        # apart, with padding only at the tail. Enumerate the bounded preceding
+        # slots directly; avoid a Q x Q mask plus sort in every physical call.
+        length = kv_history.shape[1]
+        width = min(
+            length,
+            (self.window_size + self.recurrent_stride - 1) // self.recurrent_stride,
+        )
+        offsets = (
+            length - Q + mx.arange(Q)[:, None] - mx.arange(width - 1, -1, -1)[None, :]
+        )
+        candidate = mx.broadcast_to(offsets[None], (B, Q, width))
+        safe_window = mx.stop_gradient(mx.maximum(candidate, 0))
+        wp = mx.take_along_axis(hp[:, None, :], safe_window, axis=2)
+        ws = mx.take_along_axis(hs[:, None, :], safe_window, axis=2)
+        wpad = mx.take_along_axis(hpad[:, None, :], safe_window, axis=2)
+        win_visible = (
+            (candidate >= 0)
+            & (wp <= qp[..., None])
+            & (wp > qp[..., None] - self.window_size)
+            & (ws == qs[..., None])
+            & wpad
+            & qpad[..., None]
+        )
+        win_idx = mx.stop_gradient(mx.where(win_visible, candidate, -1))
+        win_kv = self._gather_recurrent_pool(kv_history, win_idx)
+        evidence_kv = self._gather_recurrent_pool(memory, selected)
+        gathered = mx.concatenate([win_kv, evidence_kv], axis=2)
+        valid = mx.concatenate([win_idx >= 0, selected >= 0], axis=-1)
+        width = gathered.shape[2]
+        if width == 0:
+            return mx.zeros_like(x)
+        # Each query has its own gathered key pool. Flatten only the batch and
+        # query axes, retaining one query and all heads in each SDPA invocation.
+        keys = gathered.reshape(B * Q, 1, width, self.head_dim)
+        o = (
+            mx.fast.scaled_dot_product_attention(
+                q.reshape(B * Q, self.n_heads, 1, self.head_dim),
+                keys,
+                keys,
+                scale=self.softmax_scale,
+                mask=valid.reshape(B * Q, 1, 1, width),
+                sinks=self.attn_sink,
+            )
+            .reshape(B, Q, self.n_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        if self.xsa_alpha is not None:
+            o = self._xsa(o, kv_new)
+        result = self._out_proj(o.transpose(0, 2, 1, 3), safe_qp, ch, sh)
+        return mx.where(qpad[..., None], result, 0)
+
+    @staticmethod
+    def _bounded_visible_indices(visible, budget):
+        """Compact a Boolean visibility set into at most budget ordered slots."""
+        B, Q, N = visible.shape
+        K = min(max(int(budget), 0), N)
+        if K == 0:
+            return mx.zeros((B, Q, 0), dtype=mx.int32)
+        slots = mx.where(visible, mx.arange(N, dtype=mx.int32), N)
+        chosen = mx.sort(mx.partition(slots, kth=K - 1, axis=-1)[..., :K], axis=-1)
+        return mx.stop_gradient(mx.where(chosen < N, chosen, -1).astype(mx.int32))
+
+    @staticmethod
+    def _gather_recurrent_pool(pool, indices):
+        if indices.shape[-1] == 0:
+            return mx.zeros((*indices.shape, pool.shape[-1]), dtype=pool.dtype)
+        return mx.take_along_axis(
+            pool[:, None, :, :],
+            mx.stop_gradient(mx.maximum(indices, 0))[..., None],
+            axis=2,
+        )
+
     # ------------------------------------------------------------------
-    def _attend_chunked(self, q, kv_win, qr, x, token_pos, shared, segment_ids, pad_mask,
-                        token_cs=None):
+    def _attend_chunked(
+        self, q, kv_win, qr, x, token_pos, shared, segment_ids, pad_mask, token_cs=None
+    ):
         """训练路径：query 分块，滑窗 key 只取相邻两块。返回 [B,H,T,D]。"""
         B, T, _ = x.shape
         W = self.window_size
         C = T // W
-        from .kernels.sparse_attention import enabled_for, indexed_attention, topk_enabled
+        from .kernels.sparse_attention import (
+            enabled_for,
+            indexed_attention,
+            topk_enabled,
+        )
         from .kernels import indexer_select as fused_index
 
         use_sparse = enabled_for(q, W)
@@ -641,13 +1355,28 @@ class Attention(nn.Module):
                 and sel[1][0].shape == (B * T, shared.compress_kv.shape[1])
             ):
                 return indexed_attention(
-                    q, kv_win, shared.compress_kv, shared.keep_mask,
-                    segment_ids, pad_mask, self.attn_sink,
-                    W, self.softmax_scale, selection=sel[1],
+                    q,
+                    kv_win,
+                    shared.compress_kv,
+                    shared.keep_mask,
+                    segment_ids,
+                    pad_mask,
+                    self.attn_sink,
+                    W,
+                    self.softmax_scale,
+                    selection=sel[1],
                 )
             comp, cmask = self._compress_dense(
-                x, qr, token_pos, shared, None, 0, segment_ids, pad_mask,
-                sparse_selection=use_sparse and (topk_enabled() or fused_index._ENABLED),
+                x,
+                qr,
+                token_pos,
+                shared,
+                None,
+                0,
+                segment_ids,
+                pad_mask,
+                sparse_selection=use_sparse
+                and (topk_enabled() or fused_index._ENABLED),
                 token_cs=token_cs,
             )
         else:
@@ -660,8 +1389,16 @@ class Attention(nn.Module):
                 if ratio == self.ratio and metadata[0].shape == (B * T, comp.shape[1]):
                     selection = metadata
             return indexed_attention(
-                q, kv_win, comp, cmask, segment_ids, pad_mask, self.attn_sink,
-                W, self.softmax_scale, selection=selection,
+                q,
+                kv_win,
+                comp,
+                cmask,
+                segment_ids,
+                pad_mask,
+                self.attn_sink,
+                W,
+                self.softmax_scale,
+                selection=selection,
             )
 
         kc = kv_win.reshape(B, C, W, kv_win.shape[-1])
@@ -696,7 +1433,12 @@ class Attention(nn.Module):
         if comp is not None:
             N = comp.shape[1]
             k_all = mx.concatenate(
-                [k_win, mx.broadcast_to(comp[:, None, None], (B, C, 1, N, comp.shape[-1])).reshape(B, C, N, comp.shape[-1])],
+                [
+                    k_win,
+                    mx.broadcast_to(
+                        comp[:, None, None], (B, C, 1, N, comp.shape[-1])
+                    ).reshape(B, C, N, comp.shape[-1]),
+                ],
                 axis=2,
             )
             win = mx.concatenate([win, cmask.reshape(B, C, W, N)], axis=-1)
@@ -720,12 +1462,33 @@ class Attention(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    def _attend_dense(self, q, kv_win, qr, x, token_pos, tpos, shared, cache, start_pos,
-                      segment_ids, pad_mask, token_cs=None):
+    def _attend_dense(
+        self,
+        q,
+        kv_win,
+        qr,
+        x,
+        token_pos,
+        tpos,
+        shared,
+        cache,
+        start_pos,
+        segment_ids,
+        pad_mask,
+        token_cs=None,
+    ):
         """解码 / 分块 prefill / T 不整除：全 T 滑窗 key + 掩码（原路径）。"""
-        from .kernels import decode_metadata as decode_kernels, indexer_select as fused_index
-        fused_prefill = (decode_kernels._PREFILL_SELECT and cache is not None and start_pos == 0
-                         and mx.default_device() == mx.gpu)
+        from .kernels import (
+            decode_metadata as decode_kernels,
+            indexer_select as fused_index,
+        )
+
+        fused_prefill = (
+            decode_kernels._PREFILL_SELECT
+            and cache is not None
+            and start_pos == 0
+            and mx.default_device() == mx.gpu
+        )
         T = q.shape[1]
         L = 0
         kv_hist = None
@@ -745,29 +1508,42 @@ class Attention(nn.Module):
                 slots = (start_pos + T - n + mx.arange(n)) % self.window_size
                 cache.window[:, slots] = kv_win[:, T - n :]
 
-        visible = (pos_all[None, :] <= tpos[:, None]) & (pos_all[None, :] > tpos[:, None] - self.window_size)
+        visible = (pos_all[None, :] <= tpos[:, None]) & (
+            pos_all[None, :] > tpos[:, None] - self.window_size
+        )
         if segment_ids is not None:
             if start_pos != 0:
                 raise ValueError("segment_ids 只在整段 prefill（start_pos=0）时支持")
             visible = visible & (segment_ids[:, None, :] == segment_ids[:, :, None])
         if pad_mask is not None:
             visible = visible & pad_mask[:, None, :]
-        mask = visible[None, None, :, :] if visible.ndim == 2 else visible[:, None, :, :]
+        mask = (
+            visible[None, None, :, :] if visible.ndim == 2 else visible[:, None, :, :]
+        )
 
         if self.ratio > 0:
             # cmask 已在 _compress_dense 里算完（基础可达 × doc/pad × top-k）
             comp, cmask = self._compress_dense(
-                x, qr, token_pos, shared, cache, start_pos, segment_ids, pad_mask,
+                x,
+                qr,
+                token_pos,
+                shared,
+                cache,
+                start_pos,
+                segment_ids,
+                pad_mask,
                 sparse_selection=fused_prefill and fused_index._ENABLED,
-                token_cs=token_cs, materialize_keep=fused_prefill,
+                token_cs=token_cs,
+                materialize_keep=fused_prefill,
             )
             if comp is not None:
                 kv_all = mx.concatenate([kv_all, comp], axis=1)
-                cm = cmask[None, None, :, :] if cmask.ndim == 2 else cmask[:, None, :, :]
+                cm = (
+                    cmask[None, None, :, :] if cmask.ndim == 2 else cmask[:, None, :, :]
+                )
                 if mask.shape[0] != cm.shape[0]:
                     mask = mx.broadcast_to(mask, (cm.shape[0],) + mask.shape[1:])
                 mask = mx.concatenate([mask, cm], axis=-1)
-
 
         return mx.fast.scaled_dot_product_attention(
             q.transpose(0, 2, 1, 3),
@@ -791,6 +1567,7 @@ class Attention(nn.Module):
         """
         B, T, _ = x.shape
         from .kernels import decode_metadata as decode_kernels
+
         if T != 1:
             raise ValueError("decode 只接受单 token")
         if shared.pool_tokens is None:
@@ -810,10 +1587,14 @@ class Attention(nn.Module):
         cache.window[bidx, start_pos % self.window_size] = kv_new[:, 0]
 
         if shared.win_idx is None:
-            win_pos = start_pos[:, None] - (self.window_size - 1) + mx.arange(self.window_size)[None, :]
-            shared.win_idx = mx.where(
-                win_pos >= 0, win_pos % self.window_size, -1
-            )[:, None, :].astype(mx.int32)
+            win_pos = (
+                start_pos[:, None]
+                - (self.window_size - 1)
+                + mx.arange(self.window_size)[None, :]
+            )
+            shared.win_idx = mx.where(win_pos >= 0, win_pos % self.window_size, -1)[
+                :, None, :
+            ].astype(mx.int32)
         win_idx = shared.win_idx
         comp_idx = None
 
@@ -860,13 +1641,22 @@ class Attention(nn.Module):
                 if idxo.owns_k and n_max:
                     shared.index_k = cache.index_k[:, :n_max]
                 if n_max:
-                    reach = (mx.arange(n_max)[None, :] < N[:, None])[:, None, :]  # [B,1,N]
+                    reach = (mx.arange(n_max)[None, :] < N[:, None])[
+                        :, None, :
+                    ]  # [B,1,N]
                     reach_eff = reach
                     if idxo.uses_candidates and shared.candidates is not None:
                         reach_eff = reach & shared.candidates
                     sc = idxo.scores(
-                        x, qr, shared.index_k, token_pos, reach_eff, self.freq_cos, self.freq_sin,
-                        q_cos=ch, q_sin=sh,
+                        x,
+                        qr,
+                        shared.index_k,
+                        token_pos,
+                        reach_eff,
+                        self.freq_cos,
+                        self.freq_sin,
+                        q_cos=ch,
+                        q_sin=sh,
                     )
                     if idxo.is_candidate_source:
                         shared.candidates = select_candidate_blocks(
@@ -875,7 +1665,9 @@ class Attention(nn.Module):
                     elif idxo.uses_candidates and shared.candidates is not None:
                         sc = mx.where(shared.candidates, sc, NEG_INF)
                     if decode_kernels._ENABLED and mx.default_device() == mx.gpu:
-                        comp_idx = decode_kernels.topk_indices(sc, reach, idxo.index_topk, offset)
+                        comp_idx = decode_kernels.topk_indices(
+                            sc, reach, idxo.index_topk, offset
+                        )
                     else:
                         _, comp_idx = _topk_masks(sc, reach, idxo.index_topk, offset)
                     shared.topk_idx = comp_idx
@@ -888,10 +1680,16 @@ class Attention(nn.Module):
             comp_idx = mx.zeros((B, 1, 0), dtype=mx.int32)
         if decode_kernels._ENABLED and mx.default_device() == mx.gpu:
             gathered, valid_slots = decode_kernels.gather_pools(
-                cache.window, cache.src_cache.compress_kv, win_idx, comp_idx)
+                cache.window, cache.src_cache.compress_kv, win_idx, comp_idx
+            )
             o = mx.fast.scaled_dot_product_attention(
-                q.transpose(0, 2, 1, 3), gathered, gathered, scale=self.softmax_scale,
-                mask=valid_slots[:, None, :, :], sinks=self.attn_sink)
+                q.transpose(0, 2, 1, 3),
+                gathered,
+                gathered,
+                scale=self.softmax_scale,
+                mask=valid_slots[:, None, :, :],
+                sinks=self.attn_sink,
+            )
             if self.xsa_alpha is not None:
                 o = self._xsa(o, kv_new[:, 0][:, None])
             return self._out_proj(o.transpose(0, 2, 1, 3), token_pos, ch, sh)

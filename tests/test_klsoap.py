@@ -36,7 +36,11 @@ def maxdiff(a, b):
 
 
 def get_state(opt, path):
-    return {k[len(path) + 1:]: v for k, v in tree_flatten(opt.state) if k.startswith(path + ".")}
+    return {
+        k[len(path) + 1 :]: v
+        for k, v in tree_flatten(opt.state)
+        if k.startswith(path + ".")
+    }
 
 
 def test_factor_accumulation_reference():
@@ -163,7 +167,8 @@ def test_wiring():
     opt1.update(model2, grads)
     mx.eval(model2.parameters())
     finite = all(
-        bool(mx.all(mx.isfinite(v)).item()) for _, v in tree_flatten(model2.parameters())
+        bool(mx.all(mx.isfinite(v)).item())
+        for _, v in tree_flatten(model2.parameters())
     )
     check("klsoap 真实模型一步后参数有限", finite)
 

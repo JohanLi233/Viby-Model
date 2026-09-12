@@ -1,4 +1,5 @@
 """Bit-exact score/keep checks against the original-order dense Metal path."""
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -35,7 +36,7 @@ def assert_selection(selection, keep):
     for row in range(ids.shape[0]):
         target = np.flatnonzero(expected[row])
         assert lengths[row] == len(target)
-        np.testing.assert_array_equal(ids[row, :lengths[row]], target)
+        np.testing.assert_array_equal(ids[row, : lengths[row]], target)
 
 
 @pytest.mark.parametrize("b,t,n,h,d", [(2, 19, 47, 4, 32), (1, 256, 1024, 8, 64)])
@@ -59,8 +60,17 @@ def test_candidate_source_and_disjoint_compact_lists(cb):
     latest = mx.broadcast_to(mx.arange(t)[None, :] * 3, (b, t))
     dense = ix.indexer_score(q, k, w, reach)
     keep, _ = _topk_masks(dense, reach, 5, 0, need_idx=False)
-    selected, candidates = fs.fused_select(q, k, w, reach, 5, candidate_source=True,
-                                           latest=latest, block_size=cb, block_topk=2)
+    selected, candidates = fs.fused_select(
+        q,
+        k,
+        w,
+        reach,
+        5,
+        candidate_source=True,
+        latest=latest,
+        block_size=cb,
+        block_topk=2,
+    )
     assert_selection(selected, keep)
     mask = fs.candidate_mask(candidates, b, t, n, cb)
     ref_mask = select_candidate_blocks(dense, latest, 2, cb)
@@ -70,7 +80,9 @@ def test_candidate_source_and_disjoint_compact_lists(cb):
     q2 = q * 0.5
     dense2 = ix.indexer_score(q2, k, w, reach & mask)
     expected, _ = _topk_masks(dense2, reach, 5, 0, need_idx=False)
-    selected, _ = fs.fused_select(q2, k, w, reach, 5, candidates=candidates, block_size=cb)
+    selected, _ = fs.fused_select(
+        q2, k, w, reach, 5, candidates=candidates, block_size=cb
+    )
     assert_selection(selected, expected)
 
 
@@ -89,18 +101,30 @@ def test_compact_scores_vjp_scatter_to_global_keys():
     b, t, n, cb = 2, 9, 47, 7
     q, k, w, reach = inputs(b, t, n, 4, 32, mx.float16)
     nb = (n + cb - 1) // cb
-    ids = mx.broadcast_to(mx.array([0, 3, 6, -123, -123, -123, -123], mx.int32), (b * t, nb))
+    ids = mx.broadcast_to(
+        mx.array([0, 3, 6, -123, -123, -123, -123], mx.int32), (b * t, nb)
+    )
     lengths = (mx.arange(b * t) % 4).astype(mx.int32)
     mask = fs.candidate_mask((ids, lengths), b, t, n, cb)
-    values, actual_lengths = fs.score_candidate_blocks(q, k, w, reach, (ids, lengths), cb)
+    values, actual_lengths = fs.score_candidate_blocks(
+        q, k, w, reach, (ids, lengths), cb
+    )
     dense = ix.indexer_score(q, k, w, reach & mask)
     mx.eval(values, actual_lengths, dense)
     for row in range(b * t):
         count = lengths[row].item()
-        gids = np.concatenate([np.arange(j * cb, min(n, (j + 1) * cb)) for j in [0, 3, 6][:count]]) if count else np.array([], int)
+        gids = (
+            np.concatenate(
+                [np.arange(j * cb, min(n, (j + 1) * cb)) for j in [0, 3, 6][:count]]
+            )
+            if count
+            else np.array([], int)
+        )
         assert actual_lengths[row].item() == len(gids)
-        np.testing.assert_array_equal(np.asarray(values).reshape(b * t, n)[row, :len(gids)],
-                                      np.asarray(dense).reshape(b * t, n)[row, gids])
+        np.testing.assert_array_equal(
+            np.asarray(values).reshape(b * t, n)[row, : len(gids)],
+            np.asarray(dense).reshape(b * t, n)[row, gids],
+        )
 
     def compact_loss(a, kk, ww):
         scores, lens = fs.score_candidate_blocks(a, kk, ww, reach, (ids, lengths), cb)
@@ -114,7 +138,12 @@ def test_compact_scores_vjp_scatter_to_global_keys():
     gd = mx.grad(dense_loss, argnums=(0, 1, 2))(q, k, w)
     mx.eval(gc, gd)
     for a, z in zip(gc, gd):
-        np.testing.assert_allclose(np.asarray(a.astype(mx.float32)), np.asarray(z.astype(mx.float32)), rtol=3e-3, atol=3e-3)
+        np.testing.assert_allclose(
+            np.asarray(a.astype(mx.float32)),
+            np.asarray(z.astype(mx.float32)),
+            rtol=3e-3,
+            atol=3e-3,
+        )
 
 
 def test_full_reuse_reindex_attention_compiled(monkeypatch):
@@ -126,12 +155,20 @@ def test_full_reuse_reindex_attention_compiled(monkeypatch):
 
     mx.set_default_device(mx.gpu)
     mx.random.seed(3)
-    cfg = cfg_mix(n_heads=16, head_dim=64, window_size=8, index_n_heads=4,
-                  index_head_dim=32, candidate_block_size=7, candidate_topk_blocks=2, index_topk=5)
+    cfg = cfg_mix(
+        n_heads=16,
+        head_dim=64,
+        window_size=8,
+        index_n_heads=4,
+        index_head_dim=32,
+        candidate_block_size=7,
+        candidate_topk_blocks=2,
+        index_topk=5,
+    )
     layers = [Attention(cfg, i) for i in (3, 4, 5)]
     for layer in layers:
         layer.update(tree_map(lambda a: a.astype(mx.bfloat16), layer.parameters()))
-    prewarm_sparse_attention(64, 8, 64 ** -0.5)
+    prewarm_sparse_attention(64, 8, 64**-0.5)
     prewarm_topk(32)
     fs._kernel()
     x = mx.random.normal((2, 32, cfg.dim)).astype(mx.bfloat16)
@@ -151,5 +188,12 @@ def test_full_reuse_reindex_attention_compiled(monkeypatch):
         result = run(x)
         mx.eval(result)
         results.append(result)
-    for a, z in zip((results[0][0][0], results[0][1][0]), (results[1][0][0], results[1][1][0])):
-        np.testing.assert_allclose(np.asarray(a.astype(mx.float32)), np.asarray(z.astype(mx.float32)), rtol=1e-2, atol=1e-2)
+    for a, z in zip(
+        (results[0][0][0], results[0][1][0]), (results[1][0][0], results[1][1][0])
+    ):
+        np.testing.assert_allclose(
+            np.asarray(a.astype(mx.float32)),
+            np.asarray(z.astype(mx.float32)),
+            rtol=1e-2,
+            atol=1e-2,
+        )

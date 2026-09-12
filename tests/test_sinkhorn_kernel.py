@@ -1,16 +1,19 @@
 """Fused Sinkhorn against the original graph, including the epsilon-aware VJP."""
+
 import mlx.core as mx
 import numpy as np
 import pytest
 
 from model.kernels.sinkhorn_fused import (
-    prewarm_sinkhorn, sinkhorn_fused, sinkhorn_ref,
+    prewarm_sinkhorn,
+    sinkhorn_fused,
+    sinkhorn_ref,
 )
 
 
-@pytest.mark.parametrize('iters', [1, 5, 20])
-@pytest.mark.parametrize('eps', [1e-6, 0.1])
-@pytest.mark.parametrize('scale', [0.0, 3.0, 80.0])
+@pytest.mark.parametrize("iters", [1, 5, 20])
+@pytest.mark.parametrize("eps", [1e-6, 0.1])
+@pytest.mark.parametrize("scale", [0.0, 3.0, 80.0])
 def test_sinkhorn_forward_and_vjp(iters, eps, scale):
     mx.random.seed(823)
     # Transposed input checks Metal's contiguous-input handling as well.
@@ -21,6 +24,7 @@ def test_sinkhorn_forward_and_vjp(iters, eps, scale):
     def run(fn):
         def loss(a):
             return mx.sum(fn(a, iters, eps) * g)
+
         return mx.compile(lambda a: (fn(a, iters, eps), mx.grad(loss)(a)))(x)
 
     ref, dr = run(sinkhorn_ref)
@@ -32,4 +36,6 @@ def test_sinkhorn_forward_and_vjp(iters, eps, scale):
 
 def test_sinkhorn_reference_fallback():
     x = mx.ones((2, 3, 3), mx.float32)
-    np.testing.assert_array_equal(sinkhorn_fused(x, 20, 1e-6), sinkhorn_ref(x, 20, 1e-6))
+    np.testing.assert_array_equal(
+        sinkhorn_fused(x, 20, 1e-6), sinkhorn_ref(x, 20, 1e-6)
+    )

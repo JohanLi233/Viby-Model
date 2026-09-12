@@ -15,14 +15,23 @@ import numpy as np
 
 from _v41_common import cfg_tiny, tiny_model
 from model.block import apply_hc_pre_norm
-from model.hc import HyperConnection, hc_post, hc_pre, hc_split, identity_pre_mix, sinkhorn
+from model.hc import (
+    HyperConnection,
+    hc_post,
+    hc_pre,
+    hc_split,
+    identity_pre_mix,
+    sinkhorn,
+)
 
 import mlx.core as mx
 
 
 def _dev(c):
-    return (float(np.abs(np.asarray(c.sum(axis=-1)) - 1).max()),
-            float(np.abs(np.asarray(c.sum(axis=-2)) - 1).max()))
+    return (
+        float(np.abs(np.asarray(c.sum(axis=-1)) - 1).max()),
+        float(np.abs(np.asarray(c.sum(axis=-2)) - 1).max()),
+    )
 
 
 def test_sinkhorn_is_nonnegative_and_converges():
@@ -65,7 +74,9 @@ def test_identity_start_with_zero_mix_weights():
     """把混合矩阵清零 → 严格回到标准 pre-norm 残差起点（式 (2) 的恒等解）。"""
     hc_mult = 4
     cfg = cfg_tiny(hc_mult=hc_mult)
-    hc = HyperConnection(cfg.dim, hc_mult, cfg.hc_sinkhorn_iters, cfg.hc_eps, cfg.norm_eps)
+    hc = HyperConnection(
+        cfg.dim, hc_mult, cfg.hc_sinkhorn_iters, cfg.hc_eps, cfg.norm_eps
+    )
     hc.fn.weight = mx.zeros_like(hc.fn.weight)
     x = mx.random.normal((2, 3, hc_mult, cfg.dim))
     pre, post, comb = hc.mixes(x)
@@ -73,7 +84,9 @@ def test_identity_start_with_zero_mix_weights():
     # post = 2·σ(0) = 1
     assert np.allclose(np.asarray(post), 1.0, atol=1e-6)
     # pre = σ(base) + 1e-6：第 0 条流 sigmoid(4)、其余 sigmoid(-4)
-    want = np.array([1 / (1 + np.exp(-4)) + 1e-6] + [1 / (1 + np.exp(4)) + 1e-6] * (hc_mult - 1))
+    want = np.array(
+        [1 / (1 + np.exp(-4)) + 1e-6] + [1 / (1 + np.exp(4)) + 1e-6] * (hc_mult - 1)
+    )
     assert np.allclose(np.asarray(pre)[0, 0], want, atol=1e-6)
     assert np.asarray(pre)[0, 0, 0] > 0.9
     # comb = softmax(0) = 均匀 → 双随机
@@ -95,14 +108,16 @@ def test_identity_start_in_real_model():
         # post = 2σ(mix)、base 把中心放在 σ(0)=0.5：均值≈1，个体随 mix 小幅抖动
         assert 0.85 < float(mx.mean(post)) < 1.15, float(mx.mean(post))
         assert float(mx.min(post)) > 0.4 and float(mx.max(post)) < 1.6
-        assert hc.base[hc.hc_mult:2 * hc.hc_mult].tolist() == [0.0] * hc.hc_mult
+        assert hc.base[hc.hc_mult : 2 * hc.hc_mult].tolist() == [0.0] * hc.hc_mult
         assert p[0] > 0.9 and p[0] > 10 * max(p[1:]), p
 
 
 def test_hc_split_matches_formula():
     """hc_split 手算参照：pre=σ(m·s0+b0)+ε、post=2σ(m·s1+b1)、comb=m·s2+b2。"""
     hc_mult = 3
-    mix = np.random.RandomState(0).randn(2, 4, (2 + hc_mult) * hc_mult).astype(np.float32)
+    mix = (
+        np.random.RandomState(0).randn(2, 4, (2 + hc_mult) * hc_mult).astype(np.float32)
+    )
     scale = np.ones(3, np.float32)
     base = np.zeros((2 + hc_mult) * hc_mult, np.float32)
     base[:hc_mult] = np.array([4.0, -4.0, -4.0], np.float32)
@@ -110,10 +125,12 @@ def test_hc_split_matches_formula():
     mx.eval(pre, post, comb)
     m = mix
     want_pre = 1.0 / (1.0 + np.exp(-(m[..., :hc_mult] + base[:hc_mult]))) + 1e-6
-    want_post = 2.0 / (1.0 + np.exp(-(m[..., hc_mult:2 * hc_mult] + base[hc_mult:2 * hc_mult])))
+    want_post = 2.0 / (
+        1.0 + np.exp(-(m[..., hc_mult : 2 * hc_mult] + base[hc_mult : 2 * hc_mult]))
+    )
     assert np.allclose(np.asarray(pre), want_pre, atol=1e-6)
     assert np.allclose(np.asarray(post), want_post, atol=1e-6)
-    assert np.allclose(np.asarray(comb), m[..., 2 * hc_mult:], atol=1e-6)
+    assert np.allclose(np.asarray(comb), m[..., 2 * hc_mult :], atol=1e-6)
 
 
 def test_hc_pre_selects_stream_and_hc_post_formula():
@@ -137,8 +154,9 @@ def test_hc_pre_selects_stream_and_hc_post_formula():
     comb = mx.random.uniform(0, 1, (2, 4, hc_mult, hc_mult))
     out = hc_post(h, residual, post, comb)
     mx.eval(out)
-    want2 = (np.asarray(post)[..., None] * np.asarray(h)[:, :, None, :]
-             + np.einsum("bthj,btjd->bthd", np.asarray(comb), np.asarray(residual)))
+    want2 = np.asarray(post)[..., None] * np.asarray(h)[:, :, None, :] + np.einsum(
+        "bthj,btjd->bthd", np.asarray(comb), np.asarray(residual)
+    )
     assert out.shape == (2, 4, hc_mult, 6)
     assert np.allclose(np.asarray(out), want2, atol=1e-6)
 
@@ -158,7 +176,7 @@ def test_block_single_pass_wiring_matches_manual_replication():
     model = tiny_model()
     cfg = model.config
     mx.random.seed(54)
-    ids = mx.random.randint(0, cfg.vocab_size, (1, 8))   # T=8 → MoE 稠密路径，逐位可比
+    ids = mx.random.randint(0, cfg.vocab_size, (1, 8))  # T=8 → MoE 稠密路径，逐位可比
     ref, _, _ = model.model(ids)
     mx.eval(ref)
 
@@ -175,7 +193,9 @@ def test_block_single_pass_wiring_matches_manual_replication():
             h = hc_post(h, residual, attn_post, attn_comb)
             residual = h
             ffn_pre, ffn_post, ffn_comb = layer.ffn_hc.mixes(h)
-            h = apply_hc_pre_norm(h, attn_pre if single_pass else ffn_pre, layer.ffn_norm)
+            h = apply_hc_pre_norm(
+                h, attn_pre if single_pass else ffn_pre, layer.ffn_norm
+            )
             h = layer.ffn(h)
             h = hc_post(h, residual, ffn_post, ffn_comb)
             pre = ffn_pre
@@ -186,7 +206,9 @@ def test_block_single_pass_wiring_matches_manual_replication():
     assert bool(mx.all(got == ref).item()), "Single-Pass 接线与 VibyModel 前向不一致"
     other = manual(single_pass=False)
     mx.eval(other)
-    assert float(mx.max(mx.abs(other - ref))) > 1e-4, "改成 FFN 自己的 pre 后输出应当不同"
+    assert float(mx.max(mx.abs(other - ref))) > 1e-4, (
+        "改成 FFN 自己的 pre 后输出应当不同"
+    )
 
 
 def test_block_returns_fresh_ffn_pre():

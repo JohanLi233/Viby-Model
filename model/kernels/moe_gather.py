@@ -4,6 +4,7 @@ Keep the materialized sorted lhs: passing *both* lhs_indices and rhs_indices
 would give up the single-index sorted gather_mm fast path. Only the gather's
 backward changes. The inverse permutation can be shared with route combine.
 """
+
 import os
 import operator
 from functools import lru_cache
@@ -16,16 +17,23 @@ _THREADS = 128
 
 
 def enabled_for(x, routes):
-    return (_ENABLED and mx.default_device() == mx.gpu and mx.metal.is_available() and x.ndim >= 2
-            and x.dtype in (mx.float32, mx.float16, mx.bfloat16)
-            and x.size > 0 and routes > 0)
+    return (
+        _ENABLED
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+        and x.ndim >= 2
+        and x.dtype in (mx.float32, mx.float16, mx.bfloat16)
+        and x.size > 0
+        and routes > 0
+    )
 
 
 @lru_cache(None)
 def _backward_kernel():
     return mx.fast.metal_kernel(
         name="moe_route_gather_token_vjp",
-        input_names=["g", "inverse"], output_names=["dx"],
+        input_names=["g", "inverse"],
+        output_names=["dx"],
         source=r"""
         uint d = thread_position_in_grid.x;
         uint token = thread_position_in_grid.y;
@@ -56,7 +64,8 @@ def _op(routes):
             template=[("T", x.dtype), ("D", d), ("K", routes)],
             grid=(((d + _THREADS - 1) // _THREADS) * _THREADS, m, 1),
             threadgroup=(_THREADS, 1, 1),
-            output_shapes=[x.shape], output_dtypes=[x.dtype],
+            output_shapes=[x.shape],
+            output_dtypes=[x.dtype],
         )
         # MLX custom VJPs need one array leaf for EVERY array primal.
         return dx, mx.zeros_like(order), mx.zeros_like(inverse)
@@ -79,7 +88,10 @@ def gather_routes(x, order, inverse, routes):
         raise ValueError("expected x[M,D], order[M*K], inverse[M*K]")
     if order.size != x.shape[0] * routes or inverse.shape != order.shape:
         raise ValueError("route permutation size does not match M*K")
-    if order.dtype not in (mx.int32, mx.uint32) or inverse.dtype not in (mx.int32, mx.uint32):
+    if order.dtype not in (mx.int32, mx.uint32) or inverse.dtype not in (
+        mx.int32,
+        mx.uint32,
+    ):
         raise ValueError("route permutations must contain int32 or uint32 indices")
     order, inverse = mx.stop_gradient(order), mx.stop_gradient(inverse)
     if x.size == 0:

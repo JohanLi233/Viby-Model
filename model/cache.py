@@ -53,22 +53,37 @@ class SharedAttnState:
     """
 
     __slots__ = (
-        "compress_kv", "index_k", "keep_mask", "topk_idx", "candidates",
-        "latent_pos", "sparse_selection", "reach", "win_idx", "pool_tokens", "candidate_blocks",
+        "compress_kv",
+        "index_k",
+        "keep_mask",
+        "topk_idx",
+        "candidates",
+        "latent_pos",
+        "sparse_selection",
+        "reach",
+        "win_idx",
+        "pool_tokens",
+        "candidate_blocks",
+        "recurrent_metadata",
     )
 
     def __init__(self):
         self.compress_kv = None
         self.index_k = None
-        self.keep_mask = None   # 稠密路径：被 indexer 选中的压缩位置 [B,T,N] bool
-        self.topk_idx = None    # 解码路径：选中的压缩位置（含窗口 offset，-1 = 无效）
+        self.keep_mask = None  # 稠密路径：被 indexer 选中的压缩位置 [B,T,N] bool
+        self.topk_idx = None  # 解码路径：选中的压缩位置（含窗口 offset，-1 = 无效）
         self.candidates = None  # 分层索引的一级候选块掩码 [B,T,N] bool
         self.candidate_blocks = None  # (sorted block ids, GPU lengths), fused training
         self.latent_pos = None  # 压缩组首的绝对位置 [n]
         self.sparse_selection = None  # (ratio, (indices, lengths)); training only
-        self.reach = None       # 本段前向已算过的压缩可达掩码，同 ratio 的后续层复用
-        self.win_idx = None     # decode：各层共用的滑窗 gather 下标 [B,1,W]
-        self.pool_tokens = None # decode：batch 内最大 token 数（Python int，避免每层 .item()）
+        self.reach = None  # 本段前向已算过的压缩可达掩码，同 ratio 的后续层复用
+        self.win_idx = None  # decode：各层共用的滑窗 gather 下标 [B,1,W]
+        self.pool_tokens = (
+            None  # decode：batch 内最大 token 数（Python int，避免每层 .item()）
+        )
+        self.recurrent_metadata = (
+            None  # immutable query/memory metadata, one latent stack invocation
+        )
 
 
 class VibyCache:
@@ -76,14 +91,27 @@ class VibyCache:
 
     def __init__(self, config, batch_size: int = 1):
         self.config = config
-        self.layers = [LayerCache(config, i, batch_size) for i in range(config.n_layers)]
+        self.layers = [
+            LayerCache(config, i, batch_size) for i in range(config.n_layers)
+        ]
         self.start_pos = 0
-        self.decode_max_pos = 0  # Python：当前步 batch 内最大绝对位置+1，decode 用来切池
+        self.decode_max_pos = (
+            0  # Python：当前步 batch 内最大绝对位置+1，decode 用来切池
+        )
         self.engram_prev = None  # [B, max_ngram-1] 最近 token id（Engram 哈希用）
-        self.thinking_state = None  # independent terminal PSR state; never a token/cache position
+        # Parameters are shared across rounds; latent self KV is not.
+        self.ced_signature = None
+        self.ced_stages = {}
+        self.ced_output_cache = {}
+        self.ced_delta = None
+        self.ced_pre_mix = None
+        self.ced_topk_idx = None
+        self.thinking_state = (
+            None  # independent terminal PSR state; never a token/cache position
+        )
         self.psr_mode = None
-        self.psr_next_anchor = None
-        self.psr_phases = 0
+        self.psr_next_anchor = None  # native: int; engine pool: [B] int32
+        self.psr_phases = 0  # native: int; engine pool: [B] int32
         self.psr_options = None
         self.psr_gate = None
         self._wire_sources()
@@ -107,12 +135,16 @@ class VibyCache:
         """
         if offset < 0:
             raise ValueError("rewind offset must be nonnegative")
+        if offset > 0 and self.ced_signature not in (None, ("baseline",)):
+            raise ValueError("recurrent CED rewind requires a fresh prefill")
         if self.thinking_state is not None and offset > 0:
             # Reusing a workspace before its full question is observed leaks
             # future input; require a fresh prefill rather than silently lose it.
             new_pos = max(0, self.start_pos - offset)
             if bool(mx.any(new_pos <= self.thinking_state.anchor).item()):
-                raise ValueError("rewind crosses the PSR question boundary; use a fresh prefill")
+                raise ValueError(
+                    "rewind crosses the PSR question boundary; use a fresh prefill"
+                )
         self.start_pos = max(0, self.start_pos - offset)
         self.decode_max_pos = self.start_pos
         for c in self.layers:

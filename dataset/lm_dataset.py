@@ -55,12 +55,13 @@ def _tokenizer_cache_fingerprint(tokenizer) -> str:
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def pre_processing_chat(conversations, add_system_ratio=0.2):
+def pre_processing_chat(conversations, add_system_ratio=0.2, rng=None):
     """与 MiniMind 对齐：对话预处理。
 
     tool use 数据完整保留不做处理；无 system 首轮时按概率补一条
     随机 system prompt（默认 20%）。
     """
+    rng = random if rng is None else rng
     # tool use 数据完整保留不做处理
     if any(conv.get("tools") for conv in conversations):
         return conversations
@@ -79,21 +80,22 @@ def pre_processing_chat(conversations, add_system_ratio=0.2):
     ]
     # 概率性添加 system
     if conversations[0].get("role") != "system":
-        if random.random() < add_system_ratio:
+        if rng.random() < add_system_ratio:
             return [
-                {"role": "system", "content": random.choice(SYSTEM_PROMPTS)}
+                {"role": "system", "content": rng.choice(SYSTEM_PROMPTS)}
             ] + conversations
     return conversations
 
 
-def post_processing_chat(prompt_content, empty_think_ratio=0.0):
+def post_processing_chat(prompt_content, empty_think_ratio=0.0, rng=None):
     """清掉空 <think> 占位块；默认 0.0 = 始终移除（空 think 不进训练数据）。
 
     empty_think_ratio 为空 <think> 的保留阈值：0.0 = 全部移除（默认，现代大模型
     思路——思考内容应落在 think 内，空的占位块是脏数据）；>0 时按概率保留。
     """
+    rng = random if rng is None else rng
     if "<think>\n\n</think>\n\n" in prompt_content and (
-        empty_think_ratio <= 0 or random.random() > empty_think_ratio
+        empty_think_ratio <= 0 or rng.random() > empty_think_ratio
     ):
         prompt_content = prompt_content.replace("<think>\n\n</think>\n\n", "")
     return prompt_content
@@ -266,7 +268,9 @@ def _raw_int32_to_npy_aligned(
         else None
     )
     chunk = max(1, (8 * 1024 * 1024) // (width * 4))
-    pbar = _pack_tqdm(total=n_blocks, desc="[pack] write aligned npy", unit="blk", leave=False)
+    pbar = _pack_tqdm(
+        total=n_blocks, desc="[pack] write aligned npy", unit="blk", leave=False
+    )
     try:
         for b in range(0, n_blocks, chunk):
             e = min(n_blocks, b + chunk)
@@ -883,6 +887,7 @@ class SFTDataset:
         pack_sequences: bool = False,
         doc_mask: bool = False,
         empty_think_ratio: float = 0.0,
+        deterministic_seed: Optional[int] = None,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -893,6 +898,7 @@ class SFTDataset:
         # 空 <think> 占位块是脏数据：默认 empty_think_ratio=0.0，打包/取值时
         # 统一清掉；真实思考内容不含空 think 模式，不受影响。
         self.empty_think_ratio = empty_think_ratio
+        self.deterministic_seed = deterministic_seed
         self._cache: Dict[int, Dict[str, Any]] = {}
         if pack_sequences:
             # 打包模式（与 PretrainDataset 同口径）：渲染后按 token 流拼接成
@@ -1034,9 +1040,16 @@ class SFTDataset:
         sample = self._load_sample(index)
         # 概率性补 system 与 MiniMind 对齐；空 <think> 占位块默认清掉
         # （empty_think_ratio=0.0）
-        conversations = pre_processing_chat(sample["conversations"])
+        # Local RNG keeps initial-policy scoring and every epoch identical,
+        # without mutating global RNG state from the prefetch thread.
+        rng = (
+            None
+            if self.deterministic_seed is None
+            else random.Random(f"{self.deterministic_seed}:{index}")
+        )
+        conversations = pre_processing_chat(sample["conversations"], rng=rng)
         prompt = self.create_chat_prompt(conversations)
-        prompt = post_processing_chat(prompt, self.empty_think_ratio)
+        prompt = post_processing_chat(prompt, self.empty_think_ratio, rng=rng)
         # 与 MiniMind 对齐：保留序列头部（截断尾部）。超长样本的
         # assistant 回复可能被截掉，此时 loss mask 全 0（仅警告一次）
         input_ids = self.tokenizer(prompt).input_ids[: self.max_length]

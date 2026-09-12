@@ -1,137 +1,88 @@
-# 实验运行协议（agent 交接用）
+# 当前实验运行协议
 
-本文档是 optimizer/spectral-knee 研究弧线的实验操作手册。**每个已跑 probe 的完整参数
-存在 `research_runs/probe_*/pretrain_768.json` 的 `args` 字段里，复现以它为准**；
-本文只讲通用协议、命令模板和踩过的坑。
+本协议用于当前 Viby 架构、训练与性能研究。旧 optimizer / spectral-knee
+实验的原始命令和记录已保留在 [历史协议](archive/OPTIMIZER_EXPERIMENT_PROTOCOL.md)，
+其中的旧参数、脚本和默认值不作为当前启动模板。
+协作入口见 [AGENTS.md](../AGENTS.md)，检查命令见 [开发指南](../docs/DEVELOPMENT.md)。
 
-## 环境
+## 先确定实际配置
 
-- 一切用项目 venv：`.venv/bin/python ...`（不要装新包进 .venv）。
-- ruff 在 `/Users/lizhonghan/.local/bin/ruff`。
-- matplotlib 不在 venv 里；绘图用临时 env：
-  `uv run --no-project --with matplotlib python experiments/paper_figs.py`
-- 不 git commit / 不做任何 git 变更。
-- **同一时刻只跑一个训练 probe**（单机 MLX，并行会互相污染时序和吞吐）。
+1. 记录目标：正确性修复、等价性能优化，或改变学习机制的研究变体。
+2. 检查当前源码、未提交 diff、相关未跟踪实现和已有进程。使用已安装的项目
+   `.venv/bin/python`；需要变更环境时记录依赖差异，避免混入实验变量。
+3. 沿 CLI → 预设回填 → model kwargs → VibyConfig → 实际执行路径核对配置。
+   checkpoint 恢复还要核对结构 sidecar、优化器分组和实验模式。
+4. 选择对应的最小检查。具体范围服从用户任务；只写算法或文档时不自动开启训练。
 
-## 标准 probe 协议（MoE 768 档）
+模型库默认值与预训练入口默认值并不相同；研究开关显式写入命令和解析配置。
+历史 benchmark 也可能固定旧配方，需检查其模型构造与当前入口是否一致。
+[研究索引](README.md) 标明了各文档的适用范围。
 
-基线配置（= probe_p30_latesnap/pretrain_768.json，也是论文新代码口径基线）：
+## 运行和产物
 
-```bash
-.venv/bin/python trainer/train_pretrain.py \
-  --out_dir research_runs/probe_pXX_<name> \
-  --epochs 1 --batch_size 12 --accumulation_steps 2 \
-  --learning_rate 0.0015450949123618698 \
-  --device mlx --dtype bfloat16 --compile_model --no_swanlab \
-  --hidden_size 768 --num_hidden_layers 8 --num_attention_heads 8 \
-  --vocab_size 6400 --max_seq_len 1024 \
-  --pack_sequences --doc_mask \
-  --max_steps 2000 --max_train_minutes 55 --log_interval 500 \
-  --save_interval 100000 --min_lr_ratio 0.05 --lr_schedule linear \
-  --seed 1337 \
-  --use_attn_gate --mtp_depth 1 --mtp_loss_weight 0.3 --z_loss_weight 0.0001 \
-  --optimizer muon --muonh \
-  --n_routed_experts 256 --num_experts_per_tok 8 --n_shared_experts 2 \
-  --moe_intermediate_size 384 --routed_scaling_factor 2.5 \
-  --moe_router_logit_norm \
-  --data_path /Volumes/pan/text/pretrain_t2t_mini_dedup.jsonl \
-  > research_runs/probe_pXX_<name>/console.log 2>&1
+一次运行使用独立的 `research_runs/<task>/<variant>` 目录，保留：
+
+- 日期、目标、假设、对照和本轮实际执行范围。
+- Git commit、未提交补丁、相关未跟踪源码的副本或哈希；只有 commit 不足以复现。
+- 完整命令、相关环境开关、Python / MLX 版本、硬件、实际解析的模型与训练配置。
+- 数据路径与版本/哈希、tokenizer、packing / doc mask、seed、token 与步数口径。
+- 标准输出、错误输出、原始 JSON/JSONL 样本、checkpoint/sidecar 路径。
+- 实际退出状态、失败点、已建立和未建立的结论。后台任务另记 PID、启动时间和日志路径。
+
+不要重用或覆盖其他实验的输出目录。单机 GPU 同一时刻只运行一个训练、测试或
+计时任务；已有任务运行时继续做源码、文档和 host 检查，性能采样应等资源空闲。
+若发现竞争，记录受影响的样本并在空闲环境重测，不能将其归因于算法。
+
+## 正确性与性能
+
+等价 kernel 优化保持同一模型、权重、输入、dtype、loss、可见集合、Top-K 规则、
+MoE 统计和优化器配置。记录实际 dispatch / fallback，避免对比了不同路径。
+数值允许误差应按 dtype 和具体归约事先说明；测试存在不代表本轮已运行。
+
+共享计时实现见 [kernel_bench_utils.py](../experiments/kernel_bench_utils.py)：
+
+- MLX 惰性求值；每个被计时函数须在返回前 `mx.eval()` 所需输出和状态。
+- 同一进程交替 A/B；共享工具默认 warmup=3、每槽 5 次、3 组 A/B/B/A。
+  实际 benchmark 可覆盖参数，因此将实际值写入产物。
+- A/A 使用不同槽名，检查前后漂移。当前基准通常采用 3% 漂移阈值；阈值与
+  是否拒绝该轮必须随结果报告，不能从噪声内的差异宣布收益。
+- 保存原始样本、每块配对比率、median/min/p90 与内存观察。配对耗时下降和
+  配对吞吐提升分别计算；不能拿两个绝对中位数冒充配对统计。
+- fwd+bwd 对照不更新权重。完整累积窗口在每次采样前恢复参数、optimizer
+  容器与数组、MoE bias 和其他可变状态，再执行累积与真实更新。
+- 参考 [snapshot 修复记录](MOE_TRAINING_REPAIR.md)；旧窗口记录如果没有可靠
+  恢复状态，不能用作同状态对照证据。
+
+分别报告单 kernel、fwd+bwd、完整训练窗口、prefill 和 decode；各自的分母
+和工作量不同。MFU 写清 [FLOPs 口径](../trainer/flops.py)、峰值算力假设、
+有效 token 数与计时边界；逻辑工作减少不直接等于 wall-clock 改善。
+
+## 学习效果研究
+
+保持显式 baseline，匹配原始数据、tokenizer、packing、seed、预算和 LR 日程。
+比较共同权重时复制并核对实际参数与 optimizer / router 状态，相同 seed 不能
+替代状态一致性。报告新增参数、内存、训练时间及改变的目标或读取预算。
+
+微步、优化器步、训练 token 和评估 token/bytes 分别记录。训练 CE、辅助 loss、
+独立验证 CE 和 BPB 是不同指标；联合目标下降不证明 NTP 或下游能力提升。
+跨 tokenizer 比较必须说明固定 tokens 还是固定原始 bytes，以及真实字节计数方式。
+
+机制测试、有限梯度和短 probe 只支持可执行性。性能收益需要匹配的实测；质量
+收益需要受控的独立评估。失败、NaN、被中断的运行保留原始证据和限制。
+
+## 交接记录
+
+```text
+目标 / 假设：
+代码状态 / 配置 / 环境：
+实现变化及 reference：
+已执行命令 / 退出状态：
+产物目录 / 原始样本：
+正确性结果：
+性能或质量结果及适用范围：
+未执行、失败或仍不确定的部分：
+下一项可独立验证的问题：
 ```
 
-要点：
-
-- lr / muon_lr / beta2 / eps 由 `--lr_scale_auto`（默认开）公式推导，日志
-  `[lr_scale] 公式自动推导:` 会打印；上面显式给的 `--learning_rate` 是按
-  **全量 epoch token 预算**推出的值，保持历史 probe 同峰值。新短跑若不传
-  `--learning_rate` / `--token_budget`，峰值会按 `--max_steps` 的 token 数
-  重算（Marin ladder：每档用该档实际预算，tokens^-0.3461）。
-- warmup_iters 自动 = **本轮 LR horizon** 的 1%（`--max_steps 2000` → 20）。
-  要对齐历史 P 系列（warmup 279、峰值按全量 27863 微步）：显式
-  `--warmup_iters 279 --learning_rate 0.0015450949123618698`
-  `--lr_decay_steps 27863`（日程按长 run 排、短跑只走前缀，几乎不退火）。
-- CLI 默认已是 `--lr_schedule linear`（Marin #8435：warmup 1% 后立刻收到
-  `min_lr_ratio=0.05`，无平台）。`--lr_schedule wsd` 才是 warmup+平台+末尾
-  20%。数据 80% 处分相是 Marin 的 datamix，不是 LR 平台。
-- HEAD 相对 P19 基线还改了：KDA 输出门 `2·σ` 零初始化、TruncNormal 按
-  fan-in、Adam 标量组 wd=0。与下表 5.264 **不可跨减**；对照历史数字用
-  当时代码，对照新代码另开基线。
-- **指标读法**：console.log 的 `Epoch:[1/1](N/...)` 中 **N 是微步**
-  （accumulation_steps=2，优化器步 = N/2）。论文报的 loss@500 是微步 500
-  那一行：`Epoch:[1/1](500/27863) loss:5.264(...)`。
-- 500 微步短 probe ≈ 14 分钟（`--max_steps 550`，微批口径；**不要设 500**——
-  会在第 500 微步的日志行打印前停下，丢失 loss@500）。2000 微步全程 ≈
-  45–55 分钟（--max_steps 2000 + max_train_minutes 55 兜底）。
-
-### 变体开关（env 变量，均定义在 trainer/muon.py）
-
-| env | 默认 | 作用 |
-|---|---|---|
-| `VIBY_MUONH_NS_COEFF` | `cubic5b05` | NS 迭代系数/膝盖：`classic`/`cubic5`/`cubic5b05`（b05=knee50 0.05）/`cubic5b002`/`cubic5b10` 等 |
-| `VIBY_MUONH_PER_HEAD` | 0（关） | 1 = 按 head 切 NS（P21b 500 步 −0.08，P29a 2000 步中性；非默认） |
-| `VIBY_MUONH_EDGE` | 0（关） | 1 = EdgeCubic 逐形状膝盖（P29b 2000 步确认有害：+0.18 loss / +0.47 mtp，勿开） |
-| `VIBY_MUONH_EXPERTS` | 1 | 0 = 专家不进 MuonH（消融用） |
-| `VIBY_MUONH_NO_NS` | 0 | 1 = 跳过谱均衡（消融用） |
-| `VIBY_SNAPSHOT_STEPS` | "" | 逗号分隔的**优化器步**列表，dump 动量/梯度快照（见下） |
-
-例：`VIBY_MUONH_NS_COEFF=cubic5b002 .venv/bin/python trainer/train_pretrain.py ...`
-
-稠密对照档见 `research_runs/probe_p26a_dense_b05/pretrain_768.json`（去 MoE/MTP，
-loss 行只有 main/z 两项）。**dense 档必须显式 `--moe_latent_dim 0`**——缺省
-None 会解析成 hidden/2=384，把「dense」变成带 latent 瓶颈的 96M 模型
-（P34/P35 曾因此报废重跑；参数量 132.025M 才是对的）。
-
-## 动量快照 probe（σ* 测量）
-
-```bash
-VIBY_SNAPSHOT_STEPS=150,300,500,750,950 \
-  .venv/bin/python trainer/train_pretrain.py --out_dir research_runs/probe_pYY_snap ...（同上）
-```
-
-**坑：`VIBY_SNAPSHOT_STEPS` 是优化器步口径，不是微步**（曾因此返工一次）。
-产物：`mom_*_step{k}.npz` + `grad_mb{j}_step{k}.npz`。
-
-离线分析（MP 拟合、λ̂₊、方向相关坍缩、各向异性）：
-
-```bash
-.venv/bin/python experiments/mp_fit.py research_runs/probe_pYY_snap [step ...]
-```
-
-理论口径见 `research/SPECTRAL_THEORY.md`。快照 npz 是论文原始证据，**勿删**
-（model 权重 *.safetensors 已清，npz 保留）。
-
-## 执行纪律（踩过的坑）
-
-1. **后台 Bash 任务必须显式设 `timeout`**：默认 600s 杀过一个 45 分钟的 run。
-   500 微步 probe 给 ≥1800s；全程 run 给 ≥3600s。
-2. 同一时刻只跑一个训练任务。
-3. probe 命名：`probe_p<编号>_<短名>`，编号递增不重用。
-4. 新旧代码口径**不可跨减**：gate_up 零初始化 bug 修复（P19 起）使基线移动 ~0.04，
-   P13–P17 是旧口径，P19+ 是新口径。对比只在同口径内进行。
-   HEAD 相对 P19 又改了日程默认（linear / Marin #8435）、KDA 门、fan-in init、标量 wd=0，
-   再构成一档新口径。
-5. 跨 seed 噪声：σ≈0.11（P25 实测），配对差 ±0.05 以内算中性；小于此幅度
-   不要下结论。
-6. 改优化器代码后跑四个测试：
-   `.venv/bin/python -m pytest tests/test_align.py tests/test_consistency.py tests/test_kda.py tests/test_muonh_zeroinit.py`
-7. 改完代码核对注释/docstring 是否还描述旧行为（dt_bias 注释曾与实际 init 差 10×）。
-8. **发散处理**（P40 教训）：loss 先 spike 后 nan 且不再恢复 = 参数已污染，
-   该 run 作废但须如实记录（nan guard 只跳过当窗更新，挡不住已污染的参数）。
-   先查同 seed 配对 run 在相同微步是否也 spike——配对数据顺序一致，对照 run
-   平稳通过则 spike 是排程特异而非数据批问题（P40 dense b002 @2k：step~600
-   spike 8.36、~1000 起 nan 不愈；配对 b05 同批次无任何波动）。
-
-## 关键基线数字（新代码口径，seed 1337，loss@500 微步）
-
-- cubic5b05（现默认，P19）：**5.264**
-- cubic5b002（P20）：+0.054（左臂，过保守）
-- cubic5b10（P17，旧口径）：右臂 +0.091 → U 型，谷底 ≈ knee50 0.01~0.05
-- per-head / edge / per-head+edge（2000 步，P29）：edge 是元凶（+0.18 loss /
-  +0.47 mtp），per-head 单独中性
-- 稠密 132M（P26/P34/P35）：σ* 比 MoE 低一个量级；500 步平台
-  b002 3.943 ≈ b005 3.950 ≈ b01 3.963 < b10 3.974 < b05 3.997。
-  **2000 步翻盘（P40–42）**：b002 step~600 spike、~1000 步发散 nan
-  （排程特异，对照同数据无波动）；b005 2.977 差于 b05 2.905——
-  warmup 档低估膝盖，稳态最优回到 knee50≈0.01（与 MoE 默认同值）。
-
-完整结果表：`research/OPTIMIZER_RESEARCH.md`；论文：`research/PAPER.md`；
-论文图重生成：`uv run --no-project --with matplotlib python experiments/paper_figs.py`。
+新结果写入带日期或任务名称的文档，并链接到 [研究索引](README.md)。
+更新结论时指向新证据，同时保留旧结果的日期、适用配置和更正原因。

@@ -41,14 +41,31 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm(config.dim, config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attn_hc = HyperConnection(
-            config.dim, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps, config.norm_eps
+            config.dim,
+            config.hc_mult,
+            config.hc_sinkhorn_iters,
+            config.hc_eps,
+            config.norm_eps,
         )
         self.ffn_hc = HyperConnection(
-            config.dim, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps, config.norm_eps
+            config.dim,
+            config.hc_mult,
+            config.hc_sinkhorn_iters,
+            config.hc_eps,
+            config.norm_eps,
         )
 
-    def __call__(self, x, start_pos: int, pre_mix, shared, cache=None,
-                 segment_ids=None, pad_mask=None, decode: bool = False):
+    def __call__(
+        self,
+        x,
+        start_pos: int,
+        pre_mix,
+        shared,
+        cache=None,
+        segment_ids=None,
+        pad_mask=None,
+        decode: bool = False,
+    ):
         """x: [B,T,hc,d] → (x, 下一个子层要用的 pre_mix)。"""
         residual = x
         attn_pre, attn_post, attn_comb = self.attn_hc.mixes(x)
@@ -63,5 +80,47 @@ class Block(nn.Module):
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc.mixes(x)
         h = apply_hc_pre_norm(x, attn_pre, self.ffn_norm)
         h = self.ffn(h)
+        x = hc_post(h, residual, ffn_post, ffn_comb)
+        return x, ffn_pre
+
+    def recurrent(
+        self,
+        x,
+        pre_mix,
+        shared,
+        *,
+        query_positions,
+        memory_positions,
+        query_segment_ids=None,
+        memory_segment_ids=None,
+        query_pad_mask=None,
+        memory_pad_mask=None,
+        cache=None,
+    ):
+        """Run one physical recurrent CED stage, preserving mHC sublayer order.
+
+        The caller owns a separate self-KV ``cache`` for every (round, layer).
+        Parameters and boundary evidence are shared, while ``pre_mix`` and the
+        sparse selection in ``shared`` travel with the updated latent hidden.
+        """
+        residual = x
+        attn_pre, attn_post, attn_comb = self.attn_hc.mixes(x)
+        h = apply_hc_pre_norm(x, pre_mix, self.attn_norm)
+        h = self.attn.recurrent(
+            h,
+            shared,
+            query_positions=query_positions,
+            memory_positions=memory_positions,
+            query_segment_ids=query_segment_ids,
+            memory_segment_ids=memory_segment_ids,
+            query_pad_mask=query_pad_mask,
+            memory_pad_mask=memory_pad_mask,
+            cache=cache,
+        )
+        x = hc_post(h, residual, attn_post, attn_comb)
+        residual = x
+        ffn_pre, ffn_post, ffn_comb = self.ffn_hc.mixes(x)
+        h = apply_hc_pre_norm(x, attn_pre, self.ffn_norm)
+        h = self.ffn(h, pad_mask=query_pad_mask)
         x = hc_post(h, residual, ffn_post, ffn_comb)
         return x, ffn_pre

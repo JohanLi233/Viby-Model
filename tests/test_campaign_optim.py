@@ -51,8 +51,11 @@ def test_cautious_apply_kernel():
     mask = ((X * P) >= 0).astype(P.dtype)
     ref = P * (1 - lr * wd * mask) - lr * X
     mx.eval(out, ref)
-    check("cautious apply kernel == 掩码参考", maxdiff(out, ref) < 1e-6,
-          f"maxdiff={maxdiff(out, ref)}")
+    check(
+        "cautious apply kernel == 掩码参考",
+        maxdiff(out, ref) < 1e-6,
+        f"maxdiff={maxdiff(out, ref)}",
+    )
     # 非 cautious 对照：全体坐标衰减
     out2 = _stack_apply_kernel(False, apply_wd=wd, cautious=False)(P, X, lr)
     ref2 = P * (1 - lr * wd) - lr * X
@@ -116,8 +119,12 @@ def test_fused_adamw_cautious():
 
     def step(g, cautious, wd_):
         opt = FusedAdamW(
-            learning_rate=lr, betas=[0.9, 0.95], eps=1e-8,
-            weight_decay=wd_, bias_correction=True, cautious=cautious,
+            learning_rate=lr,
+            betas=[0.9, 0.95],
+            eps=1e-8,
+            weight_decay=wd_,
+            bias_correction=True,
+            cautious=cautious,
         )
         out = opt.apply_gradients({"w": g}, {"w": p0})
         mx.eval(out)
@@ -171,8 +178,11 @@ def test_batched_muon_cautious_routing():
     check("muon cautious 衰减确实改路（与耦合不同）", d > 1e-4, f"maxdiff={d}")
 
     o_h = BatchedMuon(
-        learning_rate=0.05, momentum=0.95, weight_decay=0.1,
-        cautious_wd=True, hyperball=True,
+        learning_rate=0.05,
+        momentum=0.95,
+        weight_decay=0.1,
+        cautious_wd=True,
+        hyperball=True,
     )
     n0 = fnorm(P["a"])
     p_h = o_h.apply_gradients(dict(G), dict(P))

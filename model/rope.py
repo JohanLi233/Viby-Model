@@ -14,8 +14,14 @@ import math
 import mlx.core as mx
 
 
-def _corrected_dim(dim: float, rotations: float, base: float, original_seq_len: int) -> float:
-    return dim * math.log(original_seq_len / (rotations * 2 * math.pi)) / (2 * math.log(base))
+def _corrected_dim(
+    dim: float, rotations: float, base: float, original_seq_len: int
+) -> float:
+    return (
+        dim
+        * math.log(original_seq_len / (rotations * 2 * math.pi))
+        / (2 * math.log(base))
+    )
 
 
 def precompute_freqs_cis(
@@ -33,9 +39,13 @@ def precompute_freqs_cis(
     inv = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
     if original_seq_len > 0:
         low = max(math.floor(_corrected_dim(dim, beta_fast, base, original_seq_len)), 0)
-        high = min(math.ceil(_corrected_dim(dim, beta_slow, base, original_seq_len)), dim - 1)
+        high = min(
+            math.ceil(_corrected_dim(dim, beta_slow, base, original_seq_len)), dim - 1
+        )
         ramp = mx.clip(
-            (mx.arange(dim // 2, dtype=mx.float32) - low) / max(high - low, 1e-3), 0.0, 1.0
+            (mx.arange(dim // 2, dtype=mx.float32) - low) / max(high - low, 1e-3),
+            0.0,
+            1.0,
         )
         smooth = 1.0 - ramp
         inv = inv / factor * (1.0 - smooth) + inv * smooth
@@ -43,7 +53,9 @@ def precompute_freqs_cis(
     return mx.cos(freqs), mx.sin(freqs)
 
 
-def apply_rope(x: mx.array, cos: mx.array, sin: mx.array, inverse: bool = False) -> mx.array:
+def apply_rope(
+    x: mx.array, cos: mx.array, sin: mx.array, inverse: bool = False
+) -> mx.array:
     """x: [..., S, dim]（dim 为偶数）；cos/sin: [S, dim//2]。
 
     交错对 (2i, 2i+1) 视作复数做旋转；inverse=True 时用共轭（sin 取反）。
@@ -63,8 +75,14 @@ def apply_rope(x: mx.array, cos: mx.array, sin: mx.array, inverse: bool = False)
     return out.reshape(*x.shape[:-1], d)
 
 
-def rope_partial(x: mx.array, cos: mx.array, sin: mx.array, rope_dim: int, inverse: bool = False):
+def rope_partial(
+    x: mx.array, cos: mx.array, sin: mx.array, rope_dim: int, inverse: bool = False
+):
     """只旋转最后一维的 rope_dim 个通道，其余原样拼回。"""
+    from .kernels.rope_decode import enabled_for, rope_partial_decode
+
+    if enabled_for(x, cos, sin, rope_dim):
+        return rope_partial_decode(x, cos, sin, rope_dim, inverse)
     if rope_dim == x.shape[-1]:
         return apply_rope(x, cos, sin, inverse)
     head = x[..., : x.shape[-1] - rope_dim]

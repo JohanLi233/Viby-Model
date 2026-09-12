@@ -20,9 +20,15 @@ except Exception:  # noqa: BLE001
     _hc_post_fused = None
 
 from .norms import rms_unit
+from .kernels.hc_decode import enabled_for as _decode_mixes_ok
+from .kernels.hc_decode import split_sinkhorn_decode as _decode_mixes
+from .kernels.hc_train import enabled_for as _train_mixes_ok
+from .kernels.hc_train import split_sinkhorn_train as _train_mixes
 
 
-def hc_split(mixes: mx.array, scale: mx.array, base: mx.array, hc_mult: int, eps: float = 1e-6):
+def hc_split(
+    mixes: mx.array, scale: mx.array, base: mx.array, hc_mult: int, eps: float = 1e-6
+):
     """mixes: [..., (2+hc)·hc] → (pre [...,hc], post [...,hc], comb [...,hc·hc])。
 
     eps 用 config.hc_eps：官方 hc_split_sinkhorn 的 pre 分支就是 sigmoid(...) + eps。
@@ -45,8 +51,14 @@ def sinkhorn(comb: mx.array, iters: int, eps: float) -> mx.array:
 class HyperConnection(nn.Module):
     """一条子层（attn 或 MoE）的 mHC 读写参数。"""
 
-    def __init__(self, dim: int, hc_mult: int, sinkhorn_iters: int = 20, eps: float = 1e-6,
-                 norm_eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        hc_mult: int,
+        sinkhorn_iters: int = 20,
+        eps: float = 1e-6,
+        norm_eps: float = 1e-6,
+    ):
         super().__init__()
         self.hc_mult = hc_mult
         self.sinkhorn_iters = sinkhorn_iters
@@ -59,13 +71,25 @@ class HyperConnection(nn.Module):
         self.scale = mx.ones((3,), dtype=mx.float32)
         # 起步 ≈ 标准 pre-norm 残差：pre 近 one-hot(0)、post=1、comb 均匀。
         base = mx.zeros((mix_hc,), dtype=mx.float32)
-        base = base.at[:hc_mult].add(mx.array([4.0] + [-4.0] * (hc_mult - 1), dtype=mx.float32))
+        base = base.at[:hc_mult].add(
+            mx.array([4.0] + [-4.0] * (hc_mult - 1), dtype=mx.float32)
+        )
         self.base = base
 
     def mixes(self, x: mx.array):
         """x: [B, T, hc, dim] → (pre, post, comb)，fp32。"""
         flat = x.reshape(*x.shape[:2], -1)
-        mixes = self.fn(rms_unit(flat, self.norm_eps).astype(x.dtype)).astype(mx.float32)
+        mixes = self.fn(rms_unit(flat, self.norm_eps).astype(x.dtype)).astype(
+            mx.float32
+        )
+        if _train_mixes_ok(mixes, self.scale, self.base, self.hc_mult, self.training):
+            return _train_mixes(
+                mixes, self.scale, self.base, self.sinkhorn_iters, self.eps
+            )
+        if _decode_mixes_ok(mixes, self.scale, self.base, self.hc_mult, self.training):
+            return _decode_mixes(
+                mixes, self.scale, self.base, self.sinkhorn_iters, self.eps
+            )
         pre, post, comb = hc_split(mixes, self.scale, self.base, self.hc_mult, self.eps)
         comb = sinkhorn(
             comb.reshape(*comb.shape[:-1], self.hc_mult, self.hc_mult),
@@ -86,7 +110,9 @@ def hc_pre(x: mx.array, pre_mix: mx.array) -> mx.array:
     return y
 
 
-def hc_post(x: mx.array, residual: mx.array, post: mx.array, comb: mx.array) -> mx.array:
+def hc_post(
+    x: mx.array, residual: mx.array, post: mx.array, comb: mx.array
+) -> mx.array:
     """子层输出展开回 hc 条流 + 用 comb 混入残差。
 
     x:[B,T,d] residual:[B,T,hc,d] post:[B,T,hc] comb:[B,T,hc,hc]

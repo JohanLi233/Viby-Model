@@ -1,4 +1,5 @@
 """Count actual sparse occurrences outside timing; retain the declared 6N estimate."""
+
 import mlx.core as mx
 
 from model.kernels import sparse_attention as sa
@@ -8,7 +9,9 @@ from trainer.flops import training_flops_per_token
 def audit_training_flops(model, batch):
     cfg = model.config
     if cfg.n_mtp_layers:
-        raise ValueError("this occurrence audit currently supports backbone-only training")
+        raise ValueError(
+            "this occurrence audit currently supports backbone-only training"
+        )
     x, y, loss_mask, pad, segment = batch
     b, t = x.shape
     w = min(t, cfg.window_size)
@@ -35,16 +38,28 @@ def audit_training_flops(model, batch):
 
     sa.indexed_attention = record
     try:
-        out = model(x, labels=y, loss_mask=loss_mask, attention_mask=pad, segment_ids=segment)
+        # Protected PSR does not alter backbone attention visibility. Its
+        # training anchor plan is not needed for this backbone-only occurrence
+        # audit; the FLOPs estimator accounts for the configured side separately.
+        out = model(
+            x,
+            labels=y,
+            loss_mask=loss_mask,
+            attention_mask=pad,
+            segment_ids=segment,
+            psr_mode="off",
+        )
         mx.eval(out.loss, compressed)
     finally:
         sa.indexed_attention = original
-    expected = sum(r > 0 for r in cfg.compress_ratios[:cfg.n_layers])
+    expected = sum(r > 0 for r in cfg.compress_ratios[: cfg.n_layers])
     if len(compressed) != expected:
         raise ValueError("occurrence audit requires the indexed sparse training path")
     counts = iter(float(v) for v in compressed)
-    lengths = [window_mean + (next(counts) if r else 0.0)
-               for r in cfg.compress_ratios[:cfg.n_layers]]
+    lengths = [
+        window_mean + (next(counts) if r else 0.0)
+        for r in cfg.compress_ratios[: cfg.n_layers]
+    ]
     return dict(
         method="6N GEMM estimate + measured valid attention occurrences; excludes optimizer/recompute",
         attention_mean_occurrences=lengths,

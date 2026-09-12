@@ -14,3 +14,6 @@ dependencies = [
     "transformers>=4.54.1",
     "zhconv>=1.4.3",
 ]
+
+[dependency-groups]
+dev = ["pytest>=9.1.1,<10"]
