@@ -329,6 +329,7 @@ class BaseTrainer:
         psr_gate=None,
         tail_reference=None,
         tail_fraction=None,
+        dpr_weight=None,
     ):
         """训练 loss 函数（model 走闭包引用）
 
@@ -364,6 +365,8 @@ class BaseTrainer:
                     self.args, "psr_training_mode", "recurrent"
                 )
             psr_inputs["psr_gate"] = psr_gate
+        if getattr(self.lm_config, "dpr_enabled", False):
+            psr_inputs["dpr_weight"] = dpr_weight
         res = self.model(
             input_ids=X,
             labels=Y,
@@ -388,6 +391,8 @@ class BaseTrainer:
         metrics = (
             res.metrics if res.metrics is not None else mx.zeros((X.shape[0], 8, 3))
         )
+        if getattr(res, "dpr_metrics", None) is not None:
+            metrics = res.dpr_metrics
         if res.ced_metrics is not None:
             metrics = res.ced_metrics
         if getattr(res, "tail_stats", None) is not None:
@@ -418,6 +423,7 @@ class BaseTrainer:
         psr_gate=None,
         tail_reference=None,
         tail_fraction=None,
+        dpr_weight=None,
     ):
         """参数与 MoE bias 显式作为入参的 loss 函数（value_and_grad 的目标）。
 
@@ -442,6 +448,7 @@ class BaseTrainer:
             psr_gate,
             tail_reference,
             tail_fraction,
+            dpr_weight,
         )
 
     def _compute_loss_and_grad(
@@ -504,6 +511,15 @@ class BaseTrainer:
                 if protected
                 else (0, None, tail_reference, tail_fraction)
             )
+        if getattr(self.lm_config, "dpr_enabled", False):
+            consumed = int(getattr(self.args, "dpr_consumed_tokens", 0))
+            horizon = float(getattr(self.args, "dpr_warmup_tokens", 0))
+            ratio = min(consumed / max(horizon, 1), 1.0) if horizon > 0 else 1.0
+            smooth = ratio * ratio * (3 - 2 * ratio)
+            weight = mx.array(self.lm_config.dpr_loss_weight * smooth, mx.float32)
+            extra = (0, None, tail_reference, tail_fraction, weight)
+            tokens = int(mx.sum(loss_mask).item()) if loss_mask is not None else X.size
+            self.args.dpr_consumed_tokens = consumed + tokens
         outputs, grads = self._loss_and_grad(
             eval_params, biases, X, Y, loss_mask, attn_mask, seg_ids, *extra
         )
@@ -1049,6 +1065,43 @@ class BaseTrainer:
                             f"gate_maxK={'/'.join(f'{v / 2**10:.1f}' for v in gate_max)}"
                         )
 
+                if getattr(self.lm_config, "dpr_enabled", False):
+                    from model.dpr import DPR_METRICS
+
+                    extra = dict(extra or {})
+                    if metrics.ndim == 1:
+                        extra.update(
+                            {
+                                "dpr/" + name: float(metrics[i])
+                                for i, name in enumerate(DPR_METRICS)
+                            }
+                        )
+                        Logger(
+                            f"DPR kernel={float(metrics[0]):.5f} cov={float(metrics[1]):.5f} "
+                            f"lambda={float(metrics[7]):.6f} coverage={float(metrics[5]):.3f} "
+                            f"N={int(metrics[3])} rank_deficient={int(metrics[6])}"
+                        )
+                    extra.update(
+                        lm_loss=current_main_loss,
+                        total_training_loss=current_loss,
+                        dpr_consumed_tokens=self.args.dpr_consumed_tokens,
+                    )
+                    record = {
+                        "epoch": epoch,
+                        "microstep": step,
+                        "optimizer_step": get_optimizer_steps(self.optimizer),
+                        **{
+                            k: v
+                            for k, v in extra.items()
+                            if k.startswith("dpr/")
+                            or k
+                            in ("lm_loss", "total_training_loss", "dpr_consumed_tokens")
+                        },
+                    }
+                    with open(
+                        os.path.join(self.args.save_dir, "dpr_metrics.jsonl"), "a"
+                    ) as file:
+                        file.write(json.dumps(record) + "\n")
                 if tail_reference is not None:
                     from .tail_sft import TAIL_METRICS
 
@@ -1105,6 +1158,21 @@ class BaseTrainer:
         iter_per_epoch = len(train_loader)
         total_training_steps = resolve_lr_horizon(self.args, iter_per_epoch)
         resolve_warmup_iters(self.args, total_training_steps)
+        if getattr(self.lm_config, "dpr_enabled", False):
+            if not getattr(self.args, "dpr_warmup_tokens", 0):
+                planned = (
+                    getattr(self.args, "token_budget", None)
+                    or total_training_steps
+                    * self.args.batch_size
+                    * self.args.max_seq_len
+                )
+                self.args.dpr_warmup_tokens = (
+                    planned * self.lm_config.dpr_warmup_fraction
+                )
+            Logger(
+                f"DPR warmup: {self.args.dpr_warmup_tokens:.0f} effective NTP tokens; "
+                "planned budget uses token_budget or scheduled packed token capacity"
+            )
         Logger(
             f"训练总步数: {total_training_steps}, 每轮步数: {iter_per_epoch}, "
             f"warmup: {self.args.warmup_iters}, "

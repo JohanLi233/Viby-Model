@@ -39,6 +39,15 @@ if __name__ == "__main__":
     # 创建模型配置：CLI 结构参数（含 --preset 回填）→ VibyConfig kwargs，
     # 未显式传入的字段由 VibyConfig 的 ≈1B 默认配方补齐
     lm_config = VibyConfig(**build_model_kwargs(args))
+    if lm_config.dpr_enabled:
+        from .utils import Logger
+
+        Logger(
+            f"DPR-JEPA: full token CED, boundary={lm_config.n_encoder_layers}, "
+            f"M={lm_config.dpr_particles}, r={lm_config.dpr_dim}, k={lm_config.dpr_horizon}, "
+            f"w={lm_config.dpr_width}, objective={lm_config.dpr_objective}, "
+            f"lambda={lm_config.dpr_loss_weight}; zero residual, future-only targets"
+        )
     if lm_config.ced_recurrent_enabled:
         from .utils import Logger
 
@@ -83,6 +92,13 @@ if __name__ == "__main__":
 
     train_loader = trainer.create_data_loader(train_ds)
 
+    if lm_config.dpr_enabled:
+        import json
+
+        with open(os.path.join(args.save_dir, "run_config.json"), "w") as file:
+            json.dump(
+                {"args": vars(args), "model": lm_config.to_dict()}, file, indent=2
+            )
     swanlab = init_swanlab(args, trainer)
 
     try:

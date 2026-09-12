@@ -78,7 +78,7 @@ def gemm_active_params(model) -> int:
     for path, value in tree_flatten(model.trainable_parameters()):
         # PSR runs once per prefix, with R shared transitions. Counting its
         # matrices once per token overstates work and omits repeated work.
-        if path.startswith("psr."):
+        if path.startswith(("psr.", "model.dpr.")):
             continue
         # 1-D（norm gain / mHC scale·base / attn_sink / router bias）不是 GEMM 权重
         if getattr(value, "ndim", 0) < 2:
@@ -171,6 +171,7 @@ def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int
         6 * gemms
         + attn_fwdbwd_flops_per_token(model.config, seq_len, attention_lengths)
         + psr_pretrain_flops_per_token(model.config, seq_len)
+        + dpr_train_flops_per_token(model.config, seq_len)
     )
 
 
@@ -210,3 +211,23 @@ def model_flops_utilization(
     if peak <= 0 or tokens_per_sec <= 0 or flops_per_token <= 0:
         return 0.0
     return float(tokens_per_sec) * float(flops_per_token) / peak
+
+
+def dpr_train_flops_per_token(cfg, seq_len):
+    """Major GEMMs only; target input detached; static T-k windows are computed.
+
+    Excludes kernels, covariance, norm, activation, masking and optimizer work.
+    """
+    if not getattr(cfg, "dpr_enabled", False) or seq_len <= 0:
+        return 0
+    d, k, w, r, m = (
+        cfg.dim,
+        cfg.dpr_horizon,
+        cfg.dpr_width,
+        cfg.dpr_dim,
+        cfg.dpr_particles,
+    )
+    cost = 12 * d * m * (r + 1)
+    if cfg.dpr_loss_weight > 0:
+        cost += (4 * k * d * w + 6 * w * r) * max(seq_len - k, 0) / seq_len
+    return int(cost)

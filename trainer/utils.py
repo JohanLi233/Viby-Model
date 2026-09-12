@@ -342,6 +342,20 @@ ARCH_ARG_TO_FIELD = {
     **{
         name: name
         for name in (
+            "dpr_enabled",
+            "dpr_particles",
+            "dpr_dim",
+            "dpr_width",
+            "dpr_horizon",
+            "dpr_seed",
+            "dpr_objective",
+            "dpr_loss_weight",
+            "dpr_warmup_fraction",
+        )
+    },
+    **{
+        name: name
+        for name in (
             "ced_recurrent_enabled",
             "ced_recurrent_stride",
             "ced_recurrent_rounds",
@@ -428,6 +442,8 @@ ARCH_ARG_TO_FIELD = {
 #  --preset 判断"用户是否显式传过"）
 ARCH_ARG_ALIASES = {
     "routed_scaling_factor": "route_scale",
+    "dpr": "dpr_enabled",
+    "no_dpr": "dpr_enabled",
     "psr": "psr_enabled",
     "ced_recurrent": "ced_recurrent_enabled",
     "no_ced_recurrent": "ced_recurrent_enabled",
@@ -539,6 +555,22 @@ def load_checkpoint_config(save_dir, checkpoint_name):
 def checkpoint_execution(config):
     """Execution identity independent of shared parameter names/shapes."""
     cfg = config if isinstance(config, dict) else vars(config)
+    if cfg.get("dpr_enabled", False):
+        return {
+            "kind": "dpr_jepa_v1",
+            **{
+                key: cfg.get(key, default)
+                for key, default in (
+                    ("dpr_particles", 4),
+                    ("dpr_dim", 32),
+                    ("dpr_width", 128),
+                    ("dpr_horizon", 4),
+                    ("dpr_objective", "kernel"),
+                    ("dpr_loss_weight", 0.05),
+                    ("dpr_warmup_fraction", 0.01),
+                )
+            },
+        }
     if not cfg.get("ced_recurrent_enabled", False):
         return {"kind": "token_ced_v1"}
     return {
@@ -949,7 +981,7 @@ def _artifact_sha256(path, common_only=False):
             size = struct.unpack("<Q", file.read(8))[0]
             header = json.loads(file.read(size))
             for name, entry in sorted(header.items()):
-                if name == "__metadata__" or name.startswith("psr."):
+                if name == "__metadata__" or name.startswith(("psr.", "model.dpr.")):
                     continue
                 digest.update(
                     json.dumps([name, entry["dtype"], entry["shape"]]).encode()
@@ -1033,7 +1065,7 @@ def save_checkpoint(
         }
     if any(
         getattr(lm_config, flag, False)
-        for flag in ("psr_enabled", "ced_recurrent_enabled")
+        for flag in ("psr_enabled", "ced_recurrent_enabled", "dpr_enabled")
     ):
         meta["code_sha"] = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
@@ -1092,7 +1124,7 @@ def save_checkpoint(
         )
     if any(
         getattr(lm_config, flag, False)
-        for flag in ("psr_enabled", "ced_recurrent_enabled")
+        for flag in ("psr_enabled", "ced_recurrent_enabled", "dpr_enabled")
     ):
         meta["common_weights_sha256"] = _artifact_sha256(ckp, common_only=True)
         meta[
@@ -1127,6 +1159,12 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
     )
     if fresh_psr:
         fresh_prefixes += psr_prefixes
+    if getattr(model.config, "dpr_enabled", False) and not any(
+        k.startswith("model.dpr.") for k in weights
+    ):
+        if not getattr(args, "reset_optimizer", False):
+            raise ValueError("Fresh DPR requires explicit --reset_optimizer")
+        fresh_prefixes += ("model.dpr.",)
 
     # 加载模型权重（严格校验，buffer shape 不匹配时保留当前 config 的版本）。
     # --freeze_backbone 的 DSpark 独立阶段（报告 §2.4.3）允许基座 checkpoint
@@ -1200,6 +1238,11 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
             )
         side.state = tree_unflatten(list(mx.load(side_path).items()))
         _restore_optimizer_hparams(side, meta.get("psr_optimizer", []))
+    if not getattr(args, "reset_optimizer", False) and getattr(
+        model.config, "dpr_enabled", False
+    ):
+        args.dpr_consumed_tokens = meta.get("args", {}).get("dpr_consumed_tokens", 0)
+        args.dpr_warmup_tokens = meta.get("args", {}).get("dpr_warmup_tokens", 0)
     args.psr_resumed_microstep = meta.get("psr_microstep", start_step)
     if not getattr(args, "reset_optimizer", False) and meta.get("rng"):
         rng = meta["rng"]

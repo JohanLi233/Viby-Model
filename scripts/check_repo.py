@@ -20,6 +20,7 @@ ENTRY_DOCS = (
     "research/EXPERIMENT_PROTOCOL.md",
 )
 TEST_GROUPS = {
+    "dpr": ("test_dpr.py",),
     "tools": ("test_repo_tools.py",),
     "host": ("test_moe_dataflow_host.py",),
     "config": ("test_v41_config.py",),
