@@ -73,6 +73,7 @@ class CausalLMOutput:
     tail_stats: Optional[mx.array] = None
     dpr_metrics: Optional[mx.array] = None
     dpr_loss: Optional[mx.array] = None
+    binding_trace: object = None
 
 
 def lm_head_ce(
@@ -188,7 +189,21 @@ class VibyModel(nn.Module):
         return_dpr=False,
         dpr_intervention=None,
         return_latent_features=False,
+        binding=None,
+        binding_options=None,
     ):
+        if binding is not None and (use_dpr or use_ced_recurrent):
+            raise ValueError("binding workspace requires explicit ordinary CED switches")
+        binding_options = dict(binding_options or {})
+        if cache is not None:
+            signature = None if binding is None else (binding.config.version, binding.address_mode)
+            if getattr(cache, "binding_signature", signature) != signature:
+                raise ValueError("binding execution changes require a fresh cache")
+            cache.binding_signature = signature
+            if binding is not None and (segment_ids is not None or pad_mask is not None):
+                raise ValueError("cached binding workspace requires unpadded single-document inputs")
+            if binding is not None and bool(mx.any(input_ids[:, :-1] == self.config.eos_token_id)):
+                raise ValueError("binding prefill requires one document; start a fresh prefill after EOS")
         if return_latent_features and (use_dpr or use_ced_recurrent):
             raise ValueError("latent probe requires explicit ordinary CED switches")
         dpr_active = self.dpr is not None and use_dpr
@@ -237,6 +252,7 @@ class VibyModel(nn.Module):
         memory = None
         boundary_input = None
         latent_features = None
+        binding_injection = None
         hashes, new_prev = (None, None)
         if self.engram_hash is not None:
             token_mask = None if pad_mask is None else pad_mask
@@ -286,7 +302,7 @@ class VibyModel(nn.Module):
                 # MTP 读的是目标层的"注意力输入"（mHC 均值），不是层输出
                 mains.append(mx.mean(h, axis=2))
             layer_cache = None if cache is None else cache[i]
-            if (return_memory or return_latent_features) and i == self.config.n_encoder_layers:
+            if (return_memory or return_latent_features or binding is not None) and i == self.config.n_encoder_layers:
                 boundary_input = apply_hc_pre_norm(h, pre_mix, layer.attn_norm)
             if recurrent and i == self.config.n_layers - 1:
                 h, pre_mix = layer.recurrent(
@@ -302,6 +318,11 @@ class VibyModel(nn.Module):
                     cache=None if cache is None else cache.ced_output_cache,
                 )
             else:
+                injection_args = (
+                    {"attention_injection": binding_injection}
+                    if binding_injection is not None and i == self.config.n_encoder_layers + 1
+                    else {}
+                )
                 h, pre_mix = layer(
                     h,
                     start_pos,
@@ -311,7 +332,20 @@ class VibyModel(nn.Module):
                     segment_ids,
                     pad_mask,
                     decode,
+                    **injection_args,
                 )
+            if binding is not None and i == self.config.n_encoder_layers:
+                a = apply_hc_pre_norm(h, pre_mix, self.layers[i + 1].attn_norm)
+                binding_injection, final_state, trace = binding(
+                    boundary_input, a, input_ids, pad_mask, segment_ids,
+                    initial=None if cache is None else getattr(cache, "binding_state", None),
+                    previous_token=None if cache is None else getattr(cache, "binding_previous_token", None),
+                    eos_id=self.config.eos_token_id, pad_id=self.config.pad_token_id,
+                    **binding_options,
+                )
+                if cache is not None:
+                    cache.binding_state = final_state
+                    cache.binding_previous_token = input_ids[:, -1]
             if return_latent_features and i == self.config.n_encoder_layers:
                 from .latent_inference import boundary_candidates
 
@@ -357,6 +391,8 @@ class VibyModel(nn.Module):
             result = (*result, dpr_result)
         if return_latent_features:
             result = (*result, latent_features)
+        if binding is not None:
+            result = (*result, trace)
         return result
 
 
@@ -538,6 +574,8 @@ class VibyForCausalLM(nn.Module):
         use_dpr=True,
         dpr_weight=None,
         dpr_intervention=None,
+        use_binding=True,
+        binding_options=None,
         **kwargs,
     ):
         mode = psr_mode or (
@@ -600,6 +638,8 @@ class VibyForCausalLM(nn.Module):
             use_dpr=use_dpr,
             return_dpr=want_dpr,
             dpr_intervention=dpr_intervention,
+            binding=getattr(self, "binding", None) if use_binding else None,
+            binding_options=binding_options,
         )
         hidden, mains, _ = result[:3]
         state, trace = thinking_state, None
@@ -621,6 +661,8 @@ class VibyForCausalLM(nn.Module):
         if state is not None and state.mode != mode:
             raise ValueError("state mode mismatch; create a fresh condition")
         out = CausalLMOutput(thinking_state=state, thinking_trace=trace)
+        if use_binding and getattr(self, "binding", None) is not None:
+            out.binding_trace = result[-1]
         if recurrent_active(self.config, use_ced_recurrent):
             out.ced_result = result[-1]
             out.ced_metrics = out.ced_result["metrics"]
@@ -982,6 +1024,13 @@ class VibyForCausalLM(nn.Module):
 
     def decode_step(self, token_ids: mx.array, cache: VibyCache, *, psr_gate=None):
         """单步解码，返回 (logits [B,V], cache)。"""
+        if getattr(self, "binding", None) is not None and getattr(cache, "binding_previous_token", None) is not None:
+            ended = cache.binding_previous_token == self.config.eos_token_id
+            if bool(mx.any(ended)):
+                if not bool(mx.all(ended)):
+                    raise ValueError("binding cache requires common document resets")
+                logits, fresh = self.prefill(token_ids[:, None], use_dpr=False, use_ced_recurrent=False)
+                return logits[:, 0], fresh
         cache.decode_max_pos = cache.start_pos + 1
         if psr_gate is None:
             psr_gate = cache.psr_gate

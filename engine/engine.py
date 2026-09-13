@@ -79,6 +79,8 @@ class VibyEngine:
         **kwargs,
     ):
         cfg = model.config
+        if getattr(model, "binding", None) is not None:
+            raise ValueError("binding workspace currently supports native prefill/decode only")
         if getattr(cfg, "ced_recurrent_enabled", False):
             raise ValueError(
                 "Recurrent CED uses model.prefill/decode_step/generate; the continuous-batch engine does not yet transport per-round latent cache and anchor state"

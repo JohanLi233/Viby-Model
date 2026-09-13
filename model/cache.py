@@ -133,6 +133,8 @@ class VibyCache:
 
         压缩池与索引器 K 池按整组回退：只有落在回退区间之外的组保留。
         """
+        if offset and getattr(self, "binding_state", None) is not None:
+            raise ValueError("binding workspace rewind requires a fresh prefill")
         if offset < 0:
             raise ValueError("rewind offset must be nonnegative")
         if offset > 0 and self.ced_signature not in (None, ("baseline",)):
