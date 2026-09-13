@@ -56,8 +56,11 @@ def convert_model_dtype(model, dtype_name):
                     path,
                     p.astype(
                         mx.float32
-                        if keep_router
-                        and path.endswith(("router.weight", "router.bias"))
+                        if (
+                            keep_router
+                            and path.endswith(("router.weight", "router.bias"))
+                        )
+                        or path.endswith("context_projection")
                         else target
                     )
                     if mx.issubdtype(p.dtype, mx.floating)
@@ -343,6 +346,7 @@ ARCH_ARG_TO_FIELD = {
         name: name
         for name in (
             "dpr_enabled",
+            "dpr_variant",
             "dpr_particles",
             "dpr_dim",
             "dpr_width",
@@ -548,6 +552,8 @@ def load_checkpoint_config(save_dir, checkpoint_name):
         meta = json.load(f)
     config = meta.get("config")
     if config:
+        if config.get("dpr_enabled"):
+            config.setdefault("dpr_variant", "legacy_v1")
         Logger(f"已从 {meta_path} 继承模型结构配置")
     return config
 
@@ -557,7 +563,14 @@ def checkpoint_execution(config):
     cfg = config if isinstance(config, dict) else vars(config)
     if cfg.get("dpr_enabled", False):
         return {
-            "kind": "dpr_jepa_v1",
+            "kind": "dpr_jepa_v2"
+            if cfg.get("dpr_variant", "legacy_v1") == "contextual_v2"
+            else "dpr_jepa_v1",
+            **(
+                {"dpr_seed": cfg.get("dpr_seed", 20260913)}
+                if cfg.get("dpr_variant") == "contextual_v2"
+                else {}
+            ),
             **{
                 key: cfg.get(key, default)
                 for key, default in (

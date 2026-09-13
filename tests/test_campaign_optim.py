@@ -240,6 +240,7 @@ def test_expl_nest_hook():
 
     tr = object.__new__(BaseTrainer)
     tr.args = SimpleNamespace(grad_clip=0.0)
+    tr.lm_config = SimpleNamespace()
     tr.model = _Model()
     tr.optimizer = _Opt()
     tr._expl_nest_mu = 2.0

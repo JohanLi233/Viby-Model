@@ -154,6 +154,9 @@ def add_common_args(parser):
         )
     parser.add_argument("--dpr_objective", choices=("kernel", "mse"), default="kernel")
     parser.add_argument(
+        "--dpr_variant", choices=("legacy_v1", "contextual_v2"), default="contextual_v2"
+    )
+    parser.add_argument(
         "--ced-recurrent",
         dest="ced_recurrent_enabled",
         action=argparse.BooleanOptionalAction,

@@ -19,7 +19,7 @@ def trunc_normal(shape, std: float, bound: float = 2.0):
 def _skip_init(path: str, arr: mx.array) -> bool:
     """跳过 1-D 量与专用初始化：norm 权重、attn_sink（零）、mHC scale/base、
     RoPE 表（freq_cos/freq_sin）、Engram 的 q/k_weight。"""
-    if path in ("psr.output.weight", "output.weight"):
+    if path in ("psr.output.weight", "output.weight") or path.endswith("context_projection"):
         return True
     if arr.ndim < 2:
         return True

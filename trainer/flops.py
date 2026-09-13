@@ -229,5 +229,8 @@ def dpr_train_flops_per_token(cfg, seq_len):
     )
     cost = 12 * d * m * (r + 1)
     if cfg.dpr_loss_weight > 0:
-        cost += (4 * k * d * w + 6 * w * r) * max(seq_len - k, 0) / seq_len
+        if getattr(cfg, "dpr_variant", "legacy_v1") == "contextual_v2":
+            cost += 2 * d * r if seq_len > k else 0  # fixed projection, forward only
+        else:
+            cost += (4 * k * d * w + 6 * w * r) * max(seq_len - k, 0) / seq_len
     return int(cost)

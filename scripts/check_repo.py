@@ -20,7 +20,7 @@ ENTRY_DOCS = (
     "research/EXPERIMENT_PROTOCOL.md",
 )
 TEST_GROUPS = {
-    "dpr": ("test_dpr.py",),
+    "dpr": ("test_dpr.py", "test_dpr_contextual.py", "test_dpr_diagnostics.py"),
     "tools": ("test_repo_tools.py",),
     "host": ("test_moe_dataflow_host.py",),
     "config": ("test_v41_config.py",),
@@ -65,6 +65,10 @@ TEST_GROUPS = {
     "training": (
         "test_v41_train.py",
         "test_muonh.py",
+        "test_adamw_precision.py",
+        "test_hyperball_radius.py",
+        "test_gradient_lifetime.py",
+        "test_resume_layout.py",
         "test_optimizer_fast_norm.py",
         "test_kernel_bench_state.py",
         "test_training_flops.py",
