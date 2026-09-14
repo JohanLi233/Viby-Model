@@ -187,10 +187,7 @@ class VibyModel(nn.Module):
         use_dpr=True,
         return_dpr=False,
         dpr_intervention=None,
-        return_latent_features=False,
     ):
-        if return_latent_features and (use_dpr or use_ced_recurrent):
-            raise ValueError("latent probe requires explicit ordinary CED switches")
         dpr_active = self.dpr is not None and use_dpr
         if cache is not None:
             signature = (dpr_active, dpr_intervention)
@@ -236,7 +233,6 @@ class VibyModel(nn.Module):
         positions = mx.broadcast_to(positions, (B, T))
         memory = None
         boundary_input = None
-        latent_features = None
         hashes, new_prev = (None, None)
         if self.engram_hash is not None:
             token_mask = None if pad_mask is None else pad_mask
@@ -286,7 +282,7 @@ class VibyModel(nn.Module):
                 # MTP 读的是目标层的"注意力输入"（mHC 均值），不是层输出
                 mains.append(mx.mean(h, axis=2))
             layer_cache = None if cache is None else cache[i]
-            if (return_memory or return_latent_features) and i == self.config.n_encoder_layers:
+            if return_memory and i == self.config.n_encoder_layers:
                 boundary_input = apply_hc_pre_norm(h, pre_mix, layer.attn_norm)
             if recurrent and i == self.config.n_layers - 1:
                 h, pre_mix = layer.recurrent(
@@ -311,14 +307,6 @@ class VibyModel(nn.Module):
                     segment_ids,
                     pad_mask,
                     decode,
-                )
-            if return_latent_features and i == self.config.n_encoder_layers:
-                from .latent_inference import boundary_candidates
-
-                latent_features = (
-                    apply_hc_pre_norm(h, pre_mix, self.layers[i + 1].attn_norm),
-                    boundary_input,
-                    boundary_candidates(shared, layer.attn, B, T, positions, decode),
                 )
             if dpr_active and i == self.config.n_encoder_layers:
                 a = apply_hc_pre_norm(h, pre_mix, self.layers[i + 1].attn_norm)
@@ -355,8 +343,6 @@ class VibyModel(nn.Module):
             result = (*result, ced_result)
         if return_dpr:
             result = (*result, dpr_result)
-        if return_latent_features:
-            result = (*result, latent_features)
         return result
 
 
