@@ -300,15 +300,6 @@ class VibyConfig:
         self.ced_recurrent_rounds = int(kw.get("ced_recurrent_rounds", 3))
         self.ced_recurrent_arch = str(kw.get("ced_recurrent_arch", "residual_lift_v1"))
 
-        self.dpr_enabled = bool(kw.get("dpr_enabled", False))
-        self.dpr_particles = int(kw.get("dpr_particles", 4))
-        self.dpr_dim = int(kw.get("dpr_dim", 32))
-        self.dpr_width = int(kw.get("dpr_width", 128))
-        self.dpr_horizon = int(kw.get("dpr_horizon", 4))
-        self.dpr_seed = int(kw.get("dpr_seed", 20260913))
-        self.dpr_objective = str(kw.get("dpr_objective", "kernel"))
-        self.dpr_loss_weight = float(kw.get("dpr_loss_weight", 0.05))
-        self.dpr_warmup_fraction = float(kw.get("dpr_warmup_fraction", 0.01))
         self._validate()
 
     # ------------------------------------------------------------------
@@ -358,27 +349,6 @@ class VibyConfig:
         )
 
     def _validate(self):
-        if min(self.dpr_particles, self.dpr_dim, self.dpr_width, self.dpr_horizon) < 1:
-            raise ValueError("DPR dimensions and horizon must be positive")
-        if self.dpr_objective not in ("kernel", "mse"):
-            raise ValueError("DPR objective must be kernel/mse")
-        if not self.dpr_loss_weight >= 0 or not 0 <= self.dpr_warmup_fraction <= 1:
-            raise ValueError("invalid DPR loss weight/warmup fraction")
-        if self.dpr_enabled:
-            if self.psr_enabled or self.ced_recurrent_enabled or self.n_mtp_layers:
-                raise ValueError(
-                    "DPR requires --no-psr --no-ced-recurrent --mtp_depth 0"
-                )
-            b = self.n_encoder_layers
-            if (
-                b >= self.n_layers - 1
-                or self.compress_ratios[b] != 1
-                or b not in self.kv_source_layers
-                or b not in self.index_source_layers
-            ):
-                raise ValueError(
-                    "DPR requires full ratio=1 CED boundary and a following decoder"
-                )
         if self.ced_recurrent_stride < 1 or self.ced_recurrent_rounds < 1:
             raise ValueError("CED recurrent stride and rounds must be positive")
         if self.ced_recurrent_enabled:
@@ -627,12 +597,6 @@ class VibyConfig:
                 self.psr_slots + 2 * d + 2 * hd + self.psr_horizon + self.vocab_size
             )
             total += (10 * self.psr_blocks + 2) * s * s
-        if self.dpr_enabled:
-            total += (
-                2 * d * self.dpr_particles * (self.dpr_dim + 1)
-                + self.dpr_horizon * d * self.dpr_width
-                + self.dpr_width * self.dpr_dim
-            )
         return total
 
     def num_active_parameters(self) -> int:
@@ -655,6 +619,4 @@ class VibyConfig:
             total += self.n_mtp_layers * (
                 self.dspark_n_activated_experts * 3 * d * self.moe_inter_dim + per_layer
             )
-        if self.dpr_enabled:
-            total += 2 * d * self.dpr_particles * (self.dpr_dim + 1)
         return total

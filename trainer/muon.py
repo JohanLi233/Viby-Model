@@ -1565,10 +1565,6 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         return any(p.endswith("norm") for p in path.split(".")[:-1])
 
     def _is_muon(path, arr):
-        # A zero-initialized residual cannot leave zero under a frozen-norm
-        # MuonH projection. Use the existing AdamW no-decay fallback for W_o.
-        if path == "model.dpr.output.weight":
-            return False
         # 3D 堆叠专家：muonh 下（默认）由堆叠组逐专家 NS；`--no_muonh` 或
         # VIBY_MUONH_EXPERTS=0 时排除进 AdamW，避免基类 reshape (E,out·in)
         # 跨专家耦合。MoE router 也不走 Muon：正交化更新步长恒定偏大，会把

@@ -140,20 +140,6 @@ def add_common_args(parser):
         help="启用隔离的 PSR 纠错分支；预训练默认启用，--no-psr 选择基线",
     )
     parser.add_argument(
-        "--dpr",
-        dest="dpr_enabled",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="DPR-JEPA; requires --no-psr --mtp_depth 0",
-    )
-    for name in ("dpr_particles", "dpr_dim", "dpr_width", "dpr_horizon", "dpr_seed"):
-        parser.add_argument("--" + name, type=int, default=getattr(_DEFAULT_CFG, name))
-    for name in ("dpr_loss_weight", "dpr_warmup_fraction"):
-        parser.add_argument(
-            "--" + name, type=float, default=getattr(_DEFAULT_CFG, name)
-        )
-    parser.add_argument("--dpr_objective", choices=("kernel", "mse"), default="kernel")
-    parser.add_argument(
         "--ced-recurrent",
         dest="ced_recurrent_enabled",
         action=argparse.BooleanOptionalAction,
@@ -818,18 +804,6 @@ def setup_training_args(args, training_type="pretrain"):
     # SFT/DPO 的结构参数默认 None，交给 sidecar 继承逻辑）
     if training_type == "pretrain":
         apply_preset(args)
-        if args.dpr_enabled and (
-            args.psr_enabled
-            or args.ced_recurrent_enabled
-            or args.mtp_depth
-            or args.freeze_backbone
-            or args.psr_freeze_base
-        ):
-            raise ValueError(
-                "DPR requires --no-psr --no-ced-recurrent --mtp_depth 0 and unfrozen backbone"
-            )
-        if args.dpr_enabled and args.pack_sequences and not args.doc_mask:
-            raise ValueError("DPR packed training requires --doc_mask")
         if args.ced_recurrent_enabled:
             if args.psr_enabled or args.psr_freeze_base:
                 raise ValueError(

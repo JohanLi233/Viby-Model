@@ -71,8 +71,6 @@ class CausalLMOutput:
     sequence_losses: Optional[mx.array] = None
     sequence_token_counts: Optional[mx.array] = None
     tail_stats: Optional[mx.array] = None
-    dpr_metrics: Optional[mx.array] = None
-    dpr_loss: Optional[mx.array] = None
 
 
 def lm_head_ce(
@@ -149,7 +147,6 @@ class VibyModel(nn.Module):
         self.layers = [Block(config, i) for i in range(config.n_layers)]
         self.norm = RMSNorm(config.dim, config.norm_eps)
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
-        self.dpr = None
         self.engram_layout = (
             EngramLayout.from_config(config) if config.engram_layer_ids else None
         )
@@ -184,16 +181,7 @@ class VibyModel(nn.Module):
         collect_main: bool = True,
         return_memory=False,
         use_ced_recurrent=True,
-        use_dpr=True,
-        return_dpr=False,
-        dpr_intervention=None,
     ):
-        dpr_active = self.dpr is not None and use_dpr
-        if cache is not None:
-            signature = (dpr_active, dpr_intervention)
-            if getattr(cache, "dpr_signature", signature) != signature:
-                raise ValueError("DPR condition changes require a fresh cache")
-            cache.dpr_signature = signature
         recurrent = recurrent_active(self.config, use_ced_recurrent)
         if cache is not None:
             signature = execution_signature(self.config, use_ced_recurrent)
@@ -220,8 +208,6 @@ class VibyModel(nn.Module):
                     "recurrent CED cache supports prefill then single-token decode"
                 )
         h = self.embed(input_ids)
-        raw_embeddings = h if return_dpr else None
-        dpr_result = None
         B, T = input_ids.shape
         positions = (
             (start_pos + mx.arange(T))[None, :]
@@ -306,12 +292,6 @@ class VibyModel(nn.Module):
                     pad_mask,
                     decode,
                 )
-            if dpr_active and i == self.config.n_encoder_layers:
-                a = apply_hc_pre_norm(h, pre_mix, self.layers[i + 1].attn_norm)
-                delta, pi, z = self.dpr(a, dpr_intervention)
-                h = h + delta.astype(h.dtype)[:, :, None, :]
-                if return_dpr:
-                    dpr_result = (pi, z, raw_embeddings)
             if return_memory and i == self.config.n_encoder_layers:
                 # Batched decode has one position per row. Slice to the largest
                 # live prefix; PSR masks each row's memory at its own anchor.
@@ -332,8 +312,6 @@ class VibyModel(nn.Module):
             result = (*result, memory)
         if recurrent:
             result = (*result, ced_result)
-        if return_dpr:
-            result = (*result, dpr_result)
         return result
 
 
@@ -463,18 +441,6 @@ class VibyForCausalLM(nn.Module):
             high, low = rng[0].tolist()
             mx.random.seed((int(high) << 32) | int(low))
 
-        if config.dpr_enabled:
-            from .dpr import DistributionalPredictiveResidual
-
-            rng = list(mx.random.state)
-            mx.random.seed(config.dpr_seed)
-            self.model.dpr = DistributionalPredictiveResidual(config)
-            if not skip_init:
-                apply_trunc_normal_init(self.model.dpr, config.dim)
-            self.model.dpr.output.weight = mx.zeros_like(self.model.dpr.output.weight)
-            high, low = rng[0].tolist()
-            mx.random.seed((int(high) << 32) | int(low))
-
     # ------------------------------------------------------------------
     def _head_weight(self) -> mx.array:
         return (
@@ -512,9 +478,6 @@ class VibyForCausalLM(nn.Module):
         return_sequence_losses=False,
         tail_reference=None,
         tail_fraction=None,
-        use_dpr=True,
-        dpr_weight=None,
-        dpr_intervention=None,
         **kwargs,
     ):
         mode = psr_mode or (
@@ -557,12 +520,6 @@ class VibyForCausalLM(nn.Module):
         requested = mode != "off" and thinking_state is None
         pad = None if attention_mask is None else attention_mask.astype(mx.bool_)
         want_main = bool(use_mtp and self.mtp_modules and labels is not None)
-        want_dpr = bool(
-            self.config.dpr_enabled
-            and use_dpr
-            and labels is not None
-            and self.config.dpr_loss_weight > 0
-        )
         result = self.model(
             input_ids,
             start_pos=start_pos,
@@ -574,9 +531,6 @@ class VibyForCausalLM(nn.Module):
             collect_main=want_main,
             return_memory=requested,
             use_ced_recurrent=use_ced_recurrent,
-            use_dpr=use_dpr,
-            return_dpr=want_dpr,
-            dpr_intervention=dpr_intervention,
         )
         hidden, mains, _ = result[:3]
         state, trace = thinking_state, None
@@ -737,14 +691,6 @@ class VibyForCausalLM(nn.Module):
                 [m._last_aux for m in self._moe_layers], axis=0
             ).sum()
             out.loss = out.loss + self.config.aux_balance_loss_weight * out.aux_loss
-        if want_dpr:
-            aux, metrics = self.model.dpr.auxiliary(
-                *result[-1], input_ids, pad, segment_ids
-            )
-            weight = self.config.dpr_loss_weight if dpr_weight is None else dpr_weight
-            out.dpr_loss = aux
-            out.dpr_metrics = metrics.at[7].add(mx.array(weight, mx.float32))
-            out.loss = out.loss + weight * aux
         if self.training and self._backbone_gates:
             # 作为图输出返回（compile 下纯侧信道会被剪枝，见 MoEGate.__call__）
             out.moe_loads = mx.stack(
@@ -903,7 +849,6 @@ class VibyForCausalLM(nn.Module):
         psr_mode=None,
         psr_gate=None,
         use_ced_recurrent=True,
-        use_dpr=True,
     ):
         """整段 prefill，返回 (logits [B,T,V], VibyCache)。"""
         if (
@@ -928,7 +873,6 @@ class VibyForCausalLM(nn.Module):
             psr_mode=psr_mode,
             psr_gate=psr_gate,
             use_ced_recurrent=use_ced_recurrent,
-            use_dpr=use_dpr,
             thinking_prefix_lengths=input_ids.shape[1]
             if self.config.psr_enabled and use_thinking
             else None,
@@ -982,8 +926,6 @@ class VibyForCausalLM(nn.Module):
             psr_gate=psr_gate,
             psr_anchors=new_anchor,
             use_ced_recurrent=cache.ced_signature != ("baseline",),
-            use_dpr=getattr(cache, "dpr_signature", (True, None))[0],
-            dpr_intervention=getattr(cache, "dpr_signature", (True, None))[1],
             thinking_options=cache.psr_options if new_anchor is not None else None,
         )
         if self.model.engram_hash is not None:

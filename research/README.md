@@ -11,7 +11,6 @@
 | 文档 | 用途 | 阅读边界 |
 | --- | --- | --- |
 | [受保护 PSR](VIBY_PSR.md) | 输出修正、梯度隔离、训练与 engine 状态 | 机制与历史验收不证明验证集提升 |
-| [DPR-JEPA](DPR_JEPA.md) | 完整 token CED、未来分布辅助监督、零初始化残差 | 小模型机制通过不代表 token 效率收益 |
 | [循环 CED](CED_RECURRENT.md) | 残差提升、锚点读取、分轮缓存、对照 | 可选主干变体，engine 兼容性需查当前入口 |
 | [QB 路由](MOE_QB_ROUTING.md) | 路由偏置、跨调用统计、累积窗口更新 | 改变训练配方，不是等价 kernel 优化 |
 | [TailSFT](TAIL_SFT.md) | SFT 默认损失、初始策略缓存、筛选和恢复契约 | 机制验证不证明覆盖率或后续 RL 收益 |
