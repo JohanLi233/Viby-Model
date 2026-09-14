@@ -10,7 +10,7 @@
 
 | 文档 | 用途 | 阅读边界 |
 | --- | --- | --- |
-| [默认 CED-aware NCP](NCP_CED.md) | 干净 CED KV、共享概念 KV、decoder 门控、梯度与缓存契约 | 新模型默认；机制测试不证明质量或效率收益 |
+| [默认 CED-aware NCP](NCP_CED.md) | 干净 CED KV、分层概念记忆、状态/PQ 双通路、梯度与缓存契约 | 新模型默认；机制测试不证明质量或效率收益 |
 | [循环 CED](CED_RECURRENT.md) | 残差提升、锚点读取、分轮缓存、对照 | 可选主干变体，engine 兼容性需查当前入口 |
 | [QB 路由](MOE_QB_ROUTING.md) | 路由偏置、跨调用统计、累积窗口更新 | 改变训练配方，不是等价 kernel 优化 |
 | [TailSFT](TAIL_SFT.md) | SFT 默认损失、初始策略缓存、筛选和恢复契约 | 机制验证不证明覆盖率或后续 RL 收益 |

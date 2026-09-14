@@ -161,6 +161,7 @@ def test_low_precision_coefficient_leaves_keep_native_promotion_and_vjp(
     def run(fn):
         def call(m, s, b):
             return mx.vjp(fn, [m, s, b], list(cot))
+
         return (mx.compile(call) if compiled else call)(*values)
 
     output, gradients = run(fused)

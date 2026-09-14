@@ -1,6 +1,6 @@
 """CED-aware next-concept prediction; only observed concepts enter shared KV.
 
-Losses use per-dimension means. This is a shared-memory research architecture,
+Losses use per-dimension means. V2 refreshes compact memory between concept layers,
 not a reproduction of the paper's per-layer concept Transformer.
 """
 
@@ -91,6 +91,8 @@ def cache_signature(config):
             "ncp_groups",
             "ncp_codes",
             "dim",
+            "n_layers",
+            "n_encoder_layers",
         )
     )
 
@@ -145,9 +147,9 @@ class ConceptBlock(nn.Module):
 
 
 class ConceptCache:
-    """One shared KV array, incomplete observed group, and held prediction.
+    """Compact per-depth K=V, incomplete group, held prediction/projected states.
 
-    No per-layer hidden/KV history, predicted-history entries, or token prefix.
+    No full-width hidden history, predicted-history entries, or token prefix.
     Native cache API currently uses a common clock and unpadded single document.
     """
 
@@ -160,16 +162,30 @@ class ConceptCache:
             setattr(
                 result, field, None if value is None else mx.array(value[row : row + 1])
             )
+        result.layer_memories = [
+            mx.array(x[row : row + 1]) for x in self.layer_memories
+        ]
+        result.states = (
+            None if self.states is None else mx.array(self.states[row : row + 1])
+        )
         return result
 
     def nbytes(self):
         return sum(
             int(x.nbytes)
-            for x in (self.memory, self.pending, self.prediction)
+            for x in (
+                self.memory,
+                self.pending,
+                self.prediction,
+                self.states,
+                *self.layer_memories,
+            )
             if x is not None
         )
 
     def __init__(self):
+        self.layer_memories = []
+        self.states = None
         self.memory = None
         self.pending = None
         self.prediction = None
@@ -198,14 +214,70 @@ class NextConceptPrediction(nn.Module):
         self.feedback_norm = RMSNorm(config.dim, config.norm_eps)
         self.feedback = nn.Linear(config.dim, config.dim, bias=False)
         self.feedback_gate = mx.zeros((1,))
+        self.state_enabled = config.ncp_arch == "ced_state_v2"
+        if self.state_enabled:
+            self.memory_updates = [
+                nn.Linear(config.dim, config.ncp_memory_dim, bias=False)
+                for _ in range(config.ncp_layers - 1)
+            ]
+            self.memory_update_norm = [
+                RMSNorm(config.ncp_memory_dim, config.norm_eps)
+                for _ in self.memory_updates
+            ]
+            self.state_norm = [
+                RMSNorm(config.dim, config.norm_eps) for _ in self.layers
+            ]
+            self.state_projects = [
+                nn.Linear(config.dim, config.dim, bias=False) for _ in self.layers
+            ]
+            self.route_norm = RMSNorm(config.dim, config.norm_eps)
+            self.state_routes = [
+                nn.Linear(config.dim, config.ncp_layers, bias=False)
+                for _ in config.ncp_decoder_layers
+            ]
+            self.state_gates = mx.zeros((len(config.ncp_decoder_layers),))
+            self.prediction_gates = mx.zeros((len(config.ncp_decoder_layers) - 1,))
+
+    def state_signal(self, decoder, states, slot):
+        weights = mx.softmax(
+            self.state_routes[slot](self.route_norm(decoder)).astype(mx.float32),
+            axis=-1,
+        )
+        return self.state_gates[slot] * mx.sum(
+            weights[..., None] * states.astype(mx.float32), axis=2
+        )
 
     def project_memory(self, concepts, positions):
         return _rotate(self.memory_norm(self.memory_project(concepts)), positions)
 
-    def predict_next(self, concepts, memory, positions, visible):
+    def predict_next(self, concepts, memory, positions, visible, cache=None):
         state = concepts
-        for layer in self.layers:
+        states = []
+        memories = []
+        for depth, layer in enumerate(self.layers):
+            if self.state_enabled and depth:
+                new_memory = _rotate(
+                    self.memory_update_norm[depth - 1](
+                        self.memory_updates[depth - 1](state)
+                    ),
+                    positions,
+                )
+                old = (
+                    None
+                    if cache is None or not cache.layer_memories
+                    else cache.layer_memories[depth - 1]
+                )
+                memory = (
+                    new_memory
+                    if old is None
+                    else mx.concatenate([old, new_memory], axis=1)
+                )
+                memories.append(memory)
             state = layer(state, memory, positions, visible)
+            if self.state_enabled:
+                states.append(self.state_projects[depth](self.state_norm[depth](state)))
+        if cache is not None and self.state_enabled:
+            cache.layer_memories = memories
         cfg = self.config
         probabilities = mx.softmax(
             self.predict(self.predict_norm(state))
@@ -217,7 +289,10 @@ class NextConceptPrediction(nn.Module):
         prediction = mx.einsum(
             "bmgv,gvs->bmgs", probabilities, self.codebook.astype(mx.float32)
         )
-        return prediction.reshape(*state.shape[:2], cfg.dim).astype(concepts.dtype)
+        prediction = prediction.reshape(*state.shape[:2], cfg.dim).astype(
+            concepts.dtype
+        )
+        return prediction, (mx.stack(states, axis=2) if states else None)
 
     def auxiliary_losses(self, concepts, predictions, valid, adjacent):
         cfg = self.config
@@ -273,6 +348,8 @@ class NextConceptPrediction(nn.Module):
         if n == 0:
             return dict(
                 signal=mx.zeros_like(encoder),
+                prediction_signal=mx.zeros_like(encoder),
+                states=mx.zeros((b, t, cfg.ncp_layers, cfg.dim), encoder.dtype),
                 ncp_loss=zero,
                 vq_loss=zero,
                 groups=zero,
@@ -307,7 +384,9 @@ class NextConceptPrediction(nn.Module):
             & (plan.segment_ids[:, :, None] == plan.segment_ids[:, None, :])
             & (plan.positions[:, None, :] <= plan.positions[:, :, None])
         )
-        predictions = self.predict_next(concepts, memory, plan.positions, visible)
+        predictions, states = self.predict_next(
+            concepts, memory, plan.positions, visible
+        )
         adjacent = (
             plan.valid[:, :-1]
             & plan.valid[:, 1:]
@@ -316,9 +395,16 @@ class NextConceptPrediction(nn.Module):
         )
         ncp, vq = self.auxiliary_losses(concepts, predictions, plan.valid, adjacent)
         # Project at concept frequency, then hold through the next incomplete group.
-        signals = self.feedback_gate * self.feedback(self.feedback_norm(predictions))
+        projected = self.feedback(self.feedback_norm(predictions))
+        signals = self.feedback_gate * projected
         return dict(
             signal=hold_anchors(signals, plan),
+            prediction_signal=hold_anchors(projected, plan),
+            states=(
+                hold_anchors(states, plan)
+                if states is not None
+                else mx.zeros((b, t, cfg.ncp_layers, cfg.dim), encoder.dtype)
+            ),
             ncp_loss=ncp,
             vq_loss=vq,
             groups=mx.sum(plan.valid),
@@ -344,6 +430,7 @@ class NextConceptPrediction(nn.Module):
         )
         n = source.shape[1] // cfg.ncp_stride
         predictions = None
+        states = None
         if n:
             concepts = self.pool_norm(
                 mx.mean(
@@ -369,7 +456,9 @@ class NextConceptPrediction(nn.Module):
                 <= (previous + mx.arange(n))[None, :, None],
                 (b, n, previous + n),
             )
-            predictions = self.predict_next(concepts, memory, pos, visible)
+            predictions, states = self.predict_next(
+                concepts, memory, pos, visible, cache
+            )
             cache.memory = memory
         fallback = (
             mx.zeros((b, 1, d), encoder.dtype)
@@ -382,18 +471,34 @@ class NextConceptPrediction(nn.Module):
             else mx.concatenate([fallback, predictions], axis=1)
         )
         owners = (old + mx.arange(t) + 1) // cfg.ncp_stride
-        held = pool[:, owners]
-        signal = self.feedback_gate * self.feedback(self.feedback_norm(held))
+        projected = self.feedback(self.feedback_norm(pool))[:, owners]
+        signal = self.feedback_gate * projected
+        state_fallback = (
+            mx.zeros((b, 1, cfg.ncp_layers, d), encoder.dtype)
+            if cache.states is None
+            else cache.states
+        )
+        state_pool = (
+            state_fallback
+            if states is None
+            else mx.concatenate([state_fallback, states], axis=1)
+        )
+        held_states = state_pool[:, owners]
         # Learned norm bias must never generate feedback before the first concept.
         if cache.prediction is None:
             signal = mx.where((owners > 0)[None, :, None], signal, 0)
+            projected = mx.where((owners > 0)[None, :, None], projected, 0)
         if predictions is not None:
             cache.prediction = predictions[:, -1:]
+        if states is not None:
+            cache.states = states[:, -1:]
         cache.pending = source[:, n * cfg.ncp_stride :]
         cache.tokens += t
         zero = mx.array(0.0, mx.float32)
         return dict(
             signal=signal,
+            prediction_signal=projected,
+            states=held_states,
             ncp_loss=zero,
             vq_loss=zero,
             groups=mx.array(n * b),

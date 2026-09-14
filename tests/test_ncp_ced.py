@@ -85,11 +85,11 @@ def test_default_parser_preset_and_serialized_identity(monkeypatch, tmp_path):
         monkeypatch.setattr(sys, "argv", ["train_pretrain.py", *argv])
         args = setup_training_args(get_pretrain_parser().parse_args(argv))
         cfg = VibyConfig(**build_model_kwargs(args))
-        assert cfg.ncp_enabled and cfg.ncp_arch == "ced_shared_kv_v1"
+        assert cfg.ncp_enabled and cfg.ncp_arch == "ced_state_v2"
         assert (cfg.ncp_stride, cfg.ncp_layers, cfg.ncp_memory_dim) == (4, 2, 128)
         assert cfg.n_mtp_layers == 0
         assert VibyConfig.from_dict(cfg.to_dict()).to_dict() == cfg.to_dict()
-        assert checkpoint_execution(cfg)["kind"] == "ced_shared_kv_v1"
+        assert checkpoint_execution(cfg)["kind"] == "ced_state_v2"
     assert not VibyConfig.from_dict({"preset": "tiny"}).ncp_enabled
     parser = get_pretrain_parser()
     assert not any(
@@ -128,6 +128,10 @@ def test_zero_gate_baseline_and_clean_memory_intervention():
     )
     close(m(x).logits, baseline(x).logits, atol=0)
     before, c0 = m.prefill(x)
+    m.model.ncp.state_gates = mx.array([0.25] * len(m.config.ncp_decoder_layers))
+    m.model.ncp.prediction_gates = mx.array(
+        [0.15] * (len(m.config.ncp_decoder_layers) - 1)
+    )
     m.model.ncp.feedback_gate = mx.array([0.7])
     after, c1 = m.prefill(x)
     boundary = m.config.n_encoder_layers
@@ -141,6 +145,10 @@ def test_zero_gate_baseline_and_clean_memory_intervention():
 @pytest.mark.parametrize("prefill", [1, 3, 4, 5, 8, 15])
 def test_native_cache_parity_and_exact_shared_kv_size(prefill):
     m = model()
+    m.model.ncp.state_gates = mx.array([0.25] * len(m.config.ncp_decoder_layers))
+    m.model.ncp.prediction_gates = mx.array(
+        [0.15] * (len(m.config.ncp_decoder_layers) - 1)
+    )
     m.model.ncp.feedback_gate = mx.array([0.4])
     x = tokens(19, 2)
     expected = m(x).logits
@@ -152,10 +160,15 @@ def test_native_cache_parity_and_exact_shared_kv_size(prefill):
     close(expected, mx.concatenate(parts, axis=1))
     state = cache.ncp_state
     assert state.memory.shape == (2, 4, 16)
+    assert len(state.layer_memories) == 1
+    assert state.layer_memories[0].shape == (2, 4, 16)
+    assert state.states.shape == (2, 1, 2, 64)
     assert state.pending.shape == (2, 3, 64)
     assert state.prediction.shape == (2, 1, 64)
     assert set(vars(state)) == {
         "memory",
+        "layer_memories",
+        "states",
         "pending",
         "prediction",
         "tokens",
@@ -169,6 +182,10 @@ def test_native_cache_parity_and_exact_shared_kv_size(prefill):
 
 def test_chunked_prefill_state_parity():
     m = model()
+    m.model.ncp.state_gates = mx.array([0.25] * len(m.config.ncp_decoder_layers))
+    m.model.ncp.prediction_gates = mx.array(
+        [0.15] * (len(m.config.ncp_decoder_layers) - 1)
+    )
     m.model.ncp.feedback_gate = mx.array([0.3])
     x = tokens(23)
     expected = m(x).logits
@@ -208,6 +225,10 @@ def test_document_local_pooling_padding_and_tail_feedback():
 
 def test_causality_packed_and_padding_gap_isolation():
     m = model()
+    m.model.ncp.state_gates = mx.array([0.25] * len(m.config.ncp_decoder_layers))
+    m.model.ncp.prediction_gates = mx.array(
+        [0.15] * (len(m.config.ncp_decoder_layers) - 1)
+    )
     m.model.ncp.feedback_gate = mx.array([0.6])
     x = tokens(24)
     docs = mx.array([[0] * 8 + [1] * 16])
@@ -257,7 +278,13 @@ def test_ntp_gradient_gate_and_joint_training_contract():
     y = (x + 1) % 48
     loss, grads = nn.value_and_grad(m, lambda net: net(x, labels=y).lm_loss)(m)
     assert norm(grads["model"]["ncp"]["feedback_gate"]) > 0
+    assert bool(mx.all(mx.abs(grads["model"]["ncp"]["state_gates"]) > 0))
+    assert norm(grads["model"]["ncp"]["prediction_gates"]) > 0
     assert norm(grads["model"]["ncp"]["codebook"]) == 0
+    m.model.ncp.state_gates = mx.array([0.25] * len(m.config.ncp_decoder_layers))
+    m.model.ncp.prediction_gates = mx.array(
+        [0.15] * (len(m.config.ncp_decoder_layers) - 1)
+    )
     m.model.ncp.feedback_gate = mx.array([0.4])
     _, grads = nn.value_and_grad(m, lambda net: net(x, labels=y).lm_loss)(m)
     flat = dict(tree_flatten(grads))
@@ -285,6 +312,10 @@ def test_ntp_gradient_gate_and_joint_training_contract():
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 def test_compiled_joint_loss_and_gradients(dtype):
     m = model()
+    m.model.ncp.state_gates = mx.array([0.25] * len(m.config.ncp_decoder_layers))
+    m.model.ncp.prediction_gates = mx.array(
+        [0.15] * (len(m.config.ncp_decoder_layers) - 1)
+    )
     m.model.ncp.feedback_gate = mx.array([0.2])
     convert_model_dtype(m, dtype)
     x = tokens(16, 2)
@@ -316,6 +347,10 @@ def test_engine_batch_prefix_and_state_snapshots():
     from model.cache import VibyCache
 
     m = model()
+    m.model.ncp.state_gates = mx.array([0.25] * len(m.config.ncp_decoder_layers))
+    m.model.ncp.prediction_gates = mx.array(
+        [0.15] * (len(m.config.ncp_decoder_layers) - 1)
+    )
     m.model.ncp.feedback_gate = mx.array([0.5])
     m.eval()
     prompts = [[1, 2, 3, 4, 5], [7, 8, 9, 10, 11, 12, 13, 14], [2, 5, 8]]
@@ -452,11 +487,19 @@ def test_ncp_flops_and_memory_count_include_low_frequency_work():
     cost = training_flops_per_token(m, 16) - training_flops_per_token(plain, 16)
     assert cost > 6 * size / 4
     assert cost < 6 * size
-    assert training_flops_per_token(m, 3) == training_flops_per_token(plain, 3)
+    route_params = len(m.config.ncp_decoder_layers) * m.config.dim * m.config.ncp_layers
+    assert (
+        training_flops_per_token(m, 3) - training_flops_per_token(plain, 3)
+        == 6 * route_params
+    )
 
 
 def test_global_kv_gradient_is_independent_of_concept_but_not_encoder():
     m = model()
+    m.model.ncp.state_gates = mx.array([0.25] * len(m.config.ncp_decoder_layers))
+    m.model.ncp.prediction_gates = mx.array(
+        [0.15] * (len(m.config.ncp_decoder_layers) - 1)
+    )
     m.model.ncp.feedback_gate = mx.array([0.7])
     x = tokens(12)
 
@@ -492,6 +535,10 @@ def test_memory_override_keeps_main_and_indexer_queries_on_decoder(monkeypatch):
     monkeypatch.setattr(attn, "_q", query)
     monkeypatch.setattr(attn.indexer, "_query_weights", index)
     mx.eval(m(x).logits)
+    m.model.ncp.state_gates = mx.array([0.25] * len(m.config.ncp_decoder_layers))
+    m.model.ncp.prediction_gates = mx.array(
+        [0.15] * (len(m.config.ncp_decoder_layers) - 1)
+    )
     m.model.ncp.feedback_gate = mx.array([0.8])
     mx.eval(m(x).logits)
     assert len(q_inputs) == 2 and len(index_inputs) == 2
@@ -506,6 +553,10 @@ def test_ncp_engine_speculative_commit_and_rollback(reject_at):
     from test_engine_speculative import controlled_proposals, params
 
     m = model(n_mtp_layers=1, dspark_n_routed_experts=4, dspark_n_activated_experts=2)
+    m.model.ncp.state_gates = mx.array([0.25] * len(m.config.ncp_decoder_layers))
+    m.model.ncp.prediction_gates = mx.array(
+        [0.15] * (len(m.config.ncp_decoder_layers) - 1)
+    )
     m.model.ncp.feedback_gate = mx.array([0.5])
     m.eval()
     prompt = [1, 2, 3, 4, 5]
@@ -531,6 +582,10 @@ def test_bf16_sparse_and_fused_indexer_dispatch_matches_reference(monkeypatch):
         ncp_heads=4,
     )
     convert_model_dtype(m, "bfloat16")
+    m.model.ncp.state_gates = mx.array([0.25] * len(m.config.ncp_decoder_layers))
+    m.model.ncp.prediction_gates = mx.array(
+        [0.15] * (len(m.config.ncp_decoder_layers) - 1)
+    )
     m.model.ncp.feedback_gate = mx.array([0.3], mx.bfloat16)
     x = tokens(16)
     y = (x + 1) % 48
@@ -571,3 +626,94 @@ def test_concept_document_offset_preserves_relative_position_semantics():
         "signal"
     ]
     close(standalone, packed[:, 5:])
+
+
+def test_state_only_ntp_path_bypasses_pq_and_selects_depth_per_token():
+    m = model(ncp_loss_weight=0, ncp_vq_weight=0)
+    ncp = m.model.ncp
+    ncp.state_gates = mx.array([0.4] * len(m.config.ncp_decoder_layers))
+    x = tokens(16)
+    _, grad = nn.value_and_grad(m, lambda net: net(x, labels=(x + 1) % 48).loss)(m)
+    flat = dict(tree_flatten(grad))
+    for key in (
+        "memory_updates.0.weight",
+        "layers.0.query.weight",
+        "layers.1.query.weight",
+        "state_projects.0.weight",
+        "state_projects.1.weight",
+        "state_routes.0.weight",
+        "state_routes.1.weight",
+    ):
+        assert norm(flat["model.ncp." + key]) > 0, key
+    for key in ("codebook", "predict.weight", "feedback.weight"):
+        assert norm(flat["model.ncp." + key]) == 0, key
+    m.eval()
+    normal = m(x).logits
+    off = m(x, ncp_intervention="off").logits
+    assert norm(normal[:, 3:] - off[:, 3:]) > 0
+    close(normal[:, :3], off[:, :3], atol=0)
+    # A fixed bank and differing token queries must produce differing depth mixtures.
+    states = mx.broadcast_to(
+        mx.stack([mx.ones((64,)), -mx.ones((64,))])[None, None], (1, 2, 2, 64)
+    )
+    query = mx.stack([mx.ones((64,)), -mx.ones((64,))])[None]
+    selected = ncp.state_signal(query, states, 0)
+    assert norm(selected[:, 0] - selected[:, 1]) > 0
+
+
+def test_second_layer_memory_contains_processed_history(monkeypatch):
+    ncp = NextConceptPrediction(config())
+    c = mx.random.normal((1, 3, 64))
+    pos = mx.array([[3, 7, 11]])
+    visible = mx.tril(mx.ones((1, 3, 3), mx.bool_))
+    memory = ncp.project_memory(c, pos)
+    # Alter only the FIRST historical output; the last query entering layer 2 is fixed.
+    original = type(ncp.layers[0]).__call__
+    captured = []
+    perturb = [False]
+
+    def hook(layer, state, kv, positions, mask):
+        if layer is ncp.layers[1]:
+            captured.append((mx.array(state), mx.array(kv)))
+        result = original(layer, state, kv, positions, mask)
+        if layer is ncp.layers[0] and perturb[0]:
+            result = result.at[:, 0, 0].add(2)
+        return result
+
+    monkeypatch.setattr(type(ncp.layers[0]), "__call__", hook)
+    pred0, _ = ncp.predict_next(c, memory, pos, visible)
+    perturb[0] = True
+    pred1, _ = ncp.predict_next(c, memory, pos, visible)
+    close(captured[0][0][:, -1], captured[1][0][:, -1], atol=0)
+    assert norm(captured[0][1][:, 0] - captured[1][1][:, 0]) > 0
+    assert norm(pred0[:, -1] - pred1[:, -1]) > 0
+
+
+def test_v1_checkpoint_retains_execution_and_explicit_v2_warm_start(tmp_path):
+    old = model(ncp_arch="ced_shared_kv_v1")
+    old.model.ncp.feedback_gate = mx.array([0.5])
+    x = tokens(13)
+    expected = old(x).logits
+    first, cache = old.prefill(x[:, :5])
+    close(
+        mx.concatenate([first, old(x[:, 5:], cache=cache, start_pos=5).logits], axis=1),
+        expected,
+    )
+    assert cache.ncp_state.layer_memories == [] and cache.ncp_state.states is None
+    path = tmp_path / "v1.safetensors"
+    mx.save_safetensors(str(path), dict(tree_flatten(old.parameters())))
+    path.with_suffix(".json").write_text(json.dumps({"config": old.config.to_dict()}))
+    loaded = VibyForCausalLM(VibyConfig.from_dict(old.config.to_dict()))
+    load_model_weights(loaded, str(path), strict=True)
+    close(loaded(x).logits, expected, atol=0)
+    target = model()
+    args = SimpleNamespace(reset_optimizer=False, auto_resume=False)
+    with pytest.raises(ValueError, match="reset_optimizer"):
+        validate_checkpoint_execution(path, target.config, args)
+    args.reset_optimizer = True
+    changed = validate_checkpoint_execution(path, target.config, args)
+    prefixes = ncp_warm_start_prefixes(path, target.config, changed)
+    assert "model.ncp." not in prefixes
+    load_model_weights(target, str(path), allow_fresh_prefixes=prefixes)
+    close(target.model.ncp.codebook, old.model.ncp.codebook, atol=0)
+    assert VibyConfig().ncp_decoder_layers == (6, 10)

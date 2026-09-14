@@ -98,7 +98,9 @@ class TestRepoTools(unittest.TestCase):
         tool = self.fixture_repo()
         self.assertEqual(self.run_cli(tool, "test", "typo").returncode, 2)
         (self.root / "tests/test_engine_speculative.py").unlink()
-        self.assertEqual(self.run_cli(tool, "test", "engine", "--dry-run").returncode, 2)
+        self.assertEqual(
+            self.run_cli(tool, "test", "engine", "--dry-run").returncode, 2
+        )
 
     def test_pytest_failure_exit_code_is_preserved(self):
         tool = self.fixture_repo()

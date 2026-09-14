@@ -155,7 +155,11 @@ def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int
             if p.startswith("model.ncp.") and v.ndim >= 2
         )
         gemms += (fraction - 1) * concept_gemms
-        # QK/AV share a single memory, but each concept layer still attends.
+        # Depth selection runs at token frequency, projections at concept frequency.
+        if cfg.ncp_arch == "ced_state_v2" and seq_len > 0:
+            route_params = len(cfg.ncp_decoder_layers) * cfg.dim * cfg.ncp_layers
+            gemms += (1 - fraction) * route_params
+        # Each concept layer attends to a compact K=V memory.
         concepts = seq_len // cfg.ncp_stride
         concept_attention = (
             fraction

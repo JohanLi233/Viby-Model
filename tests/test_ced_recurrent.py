@@ -108,8 +108,10 @@ def test_lift_composition_and_unsampled_perturbation_identity():
 
     def f(x):
         return 0.5 * x + 1
+
     def g(x):
         return 2 * x - 3
+
     assert (
         max_abs_diff(transform(transform(h, g), f), transform(h, lambda x: f(g(x))))
         < 2e-6
@@ -194,8 +196,10 @@ def test_ntp_gradients_reach_evidence_and_every_shared_middle_layer(compiled, dt
         return m(ids, labels=(ids + 1) % m.config.vocab_size, use_mtp=False).loss
 
     gradient = nn.value_and_grad(model, objective)
+
     def call(ids):
         return gradient(model, ids)
+
     if compiled:
         call = mx.compile(call, inputs=model.state)
     loss, grads = call(x)

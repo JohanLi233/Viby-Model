@@ -339,17 +339,21 @@ class VibyModel(nn.Module):
                     ncp_result = {
                         key: (
                             mx.concatenate([r[key] for r in rows], axis=0)
-                            if key == "signal"
+                            if key in ("signal", "prediction_signal", "states")
                             else sum(r[key] for r in rows)
                         )
                         for key in rows[0]
                     }
-                if ncp_intervention == "off":
-                    ncp_result["signal"] = mx.zeros_like(ncp_result["signal"])
-                elif ncp_intervention == "swap":
-                    # Fixed cyclic derangement: no row keeps its own concept signal.
-                    ncp_result["signal"] = mx.concatenate(
-                        [ncp_result["signal"][1:], ncp_result["signal"][:1]], axis=0
+                for key in ("signal", "prediction_signal", "states"):
+                    if ncp_intervention == "off":
+                        ncp_result[key] = mx.zeros_like(ncp_result[key])
+                    elif ncp_intervention == "swap":
+                        ncp_result[key] = mx.concatenate(
+                            [ncp_result[key][1:], ncp_result[key][:1]], axis=0
+                        )
+                if self.ncp.state_enabled:
+                    ncp_result["signal"] = ncp_result["signal"] + self.ncp.state_signal(
+                        encoder_read, ncp_result["states"], 0
                     )
                 denom = mx.sum(pre_mix.astype(mx.float32), axis=-1, keepdims=True)
                 lifted = ncp_result["signal"].astype(mx.float32) / mx.maximum(
@@ -376,6 +380,24 @@ class VibyModel(nn.Module):
                     ncp_result["feedback_diagnostics"] = mx.stack(
                         [erms, frms, frms / mx.maximum(erms, 1e-12)]
                     )
+            if (
+                self.ncp is not None
+                and self.ncp.state_enabled
+                and i in self.config.ncp_decoder_layers[1:]
+            ):
+                slot = self.config.ncp_decoder_layers.index(i)
+                signal = self.ncp.prediction_gates[slot - 1] * ncp_result[
+                    "prediction_signal"
+                ] + self.ncp.state_signal(
+                    hc_pre(h, pre_mix), ncp_result["states"], slot
+                )
+                denom = mx.sum(pre_mix.astype(mx.float32), axis=-1, keepdims=True)
+                h = (
+                    h
+                    + (signal.astype(mx.float32) / mx.maximum(denom, 1e-12)).astype(
+                        h.dtype
+                    )[:, :, None, :]
+                )
             layer_cache = None if cache is None else cache[i]
             if recurrent and i == self.config.n_layers - 1:
                 h, pre_mix = layer.recurrent(

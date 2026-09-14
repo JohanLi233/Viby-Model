@@ -290,7 +290,7 @@ class VibyConfig:
         # CED-aware NCP is the default full-token backbone. The existing
         # recurrent experiment remains a separate, explicitly selected execution.
         self.ncp_enabled = bool(kw.get("ncp_enabled", not self.ced_recurrent_enabled))
-        self.ncp_arch = str(kw.get("ncp_arch", "ced_shared_kv_v1"))
+        self.ncp_arch = str(kw.get("ncp_arch", "ced_state_v2"))
         self.ncp_stride = int(kw.get("ncp_stride", 4))
         self.ncp_layers = int(kw.get("ncp_layers", 2))
         self.ncp_memory_dim = int(kw.get("ncp_memory_dim", 128))
@@ -475,7 +475,7 @@ class VibyConfig:
                 raise ValueError("dspark_target_layer_ids 必须落在主干层内")
 
         if self.ncp_enabled:
-            if self.ncp_arch != "ced_shared_kv_v1":
+            if self.ncp_arch not in ("ced_shared_kv_v1", "ced_state_v2"):
                 raise ValueError("Unsupported NCP execution version")
             if self.ced_recurrent_enabled:
                 raise ValueError("NCP and recurrent CED are separate architectures")
@@ -609,10 +609,33 @@ class VibyConfig:
             total += self.ncp_matrix_parameters()
         return total
 
+    @property
+    def ncp_decoder_layers(self):
+        boundary = self.n_encoder_layers
+        return tuple(
+            sorted(
+                {
+                    boundary,
+                    min(
+                        self.n_layers - 1,
+                        boundary + 2 * (self.n_layers - boundary) // 3,
+                    ),
+                }
+            )
+        )
+
     def ncp_matrix_parameters(self):
         d, w, h = self.dim, self.ncp_memory_dim, self.ncp_heads
+        extra = 0
+        if self.ncp_arch == "ced_state_v2":
+            extra = (
+                (self.ncp_layers - 1) * d * w
+                + self.ncp_layers * d * d
+                + len(self.ncp_decoder_layers) * d * self.ncp_layers
+            )
         return (
-            d * w
+            extra
+            + d * w
             + self.ncp_layers * (2 * d * h * w + 6 * d * d)
             + d * self.ncp_groups * self.ncp_codes
             + self.ncp_codes * d

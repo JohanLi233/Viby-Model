@@ -21,8 +21,9 @@ V4.1 这一条技术路线；唯一的保留项是 **Gated XSA**（默认开，�
 已逐行核对）与技术报告 `DeepSeek_V41_Tech_Report`（下称"报告"）。
 
 新建模型和预训练默认接入 [CED-aware NCP](research/NCP_CED.md)：保留完整 token
-主干，在 CED 边界以每四个 token 的已观察概念运行两层共享 KV 的概念预测器。
-预测经零初始化门控只写入 decoder 状态；原 CED 全局 KV 始终来自融合前的
+主干，每四个 token 运行两层概念计算，层间更新一次紧凑概念记忆。概念状态
+由当前 token 按深度选择，与 PQ 预测分别经零初始化门控接入 decoder 第 6、10 层
+（默认 12 层布局）；原 CED 全局 KV 始终来自融合前的
 encoder 表示。旧 checkpoint 按原 sidecar 架构加载，迁移需要显式重置 optimizer。
 本轮实现及机制验证不代表训练质量或 token efficiency 收益。
 

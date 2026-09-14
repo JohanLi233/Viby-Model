@@ -120,8 +120,10 @@ def test_aux_balance_cannot_shrink_all_scores_to_reduce_loss():
     owner = SimpleNamespace(n_routed=4, top_k=2)
     scores = mx.array([[4.0, 2.0, 1.0, 1.0], [2.0, 4.0, 1.0, 1.0]])
     ids = mx.array([[0, 1], [0, 1]], dtype=mx.int32)
+
     def fn(s):
         return MoEFeedForward.seq_aux_loss(owner, s, ids, 1, 2)
+
     assert float(fn(scores)) == pytest.approx(float(fn(scores * 0.01)), abs=1e-6)
     grad = mx.grad(fn)(scores)
     assert abs(float((grad * scores).sum())) < 1e-6

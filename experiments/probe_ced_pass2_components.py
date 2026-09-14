@@ -356,6 +356,7 @@ def run(args, guard):
 
             def flags(enabled):
                 return setattr(hc_train, "_TRAIN_FUSION", enabled)
+
             shape = dict(
                 B=1,
                 T=query_count,

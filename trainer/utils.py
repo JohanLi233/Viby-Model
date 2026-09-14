@@ -598,7 +598,7 @@ def validate_checkpoint_execution(checkpoint_path, config, args, *, automatic=Fa
 
 
 def ncp_warm_start_prefixes(checkpoint_path, config, converted):
-    """Only an explicitly reset, attested ordinary CED checkpoint may add NCP."""
+    """Only explicitly reset, attested checkpoints may initialize new NCP paths."""
     if not converted or not config.ncp_enabled:
         return ()
     path = os.path.splitext(os.fspath(checkpoint_path))[0] + ".json"
@@ -607,7 +607,26 @@ def ncp_warm_start_prefixes(checkpoint_path, config, converted):
     with open(path, encoding="utf-8") as file:
         meta = json.load(file)
     execution = meta.get("execution") or checkpoint_execution(meta.get("config", {}))
-    return ("model.ncp.",) if execution.get("kind") == "token_ced_v1" else ()
+    if execution.get("kind") == "token_ced_v1":
+        return ("model.ncp.",)
+    if (
+        execution.get("kind") == "ced_shared_kv_v1"
+        and config.ncp_arch == "ced_state_v2"
+    ):
+        return tuple(
+            "model.ncp." + name
+            for name in (
+                "memory_updates.",
+                "memory_update_norm.",
+                "state_norm.",
+                "state_projects.",
+                "route_norm.",
+                "state_routes.",
+                "state_gates",
+                "prediction_gates",
+            )
+        )
+    return ()
 
 
 def build_config_from_sidecar(args, checkpoint_name):
