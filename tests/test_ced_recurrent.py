@@ -40,7 +40,6 @@ def config(**overrides):
         vocab_size=48,
         max_seq_len=64,
         window_size=8,
-        psr_enabled=False,
         ced_recurrent_enabled=True,
         ced_recurrent_stride=4,
         ced_recurrent_rounds=3,
@@ -139,7 +138,6 @@ def test_configuration_roundtrip_and_incompatible_objectives():
     c = config()
     assert VibyConfig.from_dict(c.to_dict()).to_dict() == c.to_dict()
     for invalid in (
-        {"psr_enabled": True},
         {"n_mtp_layers": 1},
         {"ced_recurrent_stride": 0},
         {"ced_recurrent_rounds": 0},

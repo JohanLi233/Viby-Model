@@ -194,7 +194,6 @@ def tiny_config():
         index_topk=4,
         hc_mult=2,
         qb_stats_rows=8,
-        psr_enabled=False,
         aux_balance_loss_weight=0.0,
     )
 
@@ -217,7 +216,6 @@ def test_real_compiled_model_trainer_and_partial_window(tmp_path):
         loss_mask=mask,
         attention_mask=mask,
         return_sequence_losses=True,
-        psr_mode="off",
     )
     ref = out.sequence_losses + mx.array([50.0, 0.0])
     mx.eval(ref)
@@ -232,7 +230,6 @@ def test_real_compiled_model_trainer_and_partial_window(tmp_path):
         labels=y,
         loss_mask=mask * mx.array([0, 1])[:, None],
         attention_mask=mask,
-        psr_mode="off",
     )
     assert abs(float(outputs[3]) * 2 - float(expected.lm_loss)) < 1e-5
     assert outputs[5][:3].tolist() == [2.0, 1.0, 8.0]
@@ -294,7 +291,7 @@ class Scorer(nn.Module):
 
     def __call__(self, x, labels, loss_mask, **kw):
         self.calls += 1
-        assert not self.training and kw["psr_mode"] == "off" and not kw["use_mtp"]
+        assert not self.training and not kw["use_mtp"]
         return SimpleNamespace(
             sequence_losses=x[:, 0].astype(mx.float32),
             sequence_token_counts=mx.sum(loss_mask, axis=1),

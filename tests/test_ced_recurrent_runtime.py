@@ -111,7 +111,6 @@ def test_real_compiled_trainer_updates_and_checkpoint_roundtrip(tmp_path):
     args = get_pretrain_parser().parse_args(
         [
             "--ced-recurrent",
-            "--no-psr",
             "--mtp_depth",
             "0",
             "--out_dir",
@@ -138,7 +137,6 @@ def test_real_compiled_trainer_updates_and_checkpoint_roundtrip(tmp_path):
     tr = BaseTrainer(
         args, model, SimpleNamespace(pad_token_id=0), model.config, "pretrain"
     )
-    assert tr.psr_optimizer is None
     for gate in model._backbone_gates:
         assert gate.qb_stats_rows == (2 if 7 <= gate.layer_idx <= 10 else 6)
     x = inputs(16)

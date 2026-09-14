@@ -1,7 +1,7 @@
 """Screen microbatch schedules with identical effective token batch and weights.
 
 This measures execution geometry, not bitwise training-trajectory equivalence:
-PSR sampling keys and QB sample rounding depend on microbatch partitioning.
+QB sample rounding depends on microbatch partitioning.
 Kernel A/B acceptance must subsequently hold the chosen geometry fixed.
 """
 
@@ -75,8 +75,8 @@ def main():
             )
         trainer._loss_and_grad = trainer._build_loss_and_grad()
         batches = batches_for(b)
-        # Visibility is counted on the actual rows; PSR side is a declared 6N
-        # estimate, just as in the fixed-geometry acceptance benchmark.
+        # Visibility is counted on the actual rows, just as in the
+        # fixed-geometry acceptance benchmark.
         audit = [audit_training_flops(model, batch) for batch in batches]
         fpt = sum(r["flops_per_token"] for r in audit) / len(audit)
         for _ in range(args.warmup):

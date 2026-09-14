@@ -70,7 +70,6 @@ def pointer_pool_diagnostic(seed, nodes=4096, tasks=512, budget=64, hops=(1, 2, 
 def make_config(args):
     settings = dict(
         n_mtp_layers=0,
-        psr_enabled=False,
         ced_recurrent_enabled=True,
         ced_recurrent_stride=args.stride,
         ced_recurrent_rounds=args.rounds,
@@ -190,7 +189,7 @@ def benchmark(args):
     return {
         "config": c.to_dict(),
         "measurements": records,
-        "scope": "Same weights, same token/label arrays, same process; MTP/PSR and Engram disabled in both. Includes evaluated forward loss / all weight gradients, router telemetry, masks and lifting. Excludes optimizer update, data loading, distributed reduction, generation cache and compilation warmup. This is not a training-throughput or efficacy result.",
+        "scope": "Same weights, same token/label arrays, same process; MTP and Engram disabled in both. Includes evaluated forward loss / all weight gradients, router telemetry, masks and lifting. Excludes optimizer update, data loading, distributed reduction, generation cache and compilation warmup. This is not a training-throughput or efficacy result.",
     }
 
 

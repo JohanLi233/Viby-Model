@@ -205,10 +205,7 @@ def main():
         flush=True,
     )
 
-    bench_psr_step = getattr(trainer, "_psr_step", 0)
-
     def run_step():
-        trainer._psr_step = bench_psr_step
         outputs, grads = trainer._compute_loss_and_grad(
             X, Y, loss_mask, attn_mask, seg_ids
         )
@@ -223,7 +220,6 @@ def main():
         from experiments.bench_kernel_optimizations import run_window
 
         run_window(trainer, [(X, Y, loss_mask, attn_mask, seg_ids)] * args.accum)
-        bench_psr_step = getattr(trainer, "_psr_step", 0)
 
     mx.reset_peak_memory()
     if args.fwd_only:
@@ -267,15 +263,9 @@ def main():
     if not args.no_opt:
         _, grads = trainer._compute_loss_and_grad(X, Y, loss_mask, attn_mask, seg_ids)
         mx.eval(grads)
-        from trainer.psr_optim import ParameterView, split_gradients
-
-        protected = getattr(cfg, "psr_enabled", False)
-        opt_model = ParameterView(model) if protected else model
-        if protected:
-            grads, _ = split_gradients(grads)
 
         def run_opt():
-            trainer.optimizer.update(opt_model, grads)
+            trainer.optimizer.update(model, grads)
             mx.eval(model.parameters(), trainer.optimizer.state)
 
         opt_min, _ = bench(run_opt, args.iters, 1)
@@ -293,7 +283,7 @@ def main():
             flush=True,
         )
     print(
-        "注：上方 MFU 只计 fwd+bwd 墙钟；optimizer仅主干，拼接窗口不含PSR优化器/梯度累加/范数/bias更新。"
+        "注：上方 MFU 只计 fwd+bwd 墙钟；optimizer仅主干，拼接窗口不含梯度累加/范数/bias更新。"
         "真实训练窗口与实测稀疏长度请用 experiments/bench_csa2_plan.py --mode window。"
     )
 

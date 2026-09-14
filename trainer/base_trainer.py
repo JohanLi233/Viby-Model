@@ -15,7 +15,6 @@ import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from .muon import create_mixed_optimizer
 from .fast_norm import gradient_square_sum
-from .psr_optim import ParameterView, split_gradients
 from .utils import (
     Logger,
     save_checkpoint,
@@ -26,7 +25,6 @@ from .utils import (
     resolve_warmup_iters,
     resolve_lr_horizon,
     set_ddp_flag,
-    get_optimizer_steps,
     validate_checkpoint_execution,
 )
 
@@ -240,31 +238,17 @@ class BaseTrainer:
 
     def _init_training_components(self):
         """初始化训练组件"""
-        protected = getattr(self.lm_config, "psr_enabled", False)
-        base_view = ParameterView(self.model) if protected else self.model
-        self.psr_optimizer = (
-            optim.AdamW(
-                learning_rate=getattr(self.args, "psr_learning_rate", 1e-4),
-                weight_decay=getattr(self.args, "psr_weight_decay", 0.0),
-            )
-            if protected
-            else None
-        )
-        self._psr_step = 0
         # 创建优化器
         if getattr(self.args, "optimizer", "muon") == "adamw":
             from .muon import create_adamw_optimizer
 
             self.optimizer = create_adamw_optimizer(
-                base_view, self.args, self.training_type
+                self.model, self.args, self.training_type
             )
         else:
             self.optimizer = create_mixed_optimizer(
-                base_view, self.args, self.training_type
+                self.model, self.args, self.training_type
             )
-
-        # Save/restore the side optimizer separately; never place it in baseline state.
-        self.optimizer.psr_optimizer = self.psr_optimizer
         # Keep the sample memory bounded across the entire accumulation window.
         self._moe_gates = list(getattr(self.model, "moe_gates", None) or [])
         if (
@@ -314,9 +298,6 @@ class BaseTrainer:
 
         # 处理检查点恢复
         self.start_epoch, self.start_step = self._handle_checkpoint_resume()
-        self._psr_step = int(
-            getattr(self.args, "psr_resumed_microstep", self.start_step)
-        )
 
     def _loss_fn(
         self,
@@ -325,8 +306,6 @@ class BaseTrainer:
         loss_mask,
         attn_mask,
         seg_ids=None,
-        psr_key=0,
-        psr_gate=None,
         tail_reference=None,
         tail_fraction=None,
     ):
@@ -340,37 +319,19 @@ class BaseTrainer:
         累加即可；QB margins 则在窗口末尾拼接一次再取分位数。
         无 MoE 时用零长占位保持图结构稳定。
         """
-        psr_inputs = dict(
-            psr_mode="off", return_metrics=getattr(self.lm_config, "psr_enabled", False)
-        )
+        extra_inputs = dict()
         if tail_reference is not None:
-            psr_inputs.update(
-                return_metrics=False,
+            extra_inputs.update(
                 tail_reference=tail_reference,
                 tail_fraction=tail_fraction,
             )
-        if self.training_type == "pretrain" and getattr(
-            self.lm_config, "psr_enabled", False
-        ):
-            from .psr_pretrain import text_psr_inputs
-
-            if getattr(self.args, "psr_training_mode", "recurrent") == "off":
-                psr_inputs = dict(psr_mode="off", return_metrics=True)
-            else:
-                psr_inputs = text_psr_inputs(
-                    self.lm_config, X, Y, loss_mask, attn_mask, seg_ids, psr_key
-                )
-                psr_inputs["psr_mode"] = getattr(
-                    self.args, "psr_training_mode", "recurrent"
-                )
-            psr_inputs["psr_gate"] = psr_gate
         res = self.model(
             input_ids=X,
             labels=Y,
             loss_mask=loss_mask,
             attention_mask=attn_mask,
             segment_ids=seg_ids,
-            **psr_inputs,
+            **extra_inputs,
         )
         mtp_loss = res.mtp_loss if res.mtp_loss is not None else mx.array(0.0)
         lm_loss = res.lm_loss if res.lm_loss is not None else res.loss
@@ -379,12 +340,6 @@ class BaseTrainer:
         if moe_loads is None:
             moe_loads = mx.zeros((0,), dtype=mx.float32)
         loss = res.loss
-        if getattr(self.args, "psr_freeze_base", False):
-            loss = (
-                res.corrected_loss
-                if res.corrected_loss is not None
-                else mx.stop_gradient(res.loss)
-            )
         metrics = (
             res.metrics if res.metrics is not None else mx.zeros((X.shape[0], 8, 3))
         )
@@ -414,8 +369,6 @@ class BaseTrainer:
         loss_mask,
         attn_mask,
         seg_ids=None,
-        psr_key=0,
-        psr_gate=None,
         tail_reference=None,
         tail_fraction=None,
     ):
@@ -438,8 +391,6 @@ class BaseTrainer:
             loss_mask,
             attn_mask,
             seg_ids,
-            psr_key,
-            psr_gate,
             tail_reference,
             tail_fraction,
         )
@@ -488,22 +439,10 @@ class BaseTrainer:
             if hasattr(self.model, "moe_bias_stack")
             else mx.zeros((0,), dtype=mx.float32)
         )
-        protected = getattr(getattr(self, "lm_config", None), "psr_enabled", False)
-        extra = ()
-        if protected:
-            microstep = getattr(self, "_psr_step", 0)
-            extra = (
-                mx.array(microstep + getattr(self.args, "seed", 1337), mx.uint32),
-                self.model.psr.calibration_gate,
-            )
-            self._psr_step = microstep + 1
-            self.args.psr_microstep = self._psr_step
         if tail_reference is not None:
-            extra = (
-                (*extra, tail_reference, tail_fraction)
-                if protected
-                else (0, None, tail_reference, tail_fraction)
-            )
+            extra = (tail_reference, tail_fraction)
+        else:
+            extra = ()
         outputs, grads = self._loss_and_grad(
             eval_params, biases, X, Y, loss_mask, attn_mask, seg_ids, *extra
         )
@@ -627,37 +566,6 @@ class BaseTrainer:
                 "QB margins must be passed before applying the optimizer update"
             )
 
-        protected = getattr(getattr(self, "lm_config", None), "psr_enabled", False)
-        if protected:
-            accum_grads, side_grads = split_gradients(accum_grads)
-            if (
-                side_grads
-                and getattr(self.args, "psr_training_mode", "recurrent") != "off"
-            ):
-                clip = getattr(self.args, "psr_grad_clip", 1.0)
-                if clip:
-                    side_grads, norm = optim.clip_grad_norm(side_grads, clip)
-                else:
-                    norm = mx.sqrt(
-                        sum(gradient_square_sum(g) for _, g in tree_flatten(side_grads))
-                    )
-                if bool(mx.isfinite(norm)):
-                    self.psr_optimizer.update(
-                        ParameterView(self.model, side=True), side_grads
-                    )
-                    mx.eval(self.model.psr.parameters(), self.psr_optimizer.state)
-                    if getattr(self.args, "log_interval", 10) <= getattr(
-                        self.args, "accumulation_steps", 1
-                    ):
-                        Logger(
-                            f"PSR optimizer_step={int(self.psr_optimizer.step)} grad_norm={float(norm):.6g}"
-                        )
-                else:
-                    Logger(
-                        "PSR gradient non-finite: skip side update only; baseline remains independent"
-                    )
-            if getattr(self.args, "psr_freeze_base", False):
-                return 0.0
         # 每个微批的 loss 已除以 accumulation_steps，
         # 累加的梯度即窗口平均梯度，无需再除
         # grad_clip=0（默认）表示不裁剪，只算范数用于日志/NaN 防护；
@@ -689,9 +597,7 @@ class BaseTrainer:
             # MLX 参数数组不可变，update 前抓到的引用即更新前的值；
             # update 替换 module 树上的数组后再抓一次，差分即实际更新 δ。
             en_before = dict(tree_flatten(self.model.trainable_parameters()))
-        self.optimizer.update(
-            ParameterView(self.model) if protected else self.model, grads
-        )
+        self.optimizer.update(self.model, grads)
         if self._expl_nest_mu > 0:
             en_after = dict(tree_flatten(self.model.trainable_parameters()))
             self._en_delta = tree_unflatten(
@@ -878,27 +784,6 @@ class BaseTrainer:
             # 反向（峰值 ~16GB），显存省 ~3×、单步快 ~2×，数值不变。
             mx.eval(loss, mtp_loss, moe_loads, lm_loss, z_loss, metrics, qb_margins)
             mx.eval(grads)
-            if (
-                getattr(self.lm_config, "psr_enabled", False)
-                and tail_reference is None
-                and not getattr(self.args, "no_save", False)
-            ):
-                group_steps = get_optimizer_steps(self.optimizer)
-                record = dict(
-                    microstep=global_step + 1,
-                    optimizer_step=max(group_steps, default=0),
-                    optimizer_group_steps=group_steps,
-                    phase="pre_update",
-                    consumed_input_tokens=int(mx.sum(attn_mask)),
-                    psr_optimizer_step=int(self.psr_optimizer.step)
-                    if self.psr_optimizer is not None
-                    else 0,
-                    sums=mx.sum(metrics, axis=0).tolist(),
-                )
-                with open(
-                    os.path.join(self.args.out_dir, "psr_metrics.jsonl"), "a"
-                ) as file:
-                    file.write(json.dumps(record) + "\n")
             # P-0/P-1 快照（env 门控，默认零开销）：捕获本微批梯度，
             # 供跨 microbatch 方向相关分析（research/OPTIMIZER_RESEARCH §0.5）
             from . import snapshot

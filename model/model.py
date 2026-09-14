@@ -33,13 +33,6 @@ from .hc import identity_pre_mix
 from .init import apply_trunc_normal_init
 from .moe import MoEFeedForward, MoEGate, update_expert_bias, update_quantile_bias
 from .norms import RMSNorm
-from .psr import (
-    EvidenceMemory,
-    ProtectedPSR,
-    ReasoningTrace,
-    ThinkingState,
-    residual_statistics,
-)
 from .recurrent import recurrent_active, execution_signature, run_middle
 
 NEG_INF = -1e30
@@ -57,15 +50,7 @@ class CausalLMOutput:
     moe_qb_margins: Optional[mx.array] = None
     aux_loss: Optional[mx.array] = None
     hidden_states: Optional[mx.array] = None
-    thinking_state: Optional[ThinkingState] = None
-    thinking_trace: Optional[ReasoningTrace] = None
-    corrected_loss: Optional[mx.array] = None
-    corrected_lm_loss: Optional[mx.array] = None
     metrics: Optional[mx.array] = None
-    base_logits: Optional[mx.array] = None
-    base_token_nll: Optional[mx.array] = None
-    corrected_token_nll: Optional[mx.array] = None
-    bridge_mask: Optional[mx.array] = None
     ced_metrics: Optional[mx.array] = None
     ced_result: object = None
     sequence_losses: Optional[mx.array] = None
@@ -179,7 +164,6 @@ class VibyModel(nn.Module):
         decode: bool = False,
         prev_tokens=None,
         collect_main: bool = True,
-        return_memory=False,
         use_ced_recurrent=True,
     ):
         recurrent = recurrent_active(self.config, use_ced_recurrent)
@@ -189,8 +173,6 @@ class VibyModel(nn.Module):
                 raise ValueError("CED execution changes require a fresh cache")
             cache.ced_signature = signature
         if recurrent:
-            if return_memory:
-                raise ValueError("recurrent CED runs independently of protected PSR")
             if isinstance(start_pos, mx.array):
                 raise ValueError(
                     "recurrent CED cache requires a common integer token clock"
@@ -215,8 +197,6 @@ class VibyModel(nn.Module):
             else start_pos[:, None] + mx.arange(T)
         )
         positions = mx.broadcast_to(positions, (B, T))
-        memory = None
-        boundary_input = None
         hashes, new_prev = (None, None)
         if self.engram_hash is not None:
             token_mask = None if pad_mask is None else pad_mask
@@ -266,8 +246,6 @@ class VibyModel(nn.Module):
                 # MTP 读的是目标层的"注意力输入"（mHC 均值），不是层输出
                 mains.append(mx.mean(h, axis=2))
             layer_cache = None if cache is None else cache[i]
-            if return_memory and i == self.config.n_encoder_layers:
-                boundary_input = apply_hc_pre_norm(h, pre_mix, layer.attn_norm)
             if recurrent and i == self.config.n_layers - 1:
                 h, pre_mix = layer.recurrent(
                     h,
@@ -292,24 +270,7 @@ class VibyModel(nn.Module):
                     pad_mask,
                     decode,
                 )
-            if return_memory and i == self.config.n_encoder_layers:
-                # Batched decode has one position per row. Slice to the largest
-                # live prefix; PSR masks each row's memory at its own anchor.
-                if cache is None:
-                    values = shared.compress_kv
-                else:
-                    memory_end = start_pos + T
-                    if isinstance(start_pos, mx.array):
-                        memory_end = (
-                            cache.decode_max_pos or int(mx.max(start_pos).item()) + T
-                        )
-                    values = cache[i].compress_kv[:, :memory_end]
-                memory = EvidenceMemory(
-                    values, boundary_input, positions, pad_mask, segment_ids
-                )
         result = (apply_hc_pre_norm(h, pre_mix, self.norm), mains, new_prev)
-        if return_memory:
-            result = (*result, memory)
         if recurrent:
             result = (*result, ced_result)
         return result
@@ -429,17 +390,6 @@ class VibyForCausalLM(nn.Module):
                     )
         if not skip_init:
             apply_trunc_normal_init(self, config.dim)
-        self.psr = None
-        if config.psr_enabled:
-            rng = list(mx.random.state)
-            self.psr = ProtectedPSR(config)
-            if not skip_init:
-                apply_trunc_normal_init(self.psr, config.psr_dim)
-            self.psr.output.weight = mx.zeros_like(self.psr.output.weight)
-            # MLX 0.32 uses a read-only per-thread RNG sentinel. key(seed)
-            # packs uint64 as two uint32 words; restore via the public seed API.
-            high, low = rng[0].tolist()
-            mx.random.seed((int(high) << 32) | int(low))
 
     # ------------------------------------------------------------------
     def _head_weight(self) -> mx.array:
@@ -463,16 +413,6 @@ class VibyForCausalLM(nn.Module):
         decode=False,
         prev_tokens=None,
         use_mtp=True,
-        thinking_prefix_lengths=None,
-        thinking_state=None,
-        thinking_options=None,
-        thinking_targets=None,
-        use_thinking=True,
-        return_thinking=False,
-        psr_mode=None,
-        psr_anchors=None,
-        psr_gate=None,
-        psr_sample_weights=None,
         return_metrics=False,
         use_ced_recurrent=True,
         return_sequence_losses=False,
@@ -480,44 +420,6 @@ class VibyForCausalLM(nn.Module):
         tail_fraction=None,
         **kwargs,
     ):
-        mode = psr_mode or (
-            "recurrent" if self.config.psr_enabled and use_thinking else "off"
-        )
-        if not use_thinking:
-            mode = "off"
-        if mode not in ("off", "state_only", "recurrent"):
-            raise ValueError("psr_mode must be off/state_only/recurrent")
-        if tail_reference is not None and (mode != "off" or labels is None):
-            raise ValueError("TailSFT requires labels and psr_mode=off")
-        if cache is not None:
-            previous = getattr(cache, "psr_mode", None)
-            if previous is not None and previous != mode:
-                raise ValueError("PSR condition changes require a fresh cache")
-            cache.psr_mode = mode
-        if mode == "off":
-            thinking_state = None
-            thinking_options = None
-            thinking_targets = None
-            psr_anchors = None
-            thinking_prefix_lengths = None
-        elif self.psr is None:
-            raise ValueError("construct with psr_enabled=True")
-        if thinking_targets is not None:
-            raise ValueError(
-                "protected PSR uses only direct next-token labels; legacy auxiliary targets were removed"
-            )
-        if thinking_state is None and cache is not None and mode != "off":
-            thinking_state = cache.thinking_state
-        if psr_anchors is None and thinking_prefix_lengths is not None:
-            lengths = thinking_prefix_lengths
-            if isinstance(lengths, int):
-                lengths = mx.full((input_ids.shape[0],), lengths, mx.int32)
-            psr_anchors = lengths[:, None] - 1
-        if mode != "off" and thinking_state is None and psr_anchors is None:
-            raise ValueError(
-                "supply a PSR anchor plan or use prefill/generate; off bypasses it"
-            )
-        requested = mode != "off" and thinking_state is None
         pad = None if attention_mask is None else attention_mask.astype(mx.bool_)
         want_main = bool(use_mtp and self.mtp_modules and labels is not None)
         result = self.model(
@@ -529,60 +431,16 @@ class VibyForCausalLM(nn.Module):
             decode=decode,
             prev_tokens=prev_tokens,
             collect_main=want_main,
-            return_memory=requested,
             use_ced_recurrent=use_ced_recurrent,
         )
         hidden, mains, _ = result[:3]
-        state, trace = thinking_state, None
-        if requested:
-            opts = dict(thinking_options or {})
-            opts.pop("mode", None)
-            boundary = self.model.layers[self.config.n_encoder_layers].attn
-            state, trace = self.psr(
-                result[3],
-                psr_anchors,
-                boundary.freq_cos,
-                boundary.freq_sin,
-                mode=mode,
-                record_trace=return_thinking,
-                **opts,
-            )
-            if cache is not None:
-                cache.thinking_state = state.for_decode()
-        if state is not None and state.mode != mode:
-            raise ValueError("state mode mismatch; create a fresh condition")
-        out = CausalLMOutput(thinking_state=state, thinking_trace=trace)
+        out = CausalLMOutput()
         if recurrent_active(self.config, use_ced_recurrent):
             out.ced_result = result[-1]
             out.ced_metrics = out.ced_result["metrics"]
         b, t, _ = hidden.shape
-        positions = (
-            (start_pos + mx.arange(t))[None]
-            if not isinstance(start_pos, mx.array)
-            else start_pos[:, None] + mx.arange(t)
-        )
-        positions = mx.broadcast_to(positions, (b, t))
-        vector, covered, offsets = (
-            None,
-            mx.zeros((b, t), mx.bool_),
-            mx.zeros((b, t), mx.int32),
-        )
-        if state is not None:
-            vector, covered, offsets = self.psr.read_workspace(
-                hidden, state, positions, segment_ids, pad
-            )
-        gate = (
-            self.psr.calibration_gate
-            if self.psr is not None and psr_gate is None
-            else psr_gate
-        )
         if labels is None:
-            out.base_logits = self.logits(hidden)
-            out.logits = (
-                out.base_logits
-                if vector is None
-                else mx.stop_gradient(out.base_logits) + gate * self.psr.output(vector)
-            )
+            out.logits = self.logits(hidden)
             return out
         z_w = float(self.config.z_loss_weight)
         if return_sequence_losses or tail_reference is not None:
@@ -609,70 +467,7 @@ class VibyForCausalLM(nn.Module):
         else:
             ce, z = lm_head_ce(hidden, self._head_weight(), labels, loss_mask, z_w)
         out.lm_loss, out.z_loss, out.loss = ce, z, ce + z_w * z
-        valid = (
-            mx.ones((b, t), mx.float32)
-            if loss_mask is None
-            else loss_mask.astype(mx.float32)
-        )
-        if vector is not None or return_metrics:
-            base_losses, corrected_losses, returned_logits = [], [], []
-            # Baseline CE above retains its exact original execution path. Correction
-            # uses detached base logits/hidden and a separate task loss.
-            for start in range(0, t, 256):
-                stop = min(start + 256, t)
-                base = mx.stop_gradient(self.logits(hidden[:, start:stop]))
-                corrected = (
-                    base
-                    if vector is None
-                    else base + gate * self.psr.output(vector[:, start:stop])
-                )
-                base_losses.append(
-                    nn.losses.cross_entropy(
-                        base.astype(mx.float32), labels[:, start:stop], reduction="none"
-                    )
-                )
-                corrected_losses.append(
-                    nn.losses.cross_entropy(
-                        corrected.astype(mx.float32),
-                        labels[:, start:stop],
-                        reduction="none",
-                    )
-                )
-                if need_logits:
-                    returned_logits.append(corrected)
-            base_nll, corrected_nll = (
-                mx.concatenate(base_losses, 1),
-                mx.concatenate(corrected_losses, 1),
-            )
-            count = mx.maximum(mx.sum(valid), 1)
-            out.corrected_lm_loss = mx.sum(corrected_nll * valid) / count
-            if vector is not None:
-                weights = (
-                    1 if psr_sample_weights is None else psr_sample_weights[:, None]
-                )
-                out.corrected_loss = (
-                    mx.sum(corrected_nll * valid * covered * weights) / count
-                )
-                out.loss = out.loss + out.corrected_loss
-            prefix_mask = (
-                None
-                if state is None
-                else positions
-                < mx.min(
-                    mx.where(state.valid, state.anchor, self.config.max_seq_len), axis=1
-                )[:, None]
-            )
-            out.metrics = residual_statistics(
-                base_nll, corrected_nll, valid, covered, offsets, prefix_mask
-            )
-            out.base_token_nll, out.corrected_token_nll, out.bridge_mask = (
-                base_nll,
-                corrected_nll,
-                covered,
-            )
-            if need_logits:
-                out.logits = mx.concatenate(returned_logits, 1)
-        elif need_logits:
+        if need_logits:
             out.logits = self.logits(hidden)
         if want_main and mains:
             mtp_loss, mtp_z = self._mtp_loss(
@@ -844,23 +639,9 @@ class VibyForCausalLM(nn.Module):
         input_ids: mx.array,
         segment_ids=None,
         *,
-        use_thinking=True,
-        thinking_options=None,
-        psr_mode=None,
-        psr_gate=None,
         use_ced_recurrent=True,
     ):
         """整段 prefill，返回 (logits [B,T,V], VibyCache)。"""
-        if (
-            self.config.psr_enabled
-            and use_thinking
-            and psr_mode != "off"
-            and segment_ids is not None
-        ):
-            if bool(mx.any(segment_ids != segment_ids[:, :1])):
-                raise ValueError(
-                    "multi-document cached PSR generation is unsupported; use uncached packed evaluation"
-                )
         cache = VibyCache(self.config, input_ids.shape[0])
         out = self(
             input_ids,
@@ -868,24 +649,9 @@ class VibyForCausalLM(nn.Module):
             cache=cache,
             segment_ids=segment_ids,
             use_mtp=False,
-            use_thinking=use_thinking,
-            thinking_options=thinking_options,
-            psr_mode=psr_mode,
-            psr_gate=psr_gate,
             use_ced_recurrent=use_ced_recurrent,
-            thinking_prefix_lengths=input_ids.shape[1]
-            if self.config.psr_enabled and use_thinking
-            else None,
         )
         cache.start_pos = input_ids.shape[1]
-        cache.psr_next_anchor = (
-            input_ids.shape[1] - 1 + self.config.psr_horizon
-            if cache.thinking_state is not None
-            else None
-        )
-        cache.psr_phases = 1 if cache.thinking_state is not None else 0
-        cache.psr_options = dict(thinking_options or {})
-        cache.psr_gate = psr_gate
         if self.model.engram_hash is not None:
             w = max(self.config.engram_max_ngram_size - 1, 0)
             cache.engram_prev = (
@@ -901,20 +667,9 @@ class VibyForCausalLM(nn.Module):
             )
         return out.logits, cache
 
-    def decode_step(self, token_ids: mx.array, cache: VibyCache, *, psr_gate=None):
+    def decode_step(self, token_ids: mx.array, cache: VibyCache):
         """单步解码，返回 (logits [B,V], cache)。"""
         cache.decode_max_pos = cache.start_pos + 1
-        if psr_gate is None:
-            psr_gate = cache.psr_gate
-        new_anchor = None
-        if (
-            cache.psr_next_anchor is not None
-            and cache.start_pos >= cache.psr_next_anchor
-        ):
-            cache.thinking_state = None
-            new_anchor = mx.full((token_ids.shape[0], 1), cache.start_pos, mx.int32)
-            cache.psr_next_anchor += self.config.psr_horizon
-            cache.psr_phases += 1
         out = self(
             token_ids[:, None],
             start_pos=cache.start_pos,
@@ -922,11 +677,7 @@ class VibyForCausalLM(nn.Module):
             decode=True,
             prev_tokens=cache.engram_prev,
             use_mtp=False,
-            psr_mode=cache.psr_mode,
-            psr_gate=psr_gate,
-            psr_anchors=new_anchor,
             use_ced_recurrent=cache.ced_signature != ("baseline",),
-            thinking_options=cache.psr_options if new_anchor is not None else None,
         )
         if self.model.engram_hash is not None:
             w = max(self.config.engram_max_ngram_size - 1, 0)
@@ -951,10 +702,6 @@ class VibyForCausalLM(nn.Module):
         top_k: int = 0,
         eos_token_id: Optional[int] = None,
         *,
-        use_thinking=True,
-        thinking_options=None,
-        psr_mode=None,
-        psr_gate=None,
         use_ced_recurrent=True,
     ):
         """自回归解码（prefill 一次 + 逐 token decode）。"""
@@ -962,10 +709,6 @@ class VibyForCausalLM(nn.Module):
         B = input_ids.shape[0]
         logits, cache = self.prefill(
             input_ids,
-            use_thinking=use_thinking,
-            thinking_options=thinking_options,
-            psr_mode=psr_mode,
-            psr_gate=psr_gate,
             use_ced_recurrent=use_ced_recurrent,
         )
         logits = logits[:, -1]
@@ -978,7 +721,7 @@ class VibyForCausalLM(nn.Module):
             finished = finished | (tok == eos)
             if bool(mx.all(finished).item()):
                 break
-            logits, cache = self.decode_step(tok, cache, psr_gate=psr_gate)
+            logits, cache = self.decode_step(tok, cache)
         if not toks:
             return input_ids
         return mx.concatenate([input_ids, mx.stack(toks, axis=1)], axis=1)

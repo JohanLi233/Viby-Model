@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Optional, Union
 
 import mlx.core as mx
@@ -83,7 +83,6 @@ class VibyEngine:
             raise ValueError(
                 "Recurrent CED uses model.prefill/decode_step/generate; the continuous-batch engine does not yet transport per-round latent cache and anchor state"
             )
-        self._psr = bool(getattr(cfg, "psr_enabled", False))
         model.eval()
         self.model = model
         self.config = cfg
@@ -95,10 +94,9 @@ class VibyEngine:
         self.pool = StatePool(cfg, 0)
         # 前缀快照的粒度：prefill 按 prefix_stride 分块，块尾插一个可复用点
         self.prefix_stride = max(1, int(prefix_stride))
-        # PSR 必须在完整问题末尾建立工作区；普通前缀快照不携带该边界和刷新时钟。
         self.prefix = (
             RadixPrefixCache(int(max_prefix_states))
-            if enable_prefix_cache and int(max_prefix_states) > 0 and not self._psr
+            if enable_prefix_cache and int(max_prefix_states) > 0
             else None
         )
         # Engram 的最近 token 历史宽度（模型侧 prev_tokens 的长度）
@@ -244,25 +242,6 @@ class VibyEngine:
         rows = []
         for seq, pl in zip(sequences, prompt_lens):
             pl = int(pl)
-            if self._psr:
-                if not 1 <= pl <= len(seq):
-                    raise ValueError(
-                        "PSR scoring requires 1 <= prompt_len <= sequence length"
-                    )
-                # Anchor at the prompt boundary, then refresh exactly as generation
-                # does. Prefilling the completion would move the first anchor.
-                logits, cache = self.model.prefill(mx.array([list(seq[:pl])], mx.int32))
-                row = logits[0, -1]
-                vals = []
-                for j in range(len(seq) - pl):
-                    if j:
-                        logits, cache = self.model.decode_step(
-                            mx.array([seq[pl + j - 1]], mx.int32), cache
-                        )
-                        row = logits[0]
-                    vals.append(float(log_softmax(row)[int(seq[pl + j])].item()))
-                rows.append(vals + [0.0] * (gen - len(vals)))
-                continue
             logits, _ = self.model.prefill(mx.array([list(seq)], dtype=mx.int32))
             lp = log_softmax(logits)[0]
             n = len(seq) - pl
@@ -297,10 +276,6 @@ class VibyEngine:
     def _validate_speculative(self, params):
         if not params.use_mtp_speculative:
             return
-        if self._psr:
-            raise ValueError(
-                "MTP speculative decoding is not supported together with PSR"
-            )
         if not getattr(self.model, "mtp_modules", None) or not callable(
             getattr(self.model, "dspark_draft", None)
         ):
@@ -324,9 +299,6 @@ class VibyEngine:
         prompt = seq.prompt_ids
         if seq.max_new <= 0:
             self._finish(seq, "length")
-            return
-        if self._psr:
-            self._admit_psr(seq)
             return
         # 1) 前缀匹配：拿最长可复用的状态快照
         n_hit, state = (0, None)
@@ -431,22 +403,6 @@ class VibyEngine:
             seq.streamer.put([list(prompt)])
         self._append_step([seq], logits[None])
 
-    def _admit_psr(self, seq: Sequence) -> None:
-        """Run the complete prompt before creating its first PSR workspace."""
-        ids = mx.array([seq.prompt_ids], mx.int32)
-        logits, scratch = self.model.prefill(ids)
-        logits = logits[:, -1]
-        mx.eval(logits)
-        row = len(self._running)
-        self.pool.ensure(row + 1, [len(s.token_ids) for s in self._running])
-        copy_state_row(self.pool.cache, row, scratch, 0, len(seq.prompt_ids))
-        seq.row = row
-        self.stats["prefill_tokens"] += len(seq.prompt_ids)
-        self._running.append(seq)
-        if seq.streamer is not None:
-            seq.streamer.put([list(seq.prompt_ids)])
-        self._append_step([seq], logits)
-
     def _dense_min_chunk(self, pos: int) -> int:
         """续跑时稠密块至少要覆盖的 token 数。
 
@@ -471,70 +427,14 @@ class VibyEngine:
         pos = mx.array([n - 1 for n in lens], dtype=mx.int32)
         cache = self.pool.cache
         cache.decode_max_pos = max(lens)
-        if self._psr:
-            logits = self._decode_psr(toks, pos, cache)
-        else:
-            hidden = self._trunk(toks, start_pos=pos, cache=cache, decode=True)
-            logits = self.model.logits(hidden)[:, 0]
+        hidden = self._trunk(toks, start_pos=pos, cache=cache, decode=True)
+        logits = self.model.logits(hidden)[:, 0]
         mx.eval(logits)
         self._update_engram_decode(cache, toks)
         self.stats["decode_tokens"] += len(seqs)
         self.stats["batch_steps"] += 1
         self.stats["max_batch"] = max(self.stats["max_batch"], len(seqs))
         return logits
-
-    def _decode_psr(self, toks: mx.array, pos: mx.array, cache: VibyCache) -> mx.array:
-        """One batched trunk step, with independent workspace refresh per row."""
-        refresh = pos >= cache.psr_next_anchor
-        needs_memory = bool(mx.any(refresh).item())
-        result = self.model.model(
-            toks,
-            start_pos=pos,
-            cache=cache,
-            decode=True,
-            prev_tokens=cache.engram_prev,
-            collect_main=False,
-            return_memory=needs_memory,
-        )
-        hidden = result[0]
-        state = cache.thinking_state
-        if needs_memory:
-            boundary = self.model.model.layers[self.config.n_encoder_layers].attn
-            anchors = mx.where(refresh, pos, -1)[:, None]
-            options = dict(cache.psr_options or {})
-            options.pop("mode", None)
-            fresh, _ = self.model.psr(
-                result[3],
-                anchors,
-                boundary.freq_cos,
-                boundary.freq_sin,
-                mode=cache.psr_mode,
-                **options,
-            )
-            arrays = {}
-            for name in ("slots", "anchor", "segment", "valid"):
-                old, new = getattr(state, name), getattr(fresh, name)
-                arrays[name] = (
-                    None
-                    if old is None
-                    else mx.where(
-                        refresh.reshape((-1,) + (1,) * (old.ndim - 1)), new, old
-                    )
-                )
-            state = cache.thinking_state = replace(fresh, **arrays)
-            cache.psr_next_anchor = mx.where(
-                refresh,
-                cache.psr_next_anchor + self.config.psr_horizon,
-                cache.psr_next_anchor,
-            )
-            cache.psr_phases = cache.psr_phases + refresh.astype(mx.int32)
-        vector, _, _ = self.model.psr.read_workspace(hidden, state, pos[:, None])
-        gate = (
-            self.model.psr.calibration_gate
-            if cache.psr_gate is None
-            else cache.psr_gate
-        )
-        return (self.model.logits(hidden) + gate * self.model.psr.output(vector))[:, 0]
 
     def _append_step(self, seqs: list, logits: mx.array) -> None:
         """逐条按各自的 SamplingParams 采样、追加 token、判定停止 + 流式输出。"""

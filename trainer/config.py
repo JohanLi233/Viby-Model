@@ -132,19 +132,11 @@ def add_common_args(parser):
     )
     parser.add_argument("--index_topk", type=int, default=_DEFAULT_CFG.index_topk)
     parser.add_argument(
-        "--psr",
-        "--psr_enabled",
-        dest="psr_enabled",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="启用隔离的 PSR 纠错分支；预训练默认启用，--no-psr 选择基线",
-    )
-    parser.add_argument(
         "--ced-recurrent",
         dest="ced_recurrent_enabled",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="残差提升式循环 CED 研究路径；配合 --no-psr --mtp_depth 0",
+        help="残差提升式循环 CED 研究路径；配合 --mtp_depth 0",
     )
     parser.add_argument(
         "--ced-recurrent-stride",
@@ -159,28 +151,6 @@ def add_common_args(parser):
         type=int,
         default=3,
         help="共享中间 decoder 栈的循环次数",
-    )
-    for name in (
-        "psr_slots",
-        "psr_dim",
-        "psr_blocks",
-        "psr_topk",
-        "psr_rounds",
-        "psr_max_rounds",
-        "psr_horizon",
-        "psr_train_anchors",
-    ):
-        parser.add_argument("--" + name, type=int, default=getattr(_DEFAULT_CFG, name))
-    parser.add_argument("--psr_learning_rate", type=float, default=1e-4)
-    parser.add_argument("--psr_weight_decay", type=float, default=0.0)
-    parser.add_argument("--psr_grad_clip", type=float, default=1.0)
-    parser.add_argument(
-        "--psr_freeze_base", action="store_true", help="冻结基座，只训练隔离纠错头"
-    )
-    parser.add_argument(
-        "--psr_training_mode",
-        choices=["off", "state_only", "recurrent"],
-        default="recurrent",
     )
     parser.add_argument(
         "--rope_theta",
@@ -618,7 +588,6 @@ def get_pretrain_parser():
         # 专门阶段单独训练（冻结主干），见 §2.4.3。要训练草稿层就显式传
         # --mtp_depth N（配合 --resume 基座 + --freeze_backbone 即官方口径）。
         mtp_depth=0,
-        psr_enabled=True,
     )
 
     parser.add_argument("--swanlab_project", type=str, default="Viby-Pretrain")
@@ -740,7 +709,6 @@ _PRESET_DERIVED_ARGS = {
     "ced_recurrent_enabled",
     "ced_recurrent_stride",
     "ced_recurrent_rounds",
-    "psr_enabled",
     "mtp_depth",
     "xsa_last_n",
     "compress_ratios",
@@ -805,20 +773,10 @@ def setup_training_args(args, training_type="pretrain"):
     if training_type == "pretrain":
         apply_preset(args)
         if args.ced_recurrent_enabled:
-            if args.psr_enabled or args.psr_freeze_base:
-                raise ValueError(
-                    "Recurrent CED requires --no-psr and an unfrozen backbone"
-                )
             if args.mtp_depth != 0:
                 raise ValueError(
                     "Recurrent CED requires --mtp_depth 0 on both comparison sides"
                 )
-        if (
-            args.psr_learning_rate <= 0
-            or args.psr_weight_decay < 0
-            or args.psr_grad_clip < 0
-        ):
-            raise ValueError("invalid isolated PSR optimizer settings")
 
     # checkpoint 保存点必须落在梯度累积窗口边界上：窗口中间保存的 checkpoint
     # 不含已累加但未更新的梯度，resume 时这部分梯度会永久丢失

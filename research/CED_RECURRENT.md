@@ -50,7 +50,6 @@ cfg = VibyConfig(
     ced_recurrent_enabled=True,
     ced_recurrent_stride=4,
     ced_recurrent_rounds=3,
-    psr_enabled=False,
     n_mtp_layers=0,
 )
 model = VibyForCausalLM(cfg)
@@ -58,10 +57,10 @@ recurrent = model(ids, labels=labels, use_mtp=False)
 baseline = model(ids, labels=labels, use_mtp=False, use_ced_recurrent=False)
 ```
 
-当前 CLI（本轮工作区并行移除了 NCP 入口）明确关闭默认 protected PSR：
+当前 CLI（2026-09-14 起 PSR 研究线已整体移除，无需再显式关闭）：
 
 ```bash
-.venv/bin/python trainer/train_pretrain.py --ced-recurrent --no-psr --mtp_depth 0 \
+.venv/bin/python trainer/train_pretrain.py --ced-recurrent --mtp_depth 0 \
   --ced-recurrent-stride 4 --ced-recurrent-rounds 3 \
   --data_path /path/to/train.jsonl --out_dir out/ced_recurrent
 # 配对基线使用同样其余参数，并将 --ced-recurrent 换为 --no-ced-recurrent。

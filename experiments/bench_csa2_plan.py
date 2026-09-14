@@ -335,8 +335,6 @@ def main():
             configure(name)
             trainer._loss_and_grad = graphs[name]
             if args.mode == "fb":
-                if snap["psr_step"] is not None:
-                    trainer._psr_step = snap["psr_step"]
                 run_fb(trainer, batches[0])
             else:
                 run_window(trainer, batches)

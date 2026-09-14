@@ -101,8 +101,7 @@ def log_parameter_count(model, args=None):
     args.flops_per_token = flops
     Logger(
         f"训练 FLOPs/token 估算：{flops / 1e9:.3f}G（6×激活 GEMM + 名义 sparse top-k，"
-        f"未实测文档掩码/阈值并列；DSpark 按槽数折算"
-        f"{'；含 PSR 固定预算文本预训练摊销' if getattr(model.config, 'psr_enabled', False) else ''}），"
+        f"未实测文档掩码/阈值并列；DSpark 按槽数折算），"
         f"peak {peak:.1f} TFLOPS"
     )
 
@@ -347,20 +346,6 @@ ARCH_ARG_TO_FIELD = {
             "ced_recurrent_rounds",
         )
     },
-    **{
-        name: name
-        for name in (
-            "psr_enabled",
-            "psr_slots",
-            "psr_dim",
-            "psr_blocks",
-            "psr_topk",
-            "psr_rounds",
-            "psr_max_rounds",
-            "psr_horizon",
-            "psr_train_anchors",
-        )
-    },
     "hidden_size": "dim",
     "num_hidden_layers": "n_layers",
     "num_attention_heads": "n_heads",
@@ -428,11 +413,8 @@ ARCH_ARG_TO_FIELD = {
 #  --preset 判断"用户是否显式传过"）
 ARCH_ARG_ALIASES = {
     "routed_scaling_factor": "route_scale",
-    "psr": "psr_enabled",
     "ced_recurrent": "ced_recurrent_enabled",
     "no_ced_recurrent": "ced_recurrent_enabled",
-    "no_psr": "psr_enabled",
-    "no_psr_enabled": "psr_enabled",
 }
 
 # 派生字段 → 生成它们的 CLI 结构参数。sidecar 里的派生字段是按当时的结构算好的；
@@ -949,7 +931,7 @@ def _artifact_sha256(path, common_only=False):
             size = struct.unpack("<Q", file.read(8))[0]
             header = json.loads(file.read(size))
             for name, entry in sorted(header.items()):
-                if name == "__metadata__" or name.startswith("psr."):
+                if name == "__metadata__":
                     continue
                 digest.update(
                     json.dumps([name, entry["dtype"], entry["shape"]]).encode()
@@ -1020,10 +1002,6 @@ def save_checkpoint(
         "execution": checkpoint_execution(lm_config),
         "training_type": training_type,
         "optimizer": _optimizer_hparams(optimizer),
-        "psr_optimizer": _optimizer_hparams(optimizer.psr_optimizer)
-        if getattr(optimizer, "psr_optimizer", None) is not None
-        else None,
-        "psr_microstep": getattr(args, "psr_microstep", step + 1),
     }
     if training_type == "sft" and getattr(args, "sft_algorithm", "standard") == "tail":
         meta["rng"] = {
@@ -1033,7 +1011,7 @@ def save_checkpoint(
         }
     if any(
         getattr(lm_config, flag, False)
-        for flag in ("psr_enabled", "ced_recurrent_enabled")
+        for flag in ("ced_recurrent_enabled",)
     ):
         meta["code_sha"] = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
@@ -1057,15 +1035,9 @@ def save_checkpoint(
             "numpy_epoch_start": getattr(args, "epoch_shuffle_state", None),
         }
         filters = getattr(optimizer, "filters", [lambda *_: True])
-        group_key = (
-            "baseline_parameter_groups"
-            if getattr(lm_config, "psr_enabled", False)
-            else "optimizer_parameter_groups"
-        )
+        group_key = "optimizer_parameter_groups"
         meta[group_key] = [[] for _ in filters]
         for key, value in tree_flatten(model.trainable_parameters()):
-            if key.startswith("psr."):
-                continue
             for i, fn in enumerate(filters):
                 if fn(key, value):
                     meta[group_key][i].append(key)
@@ -1084,22 +1056,12 @@ def save_checkpoint(
     opt_path = os.path.join(args.save_dir, f"{ckp_name}.optimizer.safetensors")
     mx.save_safetensors(opt_path, dict(tree_flatten(optimizer.state)))
 
-    side = getattr(optimizer, "psr_optimizer", None)
-    if side is not None:
-        mx.save_safetensors(
-            os.path.join(args.save_dir, f"{ckp_name}.psr_optimizer.safetensors"),
-            dict(tree_flatten(side.state)),
-        )
     if any(
         getattr(lm_config, flag, False)
-        for flag in ("psr_enabled", "ced_recurrent_enabled")
+        for flag in ("ced_recurrent_enabled",)
     ):
         meta["common_weights_sha256"] = _artifact_sha256(ckp, common_only=True)
-        meta[
-            "baseline_optimizer_sha256"
-            if getattr(lm_config, "psr_enabled", False)
-            else "optimizer_sha256"
-        ] = _artifact_sha256(opt_path)
+        meta["optimizer_sha256"] = _artifact_sha256(opt_path)
         with open(meta_path, "w") as file:
             json.dump(meta, file, indent=2, default=str)
     Logger(f"Checkpoint saved: {ckp}")
@@ -1112,21 +1074,9 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
     Logger(f"Loading checkpoint from: {checkpoint_path}")
     validate_checkpoint_execution(checkpoint_path, model.config, args)
     weights = dict(mx.load(checkpoint_path).items())
-    psr_prefixes = ("psr.",)
-    if any(
-        k.startswith(("model.reasoner.", "model.workspace_bridges.")) for k in weights
-    ):
-        raise ValueError(
-            "Legacy PSR checkpoint: retain it for E0; load an explicit baseline checkpoint for protected PSR"
-        )
-    fresh_psr = getattr(model.config, "psr_enabled", False) and not any(
-        k.startswith(psr_prefixes) for k in weights
-    )
     fresh_prefixes = (
         ("mtp_modules.",) if getattr(args, "freeze_backbone", False) else ()
     )
-    if fresh_psr:
-        fresh_prefixes += psr_prefixes
 
     # 加载模型权重（严格校验，buffer shape 不匹配时保留当前 config 的版本）。
     # --freeze_backbone 的 DSpark 独立阶段（报告 §2.4.3）允许基座 checkpoint
@@ -1161,10 +1111,6 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
         Logger(
             "--freeze_backbone：可训练集合与基座不同，自动跳过优化器状态（等价 --reset_optimizer）"
         )
-    if fresh_psr:
-        Logger(
-            "Protected PSR: loaded shared baseline exactly; new side initialized; preserving baseline optimizer/progress"
-        )
     if not getattr(args, "reset_optimizer", False) and not getattr(
         args, "freeze_backbone", False
     ):
@@ -1187,20 +1133,6 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
             "reset_optimizer set: optimizer states not loaded; start_step reset to 0"
         )
 
-    side = getattr(optimizer, "psr_optimizer", None)
-    side_path = f"{base}.psr_optimizer.safetensors"
-    if (
-        side is not None
-        and not fresh_psr
-        and not getattr(args, "reset_optimizer", False)
-    ):
-        if not os.path.exists(side_path):
-            raise ValueError(
-                "Protected PSR resume requires its separate optimizer state; use --reset_optimizer explicitly otherwise"
-            )
-        side.state = tree_unflatten(list(mx.load(side_path).items()))
-        _restore_optimizer_hparams(side, meta.get("psr_optimizer", []))
-    args.psr_resumed_microstep = meta.get("psr_microstep", start_step)
     if not getattr(args, "reset_optimizer", False) and meta.get("rng"):
         rng = meta["rng"]
         high, low = rng["mlx_key"]

@@ -61,7 +61,6 @@ def source_hashes():
 def make_config(args):
     settings = dict(
         n_mtp_layers=0,
-        psr_enabled=False,
         engram_layer_ids=(),
         ced_recurrent_enabled=True,
         ced_recurrent_stride=args.stride,
@@ -96,7 +95,6 @@ def make_config(args):
 def make_trainer(args, cfg, model):
     argv = [
         "--ced-recurrent",
-        "--no-psr",
         "--mtp_depth",
         "0",
         "--no_save",
@@ -571,7 +569,7 @@ def main():
                 attention, "_RECURRENT_SPARSE", None
             ),
         },
-        scope="Same process and weights; explicit current reference/optimized recurrent switch. MTP, PSR, Engram disabled in both. f+b returns/evaluates MoE loads and QB margins. Window includes two real BaseTrainer microbatches, gradient accumulation, norm/clip, selected optimizer and next-window MoE bias update. Snapshot restore and data generation excluded; no data loader, checkpoint I/O, generation cache, efficacy or measured FLOPs claim.",
+        scope="Same process and weights; explicit current reference/optimized recurrent switch. MTP, Engram disabled in both. f+b returns/evaluates MoE loads and QB margins. Window includes two real BaseTrainer microbatches, gradient accumulation, norm/clip, selected optimizer and next-window MoE bias update. Snapshot restore and data generation excluded; no data loader, checkpoint I/O, generation cache, efficacy or measured FLOPs claim.",
     )
     append_jsonl(args.run_dir / "measurements.jsonl", metadata)
     (args.run_dir / "working_tree.patch").write_bytes(

@@ -45,16 +45,8 @@ if __name__ == "__main__":
         Logger(
             f"Residual-lifted recurrent CED: k={lm_config.ced_recurrent_stride}, "
             f"q={lm_config.ced_recurrent_rounds}, full evidence KV, shared middle blocks; "
-            "NTP + original MoE balancing, MTP/protected PSR off. "
+            "NTP + original MoE balancing, MTP off. "
             "Logical FLOPs estimates do not establish timing or quality gains."
-        )
-    if lm_config.psr_enabled:
-        from .utils import Logger
-
-        Logger(
-            f"Protected PSR: output-only zero head, dense R={lm_config.psr_rounds}, "
-            f"H={lm_config.psr_horizon}, anchors/row={lm_config.psr_train_anchors}; "
-            "direct NTP, detached backbone, independent optimizer"
         )
 
     # 初始化模型

@@ -20,7 +20,7 @@ index_k [B,pool_scratch+1,index_dim] 池、压缩器 kv_state [B,ratio,hd] 缓�
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Optional
 
 import mlx.core as mx
@@ -89,56 +89,6 @@ def _set_engram_row(dst: VibyCache, drow: int, row: Optional[mx.array]) -> None:
     dst.engram_prev[drow] = row
 
 
-def _copy_psr_row(dst: VibyCache, drow: int, src: VibyCache, srow: int) -> None:
-    """Transport the workspace and its per-request refresh clock together."""
-    state = src.thinking_state
-    if state is None:
-        if dst.thinking_state is not None:
-            raise ValueError("cannot mix PSR and non-PSR cache rows")
-        return
-    batch = _batch_of(dst)
-    previous = dst.thinking_state
-    if previous is not None and (
-        previous.mode != state.mode
-        or previous.rounds != state.rounds
-        or previous.horizon != state.horizon
-    ):
-        raise ValueError("cannot mix different PSR conditions in one cache")
-    arrays = {}
-    for name in ("slots", "anchor", "segment", "valid"):
-        source = getattr(state, name)
-        target = None if previous is None else getattr(previous, name)
-        if source is None:
-            if target is not None:
-                raise ValueError("cannot mix segmented and unsegmented PSR states")
-            arrays[name] = None
-            continue
-        if previous is not None and (
-            target is None or target.shape[1:] != source.shape[1:]
-        ):
-            raise ValueError("incompatible PSR cache row shapes")
-        if target is None:
-            target = mx.zeros((batch,) + source.shape[1:], dtype=source.dtype)
-        arrays[name] = mx.where(
-            _row_mask(batch, drow, source.ndim), source[srow], target
-        )
-    dst.thinking_state = replace(state, **arrays)
-    for name in ("psr_next_anchor", "psr_phases"):
-        source = getattr(src, name)
-        if source is None:
-            raise ValueError("PSR cache row is missing its refresh clock")
-        source = (
-            source[srow] if isinstance(source, mx.array) and source.ndim else source
-        )
-        target = getattr(dst, name)
-        if not isinstance(target, mx.array) or target.ndim == 0:
-            target = mx.full((batch,), 0 if target is None else target, mx.int32)
-        setattr(dst, name, mx.where(mx.arange(batch) == drow, source, target))
-    dst.psr_mode = src.psr_mode
-    dst.psr_options = dict(src.psr_options or {})
-    dst.psr_gate = src.psr_gate
-
-
 def copy_state_row(
     dst: VibyCache, drow: int, src: VibyCache, srow: int = 0, n: Optional[int] = None
 ) -> None:
@@ -161,7 +111,6 @@ def copy_state_row(
             dl.index_k[drow, :k] = sl.index_k[srow, :k]
     if src.engram_prev is not None:
         _set_engram_row(dst, drow, src.engram_prev[srow])
-    _copy_psr_row(dst, drow, src, srow)
 
 
 def capture_state(
@@ -172,10 +121,6 @@ def capture_state(
     draft_mains=None,
 ) -> PrefixState:
     """从 cache 的第 row 行取长度 n 的状态快照（显式拷贝，之后 cache 再被写也不影响）。"""
-    if cache.thinking_state is not None:
-        raise ValueError(
-            "prefix snapshots do not carry PSR state; disable the prefix cache"
-        )
     state = PrefixState(n=int(n), hidden=hidden)
     if draft_mains is not None:
         state.draft_mains = tuple(mx.array(m) for m in draft_mains)
@@ -196,10 +141,6 @@ def capture_state(
 
 def restore_state(dst: VibyCache, drow: int, state: PrefixState) -> int:
     """把快照写回 dst 的第 drow 行，返回快照长度 n。"""
-    if dst.thinking_state is not None:
-        raise ValueError(
-            "prefix snapshots do not carry PSR state; disable the prefix cache"
-        )
     batch = _batch_of(dst)
     for i, dl in enumerate(dst.layers):
         # Dense prefix continuation uses a Python filled count; the decode
@@ -239,12 +180,6 @@ def cache_bytes(cache: Optional[VibyCache]) -> int:
         if lc.kv_state is not None:
             total += sum(_array_bytes(s) for s in lc.kv_state)
     total += _array_bytes(cache.engram_prev)
-    if cache.thinking_state is not None:
-        total += sum(
-            _array_bytes(getattr(cache.thinking_state, name))
-            for name in ("slots", "anchor", "segment", "valid")
-        )
-        total += _array_bytes(cache.psr_next_anchor) + _array_bytes(cache.psr_phases)
     return total
 
 

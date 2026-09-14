@@ -16,8 +16,6 @@ MFU = (tokens/s × 每 token 训练 FLOPs) / 硬件峰值。
   算子与重算，也不将稠密 fallback 的无效 mask 位置充作 useful FLOPs。
 - 不含优化器（Muon Newton-Schulz）FLOPs；墙钟含优化器，因此 MFU 会低于
   纯 GEMM 利用率。这是训练 MFU 的标准口径。
-- PSR 启用时，单独按固定预算文本预训练的一次前缀思考摊销到 token，
-  包含全量索引/读取教师、循环与桥接；不能把循环权重当成每 token 一次 GEMM。
 
 默认峰值 13.5 TFLOPS：M4 Max bf16 稠密 GEMM 实测中位
 （research/MLX_PERF.md §0：12.9~14）。换机用 --peak_tflops。
@@ -76,10 +74,6 @@ def gemm_active_params(model) -> int:
     n = 0
     block = int(getattr(cfg, "dspark_block_size", 1)) if mtp_on else 0
     for path, value in tree_flatten(model.trainable_parameters()):
-        # PSR runs once per prefix, with R shared transitions. Counting its
-        # matrices once per token overstates work and omits repeated work.
-        if path.startswith("psr."):
-            continue
         # 1-D（norm gain / mHC scale·base / attn_sink / router bias）不是 GEMM 权重
         if getattr(value, "ndim", 0) < 2:
             continue
@@ -170,34 +164,7 @@ def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int
     return int(
         6 * gemms
         + attn_fwdbwd_flops_per_token(model.config, seq_len, attention_lengths)
-        + psr_pretrain_flops_per_token(model.config, seq_len)
     )
-
-
-def psr_pretrain_flops_per_token(cfg, seq_len):
-    """Nominal dense protected-side work; no indexer/teacher/value objectives.
-
-    Includes forward-only detached baseline vocabulary logits. Sorting, gather,
-    norm, scalar ops and optimizer are not GEMM FLOPs; profile them separately.
-    """
-    t = int(seq_len)
-    if t <= 0 or not getattr(cfg, "psr_enabled", False):
-        return 0
-    a, m, s, r, d = (
-        min(cfg.psr_train_anchors, t),
-        cfg.psr_slots,
-        cfg.psr_dim,
-        cfg.psr_rounds,
-        cfg.dim,
-    )
-    hd = cfg.head_dim
-    total = 6 * a * d * s + 6 * a * r * m * (2 * s * hd + cfg.psr_blocks * 10 * s * s)
-    total += 12 * a * r * m * t * hd + cfg.psr_blocks * 12 * a * r * m * m * s
-    total += (
-        6 * (t * d * s + 2 * a * m * s * s + t * s * cfg.vocab_size) + 12 * t * m * s
-    )
-    total += 2 * t * d * cfg.vocab_size
-    return int(total / t)
 
 
 def model_flops_utilization(

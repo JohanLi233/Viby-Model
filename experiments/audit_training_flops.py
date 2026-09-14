@@ -38,16 +38,12 @@ def audit_training_flops(model, batch):
 
     sa.indexed_attention = record
     try:
-        # Protected PSR does not alter backbone attention visibility. Its
-        # training anchor plan is not needed for this backbone-only occurrence
-        # audit; the FLOPs estimator accounts for the configured side separately.
         out = model(
             x,
             labels=y,
             loss_mask=loss_mask,
             attention_mask=pad,
             segment_ids=segment,
-            psr_mode="off",
         )
         mx.eval(out.loss, compressed)
     finally:

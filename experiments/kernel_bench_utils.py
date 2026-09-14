@@ -119,10 +119,6 @@ def snapshot_train_state(model, optimizer, trainer=None):
         "trainable": clone_tree(model.trainable_parameters()),
         "optimizer": clone_tree(optimizer.state),
         "biases": None if biases is None else biases,
-        "side_optimizer": clone_tree(optimizer.psr_optimizer.state)
-        if getattr(optimizer, "psr_optimizer", None) is not None
-        else None,
-        "psr_step": getattr(trainer, "_psr_step", None),
         "en_delta": clone_tree(getattr(trainer, "_en_delta", None)),
     }
 
@@ -132,19 +128,11 @@ def restore_train_state(model, optimizer, snap, trainer=None):
     # Optimizers mutate state dictionaries in place, even though array leaves
     # are immutable. Hand back fresh containers on EVERY restore.
     optimizer.state = clone_tree(snap["optimizer"])
-    side = getattr(optimizer, "psr_optimizer", None)
-    if side is not None and snap.get("side_optimizer") is not None:
-        side.state = clone_tree(snap["side_optimizer"])
     if trainer is not None:
-        if snap.get("psr_step") is not None:
-            trainer._psr_step = snap["psr_step"]
-            trainer.args.psr_microstep = snap["psr_step"]
         trainer._en_delta = clone_tree(snap.get("en_delta"))
     if snap["biases"] is not None and hasattr(model, "apply_moe_biases"):
         model.apply_moe_biases(snap["biases"])
     mx.eval(model.parameters(), optimizer.state)
-    if side is not None:
-        mx.eval(side.state)
     if snap["biases"] is not None:
         mx.eval(snap["biases"])
 

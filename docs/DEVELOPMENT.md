@@ -34,7 +34,7 @@ python3 scripts/check_repo.py
 python3 scripts/check_repo.py list
 
 # 不执行：预览最终解释器、工作目录与 pytest 命令
-python3 scripts/check_repo.py test psr --dry-run
+python3 scripts/check_repo.py test engine --dry-run
 
 # host 使用 NumPy 模拟 MLX，只验证 host dispatch / fallback 契约
 python3 scripts/check_repo.py test host
@@ -45,7 +45,7 @@ python3 scripts/check_repo.py test tools
 # Astra 修改了某一路径后，显式选择该路径
 python3 scripts/check_repo.py test attention
 python3 scripts/check_repo.py test recurrent -- --collect-only
-python3 scripts/check_repo.py test psr -- -k 'zero' -x
+python3 scripts/check_repo.py test engine -- -k 'zero' -x
 
 # 任意更窄的 node ID 仍可直接交给 pytest
 .venv/bin/python -m pytest tests/test_v41_config.py::test_source_layer_derivation -q
@@ -64,9 +64,8 @@ git diff --check
 | attention / mask / cache | `attention` | 可见集合、prefill/decode、文档隔离、XSA |
 | 自定义 Metal / VJP | `kernels` | 数值和梯度、Indexer、Sinkhorn、稀疏后端 |
 | MoE / QB / 路由数据流 | `moe` | 路由、统计、GPU gather/count、QB |
-| 受保护 PSR | `psr` | 梯度隔离、训练接口、连续 batch 状态 |
 | 循环 CED | `recurrent` | 残差提升、缓存、配置/恢复、真实训练入口 |
-| 推理与 DSpark | `engine` | 拒绝修正采样、缓存搬运、PSR 调度 |
+| 推理与 DSpark | `engine` | 拒绝修正采样、缓存搬运 |
 | packing / loss mask | `data` | 数据打包、SFT mask |
 | TailSFT | `sft` | 序列筛选、梯度、初始损失缓存、恢复契约 |
 | 优化器、checkpoint、计时状态 | `training` | 状态恢复、范数、FLOPs 口径、保存 |
@@ -87,7 +86,7 @@ git diff --check
 SFT/DPO 还会从 checkpoint sidecar 继承结构，不能只看 parser 字段。
 
 模型库的 `VibyConfig()` 与训练入口可有不同默认值。基线和研究变体应显式
-写出功能开关，记录最终解析配置。主干、PSR、循环 CED 的使用条件见各自契约。
+写出功能开关，记录最终解析配置。主干与循环 CED 的使用条件见各自契约。
 旧研究记录及 optimizer probe 命令用于溯源；执行前确认参数仍存在。
 
 checkpoint 的结构 sidecar、优化器分组和执行模式是一组恢复条件。改变实验路径

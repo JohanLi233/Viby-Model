@@ -44,7 +44,6 @@ TEST_GROUPS = {
         "test_window_attention_backward.py",
     ),
     "moe": ("test_v41_moe.py", "test_moe_qb.py", "test_moe_dataflow_metal.py"),
-    "psr": ("test_psr.py", "test_psr_pretrain.py", "test_psr_engine.py"),
     "recurrent": (
         "test_ced_recurrent.py",
         "test_ced_recurrent_trainer.py",
@@ -56,7 +55,6 @@ TEST_GROUPS = {
     ),
     "engine": (
         "test_engine_speculative.py",
-        "test_psr_engine.py",
         "test_v41_consistency.py",
     ),
     "data": ("test_pack_dataset.py", "test_pack_sft.py"),
@@ -68,7 +66,6 @@ TEST_GROUPS = {
         "test_kernel_bench_state.py",
         "test_training_flops.py",
         "test_checkpoint_save.py",
-        "test_optimizer_step_logging.py",
         "test_sinkhorn_rows_kernel.py",
         "test_sinkhorn_pairs_kernel.py",
     ),

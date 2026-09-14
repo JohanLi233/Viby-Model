@@ -20,13 +20,8 @@ V4.1 这一条技术路线；唯一的保留项是 **Gated XSA**（默认开，�
 架构语义对照官方实现（`deepseek-ai/DeepSeek-V4.1-Flash` 的 `inference/model.py`，
 已逐行核对）与技术报告 `DeepSeek_V41_Tech_Report`（下称"报告"）。
 
-预训练默认启用受保护的 **PSR**：从 CED 证据构造连续工作区，通过零初始化的词表输出头
-修正预测；主干与纠错分支使用隔离梯度及独立优化器。`--no-psr` 选择 token baseline，
-`--psr` 显式启用 PSR。推理支持工作区随连续 batch 搬运和按 horizon 刷新，
-详见 [PSR 契约](research/VIBY_PSR.md)。
-
-另有默认关闭的[残差提升式循环 CED 实验](research/CED_RECURRENT.md)：
-`--ced-recurrent --no-psr --mtp_depth 0` 在完整 CED 证据上，以 `k=4,q=3`
+默认关闭的[残差提升式循环 CED 实验](research/CED_RECURRENT.md)：
+`--ced-recurrent --mtp_depth 0` 在完整 CED 证据上，以 `k=4,q=3`
 复用中间 decoder 权重，直接训练 NTP。已通过 MLX 机制与缓存检查；融合核在
 B=4/T=1024 的前向加反向试测节省约 4.1%，B=1 仍较慢。整训练预算与质量验收尚未完成。
 
@@ -168,7 +163,7 @@ B=4/T=1024 的前向加反向试测节省约 4.1%，B=1 仍较慢。整训练预
 
 ```bash
 # token baseline 冒烟（tiny；数据路径需指向已有语料）
-.venv/bin/python trainer/train_pretrain.py --preset tiny --no-psr --data_path ../dataset/pretrain_hq.jsonl \
+.venv/bin/python trainer/train_pretrain.py --preset tiny --data_path ../dataset/pretrain_hq.jsonl \
   --max_seq_len 128 --batch_size 2 --accumulation_steps 1 --max_steps 50
 
 # ≈1B 配方（与 V4.1 结构比例一致）
@@ -190,7 +185,7 @@ B=4/T=1024 的前向加反向试测节省约 4.1%，B=1 仍较慢。整训练预
 # DSpark 独立阶段（报告 §2.4.3）：预训练默认 --mtp_depth 0（§2.1：骨干预训练省略
 # MTP 模块），草稿层在这一阶段才引入并从零初始化；可训练集合变了会自动重置
 # 优化器状态。
-.venv/bin/python trainer/train_pretrain.py --no-psr --data_path ../dataset/pretrain_hq.jsonl \
+.venv/bin/python trainer/train_pretrain.py --data_path ../dataset/pretrain_hq.jsonl \
   --resume /path/to/pretrain.safetensors --mtp_depth 1 --freeze_backbone \
   --mtp_loss_weight 1.0
 ```
@@ -370,5 +365,5 @@ python3 scripts/check_repo.py test all
 ```
 
 现有测试覆盖整段 prefill 与 prefix+逐 token 解码、同位置批量解码与单条、
-packed 文档隔离、编译前向、梯度、Engram、PSR 和循环 CED 等路径。
+packed 文档隔离、编译前向、梯度、Engram 和循环 CED 等路径。
 历史验收数字见对应研究记录；当前工作区是否通过以本轮实际执行结果为准。

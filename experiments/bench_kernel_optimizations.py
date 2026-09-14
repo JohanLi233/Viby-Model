@@ -225,8 +225,6 @@ def main():
     if args.mode == "aa-fb":
 
         def arm():
-            if snap["psr_step"] is not None:
-                trainer._psr_step = snap["psr_step"]
             run_fb(trainer, fb_batch)
 
         result = abba_blocks(arm, arm, args.warmup, args.block_iters, args.blocks)

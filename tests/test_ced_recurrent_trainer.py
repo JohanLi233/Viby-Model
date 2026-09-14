@@ -35,7 +35,6 @@ def checkpoint(tmp_path, cfg=None, execution=None):
 def test_actual_cli_selects_separate_ced_experiment(monkeypatch, tmp_path):
     argv = [
         "--ced-recurrent",
-        "--no-psr",
         "--mtp_depth",
         "0",
         "--out_dir",
@@ -46,16 +45,9 @@ def test_actual_cli_selects_separate_ced_experiment(monkeypatch, tmp_path):
     cfg = VibyConfig(**build_model_kwargs(args))
     assert cfg.ced_recurrent_enabled
     assert (cfg.ced_recurrent_stride, cfg.ced_recurrent_rounds) == (4, 3)
-    assert cfg.n_mtp_layers == 0 and not cfg.psr_enabled
+    assert cfg.n_mtp_layers == 0
     assert cfg.n_encoder_layers == 6
     assert VibyConfig.from_dict(cfg.to_dict()).to_dict() == cfg.to_dict()
-
-
-def test_cli_requires_explicit_psr_exclusion(monkeypatch, tmp_path):
-    argv = ["--ced-recurrent", "--out_dir", str(tmp_path)]
-    monkeypatch.setattr(sys, "argv", ["train_pretrain.py", *argv])
-    with pytest.raises(ValueError, match="no-psr"):
-        setup_training_args(get_pretrain_parser().parse_args(argv))
 
 
 @pytest.mark.parametrize(
@@ -63,7 +55,6 @@ def test_cli_requires_explicit_psr_exclusion(monkeypatch, tmp_path):
     [
         ({"ced_recurrent_stride": 0}, "positive"),
         ({"ced_recurrent_rounds": 0}, "positive"),
-        ({"psr_enabled": True}, "separate experiment"),
         ({"n_mtp_layers": 1}, "mtp_depth"),
         ({"n_layers": 4}, "middle decoder"),
         ({"kv_source_layers": (0, 3)}, "CED boundary"),

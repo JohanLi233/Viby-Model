@@ -88,17 +88,17 @@ class TestRepoTools(unittest.TestCase):
     def test_dry_run_does_not_import_tests_and_forwards_pytest_arguments(self):
         tool = self.fixture_repo()
         result = self.run_cli(
-            tool, "test", "psr", "--dry-run", "--", "-k", "zero or cache"
+            tool, "test", "engine", "--dry-run", "--", "-k", "zero or cache"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("tests/test_psr_engine.py", result.stdout)
+        self.assertIn("tests/test_engine_speculative.py", result.stdout)
         self.assertIn("'zero or cache'", result.stdout)
 
     def test_unknown_group_or_missing_test_fails(self):
         tool = self.fixture_repo()
         self.assertEqual(self.run_cli(tool, "test", "typo").returncode, 2)
-        (self.root / "tests/test_psr.py").unlink()
-        self.assertEqual(self.run_cli(tool, "test", "psr", "--dry-run").returncode, 2)
+        (self.root / "tests/test_engine_speculative.py").unlink()
+        self.assertEqual(self.run_cli(tool, "test", "engine", "--dry-run").returncode, 2)
 
     def test_pytest_failure_exit_code_is_preserved(self):
         tool = self.fixture_repo()

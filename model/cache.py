@@ -106,14 +106,6 @@ class VibyCache:
         self.ced_delta = None
         self.ced_pre_mix = None
         self.ced_topk_idx = None
-        self.thinking_state = (
-            None  # independent terminal PSR state; never a token/cache position
-        )
-        self.psr_mode = None
-        self.psr_next_anchor = None  # native: int; engine pool: [B] int32
-        self.psr_phases = 0  # native: int; engine pool: [B] int32
-        self.psr_options = None
-        self.psr_gate = None
         self._wire_sources()
 
     def _wire_sources(self):
@@ -137,14 +129,6 @@ class VibyCache:
             raise ValueError("rewind offset must be nonnegative")
         if offset > 0 and self.ced_signature not in (None, ("baseline",)):
             raise ValueError("recurrent CED rewind requires a fresh prefill")
-        if self.thinking_state is not None and offset > 0:
-            # Reusing a workspace before its full question is observed leaks
-            # future input; require a fresh prefill rather than silently lose it.
-            new_pos = max(0, self.start_pos - offset)
-            if bool(mx.any(new_pos <= self.thinking_state.anchor).item()):
-                raise ValueError(
-                    "rewind crosses the PSR question boundary; use a fresh prefill"
-                )
         self.start_pos = max(0, self.start_pos - offset)
         self.decode_max_pos = self.start_pos
         for c in self.layers:

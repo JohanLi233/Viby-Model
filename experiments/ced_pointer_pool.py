@@ -44,7 +44,6 @@ def run(seed=20260912, tasks=64, nodes=512):
         max_seq_len=3 * nodes + 4,
         engram_layer_ids=(),
         n_mtp_layers=0,
-        psr_enabled=False,
         ced_recurrent_enabled=True,
     )
     model = VibyForCausalLM(cfg)

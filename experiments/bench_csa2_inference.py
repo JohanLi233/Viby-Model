@@ -55,12 +55,6 @@ _CACHE_FIELDS = (
     "start_pos",
     "decode_max_pos",
     "engram_prev",
-    "thinking_state",
-    "psr_mode",
-    "psr_next_anchor",
-    "psr_phases",
-    "psr_options",
-    "psr_gate",
 )
 
 
@@ -182,8 +176,6 @@ def main():
         execution="eager public prefill/decode APIs",
         native_expert_gemm=True,
         deterministic_prefill_combine_both_arms=True,
-        psr_enabled=cfg.psr_enabled,
-        psr_horizon=cfg.psr_horizon,
         resolved_config=cfg.to_dict(),
         compiled_moe_variants=[
             n

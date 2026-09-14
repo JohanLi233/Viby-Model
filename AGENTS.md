@@ -23,7 +23,7 @@
 | 训练 CLI 和预设 | [trainer/config.py](trainer/config.py) | [trainer/utils.py](trainer/utils.py) 的 `build_model_kwargs` / sidecar 加载，再到训练入口 |
 | loss、累积更新和路由统计 | [trainer/base_trainer.py](trainer/base_trainer.py) | [model/moe.py](model/moe.py)、[trainer/muon.py](trainer/muon.py) |
 | CSA2 / CED / 稀疏选择 | [model/attention.py](model/attention.py) | [model/kernels](model/kernels)、[model/cache.py](model/cache.py) |
-| PSR / 循环 CED | [model/psr.py](model/psr.py)、[model/recurrent.py](model/recurrent.py) | 模型前向、训练器、各自研究契约 |
+| 循环 CED | [model/recurrent.py](model/recurrent.py) | 模型前向、训练器、研究契约 |
 | 推理、请求排队、缓存 | [engine/engine.py](engine/engine.py) | [engine/memory.py](engine/memory.py)、[engine/prefix.py](engine/prefix.py)、模型 prefill/decode |
 | packing、文档隔离 | [dataset/lm_dataset.py](dataset/lm_dataset.py) | 训练 loss mask、attention 的 segment / pad mask |
 | 吞吐 / MFU | [experiments/kernel_bench_utils.py](experiments/kernel_bench_utils.py) | 实际 benchmark 的配置与 [trainer/flops.py](trainer/flops.py) |
@@ -38,7 +38,7 @@
   必须沿完整调用路径保持一致。优化 Top-K 时保持集合及 tie 规则。
 - mHC 的 `pre_mix` 传递、MoE 选择偏置与路由权重的区别、每次物理调用的统计、
   累积窗口更新边界均属于模型语义。改变它们应作为显式研究变体。
-- PSR 的梯度隔离和循环 CED 的共享参数 / 分轮缓存是不同契约，分别查文档。
+- 循环 CED 的共享参数 / 分轮缓存契约见研究文档。
   前向可用不等于 continuous-batch engine 支持相同状态。
 - MLX custom VJP 保持每个 array primal 对应一个 array 梯度叶子；检查 metadata
   占位、shape、dtype 和 cotangent 布局。不要用 `None` 造成槽位错位。

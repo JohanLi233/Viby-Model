@@ -33,7 +33,7 @@ def validate_args(args):
             raise ValueError(
                 "TailSFT requires individual sequences; stream --pack_sequences/--doc_mask splits responses. Use --sft_algorithm standard for legacy packing."
             )
-        if args.freeze_backbone or args.psr_freeze_base:
+        if args.freeze_backbone:
             raise ValueError("TailSFT requires an unfrozen SFT backbone")
         if args.batch_size == 1 and f > 0:
             from .utils import Logger
@@ -187,7 +187,6 @@ def prepare_dataset(dataset, model, config, args, checkpoint):
                     labels=y,
                     loss_mask=mask,
                     attention_mask=(x != dataset.tokenizer.pad_token_id),
-                    psr_mode="off",
                     use_mtp=False,
                     return_sequence_losses=True,
                 )

@@ -323,8 +323,6 @@ def main():
     print(
         f"[engine] VibyEngine（window / compress_kv / index_k 三类池，连续 batch，{prefix_status}）"
     )
-    if model.config.psr_enabled:
-        print(f"[engine] PSR 工作区已启用，每 {model.config.psr_horizon} 个位置刷新")
     if args.use_mtp_speculative:
         try:
             engine._validate_speculative(_sampling_params(args, tokenizer, 1))

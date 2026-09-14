@@ -280,19 +280,6 @@ class VibyConfig:
         self.dspark_n_activated_experts = int(kw.get("dspark_n_activated_experts", 3))
         self.mtp_loss_weight = float(kw.get("mtp_loss_weight", 0.3))
 
-        # PSR is opt-in; an explicit question boundary is also required per call.
-        self.psr_enabled = bool(kw.get("psr_enabled", False))
-        self.psr_slots = int(kw.get("psr_slots", 8))
-        self.psr_dim = int(kw.get("psr_dim", 256))
-        self.psr_blocks = int(kw.get("psr_blocks", 2))
-        self.psr_topk = int(kw.get("psr_topk", 16))
-        self.psr_arch = "protected_residual_v1"
-        self.psr_horizon = int(kw.get("psr_horizon", 16))
-        self.psr_train_anchors = int(kw.get("psr_train_anchors", 2))
-        self.psr_rounds = int(kw.get("psr_rounds", 1))
-        self.psr_max_rounds = int(kw.get("psr_max_rounds", 8))
-        self.psr_update_scale = float(kw.get("psr_update_scale", 0.25))
-
         # Residual lifting reuses the existing middle decoder weights. The
         # execution identity must therefore be recorded independently of keys.
         self.ced_recurrent_enabled = bool(kw.get("ced_recurrent_enabled", False))
@@ -354,8 +341,6 @@ class VibyConfig:
         if self.ced_recurrent_enabled:
             if self.ced_recurrent_arch != "residual_lift_v1":
                 raise ValueError("Unsupported recurrent CED execution version")
-            if self.psr_enabled:
-                raise ValueError("Recurrent CED is a separate experiment; use --no-psr")
             if self.n_mtp_layers != 0:
                 raise ValueError(
                     "Recurrent CED requires --mtp_depth 0; disable MTP on both comparison sides"
@@ -390,34 +375,6 @@ class VibyConfig:
                 raise ValueError(
                     "Recurrent CED candidate pool must originate at the full boundary"
                 )
-        for name in (
-            "slots",
-            "dim",
-            "blocks",
-            "topk",
-            "max_rounds",
-            "horizon",
-            "train_anchors",
-        ):
-            if getattr(self, "psr_" + name) < 1:
-                raise ValueError(f"psr_{name} must be positive")
-        if not 1 <= self.psr_rounds <= self.psr_max_rounds:
-            raise ValueError(
-                "psr_rounds must be within [1, psr_max_rounds]; use explicit off/state_only"
-            )
-        if not 0 < self.psr_update_scale <= 1:
-            raise ValueError("psr_update_scale must be within (0,1]")
-        if self.psr_enabled:
-            mid = self.n_encoder_layers
-            if (
-                len(self.compress_ratios) <= mid
-                or self.compress_ratios[mid] != 1
-                or mid not in self.kv_source_layers
-                or mid not in self.index_source_layers
-            ):
-                raise ValueError("PSR requires a Full ratio=1 CED boundary")
-            if self.rope_head_dim > self.index_head_dim:
-                raise ValueError("PSR requires rope_head_dim <= index_head_dim")
         if self.n_layers < 4:
             raise ValueError("n_layers 必须 >= 4（CED 至少 2 个编码层 + 2 个解码层）")
         # V4.1 的 head_dim 与 dim 解耦（官方 64 头 × 512 维，远超 dim/64）：
@@ -591,16 +548,10 @@ class VibyConfig:
             mtp += d * len(self.dspark_target_layer_ids) * d  # main_proj（仅第一层）
             mtp += 2 * self.vocab_size * self.dspark_markov_rank  # 马尔可夫头
             total += mtp
-        if self.psr_enabled:
-            s = self.psr_dim
-            total += s * (
-                self.psr_slots + 2 * d + 2 * hd + self.psr_horizon + self.vocab_size
-            )
-            total += (10 * self.psr_blocks + 2) * s * s
         return total
 
     def num_active_parameters(self) -> int:
-        """每 token 激活的主干/桥接参数；PSR 前缀循环成本须按 R 单独计量。"""
+        """每 token 激活的主干/桥接参数。"""
         d = self.dim
         hd = self.head_dim
         per_layer = (
