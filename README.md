@@ -32,9 +32,7 @@ B=4/T=1024 的前向加反向试测节省约 4.1%，B=1 仍较慢。整训练预
 
 默认关闭的 [DPR-JEPA](research/DPR_JEPA.md) 用 `--dpr --no-psr --no-ced-recurrent --mtp_depth 0`
 保留全部 token 层，在 CED 边界加入未来分布预测的零初始化残差。目标仅用于训练辅助损失；
-默认 `contextual_v2` 从当前编码器前向构造 detached 目标，省去独立 target 网络；
-旧目标可用 `--dpr_variant legacy_v1`。已修复 Adam 动量精度与 MuonH 半径漂移，
-迁移工具保留已有训练进度。质量与完整训练效率收益仍未建立。
+质量与完整训练效率需要 A/B/C/D 配对实验验证。
 
 ## 架构
 

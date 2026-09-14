@@ -301,7 +301,6 @@ class VibyConfig:
         self.ced_recurrent_arch = str(kw.get("ced_recurrent_arch", "residual_lift_v1"))
 
         self.dpr_enabled = bool(kw.get("dpr_enabled", False))
-        self.dpr_variant = str(kw.get("dpr_variant", "contextual_v2"))
         self.dpr_particles = int(kw.get("dpr_particles", 4))
         self.dpr_dim = int(kw.get("dpr_dim", 32))
         self.dpr_width = int(kw.get("dpr_width", 128))
@@ -359,14 +358,6 @@ class VibyConfig:
         )
 
     def _validate(self):
-        if self.dpr_variant not in ("legacy_v1", "contextual_v2"):
-            raise ValueError("DPR variant must be legacy_v1/contextual_v2")
-        if (
-            self.dpr_enabled
-            and self.dpr_variant == "contextual_v2"
-            and self.dpr_dim > self.dim
-        ):
-            raise ValueError("contextual DPR dimension must not exceed model dimension")
         if min(self.dpr_particles, self.dpr_dim, self.dpr_width, self.dpr_horizon) < 1:
             raise ValueError("DPR dimensions and horizon must be positive")
         if self.dpr_objective not in ("kernel", "mse"):
@@ -556,8 +547,6 @@ class VibyConfig:
     @classmethod
     def from_dict(cls, data: dict) -> "VibyConfig":
         data = dict(data)
-        if data.get("dpr_enabled"):
-            data.setdefault("dpr_variant", "legacy_v1")
         data.pop("model_type", None)
         data.pop("arch", None)
         return cls(**data)
@@ -639,10 +628,10 @@ class VibyConfig:
             )
             total += (10 * self.psr_blocks + 2) * s * s
         if self.dpr_enabled:
-            total += 2 * d * self.dpr_particles * (self.dpr_dim + 1) + (
-                self.dpr_horizon * d * self.dpr_width + self.dpr_width * self.dpr_dim
-                if self.dpr_variant == "legacy_v1"
-                else d * self.dpr_dim
+            total += (
+                2 * d * self.dpr_particles * (self.dpr_dim + 1)
+                + self.dpr_horizon * d * self.dpr_width
+                + self.dpr_width * self.dpr_dim
             )
         return total
 

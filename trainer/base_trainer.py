@@ -35,9 +35,6 @@ _SENTINEL = object()
 # 梯度累加是否每个微批就物化（默认开）。关掉可退回旧的惰性链行为做 A/B；
 # 依据见 _run_epoch_steps 里的注释与 research/MLX_PERF.md。
 _ACCUM_EAGER = os.environ.get("VIBY_ACCUM_EAGER", "1") != "0"
-# Keep a reference switch for matched allocation checks. Once an accumulated
-# sum is materialized, the source microbatch gradient has no remaining use.
-_RELEASE_MICROBATCH_GRADS = os.environ.get("VIBY_RELEASE_MICROBATCH_GRADS", "1") != "0"
 # optimizer step 末尾是否按块 eval 参数树，而不是一次性 eval(参数 + state)。
 # 一次性 eval 会把新旧参数 / m / v / 梯度 / Muon 临时量同时顶到峰值
 # （prof_target_step：win_eval 277ms/窗口，占窗口 ~70%），分块能让中间量
@@ -579,8 +576,7 @@ class BaseTrainer:
             return True
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
-                metadata = json.load(f)
-                ckpt_type = metadata.get("training_type")
+                ckpt_type = json.load(f).get("training_type")
         except Exception:
             return True
         if ckpt_type and ckpt_type != self.training_type:
@@ -589,9 +585,6 @@ class BaseTrainer:
                 "不继承步数/优化器，从 step 0 开始（基座权重已加载）"
             )
             return False
-        from .resume_layout import validate_resume_layout
-
-        validate_resume_layout(metadata, self.args)
         return True
 
     def _handle_checkpoint_resume(self):
@@ -685,65 +678,28 @@ class BaseTrainer:
         # 累加的梯度即窗口平均梯度，无需再除
         # grad_clip=0（默认）表示不裁剪，只算范数用于日志/NaN 防护；
         # 直接调 clip_grad_norm(·, 0) 会把梯度整体缩放到 0
-        grads = accum_grads
-        flat = tree_flatten(grads)
-        # Reuse the existing one-pass FP32 reductions for attribution. Transfer
-        # only one scalar per tensor, never the parameter/gradient arrays.
-        squares = (
-            np.asarray(mx.stack([gradient_square_sum(g) for _, g in flat]))
-            if flat
-            else np.zeros(0)
-        )
-        grad_norm_val = float(np.sqrt(np.sum(squares, dtype=np.float64)))
-        group_squares = {}
-        for (name, _), square in zip(flat, squares):
-            if name.startswith("model.dpr."):
-                group = "dpr_" + name.split(".")[2]
-            elif ".router." in name:
-                group = "router"
-            elif ".attn." in name:
-                group = "attention"
-            elif ".ffn." in name:
-                group = "ffn"
-            else:
-                group = "other"
-            group_squares[group] = group_squares.get(group, 0.0) + float(square)
-        self._last_grad_stats = {
-            "grad/" + k: float(np.sqrt(v)) for k, v in group_squares.items()
-        }
-        self._last_grad_stats["grad/pre_clip"] = grad_norm_val
-        largest = int(np.argmax(squares)) if flat else None
-        self._last_grad_max_name = flat[largest][0] if largest is not None else None
-        self._last_grad_stats["grad/max_tensor_norm"] = (
-            float(np.sqrt(squares[largest])) if largest is not None else 0.0
-        )
+        if self.args.grad_clip and self.args.grad_clip > 0:
+            grads, grad_norm = optim.clip_grad_norm(accum_grads, self.args.grad_clip)
+        else:
+            grads = accum_grads
+            # FP32 register accumulation avoids low-precision square underflow,
+            # FP16 overflow and a rounded bf16 sum across the parameter tree.
+            # Large gradients are read once without full-size FP32 temporaries.
+            sums = [gradient_square_sum(g) for _, g in tree_flatten(grads)]
+            grad_norm = mx.sqrt(mx.sum(mx.stack(sums))) if sums else mx.array(0.0)
 
         # NaN/Inf 防护：梯度范数非有限时跳过本窗口更新。单个坏微批前向 NaN
         # 会把窗口累积梯度污染成 NaN，若照常应用，norm=nan 使缩放因子变 nan，
         # 一次 update 即永久污染全部权重与 Adam 二阶矩（r080 no-tie run 实测：
         # step ~1084 单微批前向 NaN → 窗口梯度 NaN → 应用后训练永久崩溃）。
         # 跳过的代价只是损失一个窗口；持续出现说明有系统性数值问题，日志告警。
+        grad_norm_val = float(grad_norm)
         if not np.isfinite(grad_norm_val):
             Logger(
                 f"梯度范数非有限（{grad_norm_val}），跳过本累积窗口的优化器更新"
                 f"与 MoE 偏置更新；若持续出现请排查数据/数值稳定性"
             )
             return grad_norm_val
-
-        scale = (
-            min(1.0, self.args.grad_clip / (grad_norm_val + 1e-6))
-            if self.args.grad_clip > 0
-            else 1.0
-        )
-        self._last_grad_stats["grad/clip_scale"] = scale
-        if scale < 1.0:
-            grads = tree_map(
-                lambda g: (g.astype(mx.float32) * scale).astype(g.dtype), grads
-            )
-        if grad_norm_val >= 10 and flat:
-            Logger(
-                f"Gradient spike: {flat[largest][0]} norm={np.sqrt(squares[largest]):.4g}, total={grad_norm_val:.4g}"
-            )
 
         if self._expl_nest_mu > 0:
             # MLX 参数数组不可变，update 前抓到的引用即更新前的值；
@@ -792,7 +748,6 @@ class BaseTrainer:
     def _save_if_needed(self, epoch, step):
         if (step + 1) % self.args.save_interval != 0:
             return
-        started = time.perf_counter()
         save_checkpoint(
             self.model,
             self.optimizer,
@@ -802,10 +757,6 @@ class BaseTrainer:
             self.lm_config,
             self.training_type,
         )
-        self._pending_checkpoint_metrics = {
-            "checkpoint/save_seconds": time.perf_counter() - started,
-            "checkpoint/microstep": epoch * getattr(self, "_iter_per_epoch", 0) + step,
-        }
 
     def train_epoch(
         self,
@@ -854,7 +805,6 @@ class BaseTrainer:
         last_grad_norm = 0.0
         last_moe_loads = None
         qb_samples = []
-        self._iter_per_epoch = iter_per_epoch
 
         for step, batch in enumerate(loader_iter):
             # 跳过步骤（恢复训练时）
@@ -995,21 +945,15 @@ class BaseTrainer:
                 if _ACCUM_EAGER:
                     mx.eval(accum_grads)
             accum_count += 1
-            if _RELEASE_MICROBATCH_GRADS:
-                # For accumulation=1, accum_grads still owns the same arrays.
-                # For eager sums, dropping this reference frees the last input
-                # tree before optimizer allocations / the next forward pass.
-                # Lazy accumulation retains its inputs through the sum graph.
-                grads = None
 
             # 梯度累积窗口结束，执行更新
-            if (
-                step + 1
-            ) % self.args.accumulation_steps == 0 or step + 1 == iter_per_epoch:
-                # The final short window exists in pretraining too. Its losses
-                # were divided by the planned accumulation count; restore the
-                # actual window average before the optimizer and final save.
-                if accum_count < self.args.accumulation_steps:
+            if (step + 1) % self.args.accumulation_steps == 0 or (
+                getattr(self, "_tail_sft", False) and step + 1 == iter_per_epoch
+            ):
+                if (
+                    getattr(self, "_tail_sft", False)
+                    and accum_count < self.args.accumulation_steps
+                ):
                     scale = self.args.accumulation_steps / accum_count
                     accum_grads = tree_map(lambda g: g * scale, accum_grads)
                 last_grad_norm = self._optimizer_step(
@@ -1121,14 +1065,10 @@ class BaseTrainer:
                             f"gate_maxK={'/'.join(f'{v / 2**10:.1f}' for v in gate_max)}"
                         )
 
-                extra = dict(extra or {})
-                extra.update(getattr(self, "_pending_checkpoint_metrics", {}))
-                self._pending_checkpoint_metrics = {}
                 if getattr(self.lm_config, "dpr_enabled", False):
                     from model.dpr import DPR_METRICS
 
                     extra = dict(extra or {})
-                    extra.update(getattr(self, "_last_grad_stats", {}))
                     if metrics.ndim == 1:
                         extra.update(
                             {
@@ -1150,13 +1090,10 @@ class BaseTrainer:
                         "epoch": epoch,
                         "microstep": step,
                         "optimizer_step": get_optimizer_steps(self.optimizer),
-                        "gradient_max_tensor": getattr(
-                            self, "_last_grad_max_name", None
-                        ),
                         **{
                             k: v
                             for k, v in extra.items()
-                            if k.startswith(("dpr/", "grad/", "mem/", "checkpoint/"))
+                            if k.startswith("dpr/")
                             or k
                             in ("lm_loss", "total_training_loss", "dpr_consumed_tokens")
                         },

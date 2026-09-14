@@ -32,7 +32,6 @@ def cfg(**kw):
         n_activated_experts=2,
         n_mtp_layers=0,
         dpr_enabled=True,
-        dpr_variant="legacy_v1",
         dpr_dim=4,
         dpr_width=12,
         dpr_horizon=2,
@@ -109,11 +108,10 @@ def test_target_future_only_order_sensitive_and_embedding_detached():
 
 
 @pytest.mark.parametrize("skip_init", [True, False])
-@pytest.mark.parametrize("variant", ["legacy_v1", "contextual_v2"])
-def test_base_initialization_rng_and_zero_residual(skip_init, variant):
+def test_base_initialization_rng_and_zero_residual(skip_init):
     baseline = build(cfg(dpr_enabled=False), seed=123, skip_init=skip_init)
     rng_base = mx.random.uniform(shape=(8,))
-    model = build(cfg(dpr_variant=variant), seed=123, skip_init=skip_init)
+    model = build(cfg(), seed=123, skip_init=skip_init)
     rng_dpr = mx.random.uniform(shape=(8,))
     np.testing.assert_array_equal(rng_base, rng_dpr)
     base_params = dict(tree_flatten(baseline.parameters()))
@@ -239,7 +237,7 @@ def test_b_variant_skips_target_and_mse_variant_keeps_interface(monkeypatch):
 
 
 def test_parameter_budget_and_major_gemms():
-    c = VibyConfig(dpr_enabled=True, n_mtp_layers=0, dpr_variant="legacy_v1")
+    c = VibyConfig(dpr_enabled=True, n_mtp_layers=0)
     d = DistributionalPredictiveResidual(c)
     flat = dict(tree_flatten(d.parameters()))
     assert sum(p.size for p in flat.values()) == 799012
@@ -247,8 +245,7 @@ def test_parameter_budget_and_major_gemms():
     assert dpr_train_flops_per_token(c, 1024) == int(1622016 + 2121728 * 1020 / 1024)
 
 
-@pytest.mark.parametrize("variant", ["legacy_v1", "contextual_v2"])
-def test_real_trainer_accumulation_qb_zero_head_and_checkpoint(tmp_path, variant):
+def test_real_trainer_accumulation_qb_zero_head_and_checkpoint(tmp_path):
     import time
     from trainer.base_trainer import BaseTrainer
     from trainer.utils import load_checkpoint, get_optimizer_steps
@@ -278,42 +275,24 @@ def test_real_trainer_accumulation_qb_zero_head_and_checkpoint(tmp_path, variant
     args.save_dir = str(tmp_path)
     args.warmup_iters = 0
     args.dpr_warmup_tokens = 32
-    c = cfg(qb_stats_rows=32, dpr_variant=variant)
+    c = cfg(qb_stats_rows=32)
     model = convert_model_dtype(build(c), "bfloat16")
     model.freeze(keys=["freq_cos", "freq_sin"])
     tr = BaseTrainer(args, model, SimpleNamespace(pad_token_id=0), c, "pretrain")
     assert tr.psr_optimizer is None and args.muonh and args.compile_model
-    original_target = (
-        model.model.dpr.target.proj.weight
-        if variant == "legacy_v1"
-        else model.model.dpr.context_projection
-    )
+    original_target = model.model.dpr.target.proj.weight
     x = ids()
     sample = (x, x + 1, mx.ones_like(x), mx.zeros_like(x))
     tr._run_epoch_steps(iter([sample] * 4), 0, 4, 4, None, 0, time.time(), 0)
     assert float(mx.max(mx.abs(model.model.dpr.output.weight))) > 0
-    if variant == "legacy_v1":
-        assert (
-            float(mx.max(mx.abs(original_target - model.model.dpr.target.proj.weight)))
-            > 0
-        )
-    else:
-        np.testing.assert_array_equal(
-            original_target, model.model.dpr.context_projection
-        )
+    assert (
+        float(mx.max(mx.abs(original_target - model.model.dpr.target.proj.weight))) > 0
+    )
     assert bool(mx.all(mx.isfinite(model.moe_bias_stack())))
     assert args.dpr_consumed_tokens == 64
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "dpr_metrics.jsonl").read_text().splitlines()
-    ]
-    assert records[-1]["grad/pre_clip"] > 0
-    assert records[-1]["grad/dpr_predict"] >= 0
     saved = tmp_path / "pretrain_64.safetensors"
     meta = json.loads(saved.with_suffix(".json").read_text())
-    assert meta["execution"]["kind"] == (
-        "dpr_jepa_v1" if variant == "legacy_v1" else "dpr_jepa_v2"
-    )
+    assert meta["execution"]["kind"] == "dpr_jepa_v1"
     assert meta["args"]["dpr_consumed_tokens"] == 64
     assert "model/dpr.py" in meta["source_sha256"]
     other = convert_model_dtype(build(c), "bfloat16")

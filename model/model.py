@@ -220,9 +220,7 @@ class VibyModel(nn.Module):
                     "recurrent CED cache supports prefill then single-token decode"
                 )
         h = self.embed(input_ids)
-        raw_embeddings = (
-            h if return_dpr and self.config.dpr_variant == "legacy_v1" else None
-        )
+        raw_embeddings = h if return_dpr else None
         dpr_result = None
         B, T = input_ids.shape
         positions = (
@@ -313,14 +311,7 @@ class VibyModel(nn.Module):
                 delta, pi, z = self.dpr(a, dpr_intervention)
                 h = h + delta.astype(h.dtype)[:, :, None, :]
                 if return_dpr:
-                    # Contextual targets come from this same encoder pass,
-                    # before injection. They never enter current logits.
-                    target_source = (
-                        a
-                        if self.config.dpr_variant == "contextual_v2"
-                        else raw_embeddings
-                    )
-                    dpr_result = (pi, z, target_source)
+                    dpr_result = (pi, z, raw_embeddings)
             if return_memory and i == self.config.n_encoder_layers:
                 # Batched decode has one position per row. Slice to the largest
                 # live prefix; PSR masks each row's memory at its own anchor.

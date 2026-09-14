@@ -43,10 +43,10 @@ if __name__ == "__main__":
         from .utils import Logger
 
         Logger(
-            f"DPR-JEPA ({lm_config.dpr_variant}): full token CED, boundary={lm_config.n_encoder_layers}, "
+            f"DPR-JEPA: full token CED, boundary={lm_config.n_encoder_layers}, "
             f"M={lm_config.dpr_particles}, r={lm_config.dpr_dim}, k={lm_config.dpr_horizon}, "
             f"w={lm_config.dpr_width}, objective={lm_config.dpr_objective}, "
-            f"lambda={lm_config.dpr_loss_weight}; targets used only in auxiliary loss"
+            f"lambda={lm_config.dpr_loss_weight}; zero residual, future-only targets"
         )
     if lm_config.ced_recurrent_enabled:
         from .utils import Logger

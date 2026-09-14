@@ -499,11 +499,10 @@ def _stack_apply_kernel(hyperball, apply_wd=0.0, cautious=False):
         if hyperball:
 
             @mx.compile
-            def fn(P, X, lr, radius):
-                dtype = P.dtype
-                # A persistent FP32 radius prevents BF16 rounding error from
-                # becoming the next step's reference and accumulating forever.
-                P, X, lr = (a.astype(mx.float32) for a in (P, X, lr))
+            def fn(P, X, lr):
+                # 范数球半径取衰减前的 P（冻结口径是「上一步建立的本体
+                # 半径」，衰减本身不该先缩它）。
+                n0 = _fro_norm_auto(P)
                 if apply_wd != 0:
                     if cautious:
                         mask = ((X * P) >= 0).astype(P.dtype)
@@ -512,9 +511,13 @@ def _stack_apply_kernel(hyperball, apply_wd=0.0, cautious=False):
                         P = P * (1 - lr * apply_wd)
                 NP = P - lr * X
                 n1 = _fro_norm_auto(NP)
-                scale = mx.where(radius > 0, radius / mx.maximum(n1, 1e-30), 1.0)
-                NP = mx.where(n1 > 0, NP * scale, P)
-                return NP.astype(dtype)
+                # 零初始化矩阵（如 GatedNorm.gate_up）范数球半径为 0，
+                # 直接投影会把参数永久钉死在 0（P18 实测：gate 全程恒等、
+                # gate_down 梯度恒零）。n0==0 的矩阵当步跳过投影，半径由
+                # 首个更新建立，下一步起正常冻结。
+                scale = mx.where(n0 > 0, n0 / mx.maximum(n1, 1e-12), mx.ones_like(n1))
+                NP = NP * scale.astype(P.dtype)
+                return NP
 
         else:
 
@@ -682,15 +685,10 @@ def _adamw_body(b1, b2, eps, wd, bias_correction, cautious=False):
 
     cautious=True（cautious weight decay，CWD：Chen et al. 2025，
     arXiv 2510.12402；autoresearch-mlx 战役双 regime keep）：衰减加掩码，只落在与 Adam
-    步同号的坐标上（该坐标正被损失利用则不收 decay 税）。动量和更新
-    计算使用 FP32，最后才转换参数 dtype。"""
+    步同号的坐标上（该坐标正被损失利用则不收 decay 税）。wd==0 时
+    与原路径逐位一致。"""
 
     def fn(p, g, m, v, lr, step):
-        parameter_dtype = p.dtype
-        # BF16 cannot retain EMA increments/decay at beta2 ~= .99975.
-        # Promote legacy checkpoint moments too, preserving values and clock;
-        # this cannot recover information lost before the conversion.
-        p, g, m, v, lr = (a.astype(mx.float32) for a in (p, g, m, v, lr))
         m = b1 * m + (1 - b1) * g
         v = b2 * v + (1 - b2) * mx.square(g)
         if cautious and wd != 0:
@@ -709,7 +707,7 @@ def _adamw_body(b1, b2, eps, wd, bias_correction, cautious=False):
             p = p - (c1 * m) / (mx.sqrt(v) * c2 + eps)
         else:
             p = p - lr * m / (mx.sqrt(v) + eps)
-        return p.astype(parameter_dtype), m, v
+        return p, m, v
 
     return fn
 
@@ -717,8 +715,9 @@ def _adamw_body(b1, b2, eps, wd, bias_correction, cautious=False):
 def _adamw_kernel(b1, b2, eps, wd, bias_correction, cautious=False):
     """(b1,b2,eps,wd,bias_correction,cautious) 对应的 mx.compile 融合 AdamW 更新。
 
-    超参是固定的 python float；更新链显式使用 FP32，不能以 BF16 动量的
-    舍入行为作为正确性参考。lr 随 scheduler 每步变，作为 FP32 数组传入。
+    超参必须是 python float 而不是 traced 输入：MLX 的弱类型提升下
+    `float * bf16 -> bf16`，换成 f32 数组会把整条链抬到 f32，数值和基类不再
+    逐位一致。lr 会随 scheduler 每步变、step 随窗口递增，作为数组入参传进来。
 
     bias_correction 必须开：compute 公式的 beta2/eps 是在带修正的 Adam
     （optax 口径）上拟合的；不修正时有效步长带一个随时间衰减的放大因子
@@ -770,16 +769,15 @@ class FusedAdamW(optim.AdamW):
     动机：MoE 细粒度化后堆叠专家权重占了绝大部分参数（E=288/I=104/8 层
     时 621M / 655M），逐算子实现每步要把 p/g/m/v 反复读写十来遍，实测
     88ms —— 而按 8.7GB 的必要访存量算，带宽上限只需 ~22ms。融合后单次
-    读写即可。上述数字属于历史 BF16 动量实现；2026-09-13 起动量及更新
-    计算使用 FP32，不能沿用旧计时。参数仍保留原 dtype，无 master weights。
-    FP32 m/v 合计每参数 8 bytes，旧 BF16 动量每参数 4 bytes。
+    读写即可，数学与基类逐位一致（算子顺序与弱类型提升都照抄，含
+    bias_correction 分支）。
 
     同形状张量再堆成 (N,·) 一次更新：标量组 ~100 个小核变成每个形状
     1 次发射。单组超过 256MB 仍逐张量，避免再物化一份大栈。
 
     逐张量路径里的大 tensor（>=8MB，堆叠专家栈）改用 shapeful 编译：
     shapeless kernel 的动态形状索引在 100M 级 tensor 上只跑到
-    ~250GB/s，shapeful 固化 grid 后 ~410GB/s（历史 BF16 动量路径，
+    ~250GB/s，shapeful 固化 grid 后 ~410GB/s（同进程对拍逐位一致，
     见 experiments/prof_target_step.py 的 [adamw kernel] 探针）。
     """
 
@@ -793,10 +791,6 @@ class FusedAdamW(optim.AdamW):
         # （VIBY_ADAM_CAUTIOUS=0 回退）。
         self.cautious = cautious
         super().__init__(*args, **kwargs)
-
-    def init_single(self, parameter, state):
-        state["m"] = mx.zeros(parameter.shape, dtype=mx.float32)
-        state["v"] = mx.zeros(parameter.shape, dtype=mx.float32)
 
     def _kernel(self, shape, dtype):
         """按形状选编译变体：大 tensor shapeful（带宽），小 tensor shapeless。"""
@@ -824,7 +818,7 @@ class FusedAdamW(optim.AdamW):
         )
 
     def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
-        lr = self.learning_rate.astype(mx.float32)
+        lr = self.learning_rate.astype(gradient.dtype)
         p, m, v = self._kernel(gradient.shape, gradient.dtype)(
             parameter, gradient, state["m"], state["v"], lr, self.step
         )
@@ -866,9 +860,8 @@ class FusedAdamW(optim.AdamW):
 
         new_p = []
         for (shape, dt), paths in groups.items():
-            lr = self.learning_rate.astype(mx.float32)
-            # Bound FP32 moment stacks as well as parameter/gradient stacks.
-            nbytes = max(int(dt.size), 4) * len(paths)
+            lr = self.learning_rate.astype(dt)
+            nbytes = int(dt.size) * len(paths)
             for s in shape:
                 nbytes *= int(s)
             if len(paths) == 1 or nbytes > self._STACK_BYTES:
@@ -997,8 +990,8 @@ class BatchedMuon(optim.Muon):
     逐参数语义（转置规则、reshape ndim>2、nesterov、wd、lr scale）全部
     照抄基类 apply_single/_zeropower_via_newtonschulz5。
 
-    hyperball=True：更新后把每个矩阵 rescale 回持久保存的 FP32 半径，
-    完成 FP32 投影后才转换权重 dtype——方向由正交化动量决定、
+    hyperball=True（MuonH，Marin 口径）：更新后把每个矩阵 rescale 回
+    更新前的 Frobenius 范数（fp32 算范数）——方向由正交化动量决定、
     范数冻结，两者解耦。RMSNorm 架构下矩阵整体尺度大半由 norm 吸收
     （gauge 自由度），冻结它让优化器带宽全花在方向上，lr 语义也更干净。
     与 r073 bias 零均值投影同一哲学。ndim>2 的堆叠专家以 axis0 为
@@ -1245,30 +1238,6 @@ class BatchedMuon(optim.Muon):
         apply_fn = _stack_apply_kernel(self.hyperball, apply_wd, self.cautious_wd)
         polar_mom_fn = _polar_mom_kernel(m) if self.polar_ema else None
 
-        def apply_with_radius(items, P, X, lr, per_head=False):
-            if not self.hyperball:
-                return apply_fn(P, X, lr)
-            radii = []
-            for j, (path, _) in enumerate(items):
-                p = P if per_head else P[j]
-                key = path + ".radius"
-                # Old checkpoints have no radius: adopt their current weights
-                # once, without resetting optimizer clocks or rescaling them.
-                radius = flat_s.get(key)
-                if radius is None:
-                    radius = _fro_norm_auto(p)
-                radii.append(radius.astype(mx.float32))
-            R = radii[0] if per_head else mx.stack(radii)
-            result = apply_fn(P, X, lr.astype(mx.float32), R)
-            for j, ((path, _), radius) in enumerate(zip(items, radii)):
-                # A zero-initialized matrix establishes its sphere on its first
-                # nonzero update. The stored radius is never remeasured later.
-                p = result if per_head else result[j]
-                flat_s[path + ".radius"] = mx.where(
-                    radius > 0, radius, _fro_norm_auto(p)
-                )
-            return result
-
         def momentum_stack(items, r, c):
             """逐元素部分（wd/动量/nesterov）整堆叠做，返回 (U, P, V, G.dtype)。"""
             paths = [p for p, _ in items]
@@ -1311,7 +1280,7 @@ class BatchedMuon(optim.Muon):
                         X, self._normuon_v.get((r, c)), self.normuon_beta2
                     )
                     self._normuon_v[(r, c)] = vn
-                scatter_back(items, V, apply_with_radius(items, P, X, lr))
+                scatter_back(items, V, apply_fn(P, X, lr))
                 continue
             # 2D 组不用 Gram（_ns_auto 在非方阵上与 NS5 有谱差，warmup
             # 会把 MTP 打飞）。
@@ -1336,7 +1305,7 @@ class BatchedMuon(optim.Muon):
                     X, self._normuon_v.get((r, c)), self.normuon_beta2
                 )
                 self._normuon_v[(r, c)] = vn
-            scatter_back(items, V, apply_with_radius(items, P, X, lr))
+            scatter_back(items, V, apply_fn(P, X, lr))
 
         # 堆叠组（ndim>2，逐专家语义）：逐张量直接处理，不跨层 stack。
         # NS 的 batch 维无耦合、动量/投影逐矩阵，三份整组 G/P/V stack 是纯
@@ -1399,13 +1368,7 @@ class BatchedMuon(optim.Muon):
                     self._normuon_v[path] = vn
                 new_v[path] = Vn.reshape(orig)
                 new_params[path] = (
-                    apply_with_radius(
-                        [(path, orig)],
-                        flat_p[path].reshape(b, r, c),
-                        Xo,
-                        lr,
-                        per_head=True,
-                    )
+                    apply_fn(flat_p[path].reshape(b, r, c), Xo, lr)
                     .reshape(orig)
                     .astype(flat_p[path].dtype)
                 )
