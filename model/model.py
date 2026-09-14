@@ -29,7 +29,8 @@ from .block import Block, apply_hc_pre_norm
 from .cache import SharedAttnState, VibyCache
 from .config import VibyConfig
 from .engram import Engram, EngramLayout, NgramHashState, build_compressed_token_map
-from .hc import identity_pre_mix
+from .hc import identity_pre_mix, hc_pre
+from .ncp import NextConceptPrediction, cache_signature
 from .init import apply_trunc_normal_init
 from .moe import MoEFeedForward, MoEGate, update_expert_bias, update_quantile_bias
 from .norms import RMSNorm
@@ -56,6 +57,9 @@ class CausalLMOutput:
     sequence_losses: Optional[mx.array] = None
     sequence_token_counts: Optional[mx.array] = None
     tail_stats: Optional[mx.array] = None
+    ncp_loss: Optional[mx.array] = None
+    vq_loss: Optional[mx.array] = None
+    ncp_metrics: Optional[mx.array] = None
 
 
 def lm_head_ce(
@@ -132,6 +136,7 @@ class VibyModel(nn.Module):
         self.layers = [Block(config, i) for i in range(config.n_layers)]
         self.norm = RMSNorm(config.dim, config.norm_eps)
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
+        self.ncp = NextConceptPrediction(config) if config.ncp_enabled else None
         self.engram_layout = (
             EngramLayout.from_config(config) if config.engram_layer_ids else None
         )
@@ -165,8 +170,68 @@ class VibyModel(nn.Module):
         prev_tokens=None,
         collect_main: bool = True,
         use_ced_recurrent=True,
+        ncp_intervention="normal",
     ):
+        if ncp_intervention not in ("normal", "off", "swap"):
+            raise ValueError("Unknown NCP intervention")
+        if ncp_intervention != "normal":
+            if self.training or cache is not None or self.ncp is None:
+                raise ValueError(
+                    "NCP interventions require eval mode, NCP, and a fresh uncached sequence"
+                )
+            if ncp_intervention == "swap" and (
+                input_ids.shape[0] < 2
+                or segment_ids is not None
+                or pad_mask is not None
+            ):
+                raise ValueError(
+                    "NCP swap requires at least two unpadded, single-document rows"
+                )
         recurrent = recurrent_active(self.config, use_ced_recurrent)
+        ncp_clocks = None
+        if self.ncp is not None:
+            if cache is None and (
+                isinstance(start_pos, mx.array) or start_pos != 0 or decode
+            ):
+                raise ValueError("Uncached NCP requires a full prefix at start_pos=0")
+            if cache is not None:
+                if segment_ids is not None or pad_mask is not None:
+                    raise ValueError(
+                        "Cached NCP requires unpadded single-document inputs"
+                    )
+                if isinstance(start_pos, mx.array):
+                    if not decode or input_ids.shape[1] != 1:
+                        raise ValueError(
+                            "Per-row NCP clocks require single-token decode"
+                        )
+                    ncp_clocks = start_pos.tolist()
+                    if len(ncp_clocks) != input_ids.shape[0]:
+                        raise ValueError("NCP clock batch mismatch")
+                    if cache.ncp_rows is None and cache.ncp_state is not None:
+                        cache.ncp_rows = [
+                            cache.ncp_state.row_copy(row)
+                            for row in range(input_ids.shape[0])
+                        ]
+                        cache.ncp_state = None
+                elif cache.ncp_rows is not None:
+                    ncp_clocks = [start_pos] * input_ids.shape[0]
+                states = cache.ncp_rows if ncp_clocks is not None else [cache.ncp_state]
+                clocks = ncp_clocks if ncp_clocks is not None else [start_pos]
+                if (
+                    states is None
+                    or len(states) != len(clocks)
+                    or any(
+                        state is None
+                        or state.tokens != clock
+                        or state.signature not in (None, cache_signature(self.config))
+                        for state, clock in zip(states, clocks)
+                    )
+                ):
+                    raise ValueError("NCP cache clock mismatch; use a fresh prefill")
+        elif cache is not None and (
+            cache.ncp_state is not None or cache.ncp_rows is not None
+        ):
+            raise ValueError("NCP execution changes require a fresh cache")
         if cache is not None:
             signature = execution_signature(self.config, use_ced_recurrent)
             if cache.ced_signature not in (None, signature):
@@ -212,6 +277,7 @@ class VibyModel(nn.Module):
         pre_mix = identity_pre_mix(h, self.hc_mult)
         mains = []
         ced_result = None
+        ncp_result = None
         for i, layer in enumerate(self.layers):
             if (
                 recurrent
@@ -245,6 +311,71 @@ class VibyModel(nn.Module):
             if collect_main and i in self.target_layer_ids:
                 # MTP 读的是目标层的"注意力输入"（mHC 均值），不是层输出
                 mains.append(mx.mean(h, axis=2))
+            global_kv_input = None
+            if self.ncp is not None and i == self.config.n_encoder_layers:
+                encoder_read = hc_pre(h, pre_mix)
+                # Keep the same normalization/dispatch as the baseline boundary.
+                # Do not detach: ordinary NTP still trains this encoder memory.
+                global_kv_input = apply_hc_pre_norm(h, pre_mix, layer.attn_norm)
+                if ncp_clocks is None:
+                    ncp_result = self.ncp(
+                        encoder_read,
+                        segment_ids,
+                        pad_mask,
+                        cache=None if cache is None else cache.ncp_state,
+                        start_pos=start_pos,
+                    )
+                else:
+                    # Only the low-frequency concept branch is dispatched per row;
+                    # token encoder/decoder remain a continuous batch.
+                    rows = [
+                        self.ncp(
+                            encoder_read[row : row + 1], cache=state, start_pos=clock
+                        )
+                        for row, (state, clock) in enumerate(
+                            zip(cache.ncp_rows, ncp_clocks)
+                        )
+                    ]
+                    ncp_result = {
+                        key: (
+                            mx.concatenate([r[key] for r in rows], axis=0)
+                            if key == "signal"
+                            else sum(r[key] for r in rows)
+                        )
+                        for key in rows[0]
+                    }
+                if ncp_intervention == "off":
+                    ncp_result["signal"] = mx.zeros_like(ncp_result["signal"])
+                elif ncp_intervention == "swap":
+                    # Fixed cyclic derangement: no row keeps its own concept signal.
+                    ncp_result["signal"] = mx.concatenate(
+                        [ncp_result["signal"][1:], ncp_result["signal"][:1]], axis=0
+                    )
+                denom = mx.sum(pre_mix.astype(mx.float32), axis=-1, keepdims=True)
+                lifted = ncp_result["signal"].astype(mx.float32) / mx.maximum(
+                    denom, 1e-12
+                )
+                h = h + lifted.astype(h.dtype)[:, :, None, :]
+                if cache is None:
+                    # Measure the actual mHC read after rounding/lifting, not gamma alone.
+                    delta = mx.stop_gradient(
+                        hc_pre(h, pre_mix).astype(mx.float32)
+                        - encoder_read.astype(mx.float32)
+                    )
+                    boundary = mx.stop_gradient(encoder_read.astype(mx.float32))
+                    valid = (
+                        mx.ones(boundary.shape[:2], mx.float32)
+                        if pad_mask is None
+                        else pad_mask.astype(mx.float32)
+                    )
+                    count = mx.maximum(mx.sum(valid), 1)
+                    erms = mx.sqrt(
+                        mx.sum(mx.mean(boundary**2, axis=-1) * valid) / count
+                    )
+                    frms = mx.sqrt(mx.sum(mx.mean(delta**2, axis=-1) * valid) / count)
+                    ncp_result["feedback_diagnostics"] = mx.stack(
+                        [erms, frms, frms / mx.maximum(erms, 1e-12)]
+                    )
             layer_cache = None if cache is None else cache[i]
             if recurrent and i == self.config.n_layers - 1:
                 h, pre_mix = layer.recurrent(
@@ -269,10 +400,13 @@ class VibyModel(nn.Module):
                     segment_ids,
                     pad_mask,
                     decode,
+                    global_kv_input=global_kv_input,
                 )
         result = (apply_hc_pre_norm(h, pre_mix, self.norm), mains, new_prev)
         if recurrent:
             result = (*result, ced_result)
+        if self.ncp is not None:
+            result = (*result, ncp_result)
         return result
 
 
@@ -418,8 +552,11 @@ class VibyForCausalLM(nn.Module):
         return_sequence_losses=False,
         tail_reference=None,
         tail_fraction=None,
+        ncp_intervention="normal",
         **kwargs,
     ):
+        if labels is not None and cache is not None and self.config.ncp_enabled:
+            raise ValueError("NCP training losses require uncached full sequences")
         pad = None if attention_mask is None else attention_mask.astype(mx.bool_)
         want_main = bool(use_mtp and self.mtp_modules and labels is not None)
         result = self.model(
@@ -432,12 +569,32 @@ class VibyForCausalLM(nn.Module):
             prev_tokens=prev_tokens,
             collect_main=want_main,
             use_ced_recurrent=use_ced_recurrent,
+            ncp_intervention=ncp_intervention,
         )
         hidden, mains, _ = result[:3]
         out = CausalLMOutput()
         if recurrent_active(self.config, use_ced_recurrent):
             out.ced_result = result[-1]
             out.ced_metrics = out.ced_result["metrics"]
+        if self.config.ncp_enabled:
+            ncp = result[-1]
+            out.ncp_loss, out.vq_loss = ncp["ncp_loss"], ncp["vq_loss"]
+            out.ncp_metrics = mx.stack(
+                [
+                    out.ncp_loss,
+                    out.vq_loss,
+                    ncp["groups"].astype(mx.float32),
+                    ncp["pairs"].astype(mx.float32),
+                    self.model.ncp.feedback_gate[0].astype(mx.float32),
+                ]
+            )
+            out.ncp_metrics = mx.concatenate(
+                [
+                    out.ncp_metrics,
+                    ncp["diagnostics"],
+                    ncp.get("feedback_diagnostics", mx.zeros((3,))),
+                ]
+            )
         b, t, _ = hidden.shape
         if labels is None:
             out.logits = self.logits(hidden)
@@ -467,6 +624,12 @@ class VibyForCausalLM(nn.Module):
         else:
             ce, z = lm_head_ce(hidden, self._head_weight(), labels, loss_mask, z_w)
         out.lm_loss, out.z_loss, out.loss = ce, z, ce + z_w * z
+        if self.config.ncp_enabled:
+            out.loss = (
+                out.loss
+                + self.config.ncp_loss_weight * out.ncp_loss
+                + self.config.ncp_vq_weight * out.vq_loss
+            )
         if need_logits:
             out.logits = self.logits(hidden)
         if want_main and mains:

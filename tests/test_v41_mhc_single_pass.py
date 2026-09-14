@@ -58,9 +58,19 @@ def _trace(model, ids):
         segment_ids=None,
         pad_mask=None,
         decode=False,
+        global_kv_input=None,
     ):
         out, ffn_pre = orig_block(
-            self, x, start_pos, pre_mix, shared, cache, segment_ids, pad_mask, decode
+            self,
+            x,
+            start_pos,
+            pre_mix,
+            shared,
+            cache,
+            segment_ids,
+            pad_mask,
+            decode,
+            global_kv_input=global_kv_input,
         )
         ret[self.layer_idx] = np.array(ffn_pre)
         return out, ffn_pre

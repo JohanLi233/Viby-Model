@@ -65,15 +65,24 @@ class Block(nn.Module):
         segment_ids=None,
         pad_mask=None,
         decode: bool = False,
+        global_kv_input=None,
     ):
         """x: [B,T,hc,d] → (x, 下一个子层要用的 pre_mix)。"""
         residual = x
         attn_pre, attn_post, attn_comb = self.attn_hc.mixes(x)
         h = apply_hc_pre_norm(x, pre_mix, self.attn_norm)
         if decode:
-            h = self.attn.decode(h, start_pos, shared, cache)
+            h = self.attn.decode(h, start_pos, shared, cache, memory_x=global_kv_input)
         else:
-            h = self.attn(h, start_pos, shared, cache, segment_ids, pad_mask)
+            h = self.attn(
+                h,
+                start_pos,
+                shared,
+                cache,
+                segment_ids,
+                pad_mask,
+                memory_x=global_kv_input,
+            )
         x = hc_post(h, residual, attn_post, attn_comb)
 
         residual = x

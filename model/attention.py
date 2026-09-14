@@ -470,8 +470,13 @@ class Attention(nn.Module):
         sparse_selection=False,
         token_cs=None,
         materialize_keep=False,
+        memory_x=None,
     ):
         """压缩分支（prefill / 训练）：产出/复用压缩 KV，并返回可见性掩码。
+
+        x is the decoder query state (main/indexer queries and query weights).
+        memory_x, when supplied, is the clean normalized encoder state used only
+        by the compressor and hence index K. Neither source is detached.
 
         返回 (comp, cmask)：cmask 是 [B 或 1, T, N] 的 bool，等于
         「基础可达性 × 文档/pad 隔离 × indexer top-k」。原来这张掩码在
@@ -495,7 +500,7 @@ class Attention(nn.Module):
             state = cache.kv_state if cache is not None else None
             filled = cache.filled if cache is not None else 0
             latent, new_state, pos, first_group = self.compressor(
-                x, start_pos, state, filled
+                x if memory_x is None else memory_x, start_pos, state, filled
             )
             if cache is not None and new_state is not None:
                 cache.kv_state = new_state
@@ -697,7 +702,14 @@ class Attention(nn.Module):
 
     # ------------------------------------------------------------------
     def __call__(
-        self, x, start_pos: int, shared, cache=None, segment_ids=None, pad_mask=None
+        self,
+        x,
+        start_pos: int,
+        shared,
+        cache=None,
+        segment_ids=None,
+        pad_mask=None,
+        memory_x=None,
     ):
         """prefill / 训练路径：窗口与压缩两组掩码拼在一次 sdpa 里做注意力。
 
@@ -740,6 +752,7 @@ class Attention(nn.Module):
                 segment_ids,
                 pad_mask,
                 token_cs,
+                memory_x=memory_x,
             )
         else:
             o = self._attend_dense(
@@ -755,6 +768,7 @@ class Attention(nn.Module):
                 segment_ids,
                 pad_mask,
                 token_cs,
+                memory_x=memory_x,
             )
         # Gated XSA 在反向旋转之前、对未投影的 [B,H,T,D] 输出做。v 必须取
         # kv_win（query 自己的滑窗 V），不能用 kv_all[:, -T:]——尾部是压缩 latent。
@@ -1328,7 +1342,17 @@ class Attention(nn.Module):
 
     # ------------------------------------------------------------------
     def _attend_chunked(
-        self, q, kv_win, qr, x, token_pos, shared, segment_ids, pad_mask, token_cs=None
+        self,
+        q,
+        kv_win,
+        qr,
+        x,
+        token_pos,
+        shared,
+        segment_ids,
+        pad_mask,
+        token_cs=None,
+        memory_x=None,
     ):
         """训练路径：query 分块，滑窗 key 只取相邻两块。返回 [B,H,T,D]。"""
         B, T, _ = x.shape
@@ -1378,6 +1402,7 @@ class Attention(nn.Module):
                 sparse_selection=use_sparse
                 and (topk_enabled() or fused_index._ENABLED),
                 token_cs=token_cs,
+                memory_x=memory_x,
             )
         else:
             comp, cmask = None, None
@@ -1476,6 +1501,7 @@ class Attention(nn.Module):
         segment_ids,
         pad_mask,
         token_cs=None,
+        memory_x=None,
     ):
         """解码 / 分块 prefill / T 不整除：全 T 滑窗 key + 掩码（原路径）。"""
         from .kernels import (
@@ -1535,6 +1561,7 @@ class Attention(nn.Module):
                 sparse_selection=fused_prefill and fused_index._ENABLED,
                 token_cs=token_cs,
                 materialize_keep=fused_prefill,
+                memory_x=memory_x,
             )
             if comp is not None:
                 kv_all = mx.concatenate([kv_all, comp], axis=1)
@@ -1555,7 +1582,7 @@ class Attention(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    def decode(self, x, start_pos, shared, cache):
+    def decode(self, x, start_pos, shared, cache, memory_x=None):
         """单步解码：滑窗环 + indexer 挑出的压缩位置，gather 后做注意力。
 
         start_pos 可以是 int，也可以是 [B] 的逐序列位置（连续 batch 里各
@@ -1604,7 +1631,9 @@ class Attention(nn.Module):
             if self.is_kv_source:
                 if self.ratio == 1:
                     # CED 边界：每个 token 自成一组，token_pos 就是组首
-                    latent = self.compressor.norm(self.compressor.wkv(x))
+                    latent = self.compressor.norm(
+                        self.compressor.wkv(x if memory_x is None else memory_x)
+                    )
                     pos = token_pos
                     lat = rope_partial(latent, c, s, self.rope_head_dim)
                     cache.compress_kv[bidx, start_pos] = lat[:, 0]
@@ -1612,7 +1641,9 @@ class Attention(nn.Module):
                     state = cache.kv_state
                     if state is None:
                         state = self.compressor.init_state(B, x.dtype)
-                    latent, valid, state = self.compressor.step(x, state)
+                    latent, valid, state = self.compressor.step(
+                        x if memory_x is None else memory_x, state
+                    )
                     cache.kv_state = state
                     first_group = (start_pos + 1 - self.ratio) // self.ratio
                     pos = (first_group * self.ratio)[:, None]

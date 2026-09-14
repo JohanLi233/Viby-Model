@@ -287,6 +287,19 @@ class VibyConfig:
         self.ced_recurrent_rounds = int(kw.get("ced_recurrent_rounds", 3))
         self.ced_recurrent_arch = str(kw.get("ced_recurrent_arch", "residual_lift_v1"))
 
+        # CED-aware NCP is the default full-token backbone. The existing
+        # recurrent experiment remains a separate, explicitly selected execution.
+        self.ncp_enabled = bool(kw.get("ncp_enabled", not self.ced_recurrent_enabled))
+        self.ncp_arch = str(kw.get("ncp_arch", "ced_shared_kv_v1"))
+        self.ncp_stride = int(kw.get("ncp_stride", 4))
+        self.ncp_layers = int(kw.get("ncp_layers", 2))
+        self.ncp_memory_dim = int(kw.get("ncp_memory_dim", 128))
+        self.ncp_heads = int(kw.get("ncp_heads", 4))
+        self.ncp_groups = int(kw.get("ncp_groups", 8))
+        self.ncp_codes = int(kw.get("ncp_codes", 256))
+        self.ncp_loss_weight = float(kw.get("ncp_loss_weight", 1.0))
+        self.ncp_vq_weight = float(kw.get("ncp_vq_weight", 1.0))
+
         self._validate()
 
     # ------------------------------------------------------------------
@@ -461,6 +474,46 @@ class VibyConfig:
             if not 0 <= t < self.n_layers:
                 raise ValueError("dspark_target_layer_ids 必须落在主干层内")
 
+        if self.ncp_enabled:
+            if self.ncp_arch != "ced_shared_kv_v1":
+                raise ValueError("Unsupported NCP execution version")
+            if self.ced_recurrent_enabled:
+                raise ValueError("NCP and recurrent CED are separate architectures")
+            if (
+                min(
+                    self.ncp_stride,
+                    self.ncp_layers,
+                    self.ncp_memory_dim,
+                    self.ncp_heads,
+                    self.ncp_groups,
+                    self.ncp_codes,
+                )
+                < 1
+            ):
+                raise ValueError("NCP dimensions and stride must be positive")
+            if self.dim % self.ncp_groups or self.ncp_memory_dim % 2:
+                raise ValueError(
+                    "NCP requires dim divisible by PQ groups and even memory width"
+                )
+            if not (
+                0 <= self.ncp_loss_weight < float("inf")
+                and 0 <= self.ncp_vq_weight < float("inf")
+            ):
+                raise ValueError("NCP loss weights must be finite and nonnegative")
+            boundary = self.n_encoder_layers
+            if (
+                len(self.compress_ratios) < self.n_layers
+                or self.compress_ratios[boundary] != 1
+                or boundary not in self.kv_source_layers
+                or boundary not in self.index_source_layers
+            ):
+                raise ValueError("NCP requires a full ratio=1 CED boundary")
+            if any(
+                self.compress_ratios[i] != 1 or i in self.kv_source_layers
+                for i in range(boundary + 1, self.n_layers)
+            ):
+                raise ValueError("NCP decoder must share the clean boundary global KV")
+
     # ------------------------------------------------------------------
     def to_dict(self) -> dict:
         d = dict(self.__dict__)
@@ -474,6 +527,10 @@ class VibyConfig:
     @classmethod
     def from_dict(cls, data: dict) -> "VibyConfig":
         data = dict(data)
+        # Sidecars predating this architecture remain ordinary CED.
+        data.setdefault("ncp_enabled", False)
+        if data["ncp_enabled"]:
+            data.setdefault("ncp_arch", "legacy_ncp_v0")
         data.pop("model_type", None)
         data.pop("arch", None)
         return cls(**data)
@@ -548,7 +605,19 @@ class VibyConfig:
             mtp += d * len(self.dspark_target_layer_ids) * d  # main_proj（仅第一层）
             mtp += 2 * self.vocab_size * self.dspark_markov_rank  # 马尔可夫头
             total += mtp
+        if self.ncp_enabled:
+            total += self.ncp_matrix_parameters()
         return total
+
+    def ncp_matrix_parameters(self):
+        d, w, h = self.dim, self.ncp_memory_dim, self.ncp_heads
+        return (
+            d * w
+            + self.ncp_layers * (2 * d * h * w + 6 * d * d)
+            + d * self.ncp_groups * self.ncp_codes
+            + self.ncp_codes * d
+            + d * d
+        )
 
     def num_active_parameters(self) -> int:
         """每 token 激活的主干/桥接参数。"""
@@ -570,4 +639,6 @@ class VibyConfig:
             total += self.n_mtp_layers * (
                 self.dspark_n_activated_experts * 3 * d * self.moe_inter_dim + per_layer
             )
+        if self.ncp_enabled:
+            total += self.ncp_matrix_parameters()
         return total

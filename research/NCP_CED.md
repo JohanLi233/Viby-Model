@@ -1,0 +1,187 @@
+# 默认 CED-aware NCP（2026-09-14）
+
+新建 `VibyConfig()`、tiny 配置与预训练入口默认接入 `ced_shared_kv_v1`。
+没有 A/B/C/D 架构选择或“预测进入全局 KV”的变体。完整 token encoder、decoder、
+原 mHC、MoE 路由和损失继续保留。显式选择旧循环 CED 仍使用其独立执行路径，
+不与 NCP 叠加。
+
+这是用户提出的 CED-aware 结构实现，不是 NCP-ArchPreview 的严格复现，也没有
+训练质量或 1.5× token efficiency 结论。论文接口背景见
+[NCP-ArchPreview](https://arxiv.org/pdf/2609.10715)，CED 背景见
+[DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)。
+
+## 数据流与固定契约
+
+1. 在第一个 decoder 层（默认索引 6）入口读取 `hc_pre(h, pre_mix)`。
+   在注入前使用原 `apply_hc_pre_norm` 路径保存归一化的 `global_kv_input`。
+2. 文档内部每完成四个 token，将原 encoder 表示 FP32 平均后转回工作 dtype，
+   再 LayerNorm 得到已观察概念。PAD 间断、相邻文档切换均重置分组；即使
+   文档 ID 在后面重复，也不连通先前的概念历史。
+3. `memory_project → RMSNorm → RoPE` 为已观察概念生成一份宽度 128 的共享
+   K=V。概念 RoPE 使用该组最后一个原 token 的位置。两层 ConceptBlock 各自
+   更新 query 和残差，读取同一份概念 KV；每层包含 pre-norm attention 与
+   宽度 `2*dim` 的 SwiGLU。概念 query 按 head 做 RMSNorm，注意力读出在投影前
+   按 query 位置反向旋转，保持相对位置语义。
+4. PQ 预测头输出每个 segment 的 softmax 权重，与可训练 codebook 加权生成
+   连续预测。预测经过 RMSNorm、线性 feedback 和零初始化标量门控。
+5. 组结束位置立即可用该预测：k=4 时，首个预测作用于位置 3 的 logit，
+   然后保持到位置 6。它可帮助预测 x4，但 x4 不参与位置 3 的概念输入。
+   不完整尾组不构建新概念；最后完整组即使没有下一概念监督，仍提供反馈。
+6. 按 `signal / sum(pre_mix)` 等量提升到各 mHC stream，不重算 `pre_mix`。
+   `Block → Attention → _compress_dense/decode` 仅让 compressor 消费保存的
+   encoder 输入。主 query、indexer query/权重与 SWA KV 消费注入后的 decoder
+   状态；index K 来自干净的 compressor latent。chunked、dense 和 decode
+   都使用这个分工，既有选择集合和 tie 规则没有改动。
+
+因此，固定输入/权重的概念输出干预不能直接改写 CED 全局 KV。共享 KV **不
+stop-gradient**；NTP 仍能经该存储接口训练 encoder。概念能够影响 decoder
+残差、注意力 query、局部 SWA 历史与 FFN/MoE。
+
+## 默认参数和训练目标
+
+| 字段 / CLI 参数 | 默认值 |
+| --- | --- |
+| `ncp_stride` | 4 |
+| `ncp_layers` | 2 |
+| `ncp_memory_dim` | 128 |
+| `ncp_heads` | 4 |
+| `ncp_groups` | 8 |
+| `ncp_codes` | 256 / PQ segment |
+| `ncp_loss_weight` | 1.0 |
+| `ncp_vq_weight` | 1.0 |
+
+这些参数使用 `--ncp_stride` 等字段名传入，并通过原 CLI → config → sidecar
+链保存。无需新增开关即可开始新架构预训练：
+
+```bash
+.venv/bin/python trainer/train_pretrain.py --data_path /path/to/data.jsonl \
+  --out_dir /path/to/fresh-output --pack_sequences --doc_mask
+```
+
+原 `L_NTP + L_MoE (+ 原有 z/MTP 项)` 加上 `λ L_NCP + β L_VQ`。
+NCP 是下一完整同文档概念的连续向量 MSE；先对 hidden 维求 mean，再对有效
+相邻组求 mean。VQ 是已观察概念对各 PQ segment 最近码字的平方距离，同样
+使用 per-dimension mean。权重 1.0 是明确记录的起始值，**未经实际更新尺度
+校准**，不能当作论文 reduction 或已找到的最佳配方。
+
+- NTP：更新 encoder、decoder、概念历史计算、可微 PQ 与 codebook。
+- NCP：更新预测路径和历史输入；未来概念目标完整 detach。
+- VQ：概念和最近码字选择 detach，只拟合 codebook。
+- γ=0 时概念的 NTP 梯度被阻断，门控自身通常有梯度；辅助目标仍训练概念
+  分支及 encoder，因此只保证共同权重下初始前向等价，不保护后续轨迹。
+- codebook 始终进入 embedding 学习率的 AdamW，既不使用 MuonH，也不把
+  三维 PQ 表拍平成 Sinkhorn 矩阵。其余原训练配方不变。
+
+模型分别返回 `lm_loss / ncp_loss / vq_loss`；训练器将联合目标纳入原累积
+窗口和显式参数编译函数。SwanLab 的 `ncp/loss`、`ncp/vq_loss`、`ncp/groups`、
+`ncp/pairs`、`ncp/gate` 为当前记录微批的指标。TailSFT 的主 token CE 筛选
+保持原逻辑，NCP/VQ 仍按整批合法概念计算；TailSFT 日志优先报告其自身指标。
+
+## 增量状态与兼容性
+
+每条序列只增加：一份已观察概念 KV、至多 k−1 个未完成组的 encoder 表示、
+当前连续预测和 Python token 时钟/结构签名。ConceptBlock 不保存逐层 K/V，
+不重算历史概念层状态，更不会把预测当成已观察历史写入。
+
+默认概念 KV 为 `floor(T/4) * 128` 个元素，摊到原 token 为 32 个；这只是
+新增概念 KV 张量的大小。还要计算未完成组、当前预测、原 CED/indexer/SWA
+状态与分配器开销，不能把该数字称作总显存比。
+
+- 原生 `prefill/decode_step/generate` 支持非整组 prompt、分块续写和同钟 batch。
+- 连续 batch 保留完整 token 批计算，概念分支按各行自己的完成时刻推进。
+  搬行、扩容/压实、prefix snapshot/restore、DSpark scratch 与提交/拒绝
+  状态都搬运概念 KV、未完成组和当前预测。缓存字节统计包含概念状态。
+- packed/PAD 训练和整段无缓存评估受支持；**带缓存的输入仍要求每行一个无
+  PAD 文档**。不能将 packed prefill 的末文档状态无声当作普通单文档缓存。
+- 原生 `rewind` 要求 fresh prefill；engine 的投机拒绝通过完整状态快照恢复，
+  不使用这个不完整的回退接口。结构签名或 token 时钟不匹配会在主干执行前报错。
+- 旧 sidecar 缺少 NCP 字段时按旧普通 CED 加载，保证旧权重可评估；这不改变
+  新建模型的默认。旧 NCP checkpoint 缺少新执行版本时不冒充新结构。
+- 普通 CED 权重迁移到默认新架构，需要显式 checkpoint 与 `--reset_optimizer`
+  （使用新输出目录）。只允许补初始化 `model.ncp.*`，共同权重仍严格加载。
+  新架构 checkpoint 缺少概念权重会报错；不自动随机补齐。更换 loss 权重或
+  结构也改变 execution identity，不能静默续用旧 optimizer。
+
+## 计算量与验证边界
+
+`trainer/flops.py` 在原 token 层成本上加入按概念频率折算的投影、SwiGLU、
+PQ/feedback GEMM、每层概念 QK/AV 和最近码字搜索。训练权重计数包含新增矩阵。
+该统计仍是原有名义 FLOPs 近似，省略归一化/池化/softmax、路由、optimizer 等；
+packed 采用 `floor(T/k)` 静态容量。概念注意力仍随概念长度二次增长，不是
+长上下文性能验收。增量反馈投影和按行 dispatch 的实际开销需单独计时。
+
+机制检查入口：
+
+```bash
+python3 scripts/check_repo.py
+python3 scripts/check_repo.py test ncp
+```
+
+定向验证覆盖零门控等价、全局 KV 数值/梯度独立性、query 保留注入、因果对齐、
+同文档/PAD/tail、NCP/VQ 梯度边界、FP32/BF16 编译反向、真实训练器参数更新、
+原生 cache、连续 batch、prefix、DSpark 拒绝恢复、sidecar 和严格权重加载。
+本轮命令及结果保存在 `research_runs/ncp_ced_20260914/`；没有启动长训练，
+没有建立验证 CE、token efficiency、吞吐或总显存收益结论。
+
+## 训练状态诊断（2026-09-14 补充）
+
+日志继续保留原五项，新增以下 `ncp/` 指标。所有诊断在图内 detach，不加入
+训练目标，不增加可训练参数，也不改变 checkpoint execution identity。
+统计为当前记录微批，不能视作完整累积窗口或整个数据集的均值。
+
+| 指标 | 统计口径 |
+| --- | --- |
+| `concept_rms` | 所有完整有效概念的 RMS，含没有下一概念监督的最后一组 |
+| `concept_variance` | 合并有效概念后，逐通道总体方差的均值 |
+| `sample_mean_variance` | 每个 batch 行先求有效概念均值，再计算这些均值的逐通道总体方差；有效行等权 |
+| `valid_samples` | 含至少一个有效完整概念的 batch 行数；小于 2 时不能用跨样本方差判断多样性 |
+| `pool_norm_weight_rms` | 可训练池化 LayerNorm gain 的 RMS |
+| `target_energy` / `zero_mse` | 相同有效相邻组上，下一概念的逐维平方均值，即零预测的 MSE |
+| `previous_mse` | 相同监督位置上，用当前已观察概念直接预测下一概念的 MSE |
+| `relative_mse_zero` | 实际下一概念 MSE / 零预测 MSE |
+| `relative_mse_previous` | 实际下一概念 MSE / 当前概念持久预测 MSE |
+| `encoder_rms` | 注入前实际 mHC 边界读出的 RMS，排除 PAD |
+| `feedback_rms` | 注入后与注入前实际 mHC 读出的差值 RMS，包含提升和工作 dtype 舍入 |
+| `feedback_ratio` | `feedback_rms / encoder_rms`；所有非 PAD token 等权，包括尚无概念的开头位置 |
+
+无有效概念/监督对的统计记 0；结合原 `groups/pairs` 判断是否可用。相对误差
+分母下限为 `1e-12`，目标能量接近零时须查看原始分母，不能孤立解释比值。
+`relative_mse_zero < 1` 表示胜过零预测；`relative_mse_previous < 1` 表示
+胜过复制当前概念。这仍不证明 token CE 改善。跨样本均值方差也受到 packed
+文档组成和长度影响，不能单独用作完整的概念塌缩判据。
+
+当前已经启动的 Python 训练进程不会自动加载新增日志。下次正常保存并恢复训练
+后生效；本次没有重启、终止训练，也不要求为了这些诊断重置 optimizer。
+
+### 固定验证集上的概念贡献评估
+
+新增 `experiments/eval_ncp_contribution.py`，对同一个 checkpoint 和同一批验证
+输入顺序运行 normal/off/swap，分别统计 **NTP CE**，不把 NCP/VQ loss 混入。
+每种条件独立无缓存前向：只干预 decoder feedback，保留干净 CED 全局 KV。
+关闭/交换 API 只允许 eval 模式；训练不能误用。
+
+准备固定的、训练未使用的 NPZ：`input_ids` 与 `labels` 均为 `[N,T]` 整数数组，
+可选同形状非负 `loss_mask`。每行须为单个无 PAD 文档；`loss_mask` 仅控制计分，
+不承担 attention PAD 隔离。常见构造是从每个验证文档截取 T+1 个 token：
+`input_ids=tokens[:,:-1]`，`labels=tokens[:,1:]`。N 至少为 2。
+
+```bash
+# GPU 空闲时运行；使用不再被训练进程覆盖的 checkpoint 副本及配套 JSON。
+.venv/bin/python experiments/eval_ncp_contribution.py \
+  --checkpoint /path/to/immutable-checkpoint.safetensors \
+  --data /path/to/fixed-validation.npz --batch-size 4 \
+  --output research_runs/ncp_validation/paired-ce.json
+```
+
+swap 使用 batch 内固定循环置换，完整替换该行对齐后的反馈，绝不保留自己的
+信号。最后一行会并入前一批，避免 singleton 自交换；最多使用 batch-size+1 行。
+同一批三种条件使用相同 token/label/loss mask；全局 CE 按有效 token 权重汇总，
+不是 batch CE 的简单平均。输出保存每批 CE、交换来源行、总体差值、配置和输入/
+权重哈希，拒绝覆盖已有结果。batch size 改变交换来源，必须随结果记录。
+
+`off_minus_normal > 0` 表示关闭反馈使这份 checkpoint 的 CE 变差；
+`swap_minus_normal > 0` 支持样本相关反馈的重要性，但 swap 属于分布外扰动。
+这些结果不能替代独立训练的普通 CED 对照，也不证明 token efficiency。
+
+补充验证：在 GPU 正用于实际训练时，只执行 CPU 定向诊断测试和静态检查。
+没有对运行中模型执行贡献评估，也没有将前一轮 GPU 测试成绩当作本轮验证。

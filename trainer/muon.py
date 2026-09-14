@@ -1399,7 +1399,10 @@ def create_adamw_optimizer(model, args, training_type="pretrain"):
         # token embedding / lm_head / DSpark 头 / Engram 检索表：纯 AdamW 对照
         # 组（--optimizer adamw 的杠杆实验）下不细分，只按 embed 组统一 lr 系数
         return (
-            path.endswith(".embed.weight") or "lm_head" in path or "markov_head" in path
+            path.endswith(".embed.weight")
+            or "lm_head" in path
+            or "markov_head" in path
+            or path.endswith(".ncp.codebook")
         )
 
     embed_count = sum(1 for p, a in trainable if _is_embed(p, a))
@@ -1510,7 +1513,10 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         if "engram_layers" in path:
             return False
         return (
-            path.endswith(".embed.weight") or "lm_head" in path or "markov_head" in path
+            path.endswith(".embed.weight")
+            or "lm_head" in path
+            or "markov_head" in path
+            or path.endswith(".ncp.codebook")
         )
 
     def _is_ngram_table(path, arr):
@@ -1857,9 +1863,9 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     adamw_norm.base_lr = adam_lr * scalar_lr_mult
     adamw_router.base_lr = adam_lr * router_lr_mult
     adamw_nowd.base_lr = adam_lr * scalar_lr_mult
+    adamw_embed.base_lr = adam_lr * embed_lr_mult
     if not sinkhorn_on:  # 消融回退组（VIBY_SINKHORN=0）
         adamh_head.base_lr = muon_lr
-        adamw_embed.base_lr = adam_lr * embed_lr_mult
         adamw_ngram_table.base_lr = adam_lr * embed_lr_mult * 5.0
 
     # MultiOptimizer: filters 数量 = len(optimizers) - 1，按顺序首个命中生效，
@@ -1877,6 +1883,14 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         optimizers += [sinkhorn_engram, sinkhorn_embed]
         counts += [sinkhorn_engram_count, sinkhorn_embed_count]
         filters_all += [_is_ngram_sinkhorn, _is_sinkhorn]
+        # PQ tables are 3-D embedding-like parameters, never Muon or flattened
+        # Sinkhorn matrices. Use the embedding AdamW recipe also in this mode.
+        codebook_count = sum(p.endswith(".ncp.codebook") for p, _ in trainable)
+        if codebook_count:
+            optimizers.append(adamw_embed)
+            counts.append(codebook_count)
+            filters_all.append(lambda path, arr: path.endswith(".ncp.codebook"))
+            Logger(f"  - NCP codebook AdamW embedding group: {codebook_count} tensor")
     else:
         optimizers += [adamh_head, adamw_embed, adamw_ngram_table]
         counts += [adamh_count, embed_count, ngram_table_count]

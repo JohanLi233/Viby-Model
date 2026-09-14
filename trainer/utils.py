@@ -295,20 +295,26 @@ def build_model_and_tokenizer(
     model_path = getattr(args, "model_path", "./model/")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     # 严格加载基座时全部参数都会被 checkpoint 覆盖，跳过随机初始化
-    model = VibyForCausalLM(lm_config, skip_init=checkpoint_name is not None and strict)
+    model = VibyForCausalLM(
+        lm_config,
+        skip_init=checkpoint_name is not None
+        and strict
+        and not getattr(args, "reset_optimizer", False),
+    )
 
     if checkpoint_name is not None:
         checkpoint_path = os.path.join(args.save_dir, checkpoint_name)
-        validate_checkpoint_execution(checkpoint_path, lm_config, args)
+        converted = validate_checkpoint_execution(checkpoint_path, lm_config, args)
         loaded = load_model_weights(
             model,
             checkpoint_path,
             strict=strict,
             label=checkpoint_label,
             # DSpark 独立阶段：基座 checkpoint 没有草稿层参数，从零初始化
-            allow_fresh_prefixes=("mtp_modules.",)
-            if getattr(args, "freeze_backbone", False)
-            else (),
+            allow_fresh_prefixes=(
+                ("mtp_modules.",) if getattr(args, "freeze_backbone", False) else ()
+            )
+            + ncp_warm_start_prefixes(checkpoint_path, lm_config, converted),
         )
         if not loaded:
             raise FileNotFoundError(
@@ -338,6 +344,19 @@ def build_model_and_tokenizer(
 # sidecar config / 组成 VibyConfig 的 kwargs。SFT/DPO 的 parser 把这些参数默认
 # 设为 None：表示"从基座 checkpoint 的 sidecar config 继承"，显式传入才覆盖。
 ARCH_ARG_TO_FIELD = {
+    **{
+        name: name
+        for name in [
+            "ncp_stride",
+            "ncp_layers",
+            "ncp_memory_dim",
+            "ncp_heads",
+            "ncp_groups",
+            "ncp_codes",
+            "ncp_loss_weight",
+            "ncp_vq_weight",
+        ]
+    },
     **{
         name: name
         for name in (
@@ -521,6 +540,23 @@ def load_checkpoint_config(save_dir, checkpoint_name):
 def checkpoint_execution(config):
     """Execution identity independent of shared parameter names/shapes."""
     cfg = config if isinstance(config, dict) else vars(config)
+    if cfg.get("ncp_enabled", False):
+        return {
+            "kind": cfg.get("ncp_arch", "legacy_ncp_v0"),
+            **{
+                name: cfg.get(name, default)
+                for name, default in (
+                    ("ncp_stride", 4),
+                    ("ncp_layers", 2),
+                    ("ncp_memory_dim", 128),
+                    ("ncp_heads", 4),
+                    ("ncp_groups", 8),
+                    ("ncp_codes", 256),
+                    ("ncp_loss_weight", 1.0),
+                    ("ncp_vq_weight", 1.0),
+                )
+            },
+        }
     if not cfg.get("ced_recurrent_enabled", False):
         return {"kind": "token_ced_v1"}
     return {
@@ -561,6 +597,19 @@ def validate_checkpoint_execution(checkpoint_path, config, args, *, automatic=Fa
     return True
 
 
+def ncp_warm_start_prefixes(checkpoint_path, config, converted):
+    """Only an explicitly reset, attested ordinary CED checkpoint may add NCP."""
+    if not converted or not config.ncp_enabled:
+        return ()
+    path = os.path.splitext(os.fspath(checkpoint_path))[0] + ".json"
+    if not os.path.exists(path):
+        return ()
+    with open(path, encoding="utf-8") as file:
+        meta = json.load(file)
+    execution = meta.get("execution") or checkpoint_execution(meta.get("config", {}))
+    return ("model.ncp.",) if execution.get("kind") == "token_ced_v1" else ()
+
+
 def build_config_from_sidecar(args, checkpoint_name):
     """以基座 checkpoint 的 sidecar config 为底，CLI 显式参数（非 None）覆盖。
 
@@ -570,6 +619,10 @@ def build_config_from_sidecar(args, checkpoint_name):
     """
     sidecar = load_checkpoint_config(args.save_dir, checkpoint_name)
     cfg = dict(sidecar) if sidecar else {}
+    if sidecar:
+        cfg.setdefault("ncp_enabled", False)
+        if cfg["ncp_enabled"]:
+            cfg.setdefault("ncp_arch", "legacy_ncp_v0")
     given = set()
     for arg, field in ARCH_ARG_TO_FIELD.items():
         value = getattr(args, arg, None)
@@ -931,7 +984,7 @@ def _artifact_sha256(path, common_only=False):
             size = struct.unpack("<Q", file.read(8))[0]
             header = json.loads(file.read(size))
             for name, entry in sorted(header.items()):
-                if name == "__metadata__":
+                if name == "__metadata__" or name.startswith("model.ncp."):
                     continue
                 digest.update(
                     json.dumps([name, entry["dtype"], entry["shape"]]).encode()
@@ -1011,7 +1064,7 @@ def save_checkpoint(
         }
     if any(
         getattr(lm_config, flag, False)
-        for flag in ("ced_recurrent_enabled",)
+        for flag in ("ced_recurrent_enabled", "ncp_enabled")
     ):
         meta["code_sha"] = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
@@ -1058,7 +1111,7 @@ def save_checkpoint(
 
     if any(
         getattr(lm_config, flag, False)
-        for flag in ("ced_recurrent_enabled",)
+        for flag in ("ced_recurrent_enabled", "ncp_enabled")
     ):
         meta["common_weights_sha256"] = _artifact_sha256(ckp, common_only=True)
         meta["optimizer_sha256"] = _artifact_sha256(opt_path)
@@ -1072,11 +1125,11 @@ def save_checkpoint(
 def load_checkpoint(checkpoint_path, model, optimizer, args):
     """统一的检查点加载函数（safetensors 格式）"""
     Logger(f"Loading checkpoint from: {checkpoint_path}")
-    validate_checkpoint_execution(checkpoint_path, model.config, args)
+    converted = validate_checkpoint_execution(checkpoint_path, model.config, args)
     weights = dict(mx.load(checkpoint_path).items())
     fresh_prefixes = (
         ("mtp_modules.",) if getattr(args, "freeze_backbone", False) else ()
-    )
+    ) + ncp_warm_start_prefixes(checkpoint_path, model.config, converted)
 
     # 加载模型权重（严格校验，buffer shape 不匹配时保留当前 config 的版本）。
     # --freeze_backbone 的 DSpark 独立阶段（报告 §2.4.3）允许基座 checkpoint

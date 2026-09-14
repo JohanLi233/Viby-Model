@@ -99,6 +99,12 @@ class VibyCache:
             0  # Python：当前步 batch 内最大绝对位置+1，decode 用来切池
         )
         self.engram_prev = None  # [B, max_ngram-1] 最近 token id（Engram 哈希用）
+        from .ncp import ConceptCache, cache_signature
+
+        self.ncp_state = ConceptCache() if config.ncp_enabled else None
+        if self.ncp_state is not None:
+            self.ncp_state.signature = cache_signature(config)
+        self.ncp_rows = None  # continuous batch: independent group clocks per row
         # Parameters are shared across rounds; latent self KV is not.
         self.ced_signature = None
         self.ced_stages = {}
@@ -125,6 +131,8 @@ class VibyCache:
 
         压缩池与索引器 K 池按整组回退：只有落在回退区间之外的组保留。
         """
+        if offset > 0 and (self.ncp_state is not None or self.ncp_rows is not None):
+            raise ValueError("NCP rewind requires a fresh prefill")
         if offset < 0:
             raise ValueError("rewind offset must be nonnegative")
         if offset > 0 and self.ced_signature not in (None, ("baseline",)):

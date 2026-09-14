@@ -16,7 +16,7 @@ from trainer.utils import (
 
 
 def config(**changes):
-    values = dict(ced_recurrent_enabled=True, n_mtp_layers=0)
+    values = dict(ced_recurrent_enabled=True, ncp_enabled=False, n_mtp_layers=0)
     values.update(changes)
     return VibyConfig(**values)
 

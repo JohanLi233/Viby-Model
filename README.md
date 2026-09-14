@@ -20,6 +20,12 @@ V4.1 这一条技术路线；唯一的保留项是 **Gated XSA**（默认开，�
 架构语义对照官方实现（`deepseek-ai/DeepSeek-V4.1-Flash` 的 `inference/model.py`，
 已逐行核对）与技术报告 `DeepSeek_V41_Tech_Report`（下称"报告"）。
 
+新建模型和预训练默认接入 [CED-aware NCP](research/NCP_CED.md)：保留完整 token
+主干，在 CED 边界以每四个 token 的已观察概念运行两层共享 KV 的概念预测器。
+预测经零初始化门控只写入 decoder 状态；原 CED 全局 KV 始终来自融合前的
+encoder 表示。旧 checkpoint 按原 sidecar 架构加载，迁移需要显式重置 optimizer。
+本轮实现及机制验证不代表训练质量或 token efficiency 收益。
+
 默认关闭的[残差提升式循环 CED 实验](research/CED_RECURRENT.md)：
 `--ced-recurrent --mtp_depth 0` 在完整 CED 证据上，以 `k=4,q=3`
 复用中间 decoder 权重，直接训练 NTP。已通过 MLX 机制与缓存检查；融合核在
@@ -162,7 +168,7 @@ B=4/T=1024 的前向加反向试测节省约 4.1%，B=1 仍较慢。整训练预
 ## 训练
 
 ```bash
-# token baseline 冒烟（tiny；数据路径需指向已有语料）
+# 默认 CED-aware NCP 冒烟（tiny；数据路径需指向已有语料）
 .venv/bin/python trainer/train_pretrain.py --preset tiny --data_path ../dataset/pretrain_hq.jsonl \
   --max_seq_len 128 --batch_size 2 --accumulation_steps 1 --max_steps 50
 

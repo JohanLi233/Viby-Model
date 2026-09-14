@@ -343,6 +343,8 @@ class BaseTrainer:
         metrics = (
             res.metrics if res.metrics is not None else mx.zeros((X.shape[0], 8, 3))
         )
+        if getattr(res, "ncp_metrics", None) is not None:
+            metrics = res.ncp_metrics
         if res.ced_metrics is not None:
             metrics = res.ced_metrics
         if getattr(res, "tail_stats", None) is not None:
@@ -949,6 +951,14 @@ class BaseTrainer:
                         f"TailSFT kept={int(metrics[1])}/{int(metrics[0])} "
                         f"tokens={int(metrics[2])} offset={float(metrics[4]):.5f}"
                     )
+                elif (
+                    getattr(self.lm_config, "ncp_enabled", False) and metrics.ndim == 1
+                ):
+                    extra = dict(extra or {})
+                    from model.ncp import NCP_METRICS
+
+                    for i, name in enumerate(NCP_METRICS):
+                        extra["ncp/" + name] = float(metrics[i])
                 elif (
                     getattr(self.lm_config, "ced_recurrent_enabled", False)
                     and metrics.ndim == 1

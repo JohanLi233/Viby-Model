@@ -131,6 +131,19 @@ def add_common_args(parser):
         "--index_head_dim", type=int, default=_DEFAULT_CFG.index_head_dim
     )
     parser.add_argument("--index_topk", type=int, default=_DEFAULT_CFG.index_topk)
+    # Default CED-aware NCP; these are explicit shape/loss settings, not variants.
+    for name in [
+        "ncp_stride",
+        "ncp_layers",
+        "ncp_memory_dim",
+        "ncp_heads",
+        "ncp_groups",
+        "ncp_codes",
+        "ncp_loss_weight",
+        "ncp_vq_weight",
+    ]:
+        value = getattr(_DEFAULT_CFG, name)
+        parser.add_argument("--" + name, type=type(value), default=value)
     parser.add_argument(
         "--ced-recurrent",
         dest="ced_recurrent_enabled",

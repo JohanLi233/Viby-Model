@@ -34,9 +34,17 @@ def seed_of(name: str, default: int = 0) -> int:
 # ---------------------------------------------------------------- 配置预设
 
 
+# These fixtures explicitly retain plain CED for legacy component contracts.
+# Default NCP construction and its integration are tested in test_ncp_ced.py.
 def cfg_tiny(**kw) -> VibyConfig:
     """tiny 预设：4 层 / dim 256 / 16 专家 top-4，默认关 Engram（省 tokenizer）。"""
-    base = dict(preset="tiny", engram_layer_ids=(), vocab_size=256, max_seq_len=128)
+    base = dict(
+        preset="tiny",
+        ncp_enabled=False,
+        engram_layer_ids=(),
+        vocab_size=256,
+        max_seq_len=128,
+    )
     base.update(kw)
     return VibyConfig(**base)
 
@@ -50,6 +58,7 @@ def cfg_mix(**kw) -> VibyConfig:
     """
     base = dict(
         preset="tiny",
+        ncp_enabled=False,
         n_layers=6,
         compress_ratios=(0, 0, 2, 1, 1, 1, 0),
         kv_source_layers=(2, 3),
@@ -66,7 +75,12 @@ def cfg_mix(**kw) -> VibyConfig:
 def cfg_ced(**kw) -> VibyConfig:
     """纯 CED 配置：编码段 r=2（第 2 层），解码段 r=1（第 3 层起），无 reindex。"""
     base = dict(
-        preset="tiny", n_layers=6, engram_layer_ids=(), vocab_size=256, max_seq_len=128
+        preset="tiny",
+        ncp_enabled=False,
+        n_layers=6,
+        engram_layer_ids=(),
+        vocab_size=256,
+        max_seq_len=128,
     )
     base.update(kw)
     return VibyConfig(**base)
@@ -76,6 +90,7 @@ def cfg_engram(**kw) -> VibyConfig:
     """带 Engram 的 tiny 配置（挂第 1、2 层，用仓库自带 tokenizer 建压缩表）。"""
     base = dict(
         preset="tiny",
+        ncp_enabled=False,
         vocab_size=256,
         max_seq_len=64,
         engram_layer_ids=(1, 2),

@@ -146,6 +146,29 @@ def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int
     """
     cfg = model.config
     gemms = gemm_active_params(model)
+    concept_attention = 0
+    if getattr(cfg, "ncp_enabled", False):
+        fraction = (seq_len // cfg.ncp_stride) / seq_len if seq_len > 0 else 0
+        concept_gemms = sum(
+            int(v.size)
+            for p, v in tree_flatten(model.trainable_parameters())
+            if p.startswith("model.ncp.") and v.ndim >= 2
+        )
+        gemms += (fraction - 1) * concept_gemms
+        # QK/AV share a single memory, but each concept layer still attends.
+        concepts = seq_len // cfg.ncp_stride
+        concept_attention = (
+            fraction
+            * 12
+            * cfg.ncp_layers
+            * cfg.ncp_heads
+            * cfg.ncp_memory_dim
+            * (concepts + 1)
+            / 2
+        )
+        # Nearest-codebook search is detached from concepts (forward only);
+        # soft codeword prediction is already counted in concept_gemms.
+        concept_attention += fraction * 2 * cfg.dim * cfg.ncp_codes
     if recurrent_active(cfg) and seq_len > 0:
         fraction = (
             cfg.ced_recurrent_rounds * (seq_len // cfg.ced_recurrent_stride) / seq_len
@@ -163,6 +186,7 @@ def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int
         gemms += (fraction - 1) * middle_gemms
     return int(
         6 * gemms
+        + concept_attention
         + attn_fwdbwd_flops_per_token(model.config, seq_len, attention_lengths)
     )
 

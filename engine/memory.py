@@ -33,6 +33,7 @@ class PrefixState:
     """某条序列在长度 n 处的整套解码状态快照（前缀缓存的复用单元）。"""
 
     n: int
+    ncp: object = None
     window: list = field(default_factory=list)  # 每层 [window, hd]
     compress: dict = field(default_factory=dict)  # 源层 → [n//ratio, hd]
     index_k: dict = field(
@@ -89,6 +90,38 @@ def _set_engram_row(dst: VibyCache, drow: int, row: Optional[mx.array]) -> None:
     dst.engram_prev[drow] = row
 
 
+def _ncp_row(cache, row):
+    if cache.ncp_rows is not None:
+        return cache.ncp_rows[row].row_copy()
+    return None if cache.ncp_state is None else cache.ncp_state.row_copy(row)
+
+
+def _set_ncp_row(cache, row, state):
+    if state is None:
+        if cache.config.ncp_enabled:
+            raise ValueError("Prefix state is missing NCP memory; use a fresh prefill")
+        return
+    if not cache.config.ncp_enabled:
+        raise ValueError("NCP prefix state cannot be loaded into ordinary CED")
+    from model.ncp import cache_signature
+
+    if state.signature != cache_signature(cache.config):
+        raise ValueError("NCP prefix execution differs; use a fresh prefill")
+    batch = _batch_of(cache)
+    if batch == 1:
+        cache.ncp_state = state.row_copy()
+        cache.ncp_rows = None
+    else:
+        if cache.ncp_rows is None:
+            from model.ncp import ConceptCache
+
+            cache.ncp_rows = [ConceptCache() for _ in range(batch)]
+            for item in cache.ncp_rows:
+                item.signature = cache_signature(cache.config)
+        cache.ncp_rows[row] = state.row_copy()
+        cache.ncp_state = None
+
+
 def copy_state_row(
     dst: VibyCache, drow: int, src: VibyCache, srow: int = 0, n: Optional[int] = None
 ) -> None:
@@ -98,6 +131,7 @@ def copy_state_row(
     None 表示整行复制（池子扩容/压实用，池尾多出的槽位反正不会被读到）。
     """
     batch = _batch_of(dst)
+    _set_ncp_row(dst, drow, _ncp_row(src, srow))
     for i, dl in enumerate(dst.layers):
         sl = src.layers[i]
         dl.window[drow] = sl.window[srow]
@@ -122,6 +156,9 @@ def capture_state(
 ) -> PrefixState:
     """从 cache 的第 row 行取长度 n 的状态快照（显式拷贝，之后 cache 再被写也不影响）。"""
     state = PrefixState(n=int(n), hidden=hidden)
+    state.ncp = _ncp_row(cache, row)
+    if state.ncp is not None and state.ncp.tokens != n:
+        raise ValueError("NCP snapshot must use the actual processed token clock")
     if draft_mains is not None:
         state.draft_mains = tuple(mx.array(m) for m in draft_mains)
     for i, lc in enumerate(cache.layers):
@@ -142,6 +179,9 @@ def capture_state(
 def restore_state(dst: VibyCache, drow: int, state: PrefixState) -> int:
     """把快照写回 dst 的第 drow 行，返回快照长度 n。"""
     batch = _batch_of(dst)
+    if state.ncp is not None and state.ncp.tokens != state.n:
+        raise ValueError("NCP prefix clock mismatch")
+    _set_ncp_row(dst, drow, state.ncp)
     for i, dl in enumerate(dst.layers):
         # Dense prefix continuation uses a Python filled count; the decode
         # compressor also carries a per-row GPU count in kv_state.
@@ -180,6 +220,10 @@ def cache_bytes(cache: Optional[VibyCache]) -> int:
         if lc.kv_state is not None:
             total += sum(_array_bytes(s) for s in lc.kv_state)
     total += _array_bytes(cache.engram_prev)
+    if cache.ncp_rows is not None:
+        total += sum(state.nbytes() for state in cache.ncp_rows)
+    elif cache.ncp_state is not None:
+        total += cache.ncp_state.nbytes()
     return total
 
 
@@ -191,6 +235,8 @@ def state_bytes(state: PrefixState) -> int:
         total += sum(_array_bytes(s) for s in tup)
     total += _array_bytes(state.engram_prev)
     total += _array_bytes(state.hidden)
+    if state.ncp is not None:
+        total += state.ncp.nbytes()
     if state.draft_mains is not None:
         total += sum(_array_bytes(m) for m in state.draft_mains)
     return total

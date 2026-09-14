@@ -44,6 +44,7 @@ TEST_GROUPS = {
         "test_window_attention_backward.py",
     ),
     "moe": ("test_v41_moe.py", "test_moe_qb.py", "test_moe_dataflow_metal.py"),
+    "ncp": ("test_ncp_ced.py", "test_ncp_diagnostics.py"),
     "recurrent": (
         "test_ced_recurrent.py",
         "test_ced_recurrent_trainer.py",
