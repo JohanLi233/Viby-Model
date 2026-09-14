@@ -65,7 +65,6 @@ class Block(nn.Module):
         segment_ids=None,
         pad_mask=None,
         decode: bool = False,
-        attention_injection=None,
     ):
         """x: [B,T,hc,d] → (x, 下一个子层要用的 pre_mix)。"""
         residual = x
@@ -75,8 +74,6 @@ class Block(nn.Module):
             h = self.attn.decode(h, start_pos, shared, cache)
         else:
             h = self.attn(h, start_pos, shared, cache, segment_ids, pad_mask)
-        if attention_injection is not None:
-            h = (h.astype(attention_injection.dtype) + attention_injection).astype(h.dtype)
         x = hc_post(h, residual, attn_post, attn_comb)
 
         residual = x

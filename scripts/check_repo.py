@@ -20,7 +20,6 @@ ENTRY_DOCS = (
     "research/EXPERIMENT_PROTOCOL.md",
 )
 TEST_GROUPS = {
-    "binding": ("test_binding_workspace.py",),
     "latent": ("test_latent_inference.py",),
     "dpr": ("test_dpr.py", "test_dpr_contextual.py", "test_dpr_diagnostics.py"),
     "tools": ("test_repo_tools.py",),
