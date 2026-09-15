@@ -287,10 +287,10 @@ class VibyConfig:
         self.ced_recurrent_rounds = int(kw.get("ced_recurrent_rounds", 3))
         self.ced_recurrent_arch = str(kw.get("ced_recurrent_arch", "residual_lift_v1"))
 
-        # CED-aware NCP is the default full-token backbone. The existing
-        # recurrent experiment remains a separate, explicitly selected execution.
-        self.ncp_enabled = bool(kw.get("ncp_enabled", not self.ced_recurrent_enabled))
-        self.ncp_arch = str(kw.get("ncp_arch", "ced_state_v2"))
+        # Legacy NCP stays loadable but is no longer a training default.
+        # Recurrent CED and the replacement thinking pipeline are separate variants.
+        self.ncp_enabled = bool(kw.get("ncp_enabled", False))
+        self.ncp_arch = str(kw.get("ncp_arch", "ced_state_v3"))
         self.ncp_stride = int(kw.get("ncp_stride", 4))
         self.ncp_layers = int(kw.get("ncp_layers", 2))
         self.ncp_memory_dim = int(kw.get("ncp_memory_dim", 128))
@@ -299,6 +299,14 @@ class VibyConfig:
         self.ncp_codes = int(kw.get("ncp_codes", 256))
         self.ncp_loss_weight = float(kw.get("ncp_loss_weight", 1.0))
         self.ncp_vq_weight = float(kw.get("ncp_vq_weight", 1.0))
+
+        # The bounded pilot did not clear the quality gate. Keep pure CED as the
+        # default; the replacement latent architecture is explicitly --thinking.
+        self.thinking_enabled = bool(kw.get("thinking_enabled", False))
+        self.thinking_arch = str(kw.get("thinking_arch", "ced_iterative_tied_v1"))
+        self.thinking_dim = int(kw.get("thinking_dim", 128))
+        self.thinking_scale = float(kw.get("thinking_scale", 0.1))
+        self.thinking_steps = int(kw.get("thinking_steps", 2))
 
         self._validate()
 
@@ -474,8 +482,32 @@ class VibyConfig:
             if not 0 <= t < self.n_layers:
                 raise ValueError("dspark_target_layer_ids 必须落在主干层内")
 
+        if self.thinking_enabled:
+            if self.ncp_enabled or self.ced_recurrent_enabled:
+                raise ValueError(
+                    "Thinking, NCP and recurrent CED are separate architectures"
+                )
+            if self.thinking_arch not in (
+                "ced_pipeline_v1",
+                "ced_iterative_v2",
+                "ced_iterative_tied_v1",
+            ):
+                raise ValueError("Unsupported thinking execution version")
+            if self.thinking_steps < 1:
+                raise ValueError("thinking_steps must be positive")
+            if self.thinking_arch == "ced_pipeline_v1" and self.thinking_steps != 2:
+                raise ValueError("Legacy thinking pipeline has exactly two stages")
+            if self.thinking_dim < 2 or self.thinking_dim % 2:
+                raise ValueError("thinking_dim must be positive and even")
+            if not 0 < self.thinking_scale <= 1:
+                raise ValueError("thinking_scale must be finite in (0, 1]")
+
         if self.ncp_enabled:
-            if self.ncp_arch not in ("ced_shared_kv_v1", "ced_state_v2"):
+            if self.ncp_arch not in (
+                "ced_shared_kv_v1",
+                "ced_state_v2",
+                "ced_state_v3",
+            ):
                 raise ValueError("Unsupported NCP execution version")
             if self.ced_recurrent_enabled:
                 raise ValueError("NCP and recurrent CED are separate architectures")
@@ -500,6 +532,7 @@ class VibyConfig:
                 and 0 <= self.ncp_vq_weight < float("inf")
             ):
                 raise ValueError("NCP loss weights must be finite and nonnegative")
+        if self.ncp_enabled or self.thinking_enabled:
             boundary = self.n_encoder_layers
             if (
                 len(self.compress_ratios) < self.n_layers
@@ -507,12 +540,14 @@ class VibyConfig:
                 or boundary not in self.kv_source_layers
                 or boundary not in self.index_source_layers
             ):
-                raise ValueError("NCP requires a full ratio=1 CED boundary")
+                raise ValueError("NCP/thinking requires a full ratio=1 CED boundary")
             if any(
                 self.compress_ratios[i] != 1 or i in self.kv_source_layers
                 for i in range(boundary + 1, self.n_layers)
             ):
-                raise ValueError("NCP decoder must share the clean boundary global KV")
+                raise ValueError(
+                    "NCP/thinking decoder must share the clean boundary global KV"
+                )
 
     # ------------------------------------------------------------------
     def to_dict(self) -> dict:
@@ -527,6 +562,9 @@ class VibyConfig:
     @classmethod
     def from_dict(cls, data: dict) -> "VibyConfig":
         data = dict(data)
+        data.setdefault("thinking_enabled", False)
+        if data["thinking_enabled"]:
+            data.setdefault("thinking_arch", "ced_pipeline_v1")
         # Sidecars predating this architecture remain ordinary CED.
         data.setdefault("ncp_enabled", False)
         if data["ncp_enabled"]:
@@ -607,6 +645,14 @@ class VibyConfig:
             total += mtp
         if self.ncp_enabled:
             total += self.ncp_matrix_parameters()
+        if self.thinking_enabled:
+            w = self.thinking_dim
+            if self.thinking_arch == "ced_iterative_tied_v1":
+                total += 2 * self.dim * w + w * w
+            elif self.thinking_arch == "ced_iterative_v2":
+                total += 3 * self.dim * w + w * w
+            else:
+                total += 2 * self.dim * w + 8 * w * w
         return total
 
     @property
@@ -627,17 +673,23 @@ class VibyConfig:
     def ncp_matrix_parameters(self):
         d, w, h = self.dim, self.ncp_memory_dim, self.ncp_heads
         extra = 0
-        if self.ncp_arch == "ced_state_v2":
+        if self.ncp_arch in ("ced_state_v2", "ced_state_v3"):
             extra = (
                 (self.ncp_layers - 1) * d * w
                 + self.ncp_layers * d * d
                 + len(self.ncp_decoder_layers) * d * self.ncp_layers
             )
+        # v3's copy-residual head replaces the PQ predict GEMM; pool_slots is 1-D.
+        predictor = (
+            2 * d * d
+            if self.ncp_arch == "ced_state_v3"
+            else d * self.ncp_groups * self.ncp_codes
+        )
         return (
             extra
             + d * w
             + self.ncp_layers * (2 * d * h * w + 6 * d * d)
-            + d * self.ncp_groups * self.ncp_codes
+            + predictor
             + self.ncp_codes * d
             + d * d
         )

@@ -12,13 +12,14 @@ import pytest
 
 from model.config import VibyConfig
 from model.model import VibyForCausalLM
-from model.ncp import NextConceptPrediction
+from model.ncp import NextConceptPrediction, NCP_METRICS
 from trainer.config import get_pretrain_parser, get_sft_parser, setup_training_args
 from trainer.utils import (
     build_model_kwargs,
     checkpoint_execution,
     validate_checkpoint_execution,
     ncp_warm_start_prefixes,
+    ncp_warm_start_drop_prefixes,
     load_model_weights,
     convert_model_dtype,
     build_config_from_sidecar,
@@ -28,6 +29,8 @@ from trainer.utils import (
 def config(**kw):
     values = dict(
         preset="tiny",
+        ncp_enabled=True,
+        thinking_enabled=False,
         dim=64,
         n_heads=2,
         o_groups=1,
@@ -79,17 +82,17 @@ def norm(x):
 
 
 def test_default_parser_preset_and_serialized_identity(monkeypatch, tmp_path):
-    assert VibyConfig().ncp_enabled
+    assert not VibyConfig().ncp_enabled and not VibyConfig().thinking_enabled
     for options in ([], ["--preset", "tiny"]):
         argv = options + ["--out_dir", str(tmp_path)]
         monkeypatch.setattr(sys, "argv", ["train_pretrain.py", *argv])
         args = setup_training_args(get_pretrain_parser().parse_args(argv))
         cfg = VibyConfig(**build_model_kwargs(args))
-        assert cfg.ncp_enabled and cfg.ncp_arch == "ced_state_v2"
+        assert not cfg.ncp_enabled and not cfg.thinking_enabled
         assert (cfg.ncp_stride, cfg.ncp_layers, cfg.ncp_memory_dim) == (4, 2, 128)
         assert cfg.n_mtp_layers == 0
         assert VibyConfig.from_dict(cfg.to_dict()).to_dict() == cfg.to_dict()
-        assert checkpoint_execution(cfg)["kind"] == "ced_state_v2"
+        assert checkpoint_execution(cfg)["kind"] == "token_ced_v1"
     assert not VibyConfig.from_dict({"preset": "tiny"}).ncp_enabled
     parser = get_pretrain_parser()
     assert not any(
@@ -254,19 +257,26 @@ def test_loss_target_and_codebook_gradient_boundaries():
     ncp = NextConceptPrediction(config())
     c = mx.random.normal((1, 3, 64))
     p = mx.random.normal((1, 3, 64))
+    r = mx.random.normal((1, 3, 64)) * 0.1
     valid = mx.ones((1, 3), mx.bool_)
     adjacent = mx.ones((1, 2), mx.bool_)
+    # v3: the copy base and the differential target are both detached; concepts
+    # receive auxiliary gradient only through the residual head input path.
     for index in (0, 1):
-        grad = mx.grad(lambda x: ncp.auxiliary_losses(x, p, valid, adjacent)[index])(c)
+        grad = mx.grad(lambda x: ncp.auxiliary_losses(x, p, r, valid, adjacent)[index])(
+            c
+        )
         assert norm(grad) == 0
-    gp = mx.grad(lambda x: ncp.auxiliary_losses(c, x, valid, adjacent)[0])(p)
-    assert norm(gp[:, :2]) > 0 and norm(gp[:, 2:]) == 0
+    gr = mx.grad(lambda x: ncp.auxiliary_losses(c, p, x, valid, adjacent)[0])(r)
+    assert norm(gr[:, :2]) > 0 and norm(gr[:, 2:]) == 0
     _, grads = nn.value_and_grad(
-        ncp, lambda net: net.auxiliary_losses(c, p, valid, adjacent)[1]
+        ncp, lambda net: net.auxiliary_losses(c, p, r, valid, adjacent)[1]
     )(ncp)
     assert norm(grads["codebook"]) > 0
     assert all(norm(v) == 0 for path, v in tree_flatten(grads) if path != "codebook")
-    # Historical concept inputs do receive the NCP gradient.
+    # Historical concept inputs do receive the NCP gradient once the zero-init
+    # output projection has moved.
+    ncp.residual_out.weight = mx.random.normal(ncp.residual_out.weight.shape) * 0.05
     e = mx.random.normal((1, 16, 64))
     ge = mx.grad(lambda x: ncp(x)["ncp_loss"])(e)
     assert norm(ge[:, :4]) > 0 and norm(ge[:, 12:]) == 0
@@ -286,10 +296,20 @@ def test_ntp_gradient_gate_and_joint_training_contract():
         [0.15] * (len(m.config.ncp_decoder_layers) - 1)
     )
     m.model.ncp.feedback_gate = mx.array([0.4])
+    # The zero-init residual output projection blocks NTP gradient into the
+    # residual MLP until the auxiliary loss moves it; model that post-warmup
+    # state here (same semantics as the boundary test above).
+    m.model.ncp.residual_out.weight = (
+        mx.random.normal(m.model.ncp.residual_out.weight.shape) * 0.05
+    )
     _, grads = nn.value_and_grad(m, lambda net: net(x, labels=y).lm_loss)(m)
     flat = dict(tree_flatten(grads))
+    # v3: the codebook is only trained by VQ; NTP reaches the concept branch
+    # through the copy-residual prediction and state paths, not the PQ table.
+    assert norm(flat["model.ncp.codebook"]) == 0
     for key in (
-        "model.ncp.codebook",
+        "model.ncp.residual_in.weight",
+        "model.ncp.pool_slots",
         "model.ncp.layers.0.query.weight",
         "model.ncp.layers.1.query.weight",
         "model.ncp.memory_project.weight",
@@ -456,8 +476,6 @@ def test_real_compiled_trainer_updates_ncp_and_codebook_adamw():
     mask = mx.ones(x.shape)
     values, grads = trainer._compute_loss_and_grad(x, y, mask, mask)
     mx.eval(values, grads)
-    from model.ncp import NCP_METRICS
-
     assert values[5].shape == (len(NCP_METRICS),)
     assert float(values[0]) > float(values[3])
     optimizer.update(m, grads)
@@ -628,7 +646,7 @@ def test_concept_document_offset_preserves_relative_position_semantics():
     close(standalone, packed[:, 5:])
 
 
-def test_state_only_ntp_path_bypasses_pq_and_selects_depth_per_token():
+def test_state_only_ntp_path_bypasses_prediction_and_selects_depth_per_token():
     m = model(ncp_loss_weight=0, ncp_vq_weight=0)
     ncp = m.model.ncp
     ncp.state_gates = mx.array([0.4] * len(m.config.ncp_decoder_layers))
@@ -645,7 +663,7 @@ def test_state_only_ntp_path_bypasses_pq_and_selects_depth_per_token():
         "state_routes.1.weight",
     ):
         assert norm(flat["model.ncp." + key]) > 0, key
-    for key in ("codebook", "predict.weight", "feedback.weight"):
+    for key in ("codebook", "residual_in.weight", "feedback.weight"):
         assert norm(flat["model.ncp." + key]) == 0, key
     m.eval()
     normal = m(x).logits
@@ -663,6 +681,9 @@ def test_state_only_ntp_path_bypasses_pq_and_selects_depth_per_token():
 
 def test_second_layer_memory_contains_processed_history(monkeypatch):
     ncp = NextConceptPrediction(config())
+    if ncp.residual_predictor:
+        # v3's zero-init residual output would mask layer processing at init.
+        ncp.residual_out.weight = mx.random.normal(ncp.residual_out.weight.shape) * 0.05
     c = mx.random.normal((1, 3, 64))
     pos = mx.array([[3, 7, 11]])
     visible = mx.tril(mx.ones((1, 3, 3), mx.bool_))
@@ -681,15 +702,15 @@ def test_second_layer_memory_contains_processed_history(monkeypatch):
         return result
 
     monkeypatch.setattr(type(ncp.layers[0]), "__call__", hook)
-    pred0, _ = ncp.predict_next(c, memory, pos, visible)
+    pred0, _, _ = ncp.predict_next(c, memory, pos, visible)
     perturb[0] = True
-    pred1, _ = ncp.predict_next(c, memory, pos, visible)
+    pred1, _, _ = ncp.predict_next(c, memory, pos, visible)
     close(captured[0][0][:, -1], captured[1][0][:, -1], atol=0)
     assert norm(captured[0][1][:, 0] - captured[1][1][:, 0]) > 0
     assert norm(pred0[:, -1] - pred1[:, -1]) > 0
 
 
-def test_v1_checkpoint_retains_execution_and_explicit_v2_warm_start(tmp_path):
+def test_v1_checkpoint_retains_execution_and_explicit_v3_warm_start(tmp_path):
     old = model(ncp_arch="ced_shared_kv_v1")
     old.model.ncp.feedback_gate = mx.array([0.5])
     x = tokens(13)
@@ -713,7 +734,89 @@ def test_v1_checkpoint_retains_execution_and_explicit_v2_warm_start(tmp_path):
     args.reset_optimizer = True
     changed = validate_checkpoint_execution(path, target.config, args)
     prefixes = ncp_warm_start_prefixes(path, target.config, changed)
+    drops = ncp_warm_start_drop_prefixes(path, target.config, changed)
     assert "model.ncp." not in prefixes
-    load_model_weights(target, str(path), allow_fresh_prefixes=prefixes)
+    assert "model.ncp.pool_slots" in prefixes
+    assert drops == ("model.ncp.predict.", "model.ncp.predict_norm.")
+    load_model_weights(
+        target,
+        str(path),
+        allow_fresh_prefixes=prefixes,
+        allow_drop_prefixes=drops,
+    )
     close(target.model.ncp.codebook, old.model.ncp.codebook, atol=0)
+    close(target.model.ncp.feedback_gate, old.model.ncp.feedback_gate, atol=0)
     assert VibyConfig().ncp_decoder_layers == (6, 10)
+
+
+def test_v3_copy_residual_starts_as_exact_copy():
+    m = model()
+    x = tokens(16, 2)
+    out = m(x, labels=x)
+    metrics = dict(zip(NCP_METRICS, out.ncp_metrics.tolist()))
+    # Zero-init residual: prediction == current concept, so the auxiliary loss
+    # equals the copy (persistence) baseline and relative_mse_previous == 1.
+    close(out.ncp_loss, mx.array(metrics["previous_mse"]), atol=1e-4)
+    assert metrics["relative_mse_previous"] == pytest.approx(1.0, abs=1e-4)
+    assert metrics["state_gate"] == 0 and metrics["prediction_gate"] == 0
+
+
+def test_v3_zero_residual_out_survives_trunc_normal_init():
+    from model.init import apply_trunc_normal_init
+
+    ncp = NextConceptPrediction(config())
+    apply_trunc_normal_init(ncp, 64)
+    assert norm(ncp.residual_out.weight) == 0
+    assert norm(ncp.residual_in.weight) > 0
+
+
+def test_v3_slot_pooling_convex_weights_and_token_order():
+    ncp = NextConceptPrediction(config())
+    grouped = mx.random.normal((2, 3, 4, 64))
+    # All-zero logits degenerate to exact mean pooling.
+    close(ncp._pool(grouped), mx.mean(grouped, axis=2), atol=1e-6)
+    # Boost slot r=0 (group end -> token j = stride-1) to pin the token order.
+    ncp.pool_slots = mx.concatenate([mx.full((64,), 20.0), mx.zeros((3 * 64,))])
+    close(ncp._pool(grouped), grouped[:, :, 3, :], atol=1e-3)
+
+
+def test_v3_zero_init_residual_blocks_concept_gradient_until_output_moves():
+    ncp = NextConceptPrediction(config())
+    e = mx.random.normal((1, 16, 64))
+    _, grads = nn.value_and_grad(ncp, lambda net: net(e)["ncp_loss"])(ncp)
+    flat = dict(tree_flatten(grads))
+    assert norm(flat["residual_out.weight"]) > 0
+    assert norm(flat["memory_project.weight"]) == 0
+
+
+def test_v2_to_v3_warm_start_drops_pq_and_initializes_residual(tmp_path):
+    old = model(ncp_arch="ced_state_v2")
+    x = tokens(13)
+    expected = old(x).logits
+    path = tmp_path / "v2.safetensors"
+    mx.save_safetensors(str(path), dict(tree_flatten(old.parameters())))
+    path.with_suffix(".json").write_text(json.dumps({"config": old.config.to_dict()}))
+    target = model()
+    args = SimpleNamespace(reset_optimizer=True, auto_resume=False)
+    changed = validate_checkpoint_execution(path, target.config, args)
+    prefixes = ncp_warm_start_prefixes(path, target.config, changed)
+    drops = ncp_warm_start_drop_prefixes(path, target.config, changed)
+    assert sorted(prefixes) == sorted(
+        "model.ncp." + name
+        for name in ("pool_slots", "residual_norm.", "residual_in.", "residual_out.")
+    )
+    assert drops == ("model.ncp.predict.", "model.ncp.predict_norm.")
+    load_model_weights(
+        target,
+        str(path),
+        allow_fresh_prefixes=prefixes,
+        allow_drop_prefixes=drops,
+    )
+    close(target.model.ncp.codebook, old.model.ncp.codebook, atol=0)
+    close(
+        target.model.ncp.state_projects[0].weight,
+        old.model.ncp.state_projects[0].weight,
+        atol=0,
+    )
+    # All gates stay zero after warm start: the v3 forward must match v2 logits.
+    close(target(x).logits, expected, atol=0)

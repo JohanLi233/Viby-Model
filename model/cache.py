@@ -105,6 +105,12 @@ class VibyCache:
         if self.ncp_state is not None:
             self.ncp_state.signature = cache_signature(config)
         self.ncp_rows = None  # continuous batch: independent group clocks per row
+        from .thinking import ThinkingCache, cache_signature as thinking_signature
+
+        self.thinking_state = ThinkingCache() if config.thinking_enabled else None
+        if self.thinking_state is not None:
+            self.thinking_state.signature = thinking_signature(config)
+        self.thinking_rows = None
         # Parameters are shared across rounds; latent self KV is not.
         self.ced_signature = None
         self.ced_stages = {}
@@ -131,6 +137,12 @@ class VibyCache:
 
         压缩池与索引器 K 池按整组回退：只有落在回退区间之外的组保留。
         """
+        if offset > 0 and (
+            self.thinking_state is not None or self.thinking_rows is not None
+        ):
+            raise ValueError(
+                "Thinking rewind requires a fresh prefill or complete snapshot restore"
+            )
         if offset > 0 and (self.ncp_state is not None or self.ncp_rows is not None):
             raise ValueError("NCP rewind requires a fresh prefill")
         if offset < 0:

@@ -689,6 +689,8 @@ def _adamw_body(b1, b2, eps, wd, bias_correction, cautious=False):
     与原路径逐位一致。"""
 
     def fn(p, g, m, v, lr, step):
+        dtype = p.dtype
+        p, g, m, v, lr = (x.astype(mx.float32) for x in (p, g, m, v, lr))
         m = b1 * m + (1 - b1) * g
         v = b2 * v + (1 - b2) * mx.square(g)
         if cautious and wd != 0:
@@ -707,7 +709,7 @@ def _adamw_body(b1, b2, eps, wd, bias_correction, cautious=False):
             p = p - (c1 * m) / (mx.sqrt(v) * c2 + eps)
         else:
             p = p - lr * m / (mx.sqrt(v) + eps)
-        return p, m, v
+        return p.astype(dtype), m, v
 
     return fn
 
@@ -715,9 +717,8 @@ def _adamw_body(b1, b2, eps, wd, bias_correction, cautious=False):
 def _adamw_kernel(b1, b2, eps, wd, bias_correction, cautious=False):
     """(b1,b2,eps,wd,bias_correction,cautious) 对应的 mx.compile 融合 AdamW 更新。
 
-    超参必须是 python float 而不是 traced 输入：MLX 的弱类型提升下
-    `float * bf16 -> bf16`，换成 f32 数组会把整条链抬到 f32，数值和基类不再
-    逐位一致。lr 会随 scheduler 每步变、step 随窗口递增，作为数组入参传进来。
+    超参作为编译缓存键，lr/step 是运行时输入。2026-09-14 起更新算术与 m/v
+    显式 FP32，最后仅参数转回原 dtype，不再复现旧 BF16 EMA 的逐位舍入。
 
     bias_correction 必须开：compute 公式的 beta2/eps 是在带修正的 Adam
     （optax 口径）上拟合的；不修正时有效步长带一个随时间衰减的放大因子
@@ -769,8 +770,8 @@ class FusedAdamW(optim.AdamW):
     动机：MoE 细粒度化后堆叠专家权重占了绝大部分参数（E=288/I=104/8 层
     时 621M / 655M），逐算子实现每步要把 p/g/m/v 反复读写十来遍，实测
     88ms —— 而按 8.7GB 的必要访存量算，带宽上限只需 ~22ms。融合后单次
-    读写即可，数学与基类逐位一致（算子顺序与弱类型提升都照抄，含
-    bias_correction 分支）。
+    读写即可。以上是历史 BF16 EMA 性能记录；2026-09-14 精度修复后，m/v 和
+    更新算术保持 FP32，不能沿用旧访存量、带宽或逐位等价结论。
 
     同形状张量再堆成 (N,·) 一次更新：标量组 ~100 个小核变成每个形状
     1 次发射。单组超过 256MB 仍逐张量，避免再物化一份大栈。
@@ -791,6 +792,11 @@ class FusedAdamW(optim.AdamW):
         # （VIBY_ADAM_CAUTIOUS=0 回退）。
         self.cautious = cautious
         super().__init__(*args, **kwargs)
+
+    def init_single(self, parameter: mx.array, state: dict):
+        # beta2 can be ~0.99975: BF16 EMA plateaus long before convergence.
+        state["m"] = mx.zeros(parameter.shape, mx.float32)
+        state["v"] = mx.zeros(parameter.shape, mx.float32)
 
     def _kernel(self, shape, dtype):
         """按形状选编译变体：大 tensor shapeful（带宽），小 tensor shapeless。"""
@@ -818,7 +824,7 @@ class FusedAdamW(optim.AdamW):
         )
 
     def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
-        lr = self.learning_rate.astype(gradient.dtype)
+        lr = self.learning_rate.astype(mx.float32)
         p, m, v = self._kernel(gradient.shape, gradient.dtype)(
             parameter, gradient, state["m"], state["v"], lr, self.step
         )
@@ -860,8 +866,8 @@ class FusedAdamW(optim.AdamW):
 
         new_p = []
         for (shape, dt), paths in groups.items():
-            lr = self.learning_rate.astype(dt)
-            nbytes = int(dt.size) * len(paths)
+            lr = self.learning_rate.astype(mx.float32)
+            nbytes = max(int(dt.size), 4) * len(paths)
             for s in shape:
                 nbytes *= int(s)
             if len(paths) == 1 or nbytes > self._STACK_BYTES:
@@ -1467,7 +1473,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
     （SFT 时 embed/scalar lr 分别乘 0.1/0.3；norm 组 wd=0.01，no-wd 组 wd=0。
     VIBY_SINKHORN=0 回退旧分组：lm_head 走 AdamH、embed/Engram 表走 AdamW）
 
-    --muonh（MuonH/AdamH/Adam 体系，Marin 口径，默认开启）：
+    --muonh（MuonH/AdamH/Adam 体系，Marin 口径，默认关闭，显式开启）：
     - Muon 组更新加 Frobenius 范数球投影（方向/范数解耦，hyperball）；
     - 3D 堆叠专家从 AdamW 移入 MuonH：以 axis0 为 batch 逐专家 NS
       （_ns5 批量维无耦合，语义正确；旧排除是因为 reshape (E,out·in)
@@ -1571,7 +1577,7 @@ def create_mixed_optimizer(model, args, training_type="pretrain"):
         return any(p.endswith("norm") for p in path.split(".")[:-1])
 
     def _is_muon(path, arr):
-        # 3D 堆叠专家：muonh 下（默认）由堆叠组逐专家 NS；`--no_muonh` 或
+        # 3D 堆叠专家：显式启用 muonh 且 VIBY_MUONH_EXPERTS=1 时逐专家 NS；
         # VIBY_MUONH_EXPERTS=0 时排除进 AdamW，避免基类 reshape (E,out·in)
         # 跨专家耦合。MoE router 也不走 Muon：正交化更新步长恒定偏大，会把
         # 路由打分持续推向失衡；单独小 lr AdamW 组。

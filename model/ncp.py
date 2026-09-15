@@ -1,7 +1,9 @@
 """CED-aware next-concept prediction; only observed concepts enter shared KV.
 
 Losses use per-dimension means. V2 refreshes compact memory between concept layers,
-not a reproduction of the paper's per-layer concept Transformer.
+not a reproduction of the paper's per-layer concept Transformer. V3 replaces the PQ
+predictor with a copy-residual head on a detached differential target, and mean
+pooling with per-slot convex pooling (all-zero logits == exact mean at init).
 """
 
 import mlx.core as mx
@@ -30,6 +32,8 @@ NCP_METRICS = (
     "encoder_rms",
     "feedback_rms",
     "feedback_ratio",
+    "state_gate",
+    "prediction_gate",
 )
 
 
@@ -201,10 +205,21 @@ class NextConceptPrediction(nn.Module):
         self.memory_project = nn.Linear(config.dim, config.ncp_memory_dim, bias=False)
         self.memory_norm = RMSNorm(config.ncp_memory_dim, config.norm_eps)
         self.layers = [ConceptBlock(config) for _ in range(config.ncp_layers)]
-        self.predict_norm = RMSNorm(config.dim, config.norm_eps)
-        self.predict = nn.Linear(
-            config.dim, config.ncp_groups * config.ncp_codes, bias=False
-        )
+        self.residual_predictor = config.ncp_arch == "ced_state_v3"
+        if self.residual_predictor:
+            # Per-slot convex pooling logits (slot, channel); zeros == exact mean.
+            self.pool_slots = mx.zeros((config.ncp_stride * config.dim,))
+            # Copy-residual head r = W2·silu(W1·norm(state)); W2 zero-init makes the
+            # initial prediction an exact copy of the current concept.
+            self.residual_norm = RMSNorm(config.dim, config.norm_eps)
+            self.residual_in = nn.Linear(config.dim, config.dim, bias=False)
+            self.residual_out = nn.Linear(config.dim, config.dim, bias=False)
+            self.residual_out.weight = mx.zeros_like(self.residual_out.weight)
+        else:
+            self.predict_norm = RMSNorm(config.dim, config.norm_eps)
+            self.predict = nn.Linear(
+                config.dim, config.ncp_groups * config.ncp_codes, bias=False
+            )
         self.codebook = (
             mx.random.normal(
                 (config.ncp_groups, config.ncp_codes, config.dim // config.ncp_groups)
@@ -214,7 +229,7 @@ class NextConceptPrediction(nn.Module):
         self.feedback_norm = RMSNorm(config.dim, config.norm_eps)
         self.feedback = nn.Linear(config.dim, config.dim, bias=False)
         self.feedback_gate = mx.zeros((1,))
-        self.state_enabled = config.ncp_arch == "ced_state_v2"
+        self.state_enabled = config.ncp_arch in ("ced_state_v2", "ced_state_v3")
         if self.state_enabled:
             self.memory_updates = [
                 nn.Linear(config.dim, config.ncp_memory_dim, bias=False)
@@ -246,6 +261,26 @@ class NextConceptPrediction(nn.Module):
         return self.state_gates[slot] * mx.sum(
             weights[..., None] * states.astype(mx.float32), axis=2
         )
+
+    def _pool(self, grouped):
+        """(b, n, stride, d) FP32, slot j = j-th token from group start -> (b, n, d).
+
+        V3 applies per-channel convex slot weights; pool_slots index r counts back
+        from the group end (training gathers plan.indices - r), so token j uses
+        r = stride-1-j. All-zero logits degenerate to exact mean pooling.
+        """
+        if not self.residual_predictor:
+            return mx.mean(grouped, axis=2)
+        weights = mx.softmax(
+            self.pool_slots.reshape(self.config.ncp_stride, self.config.dim).astype(
+                mx.float32
+            ),
+            axis=0,
+        )
+        by_token = weights[
+            (self.config.ncp_stride - 1) - mx.arange(self.config.ncp_stride)
+        ]
+        return mx.sum(grouped * by_token[None, None], axis=2)
 
     def project_memory(self, concepts, positions):
         return _rotate(self.memory_norm(self.memory_project(concepts)), positions)
@@ -279,6 +314,14 @@ class NextConceptPrediction(nn.Module):
         if cache is not None and self.state_enabled:
             cache.layer_memories = memories
         cfg = self.config
+        states = mx.stack(states, axis=2) if states else None
+        if self.residual_predictor:
+            # Unconstrained continuous residual on an exact-copy base; the PQ
+            # codebook stays in use only for the VQ tracking objective.
+            residual = self.residual_out(
+                nn.silu(self.residual_in(self.residual_norm(state)))
+            )
+            return concepts + residual.astype(concepts.dtype), states, residual
         probabilities = mx.softmax(
             self.predict(self.predict_norm(state))
             .astype(mx.float32)
@@ -292,18 +335,26 @@ class NextConceptPrediction(nn.Module):
         prediction = prediction.reshape(*state.shape[:2], cfg.dim).astype(
             concepts.dtype
         )
-        return prediction, (mx.stack(states, axis=2) if states else None)
+        return prediction, states, None
 
-    def auxiliary_losses(self, concepts, predictions, valid, adjacent):
+    def auxiliary_losses(self, concepts, predictions, residual, valid, adjacent):
         cfg = self.config
         target = mx.stop_gradient(concepts.astype(mx.float32))
         zero = mx.array(0.0, mx.float32)
         ncp = zero
         if concepts.shape[1] > 1:
-            err = mx.mean(
-                mx.square(predictions[:, :-1].astype(mx.float32) - target[:, 1:]),
-                axis=-1,
-            )
+            if residual is None:
+                err = mx.mean(
+                    mx.square(predictions[:, :-1].astype(mx.float32) - target[:, 1:]),
+                    axis=-1,
+                )
+            else:
+                # Detached differential target: the copy base carries no gradient,
+                # so the loss cannot pull c_t toward c_{t+1}.
+                diff = target[:, 1:] - target[:, :-1]
+                err = mx.mean(
+                    mx.square(residual[:, :-1].astype(mx.float32) - diff), axis=-1
+                )
             ncp = mx.sum(mx.where(adjacent, err, 0)) / mx.maximum(mx.sum(adjacent), 1)
         pieces = target.reshape(
             *target.shape[:2], cfg.ncp_groups, cfg.dim // cfg.ncp_groups
@@ -369,13 +420,19 @@ class NextConceptPrediction(nn.Module):
                     ]
                 ),
             )
-        pooled = mx.zeros((b, n, cfg.dim), mx.float32)
-        for offset in range(cfg.ncp_stride):
-            ids = mx.maximum(plan.indices - offset, 0)
-            pooled = pooled + mx.take_along_axis(
-                encoder, ids[..., None], axis=1
-            ).astype(mx.float32)
-        concepts = self.pool_norm((pooled / cfg.ncp_stride).astype(encoder.dtype))
+        # Token-order slots: gather offset = stride-1-j for slot j (group start first).
+        grouped = mx.stack(
+            [
+                mx.take_along_axis(
+                    encoder,
+                    mx.maximum(plan.indices - offset, 0)[..., None],
+                    axis=1,
+                ).astype(mx.float32)
+                for offset in range(cfg.ncp_stride - 1, -1, -1)
+            ],
+            axis=2,
+        )
+        concepts = self.pool_norm(self._pool(grouped).astype(encoder.dtype))
         concepts = mx.where(plan.valid[..., None], concepts, 0)
         memory = self.project_memory(concepts, plan.positions)
         visible = (
@@ -384,7 +441,7 @@ class NextConceptPrediction(nn.Module):
             & (plan.segment_ids[:, :, None] == plan.segment_ids[:, None, :])
             & (plan.positions[:, None, :] <= plan.positions[:, :, None])
         )
-        predictions, states = self.predict_next(
+        predictions, states, residual = self.predict_next(
             concepts, memory, plan.positions, visible
         )
         adjacent = (
@@ -393,7 +450,9 @@ class NextConceptPrediction(nn.Module):
             & (plan.segment_ids[:, :-1] == plan.segment_ids[:, 1:])
             & (plan.positions[:, 1:] - plan.positions[:, :-1] == cfg.ncp_stride)
         )
-        ncp, vq = self.auxiliary_losses(concepts, predictions, plan.valid, adjacent)
+        ncp, vq = self.auxiliary_losses(
+            concepts, predictions, residual, plan.valid, adjacent
+        )
         # Project at concept frequency, then hold through the next incomplete group.
         projected = self.feedback(self.feedback_norm(predictions))
         signals = self.feedback_gate * projected
@@ -433,11 +492,10 @@ class NextConceptPrediction(nn.Module):
         states = None
         if n:
             concepts = self.pool_norm(
-                mx.mean(
+                self._pool(
                     source[:, : n * cfg.ncp_stride]
                     .astype(mx.float32)
-                    .reshape(b, n, cfg.ncp_stride, d),
-                    axis=2,
+                    .reshape(b, n, cfg.ncp_stride, d)
                 ).astype(encoder.dtype)
             )
             pos = mx.broadcast_to(
@@ -456,7 +514,7 @@ class NextConceptPrediction(nn.Module):
                 <= (previous + mx.arange(n))[None, :, None],
                 (b, n, previous + n),
             )
-            predictions, states = self.predict_next(
+            predictions, states, _ = self.predict_next(
                 concepts, memory, pos, visible, cache
             )
             cache.memory = memory

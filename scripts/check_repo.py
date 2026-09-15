@@ -45,6 +45,11 @@ TEST_GROUPS = {
     ),
     "moe": ("test_v41_moe.py", "test_moe_qb.py", "test_moe_dataflow_metal.py"),
     "ncp": ("test_ncp_ced.py", "test_ncp_diagnostics.py"),
+    "thinking": (
+        "test_thinking.py",
+        "test_iterative_thinking.py",
+        "test_adam_precision.py",
+    ),
     "recurrent": (
         "test_ced_recurrent.py",
         "test_ced_recurrent_trainer.py",

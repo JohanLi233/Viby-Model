@@ -147,6 +147,24 @@ def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int
     cfg = model.config
     gemms = gemm_active_params(model)
     concept_attention = 0
+    if getattr(cfg, "thinking_enabled", False):
+        if cfg.thinking_arch in ("ced_iterative_v2", "ced_iterative_tied_v1"):
+            # Address projection: once for keys plus once for each query round.
+            gemms += cfg.thinking_steps * cfg.thinking_dim**2
+            if cfg.thinking_arch == "ced_iterative_tied_v1":
+                gemms += (
+                    cfg.dim * cfg.thinking_dim
+                )  # input projection reused in writeback
+            rounds = cfg.thinking_steps
+        else:
+            gemms += sum(
+                int(v.size)
+                for p, v in tree_flatten(model.trainable_parameters())
+                if p.startswith("model.thinking.block.") and v.ndim >= 2
+            )
+            rounds = 2
+        # Dense masked QK/AV, including masked slots; nominal logical work.
+        concept_attention += 12 * rounds * cfg.thinking_dim * max(seq_len, 0)
     if getattr(cfg, "ncp_enabled", False):
         fraction = (seq_len // cfg.ncp_stride) / seq_len if seq_len > 0 else 0
         concept_gemms = sum(
@@ -156,7 +174,7 @@ def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int
         )
         gemms += (fraction - 1) * concept_gemms
         # Depth selection runs at token frequency, projections at concept frequency.
-        if cfg.ncp_arch == "ced_state_v2" and seq_len > 0:
+        if cfg.ncp_arch in ("ced_state_v2", "ced_state_v3") and seq_len > 0:
             route_params = len(cfg.ncp_decoder_layers) * cfg.dim * cfg.ncp_layers
             gemms += (1 - fraction) * route_params
         # Each concept layer attends to a compact K=V memory.
@@ -171,7 +189,7 @@ def training_flops_per_token(model, seq_len: int, attention_lengths=None) -> int
             / 2
         )
         # Nearest-codebook search is detached from concepts (forward only);
-        # soft codeword prediction is already counted in concept_gemms.
+        # the prediction head (PQ mix or v3 residual MLP) is in concept_gemms.
         concept_attention += fraction * 2 * cfg.dim * cfg.ncp_codes
     if recurrent_active(cfg) and seq_len > 0:
         fraction = (

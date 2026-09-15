@@ -10,7 +10,11 @@
 
 | 文档 | 用途 | 阅读边界 |
 | --- | --- | --- |
-| [默认 CED-aware NCP](NCP_CED.md) | 干净 CED KV、分层概念记忆、状态/PQ 双通路、梯度与缓存契约 | 新模型默认；机制测试不证明质量或效率收益 |
+| [thinking2 完整训练梯度审计](THINKING_GRADIENT_AUDIT_20260915.md) | 梯度尖峰、LR/路由/批次对齐与FP32矩核查 | 完整训练正常结束；根因未定位，不等于质量或thinking贡献验收 |
+| [迭代读取与共享写回](TRANSITION_THINKING_20260914.md) | 可复用状态更新、三种子关系任务/反事实、真实文本对照 | `--thinking` 新模型选择共享写回迭代版；机制有局部证据，语言迭代收益未过gate，默认关闭 |
+| [历史 CED 两阶段思考态](CED_THINKING.md) | 流水线、FP32 Adam 修复、旧pilot和数值限制 | `ced_pipeline_v1`保留兼容；不作为迭代thinking证据 |
+| [历史 CED-aware NCP](NCP_CED.md) | v1/v2/v3 结构和旧检查点契约 | 用户终止 v1/v3；保留历史，不再默认启用 |
+| [查询递推筛查与 RLT 修正状态候选](LATENT_QUERY_20260914.md) | 两跳 answer-only 失败记录、RLT 现状与跨 token residual state 推导 | 独立 CPU probe；不支持 Viby 质量或 token 效率收益，后续候选未实现 |
 | [循环 CED](CED_RECURRENT.md) | 残差提升、锚点读取、分轮缓存、对照 | 可选主干变体，engine 兼容性需查当前入口 |
 | [QB 路由](MOE_QB_ROUTING.md) | 路由偏置、跨调用统计、累积窗口更新 | 改变训练配方，不是等价 kernel 优化 |
 | [TailSFT](TAIL_SFT.md) | SFT 默认损失、初始策略缓存、筛选和恢复契约 | 机制验证不证明覆盖率或后续 RL 收益 |

@@ -18,8 +18,12 @@ def trunc_normal(shape, std: float, bound: float = 2.0):
 
 def _skip_init(path: str, arr: mx.array) -> bool:
     """跳过 1-D 量与专用初始化：norm 权重、attn_sink（零）、mHC scale/base、
-    RoPE 表（freq_cos/freq_sin）、Engram 的 q/k_weight。"""
+    RoPE 表（freq_cos/freq_sin）、Engram 的 q/k_weight、NCP 零初始化残差头。"""
     if path in ("output.weight",):
+        return True
+    # NCP copy-residual 输出投影：零初始化是语义（初始预测 = 精确 copy），
+    # 全局重新随机化会无声破坏它（与 feedback_gate 等 1-D 零门不同，它是 2-D）。
+    if path.endswith("residual_out.weight"):
         return True
     if arr.ndim < 2:
         return True

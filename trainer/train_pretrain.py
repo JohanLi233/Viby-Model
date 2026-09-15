@@ -39,6 +39,15 @@ if __name__ == "__main__":
     # 创建模型配置：CLI 结构参数（含 --preset 回填）→ VibyConfig kwargs，
     # 未显式传入的字段由 VibyConfig 的 ≈1B 默认配方补齐
     lm_config = VibyConfig(**build_model_kwargs(args))
+    if lm_config.thinking_enabled:
+        from .utils import Logger
+
+        Logger(
+            f"Experimental CED thinking: arch={lm_config.thinking_arch}, "
+            f"width={lm_config.thinking_dim}, steps={lm_config.thinking_steps}, "
+            f"injection scale={lm_config.thinking_scale}; NTP only, no NCP/VQ. "
+            "Language-model quality and token efficiency are not established."
+        )
     if lm_config.ced_recurrent_enabled:
         from .utils import Logger
 

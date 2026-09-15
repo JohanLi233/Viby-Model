@@ -20,12 +20,17 @@ V4.1 这一条技术路线；唯一的保留项是 **Gated XSA**（默认开，�
 架构语义对照官方实现（`deepseek-ai/DeepSeek-V4.1-Flash` 的 `inference/model.py`，
 已逐行核对）与技术报告 `DeepSeek_V41_Tech_Report`（下称"报告"）。
 
-新建模型和预训练默认接入 [CED-aware NCP](research/NCP_CED.md)：保留完整 token
-主干，每四个 token 运行两层概念计算，层间更新一次紧凑概念记忆。概念状态
-由当前 token 按深度选择，与 PQ 预测分别经零初始化门控接入 decoder 第 6、10 层
-（默认 12 层布局）；原 CED 全局 KV 始终来自融合前的
-encoder 表示。旧 checkpoint 按原 sidecar 架构加载，迁移需要显式重置 optimizer。
-本轮实现及机制验证不代表训练质量或 token efficiency 收益。
+新建模型和预训练默认使用**纯 CED**。NCP v1/v3 已由用户终止，历史检查点仍按
+原 sidecar 加载。当前 [迭代思考实验](research/TRANSITION_THINKING_20260914.md) 用
+每轮读取结果更新下一轮查询，共享寻址映射，并用输入投影的转置写回decoder。
+新模型显式 `--thinking` 选择 `ced_iterative_tied_v1`，`--thinking_steps` 控制计算预算。
+结构化关系任务的三个新种子通过组合/反事实检验；小模型文本实验的总体NLL改善
+尚不能归因于迭代本身，因此thinking仍默认关闭，MuonH也默认关闭。旧
+[两阶段流水线](research/CED_THINKING.md) 保留 `--thinking_arch ced_pipeline_v1` 和原sidecar加载。
+
+本轮同时修复 FusedAdamW 的 BF16 动量精度问题：一、二阶矩和更新算术使用 FP32，
+参数保持原 dtype。旧 optimizer 语义需要 `--reset_optimizer`，新矩状态会增加内存；
+这项数值修复不等于已经解决全部梯度尖峰。
 
 默认关闭的[残差提升式循环 CED 实验](research/CED_RECURRENT.md)：
 `--ced-recurrent --mtp_depth 0` 在完整 CED 证据上，以 `k=4,q=3`
@@ -169,7 +174,7 @@ B=4/T=1024 的前向加反向试测节省约 4.1%，B=1 仍较慢。整训练预
 ## 训练
 
 ```bash
-# 默认 CED-aware NCP 冒烟（tiny；数据路径需指向已有语料）
+# 默认纯 CED 冒烟（tiny；数据路径需指向已有语料）
 .venv/bin/python trainer/train_pretrain.py --preset tiny --data_path ../dataset/pretrain_hq.jsonl \
   --max_seq_len 128 --batch_size 2 --accumulation_steps 1 --max_steps 50
 
@@ -178,7 +183,9 @@ B=4/T=1024 的前向加反向试测节省约 4.1%，B=1 仍较慢。整训练预
   --hidden_size 1024 --num_hidden_layers 12 --num_attention_heads 16 \
   --n_routed_experts 96 --num_experts_per_tok 6 --moe_intermediate_size 256 \
   --batch_size 12 --accumulation_steps 2 --max_seq_len 1024 \
-  --pack_sequences --doc_mask --compile_model --muonh
+  --pack_sequences --doc_mask --compile_model
+
+# MuonH 默认关闭；需要时显式添加 --muonh。
 
 # TailSFT（默认；需要 pretrain 检查点，先缓存初始模型的逐序列损失）
 .venv/bin/python trainer/train_full_sft.py --data_path ../dataset/sft_512.jsonl

@@ -47,7 +47,8 @@ def test_eval_interventions_and_diagnostic_vector():
     off = m(x, labels=x, ncp_intervention="off")
     metrics = dict(zip(NCP_METRICS, off.ncp_metrics.tolist()))
     assert metrics["feedback_rms"] == 0 and metrics["feedback_ratio"] == 0
-    assert normal.ncp_metrics[-1].item() > 0
+    normal_metrics = dict(zip(NCP_METRICS, normal.ncp_metrics.tolist()))
+    assert normal_metrics["feedback_ratio"] > 0
     close(normal.ncp_loss, off.ncp_loss)
     swapped = m(x, labels=x, ncp_intervention="swap")
     assert np.isfinite(swapped.lm_loss.item())

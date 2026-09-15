@@ -31,6 +31,8 @@ from .config import VibyConfig
 from .engram import Engram, EngramLayout, NgramHashState, build_compressed_token_map
 from .hc import identity_pre_mix, hc_pre
 from .ncp import NextConceptPrediction, cache_signature
+from .thinking import LatentThinking, cache_signature as thinking_signature
+from .iterative_thinking import IterativeThinking
 from .init import apply_trunc_normal_init
 from .moe import MoEFeedForward, MoEGate, update_expert_bias, update_quantile_bias
 from .norms import RMSNorm
@@ -137,6 +139,12 @@ class VibyModel(nn.Module):
         self.norm = RMSNorm(config.dim, config.norm_eps)
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
         self.ncp = NextConceptPrediction(config) if config.ncp_enabled else None
+        thinker = (
+            IterativeThinking
+            if config.thinking_arch in ("ced_iterative_v2", "ced_iterative_tied_v1")
+            else LatentThinking
+        )
+        self.thinking = thinker(config) if config.thinking_enabled else None
         self.engram_layout = (
             EngramLayout.from_config(config) if config.engram_layer_ids else None
         )
@@ -171,7 +179,76 @@ class VibyModel(nn.Module):
         collect_main: bool = True,
         use_ced_recurrent=True,
         ncp_intervention="normal",
+        thinking_intervention="normal",
     ):
+        if thinking_intervention not in ("normal", "off", "reset", "swap"):
+            raise ValueError("Unknown thinking intervention")
+        if thinking_intervention != "normal":
+            if self.training or cache is not None or self.thinking is None:
+                raise ValueError(
+                    "Thinking interventions require eval mode and an uncached sequence"
+                )
+            if thinking_intervention == "swap" and (
+                input_ids.shape[0] < 2
+                or segment_ids is not None
+                or pad_mask is not None
+            ):
+                raise ValueError(
+                    "Thinking swap needs two unpadded single-document rows"
+                )
+        thinking_clocks = None
+        if self.thinking is not None:
+            if cache is None and (
+                isinstance(start_pos, mx.array) or start_pos != 0 or decode
+            ):
+                raise ValueError(
+                    "Uncached thinking requires a full prefix at start_pos=0"
+                )
+            if cache is not None:
+                if segment_ids is not None or pad_mask is not None:
+                    raise ValueError(
+                        "Cached thinking requires unpadded single-document inputs"
+                    )
+                if isinstance(start_pos, mx.array):
+                    if not decode or input_ids.shape[1] != 1:
+                        raise ValueError(
+                            "Per-row thinking clocks require single-token decode"
+                        )
+                    thinking_clocks = start_pos.tolist()
+                    if len(thinking_clocks) != input_ids.shape[0]:
+                        raise ValueError("Thinking clock batch mismatch")
+                    if cache.thinking_rows is None and cache.thinking_state is not None:
+                        cache.thinking_rows = [
+                            cache.thinking_state.row_copy(row)
+                            for row in range(input_ids.shape[0])
+                        ]
+                        cache.thinking_state = None
+                elif cache.thinking_rows is not None:
+                    thinking_clocks = [start_pos] * input_ids.shape[0]
+                states = (
+                    cache.thinking_rows
+                    if thinking_clocks is not None
+                    else [cache.thinking_state]
+                )
+                clocks = thinking_clocks if thinking_clocks is not None else [start_pos]
+                if (
+                    states is None
+                    or len(states) != len(clocks)
+                    or any(
+                        state is None
+                        or state.tokens != clock
+                        or state.signature
+                        not in (None, thinking_signature(self.config))
+                        for state, clock in zip(states, clocks)
+                    )
+                ):
+                    raise ValueError(
+                        "Thinking cache clock/signature mismatch; use a fresh prefill"
+                    )
+        elif cache is not None and (
+            cache.thinking_state is not None or cache.thinking_rows is not None
+        ):
+            raise ValueError("Thinking execution changes require a fresh cache")
         if ncp_intervention not in ("normal", "off", "swap"):
             raise ValueError("Unknown NCP intervention")
         if ncp_intervention != "normal":
@@ -312,6 +389,39 @@ class VibyModel(nn.Module):
                 # MTP 读的是目标层的"注意力输入"（mHC 均值），不是层输出
                 mains.append(mx.mean(h, axis=2))
             global_kv_input = None
+            if self.thinking is not None and i == self.config.n_encoder_layers:
+                encoder_read = hc_pre(h, pre_mix)
+                global_kv_input = apply_hc_pre_norm(h, pre_mix, layer.attn_norm)
+                if thinking_clocks is None:
+                    signal = self.thinking(
+                        encoder_read,
+                        segment_ids,
+                        pad_mask,
+                        cache=None if cache is None else cache.thinking_state,
+                        start_pos=start_pos,
+                        intervention=thinking_intervention,
+                    )
+                else:
+                    signal = mx.concatenate(
+                        [
+                            self.thinking(
+                                encoder_read[row : row + 1],
+                                cache=state,
+                                start_pos=clock,
+                            )
+                            for row, (state, clock) in enumerate(
+                                zip(cache.thinking_rows, thinking_clocks)
+                            )
+                        ],
+                        axis=0,
+                    )
+                denom = mx.sum(pre_mix.astype(mx.float32), axis=-1, keepdims=True)
+                h = (
+                    h
+                    + (signal.astype(mx.float32) / mx.maximum(denom, 1e-12)).astype(
+                        h.dtype
+                    )[:, :, None]
+                )
             if self.ncp is not None and i == self.config.n_encoder_layers:
                 encoder_read = hc_pre(h, pre_mix)
                 # Keep the same normalization/dispatch as the baseline boundary.
@@ -575,8 +685,11 @@ class VibyForCausalLM(nn.Module):
         tail_reference=None,
         tail_fraction=None,
         ncp_intervention="normal",
+        thinking_intervention="normal",
         **kwargs,
     ):
+        if labels is not None and cache is not None and self.config.thinking_enabled:
+            raise ValueError("Thinking training losses require uncached full sequences")
         if labels is not None and cache is not None and self.config.ncp_enabled:
             raise ValueError("NCP training losses require uncached full sequences")
         pad = None if attention_mask is None else attention_mask.astype(mx.bool_)
@@ -592,6 +705,7 @@ class VibyForCausalLM(nn.Module):
             collect_main=want_main,
             use_ced_recurrent=use_ced_recurrent,
             ncp_intervention=ncp_intervention,
+            thinking_intervention=thinking_intervention,
         )
         hidden, mains, _ = result[:3]
         out = CausalLMOutput()
@@ -617,6 +731,23 @@ class VibyForCausalLM(nn.Module):
                     ncp.get("feedback_diagnostics", mx.zeros((3,))),
                 ]
             )
+            gates = mx.zeros((2,), mx.float32)
+            if self.model.ncp.state_enabled:
+                gates = mx.stack(
+                    [
+                        mx.mean(
+                            mx.stop_gradient(self.model.ncp.state_gates).astype(
+                                mx.float32
+                            )
+                        ),
+                        mx.mean(
+                            mx.stop_gradient(self.model.ncp.prediction_gates).astype(
+                                mx.float32
+                            )
+                        ),
+                    ]
+                )
+            out.ncp_metrics = mx.concatenate([out.ncp_metrics, gates])
         b, t, _ = hidden.shape
         if labels is None:
             out.logits = self.logits(hidden)

@@ -144,6 +144,7 @@ def load_model_weights(
     strict=True,
     label="checkpoint",
     allow_fresh_prefixes=(),
+    allow_drop_prefixes=(),
     weights=None,
 ):
     """安全地加载模型权重。
@@ -153,6 +154,8 @@ def load_model_weights(
     - `allow_fresh_prefixes`：这些前缀下的参数允许 checkpoint 里没有（从零
       初始化）。DSpark 独立阶段（报告 §2.4.3）就是用它：基座预训练时不含
       MTP 模块，草稿层在这一阶段才引入。
+    - `allow_drop_prefixes`：checkpoint 里这些前缀下的参数允许模型没有
+      （丢弃）。仅用于 attest 过的 NCP 执行版本迁移（v3 移除 PQ 预测头）。
     """
     if not checkpoint_path or not os.path.exists(checkpoint_path):
         Logger(f"Warning: {label} {checkpoint_path} not found")
@@ -165,6 +168,9 @@ def load_model_weights(
     skipped = []
     for key, value in weights.items():
         if key not in model_shapes:
+            if any(key.startswith(p) for p in allow_drop_prefixes):
+                skipped.append(key)
+                continue
             # 已删除子系统（HRM/Engram/value-res/CycleDelta）的旧参数
             # 属于已知可丢弃参数。
             if any(m in key for m in _LEGACY_WEIGHT_MARKERS):
@@ -315,6 +321,9 @@ def build_model_and_tokenizer(
                 ("mtp_modules.",) if getattr(args, "freeze_backbone", False) else ()
             )
             + ncp_warm_start_prefixes(checkpoint_path, lm_config, converted),
+            allow_drop_prefixes=ncp_warm_start_drop_prefixes(
+                checkpoint_path, lm_config, converted
+            ),
         )
         if not loaded:
             raise FileNotFoundError(
@@ -347,6 +356,11 @@ ARCH_ARG_TO_FIELD = {
     **{
         name: name
         for name in [
+            "thinking_enabled",
+            "thinking_dim",
+            "thinking_arch",
+            "thinking_steps",
+            "thinking_scale",
             "ncp_stride",
             "ncp_layers",
             "ncp_memory_dim",
@@ -431,6 +445,8 @@ ARCH_ARG_TO_FIELD = {
 # （--routed_scaling_factor 与 --route_scale 共用一个 dest，这里只用于
 #  --preset 判断"用户是否显式传过"）
 ARCH_ARG_ALIASES = {
+    "thinking": "thinking_enabled",
+    "no_thinking": "thinking_enabled",
     "routed_scaling_factor": "route_scale",
     "ced_recurrent": "ced_recurrent_enabled",
     "no_ced_recurrent": "ced_recurrent_enabled",
@@ -540,6 +556,15 @@ def load_checkpoint_config(save_dir, checkpoint_name):
 def checkpoint_execution(config):
     """Execution identity independent of shared parameter names/shapes."""
     cfg = config if isinstance(config, dict) else vars(config)
+    if cfg.get("thinking_enabled", False):
+        execution = {
+            "kind": cfg.get("thinking_arch", "ced_pipeline_v1"),
+            "thinking_dim": cfg.get("thinking_dim", 128),
+            "thinking_scale": cfg.get("thinking_scale", 0.1),
+        }
+        if execution["kind"] in ("ced_iterative_v2", "ced_iterative_tied_v1"):
+            execution["thinking_steps"] = cfg.get("thinking_steps", 2)
+        return execution
     if cfg.get("ncp_enabled", False):
         return {
             "kind": cfg.get("ncp_arch", "legacy_ncp_v0"),
@@ -597,35 +622,72 @@ def validate_checkpoint_execution(checkpoint_path, config, args, *, automatic=Fa
     return True
 
 
-def ncp_warm_start_prefixes(checkpoint_path, config, converted):
-    """Only explicitly reset, attested checkpoints may initialize new NCP paths."""
-    if not converted or not config.ncp_enabled:
-        return ()
+def _ncp_source_execution(checkpoint_path):
     path = os.path.splitext(os.fspath(checkpoint_path))[0] + ".json"
     if not os.path.exists(path):
-        return ()
+        return {}
     with open(path, encoding="utf-8") as file:
         meta = json.load(file)
-    execution = meta.get("execution") or checkpoint_execution(meta.get("config", {}))
-    if execution.get("kind") == "token_ced_v1":
+    return meta.get("execution") or checkpoint_execution(meta.get("config", {}))
+
+
+_NCP_STATE_PREFIXES = (
+    "memory_updates.",
+    "memory_update_norm.",
+    "state_norm.",
+    "state_projects.",
+    "route_norm.",
+    "state_routes.",
+    "state_gates",
+    "prediction_gates",
+)
+_NCP_V3_PREFIXES = ("pool_slots", "residual_norm.", "residual_in.", "residual_out.")
+
+
+def ncp_warm_start_prefixes(checkpoint_path, config, converted):
+    """Only explicitly reset, attested checkpoints may initialize new NCP paths."""
+    if converted and config.thinking_enabled:
+        if _ncp_source_execution(checkpoint_path).get("kind") != config.thinking_arch:
+            return ("model.thinking.",)
+    if not converted or not config.ncp_enabled:
+        return ()
+    kind = _ncp_source_execution(checkpoint_path).get("kind")
+    if kind == "token_ced_v1":
         return ("model.ncp.",)
+    fresh = None
+    if kind == "ced_shared_kv_v1":
+        if config.ncp_arch == "ced_state_v2":
+            fresh = _NCP_STATE_PREFIXES
+        elif config.ncp_arch == "ced_state_v3":
+            fresh = _NCP_STATE_PREFIXES + _NCP_V3_PREFIXES
+    elif kind == "ced_state_v2" and config.ncp_arch == "ced_state_v3":
+        fresh = _NCP_V3_PREFIXES
+    if fresh is None:
+        return ()
+    return tuple("model.ncp." + name for name in fresh)
+
+
+def ncp_warm_start_drop_prefixes(checkpoint_path, config, converted):
+    """v3 removes the PQ predict head; v1/v2 checkpoints must drop its keys."""
+    source_kind = (
+        _ncp_source_execution(checkpoint_path).get("kind") if converted else None
+    )
+    if source_kind in (
+        "ced_pipeline_v1",
+        "ced_iterative_v2",
+        "ced_iterative_tied_v1",
+    ) and (not config.thinking_enabled or config.thinking_arch != source_kind):
+        return ("model.thinking.",)
     if (
-        execution.get("kind") == "ced_shared_kv_v1"
-        and config.ncp_arch == "ced_state_v2"
+        converted
+        and not config.ncp_enabled
+        and source_kind in ("ced_shared_kv_v1", "ced_state_v2", "ced_state_v3")
     ):
-        return tuple(
-            "model.ncp." + name
-            for name in (
-                "memory_updates.",
-                "memory_update_norm.",
-                "state_norm.",
-                "state_projects.",
-                "route_norm.",
-                "state_routes.",
-                "state_gates",
-                "prediction_gates",
-            )
-        )
+        return ("model.ncp.",)
+    if not converted or not config.ncp_enabled or config.ncp_arch != "ced_state_v3":
+        return ()
+    if source_kind in ("ced_shared_kv_v1", "ced_state_v2"):
+        return ("model.ncp.predict.", "model.ncp.predict_norm.")
     return ()
 
 
@@ -639,6 +701,9 @@ def build_config_from_sidecar(args, checkpoint_name):
     sidecar = load_checkpoint_config(args.save_dir, checkpoint_name)
     cfg = dict(sidecar) if sidecar else {}
     if sidecar:
+        cfg.setdefault("thinking_enabled", False)
+        if cfg["thinking_enabled"]:
+            cfg.setdefault("thinking_arch", "ced_pipeline_v1")
         cfg.setdefault("ncp_enabled", False)
         if cfg["ncp_enabled"]:
             cfg.setdefault("ncp_arch", "legacy_ncp_v0")
@@ -648,6 +713,12 @@ def build_config_from_sidecar(args, checkpoint_name):
         if value is not None:
             cfg[field] = _as_int_tuple(value) if arg in ARCH_LIST_ARGS else value
             given.add(arg)
+    if getattr(args, "thinking_enabled", None) is True:
+        # Explicit SFT/DPO migration replaces the inherited legacy branch.
+        # Weight loading still requires the execution reset attestation.
+        cfg["ncp_enabled"] = False
+        if getattr(args, "ced_recurrent_enabled", None) is not True:
+            cfg["ced_recurrent_enabled"] = False
     if sidecar:
         # 结构生成参数被显式改动时，sidecar 里的派生字段作废（见
         # DERIVED_FIELD_TRIGGERS 的说明）；用户显式传了的派生字段保留
@@ -1003,7 +1074,9 @@ def _artifact_sha256(path, common_only=False):
             size = struct.unpack("<Q", file.read(8))[0]
             header = json.loads(file.read(size))
             for name, entry in sorted(header.items()):
-                if name == "__metadata__" or name.startswith("model.ncp."):
+                if name == "__metadata__" or name.startswith(
+                    ("model.ncp.", "model.thinking.")
+                ):
                     continue
                 digest.update(
                     json.dumps([name, entry["dtype"], entry["shape"]]).encode()
@@ -1074,6 +1147,7 @@ def save_checkpoint(
         "execution": checkpoint_execution(lm_config),
         "training_type": training_type,
         "optimizer": _optimizer_hparams(optimizer),
+        "optimizer_math": "adam_fp32_v1",
     }
     if training_type == "sft" and getattr(args, "sft_algorithm", "standard") == "tail":
         meta["rng"] = {
@@ -1083,7 +1157,7 @@ def save_checkpoint(
         }
     if any(
         getattr(lm_config, flag, False)
-        for flag in ("ced_recurrent_enabled", "ncp_enabled")
+        for flag in ("ced_recurrent_enabled", "ncp_enabled", "thinking_enabled")
     ):
         meta["code_sha"] = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
@@ -1130,7 +1204,7 @@ def save_checkpoint(
 
     if any(
         getattr(lm_config, flag, False)
-        for flag in ("ced_recurrent_enabled", "ncp_enabled")
+        for flag in ("ced_recurrent_enabled", "ncp_enabled", "thinking_enabled")
     ):
         meta["common_weights_sha256"] = _artifact_sha256(ckp, common_only=True)
         meta["optimizer_sha256"] = _artifact_sha256(opt_path)
@@ -1145,6 +1219,21 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
     """统一的检查点加载函数（safetensors 格式）"""
     Logger(f"Loading checkpoint from: {checkpoint_path}")
     converted = validate_checkpoint_execution(checkpoint_path, model.config, args)
+    # Reject obsolete EMA semantics before mutating model or optimizer state.
+    meta_file = os.path.splitext(checkpoint_path)[0] + ".json"
+    if not getattr(args, "reset_optimizer", False) and not getattr(
+        args, "freeze_backbone", False
+    ):
+        old_opt_file = os.path.splitext(checkpoint_path)[0] + ".optimizer.safetensors"
+        if os.path.exists(meta_file) or os.path.exists(old_opt_file):
+            precision_meta = {}
+            if os.path.exists(meta_file):
+                with open(meta_file) as stream:
+                    precision_meta = json.load(stream)
+            if precision_meta.get("optimizer_math") != "adam_fp32_v1":
+                raise ValueError(
+                    "Checkpoint uses legacy Adam moments; use --reset_optimizer for FP32 Adam"
+                )
     weights = dict(mx.load(checkpoint_path).items())
     fresh_prefixes = (
         ("mtp_modules.",) if getattr(args, "freeze_backbone", False) else ()
@@ -1159,6 +1248,9 @@ def load_checkpoint(checkpoint_path, model, optimizer, args):
         strict=True,
         label="checkpoint",
         allow_fresh_prefixes=fresh_prefixes,
+        allow_drop_prefixes=ncp_warm_start_drop_prefixes(
+            checkpoint_path, model.config, converted
+        ),
         weights=weights,
     ):
         raise FileNotFoundError(f"Checkpoint 不存在: {checkpoint_path}")

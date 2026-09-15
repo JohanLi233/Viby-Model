@@ -131,7 +131,27 @@ def add_common_args(parser):
         "--index_head_dim", type=int, default=_DEFAULT_CFG.index_head_dim
     )
     parser.add_argument("--index_topk", type=int, default=_DEFAULT_CFG.index_topk)
-    # Default CED-aware NCP; these are explicit shape/loss settings, not variants.
+    parser.add_argument(
+        "--thinking",
+        dest="thinking_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Experimental CED iterative thinking; disabled by default, pure CED is the baseline",
+    )
+    parser.add_argument("--thinking_dim", type=int, default=_DEFAULT_CFG.thinking_dim)
+    parser.add_argument(
+        "--thinking_arch",
+        choices=("ced_pipeline_v1", "ced_iterative_v2", "ced_iterative_tied_v1"),
+        default=None,
+        help="Thinking execution version; legacy sidecars retain their version",
+    )
+    parser.add_argument(
+        "--thinking_steps", type=int, default=_DEFAULT_CFG.thinking_steps
+    )
+    parser.add_argument(
+        "--thinking_scale", type=float, default=_DEFAULT_CFG.thinking_scale
+    )
+    # Retained only for explicitly constructed legacy NCP models/sidecars.
     for name in [
         "ncp_stride",
         "ncp_layers",
@@ -566,11 +586,11 @@ def add_common_args(parser):
         "--muonh",
         dest="muonh",
         action="store_true",
-        default=True,
+        default=False,
         help="MuonH/AdamH/Adam 体系（Marin 口径）：Muon 组更新加 Frobenius "
         "范数球投影（方向/范数解耦）；3D 堆叠专家逐专家 NS 进 MuonH（"
         "`--no_muonh` 或 VIBY_MUONH_EXPERTS=0 时专家回 AdamW）；lm_head（非 tied）"
-        "走 AdamH（Adam 方向+范数球投影，lr=muon 基础 lr）。默认开启。"
+        "走 AdamH（Adam 方向+范数球投影，lr=muon 基础 lr）。默认关闭，显式 --muonh 开启。"
         "注意：开关改变优化器分组，不能用于续跑旧 checkpoint（optimizer state "
         "分组对不上），只用于新 run。正交化固定每步全量重算：NS 降频复用/"
         "Temporal Q 缓存是 r082 回退的最大元凶（早期 −0.4~0.5 nat），机制已删除，"

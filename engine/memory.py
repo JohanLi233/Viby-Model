@@ -34,6 +34,7 @@ class PrefixState:
 
     n: int
     ncp: object = None
+    thinking: object = None
     window: list = field(default_factory=list)  # 每层 [window, hd]
     compress: dict = field(default_factory=dict)  # 源层 → [n//ratio, hd]
     index_k: dict = field(
@@ -96,6 +97,35 @@ def _ncp_row(cache, row):
     return None if cache.ncp_state is None else cache.ncp_state.row_copy(row)
 
 
+def _thinking_row(cache, row):
+    if cache.thinking_rows is not None:
+        return cache.thinking_rows[row].row_copy()
+    return None if cache.thinking_state is None else cache.thinking_state.row_copy(row)
+
+
+def _set_thinking_row(cache, row, state):
+    from model.thinking import ThinkingCache, cache_signature
+
+    if state is None:
+        if cache.config.thinking_enabled:
+            raise ValueError("Prefix is missing thinking state; use a fresh prefill")
+        return
+    if not cache.config.thinking_enabled or state.signature != cache_signature(
+        cache.config
+    ):
+        raise ValueError("Thinking prefix execution differs; use a fresh prefill")
+    batch = _batch_of(cache)
+    if batch == 1:
+        cache.thinking_state, cache.thinking_rows = state.row_copy(), None
+    else:
+        if cache.thinking_rows is None:
+            cache.thinking_rows = [ThinkingCache() for _ in range(batch)]
+            for item in cache.thinking_rows:
+                item.signature = cache_signature(cache.config)
+        cache.thinking_rows[row] = state.row_copy()
+        cache.thinking_state = None
+
+
 def _set_ncp_row(cache, row, state):
     if state is None:
         if cache.config.ncp_enabled:
@@ -132,6 +162,7 @@ def copy_state_row(
     """
     batch = _batch_of(dst)
     _set_ncp_row(dst, drow, _ncp_row(src, srow))
+    _set_thinking_row(dst, drow, _thinking_row(src, srow))
     for i, dl in enumerate(dst.layers):
         sl = src.layers[i]
         dl.window[drow] = sl.window[srow]
@@ -157,6 +188,9 @@ def capture_state(
     """从 cache 的第 row 行取长度 n 的状态快照（显式拷贝，之后 cache 再被写也不影响）。"""
     state = PrefixState(n=int(n), hidden=hidden)
     state.ncp = _ncp_row(cache, row)
+    state.thinking = _thinking_row(cache, row)
+    if state.thinking is not None and state.thinking.tokens != n:
+        raise ValueError("Thinking snapshot must match the complete prefix clock")
     if state.ncp is not None and state.ncp.tokens != n:
         raise ValueError("NCP snapshot must use the actual processed token clock")
     if draft_mains is not None:
@@ -182,6 +216,9 @@ def restore_state(dst: VibyCache, drow: int, state: PrefixState) -> int:
     if state.ncp is not None and state.ncp.tokens != state.n:
         raise ValueError("NCP prefix clock mismatch")
     _set_ncp_row(dst, drow, state.ncp)
+    if state.thinking is not None and state.thinking.tokens != state.n:
+        raise ValueError("Thinking snapshot clock mismatch")
+    _set_thinking_row(dst, drow, state.thinking)
     for i, dl in enumerate(dst.layers):
         # Dense prefix continuation uses a Python filled count; the decode
         # compressor also carries a per-row GPU count in kv_state.
@@ -220,6 +257,10 @@ def cache_bytes(cache: Optional[VibyCache]) -> int:
         if lc.kv_state is not None:
             total += sum(_array_bytes(s) for s in lc.kv_state)
     total += _array_bytes(cache.engram_prev)
+    if cache.thinking_rows is not None:
+        total += sum(state.nbytes() for state in cache.thinking_rows)
+    elif cache.thinking_state is not None:
+        total += cache.thinking_state.nbytes()
     if cache.ncp_rows is not None:
         total += sum(state.nbytes() for state in cache.ncp_rows)
     elif cache.ncp_state is not None:
@@ -235,6 +276,8 @@ def state_bytes(state: PrefixState) -> int:
         total += sum(_array_bytes(s) for s in tup)
     total += _array_bytes(state.engram_prev)
     total += _array_bytes(state.hidden)
+    if state.thinking is not None:
+        total += state.thinking.nbytes()
     if state.ncp is not None:
         total += state.ncp.nbytes()
     if state.draft_mains is not None:
